@@ -11,7 +11,7 @@ namespace eval gnulib {}
 
 proc gnulib::setup {} {
     global os.platform os.major
-    if {${os.platform} eq "darwin" && ${os.major} <= 9} {
+    if {${os.platform} eq "darwin" && ${os.major} <= 10} {
         # Override configure tests that causes problems on older macOS.
         # https://trac.macports.org/ticket/62994
         configure.args-append \
