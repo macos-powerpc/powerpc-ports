@@ -81,12 +81,7 @@ options compilers.add_gcc_rpath_support
 default compilers.add_gcc_rpath_support yes
 
 # Set a default gcc version
-if {${os.major} < 10 && ${os.platform} eq "darwin" } {
-    # see https://trac.macports.org/ticket/57135
-    set compilers.gcc_default gcc7
-} else {
-    set compilers.gcc_default gcc14
-}
+set compilers.gcc_default gcc14
 
 set compilers.list {cc cxx cpp objc fc f77 f90}
 
@@ -101,22 +96,23 @@ if { ${os.arch} eq "arm" || ${os.platform} ne "darwin" } {
 } else {
     set gcc_versions [list]
     if { ${os.major} < 15 } {
-        lappend gcc_versions 5 6 7 8 9
-    }
-    if { ${os.major} >= 10 } {
-        if { [vercmp ${xcodeversion} < 16.0] && [vercmp ${xcodecltversion} < 16.0] } {
-            lappend gcc_versions 10 11 12 13
+        lappend gcc_versions 5 6 7
+        if { ${os.major} > 10 } {
+            lappend gcc_versions 8 9
         }
-        lappend gcc_versions 14 devel
+    }
+    if { [vercmp ${xcodeversion} < 16.0] && [vercmp ${xcodecltversion} < 16.0] } {
+        lappend gcc_versions 10 11 12 13
+    }
+    lappend gcc_versions 14 devel
+    if { ${os.arch} eq "powerpc" } {
+        lappend gcc_versions powerpc
     }
 }
 # GCC version providing the primary runtime
 # Note settings here *must* match those in the lang/libgcc port.
-if { ${os.major} < 10 && ${os.platform} eq "darwin" } {
-    set gcc_main_version 7
-} else {
-    set gcc_main_version 14
-}
+set gcc_main_version 14
+
 ui_debug "GCC versions for Darwin ${os.major} ${os.arch} - ${gcc_versions}"
 foreach ver ${gcc_versions} {
     # Remove dot from version if present
@@ -129,6 +125,10 @@ foreach ver ${gcc_versions} {
         set cdb(gcc$ver_nodot,depends)  port:gcc-devel
         set cdb(gcc$ver_nodot,dependsl) "port:libgcc-devel"
         set cdb(gcc$ver_nodot,dependsa) gcc-devel
+    } elseif { $ver eq "powerpc" } {
+        set cdb(gcc$ver_nodot,depends)  port:gcc-powerpc
+        set cdb(gcc$ver_nodot,dependsl) "port:libgcc-powerpc"
+        set cdb(gcc$ver_nodot,dependsa) gcc-powerpc
     } else {
         set cdb(gcc$ver_nodot,depends)  port:gcc$ver_nodot
         if {[vercmp ${ver} < 4.6]} {
@@ -841,7 +841,7 @@ proc compilers::add_fortran_legacy_support {} {
     global compilers.allow_arguments_mismatch
     if {${compilers.allow_arguments_mismatch}} {
         set gcc_v [compilers::get_current_gcc_version]
-        if { ${gcc_v} >= 10 || ${gcc_v} == "devel" } {
+        if { ${gcc_v} >= 10 || ${gcc_v} == "devel" || ${gcc_v} == "powerpc" } {
             configure.fflags-delete     -fallow-argument-mismatch
             configure.fcflags-delete    -fallow-argument-mismatch
             configure.f90flags-delete   -fallow-argument-mismatch
@@ -857,7 +857,7 @@ port::register_callback compilers::add_fortran_legacy_support
 proc compilers::add_gcc_rpath_support {} {
     global prefix os.platform os.major
     set gcc_v [compilers::get_current_gcc_version]
-    if { ${gcc_v} >= 10 || ${gcc_v} == "devel" } {
+    if { ${gcc_v} >= 10 || ${gcc_v} == "devel" || ${gcc_v} == "powerpc" } {
         if {${os.platform} eq "darwin" && ${os.major} > 8} {
             ui_debug "compilers PG: RPATH added to ldflags as GCC version is ${gcc_v}"
             configure.ldflags-delete  -Wl,-rpath,${prefix}/lib/libgcc
