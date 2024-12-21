@@ -2,7 +2,7 @@
 
 # GCC version providing the primary runtime
 # Note settings here *must* match those in the lang/libgcc port and compilers PG
-set gcc_main_version    14
+set gcc_main_version 14
 
 # compiler links against libraries in libgcc\d* and/or libgcc-*
 if {[vercmp ${gcc_version} 4.6] < 0} {
