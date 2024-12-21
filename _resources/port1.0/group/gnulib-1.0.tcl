@@ -11,6 +11,8 @@ namespace eval gnulib {}
 
 proc gnulib::setup {} {
     global os.platform os.major
+    # This fix is only needed on 10a190, but keep it for now.
+    # Once we move to 10.6.8 completely, it can be dropped (10.5 still needs it).
     if {${os.platform} eq "darwin" && ${os.major} <= 10} {
         # Override configure tests that causes problems on older macOS.
         # https://trac.macports.org/ticket/62994
