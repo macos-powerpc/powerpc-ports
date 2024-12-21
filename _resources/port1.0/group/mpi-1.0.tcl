@@ -351,6 +351,12 @@ proc mpi.setup {args} {
                 -gcc7 -gcc9 \
                 -clang90 -clang10
         }
+
+        if {${os.arch} eq "powerpc"} {
+            # Disable compilers not supported on powerpc.
+            lappend ::mpi.disabled_compilers \
+                -clang -gcc9
+        }
     }
 
     compilers.setup {*}$cl {*}${::mpi.disabled_compilers}
