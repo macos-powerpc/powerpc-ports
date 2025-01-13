@@ -56,11 +56,16 @@ foreach mpiname [array names mpidb *,variant] {
 unset mpiname
 
 proc mpi.get_default_mpi_compiler {} {
+    global os.arch
     # No MPI variant has been selected.
     # Attempt to select the MPI port that is consistent with the compiler being used.
     lassign [split [option configure.compiler] "-"] ismacports type ver
     if {${ismacports} ne "macports"} {
         # system compiler is being used, so use {mpich,openmpi}-default
+        return {mp default}
+    } elseif {${os.arch} eq "powerpc"} {
+        # MPI never uses Xcode gcc and there is no clang.
+        # Avoid unnecessary zoo of mpich versions.
         return {mp default}
     } else {
         # macports compiler is being used, so use the corresponding MPI port
