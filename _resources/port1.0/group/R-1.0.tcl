@@ -112,20 +112,13 @@ if { ${os.major} > 23 } {
 # Similarly, for gcc select the gcc13 variant of the compilers PG.
 # This setting should also be kept in sync with that in the R Port.
 # Updates should be coordinated with the R maintainers.
-if { ${os.major} < 10 || ${os.major} > 23 } {
-    # https://trac.macports.org/ticket/70799
-    compiler.blacklist-append   {macports-gcc-1[5-9]}
-} else {
-    compiler.blacklist-append   {macports-gcc-1[4-9]}
-}
-# NOTE: upon the update to gcc14, please update the blacklist accordingly,
+# https://trac.macports.org/ticket/70799
+compiler.blacklist-append   {macports-gcc-1[5-9]}
+
+# NOTE: upon the update to gcc15, please update the blacklist accordingly,
 # like it is done for clangs. We would prefer using the same version of gcc and gfortran.
-if { ${os.major} < 10 || ${os.major} > 23 } {
-    # https://trac.macports.org/ticket/70799
-    default_variants-append +gcc14
-} else {
-    default_variants-append +gcc13
-}
+# https://trac.macports.org/ticket/70799
+default_variants-append     +gcc14
 
 # R bakes in the compiler, so if it is built with ccache,
 # then it will require ccache to build R packages.
