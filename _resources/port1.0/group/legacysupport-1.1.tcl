@@ -154,7 +154,7 @@ set ls_cache_cppflags [list]
 proc legacysupport::add_legacysupport {} {
     global prefix os.platform os.major
     global ls_cache_incpath ls_cache_ldflags ls_cache_cppflags
-    global configure.cxx_stdlib
+    global configure.cxx_stdlib configure.compiler
 
     if { ${os.platform} eq "darwin" && ${os.major} <= [option legacysupport.newest_darwin_requires_legacy] } {
 
@@ -177,10 +177,15 @@ proc legacysupport::add_legacysupport {} {
 
         # Flags for using MP libcxx
         if { [option legacysupport.use_mp_libcxx] && ${configure.cxx_stdlib} eq "libc++" } {
-            legacysupport::add_once depends_lib append port:macports-libcxx
-            append ls_cache_incpath  " ${prefix}/include/libcxx/v1"
-            append ls_cache_ldflags  " -L${prefix}/lib/libcxx"
-            append ls_cache_cppflags " -nostdinc++ -isystem${prefix}/include/libcxx/v1"
+            if { [string match macports-clang-* ${configure.compiler}] } {
+                legacysupport::add_once depends_lib append port:macports-libcxx
+                append ls_cache_incpath  " ${prefix}/include/libcxx/v1"
+                append ls_cache_ldflags  " -L${prefix}/lib/libcxx"
+                append ls_cache_cppflags " -nostdinc++ -isystem${prefix}/include/libcxx/v1"
+            } elseif { [string match macports-gcc-* ${configure.compiler}] } {
+                # libcxx-powerpc has filesystem in a separate lib
+                append ls_cache_ldflags  " -lc++fs"
+            }
         }
 
         ui_debug "legacysupport: ldflags  ${ls_cache_ldflags}"
