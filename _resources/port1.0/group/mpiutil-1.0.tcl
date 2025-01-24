@@ -194,7 +194,7 @@ proc mpiutil_add_depends_run {subport cname} {
 }
 
 proc mpiutil_set_binary_eligibility {subport cname} {
-    if {[lsearch -exact {mp llvm clang} ${cname}] != -1} {
+    if {[lsearch -exact {llvm clang} ${cname}] != -1} {
         # Force local builds with Xcode-provided compilers (avoid issues with
         # different Xcode versions on buildbot and user machines)
         ui_debug "mpiutil_set_binary_eligibility: ${subport}: Disabling binary use"
