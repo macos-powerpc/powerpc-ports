@@ -174,6 +174,8 @@ PortGroup   compiler_blacklist_versions 1.0
 ## - wxPython-3.0
 ## - wxWidgets-3.0-cxx11
 ## - wxWidgets-3.2
+## - wxGTK-3.2
+## - wxX11-3.2
 proc wxWidgets._set {option action args} {
     global prefix frameworks_dir os.major
     global wxWidgets.name wxWidgets.version wxWidgets.prefix wxWidgets.wxdir
@@ -279,9 +281,17 @@ proc wxWidgets._set {option action args} {
                 return -code error "incompatible macOS version"
             }
         }
+    } elseif {${args} eq "wxGTK-3.2"} {
+        wxWidgets.name      "wxGTK"
+        wxWidgets.version   "3.2"
+        wxWidgets.port      "wxgtk-3.2"
+    } elseif {${args} eq "wxGTK-3.3"} {
+        wxWidgets.name      "wxGTK"
+        wxWidgets.version   "3.3"
+        wxWidgets.port      "wxgtk-devel"
     } else {
         # throw an error
-        ui_error "invalid parameter for wxWidgets.use; use one of:\n\twxWidgets-2.8/wxGTK-2.8/wxWidgets-3.0/wxGTK-3.0/wxPython-3.0/wxWidgets-3.2"
+        ui_error "invalid parameter for wxWidgets.use; use one of:\n\twxWidgets-2.8/wxGTK-2.8/wxWidgets-3.0/wxGTK-3.0/wxPython-3.0/wxWidgets-3.2/wxGTK-3.2/wxGTK-3.3"
         return -code return "invalid parameter for wxWidgets.use"
     }
     wxWidgets.prefix    ${frameworks_dir}/wxWidgets.framework/Versions/${wxWidgets.name}/${wxWidgets.version}
