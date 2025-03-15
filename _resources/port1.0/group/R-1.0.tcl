@@ -103,7 +103,7 @@ compiler.blacklist-append   {clang}
 # is then in the hands of the R maintainers and will not change
 # from the current defaults when these get bumped centrally.
 # NOTE : Keep this setting in sync with the one in the R port.
-if { ${os.major} > 23 } {
+if { ${os.major} > 22 } {
     # https://trac.macports.org/ticket/70799
     compiler.blacklist-append   {macports-clang-19} {macports-clang-2[0-9]}
 } else {
