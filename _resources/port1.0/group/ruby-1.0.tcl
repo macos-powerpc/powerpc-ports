@@ -186,7 +186,8 @@ proc ruby.setup {module vers {type "install.rb"} {docs {}} {source "custom"} {im
         }
     } else {
         switch ${implementation} {
-            ruby-devel { ruby.branch 3.4 }
+            ruby-devel { ruby.branch 3.5 }
+            ruby34 { ruby.branch 3.4 }
             ruby33 { ruby.branch 3.3 }
             ruby32 { ruby.branch 3.2 }
             ruby31 { ruby.branch 3.1 }
