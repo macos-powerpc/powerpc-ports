@@ -296,7 +296,7 @@ if {![info exists building_qt4]} {
 
 # use PKGCONFIG for Qt discovery in configure scripts
 depends_build-delete    port:pkgconfig
-depends_build-append    port:pkgconfig
+depends_build-append    path:bin/pkg-config:pkgconfig
 
 # standard destroot environment
 
