@@ -1,0 +1,133 @@
+From f006d069fd17099d9de12da8eac6da1dbe008c3f Mon Sep 17 00:00:00 2001
+From: Eduardo Aguilar <eduardo.aguilar@mind.be>
+Date: Mon, 2 Nov 2020 16:37:03 +0100
+Subject: [PATCH 2/2] ppc: fix Float64Sqrt implementation in 32 bit
+
+Use fsqrte to get an approximate of 1/sqrt(x), then use
+two iterations of the Newton method to obtain a better result.
+
+Add a truncation at the end to omit imprecise decimals for integer
+square roots.
+
+Signed-off-by: Eduardo Aguilar <eduardo.aguilar@mind.be>
+---
+ .../v8/src/codegen/ppc/macro-assembler-ppc.cc | 68 +++++++++++++++++++
+ deps/v8/src/codegen/ppc/macro-assembler-ppc.h |  2 +
+ .../backend/ppc/code-generator-ppc.cc         |  7 +-
+ 3 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/deps/v8/src/codegen/ppc/macro-assembler-ppc.cc b/deps/v8/src/codegen/ppc/macro-assembler-ppc.cc
+index 0153c1a8..6e99ce41 100644
+--- a/deps/v8/src/codegen/ppc/macro-assembler-ppc.cc
++++ b/deps/v8/src/codegen/ppc/macro-assembler-ppc.cc
+@@ -697,6 +697,74 @@ void TurboAssembler::CanonicalizeNaN(const DoubleRegister dst,
+   fsub(dst, src, kDoubleRegZero);
+ }
+ 
++
++void TurboAssembler::TruncateApproximatedDouble(
++  DoubleRegister dst, DoubleRegister src,
++  unsigned int bits)  {
++  Register scratch = kScratchReg;
++
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(src, MemOperand(sp, 0));
++  lwz(scratch, MemOperand(sp, LO_WORD_OFFSET));
++  rlwinm(scratch, scratch, 0, 0, 31-bits);
++  stw(scratch, MemOperand(sp, LO_WORD_OFFSET));
++  lfd(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kDoubleSize));
++}
++
++void TurboAssembler::RsqrtNewtonStep(
++  DoubleRegister dst, DoubleRegister src,
++  	RCBit rc)  {
++  DoubleRegister Dscratch = d11;
++  DoubleRegister Dscratch2 = d12;
++  DoubleRegister Dscratch3 = kScratchDoubleReg;
++  Register scratch = kScratchReg;
++
++  /* fast 1/sqrt(x) estimated */
++  frsqrte(Dscratch3, src, rc);
++
++  /* Two Newton method iterations over result to improve accuracy
++     https://en.wikipedia.org/wiki/Fast_inverse_square_root
++     y_n+1 = y_n(1.5 - 0.5*x*y_n^2)
++  */
++  subi(sp, sp, Operand(2*kFloatSize));
++
++  lis(scratch, Operand(0x3f00));
++  stw(scratch, MemOperand(sp, 0));
++  lfs(Dscratch, MemOperand(sp, 0));
++  lis(scratch, Operand(0x3fc0));
++  stw(scratch, MemOperand(sp, kFloatSize));
++  lfs(Dscratch2, MemOperand(sp, kFloatSize));
++
++  fmul(Dscratch, Dscratch, src);
++  fmul(Dscratch, Dscratch, Dscratch3);
++  fmul(Dscratch, Dscratch, Dscratch3);
++
++  fsub(Dscratch2, Dscratch2, Dscratch);
++  fmul(Dscratch3, Dscratch3, Dscratch2);
++
++  lfs(Dscratch, MemOperand(sp, 0));
++
++  fmul(Dscratch, Dscratch, src);
++  fmul(Dscratch, Dscratch, Dscratch3);
++  fmul(Dscratch, Dscratch, Dscratch3);
++
++  lfs(Dscratch2, MemOperand(sp, kFloatSize));
++
++  fsub(Dscratch2, Dscratch2, Dscratch);
++  fmul(dst, Dscratch3, Dscratch2);
++
++/* Calculate 1/x */
++  lis(scratch, Operand(0x3f80));
++  stw(scratch, MemOperand(sp, 0));
++  lfs(Dscratch, MemOperand(sp, 0));
++  fdiv(dst, Dscratch, dst, rc);
++
++  addi(sp, sp, Operand(2*kFloatSize));
++
++  TruncateApproximatedDouble(dst, dst, 16);
++}
++
+ void TurboAssembler::ConvertDoubleToInt32NoPPC64(
+   DoubleRegister src,
+   Register dest, Register dest_hi,
+diff --git a/deps/v8/src/codegen/ppc/macro-assembler-ppc.h b/deps/v8/src/codegen/ppc/macro-assembler-ppc.h
+index 964a1f79..0018e66b 100644
+--- a/deps/v8/src/codegen/ppc/macro-assembler-ppc.h
++++ b/deps/v8/src/codegen/ppc/macro-assembler-ppc.h
+@@ -78,6 +78,8 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
+                                 Register dest,
+                                 Register dest_hi,
+                                 FPRoundingMode rounding_mode = kRoundToZero);
++  void RsqrtNewtonStep(DoubleRegister dst, DoubleRegister src, RCBit rc);
++  void TruncateApproximatedDouble(DoubleRegister dst, DoubleRegister src, unsigned int bits);
+   #endif
+ 
+   // Converts the integer (untagged smi) in |src| to a double, storing
+diff --git a/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index fe92423c..71ff509f 100644
+--- a/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1665,13 +1665,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+ #ifdef V8_TARGET_ARCH_PPC64
+       ASSEMBLE_FLOAT_UNOP_RC(fsqrt, MiscField::decode(instr->opcode()));
+ #else
+-    __ frsqrte(i.OutputDoubleRegister(), i.InputDoubleRegister(0), 
+-              i.OutputRCBit());
+-    __ fmul(i.OutputDoubleRegister(), i.OutputDoubleRegister(), 
+-              i.InputDoubleRegister(0), i.OutputRCBit());
++    __ RsqrtNewtonStep(i.OutputDoubleRegister(), i.InputDoubleRegister(0), i.OutputRCBit());
+     if (MiscField::decode(instr->opcode())) {
+       __ frsp(i.OutputDoubleRegister(), i.OutputDoubleRegister());
+-    } 
++    }
+ #endif
+       break;
+     case kPPC_FloorDouble:
+-- 
+2.28.0
+
