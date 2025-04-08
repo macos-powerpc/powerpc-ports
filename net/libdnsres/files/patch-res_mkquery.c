@@ -4,7 +4,7 @@
  #include <sys/socket.h>
  #include <netinet/in.h>
  #include <arpa/nameser.h>
-+#include <arpa/nameser8_compat.h>
++#include <arpa/nameser_compat.h>
  
  #include <stdio.h>
  #include <string.h>
