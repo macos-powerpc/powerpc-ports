@@ -32,6 +32,9 @@ default legacysupport.use_static        no
 options legacysupport.redirect_bins
 default legacysupport.redirect_bins     {}
 
+options legacysupport.redirect_sbins
+default legacysupport.redirect_sbins    {}
+
 options legacysupport.use_mp_libcxx
 default legacysupport.use_mp_libcxx     no
 
@@ -249,6 +252,31 @@ post-destroot {
                     ${destroot}${bin}-orig
 
             set  wrapper    [open "${destroot}${bin}" w 0755]
+            puts ${wrapper} "#!/bin/bash"
+            puts ${wrapper} ""
+            puts ${wrapper} {if [ -n "$DYLD_LIBRARY_PATH" ]; then}
+            puts ${wrapper} "   DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\${DYLD_LIBRARY_PATH}"
+            puts ${wrapper} {else}
+            puts ${wrapper} "   DYLD_LIBRARY_PATH=${prefix}/lib/libgcc"
+            puts ${wrapper} {fi}
+            puts ${wrapper} {export DYLD_LIBRARY_PATH}
+            puts ${wrapper} ""
+            puts ${wrapper} {exec "${0}-orig" "$@"}
+            close $wrapper
+
+        }
+
+        foreach rsbin ${legacysupport.redirect_sbins} {
+            set dir [file dirname ${rsbin}]
+            if {${dir} eq "."} {
+                set dir ${prefix}/sbin
+            }
+            set sbin ${dir}/[file tail ${rsbin}]
+
+            move    ${destroot}${sbin} \
+                    ${destroot}${sbin}-orig
+
+            set  wrapper    [open "${destroot}${sbin}" w 0755]
             puts ${wrapper} "#!/bin/bash"
             puts ${wrapper} ""
             puts ${wrapper} {if [ -n "$DYLD_LIBRARY_PATH" ]; then}
