@@ -61,7 +61,7 @@ pre-configure {
 namespace eval meson { }
 
 proc meson::get_post_args {} {
-    global configure.dir build_dir build.dir muniversal.current_arch muniversal.build_arch
+    global configure.dir build_dir build.dir build_arch muniversal.current_arch muniversal.build_arch
     set args [list ${configure.dir}]
     if {[info exists muniversal.build_arch]} {
         # muniversal 1.1 PG is being used
@@ -72,6 +72,9 @@ proc meson::get_post_args {} {
     } elseif {[info exists muniversal.current_arch]} {
         # muniversal 1.0 PG is being used
         lappend args ${build_dir}-${muniversal.current_arch} --cross-file=${muniversal.current_arch}-darwin
+    } elseif {${build_arch} eq "ppc64"} {
+        # https://trac.macports.org/ticket/72364
+        lappend args ${build_dir} --cross-file=ppc64-darwin
     } else {
         lappend args ${build_dir}
     }
