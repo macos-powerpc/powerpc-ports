@@ -94,23 +94,18 @@ default categories          "R science"
 # For w/e reason universal is presently disabled for R in Macports.
 default universal_variant   no
 
-compiler.cxx_standard       2011
+compiler.cxx_standard       2014
 
 # Avoid Apple clangs:
 compiler.blacklist-append   {clang}
-# Blacklist macports-clang-17+. See discussion: https://trac.macports.org/ticket/67144
+# Blacklist macports-clang-20+. See discussion: https://trac.macports.org/ticket/67144
 # for rationale. The decision when to migrate to a new compiler
 # is then in the hands of the R maintainers and will not change
 # from the current defaults when these get bumped centrally.
-# NOTE : Keep this setting in sync with the one in the R port.
-if { ${os.major} > 22 } {
-    # https://trac.macports.org/ticket/70799
-    compiler.blacklist-append   {macports-clang-19} {macports-clang-2[0-9]}
-} else {
-    compiler.blacklist-append   {macports-clang-1[7-9]} {macports-clang-2[0-9]}
-}
-# Similarly, for gcc select the gcc13 variant of the compilers PG.
-# This setting should also be kept in sync with that in the R Port.
+# NOTE: Keep this setting in sync with the one in the R port.
+compiler.blacklist-append   {macports-clang-2[0-9]}
+# Similarly, for gcc select the gcc14 variant of the compilers PG.
+# This setting should also be kept in sync with the one in the R port.
 # Updates should be coordinated with the R maintainers.
 # https://trac.macports.org/ticket/70799
 compiler.blacklist-append   {macports-gcc-1[5-9]}
