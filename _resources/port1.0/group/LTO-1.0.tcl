@@ -398,7 +398,11 @@ if {![variant_exists cputuned]} {
 }
 
 if {[variant_isset cputuned]} {
-    default LTO.cpuflags "-march=native"
+    if {${build_arch} in [list ppc ppc64]} {
+        default LTO.cpuflags "-mtune=native"
+    } else {
+        default LTO.cpuflags "-march=native"
+    }
     default configure.march {native}
 }
 if {[variant_isset cpucompat]} {
