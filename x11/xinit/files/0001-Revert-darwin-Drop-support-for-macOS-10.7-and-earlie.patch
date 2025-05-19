@@ -1,0 +1,645 @@
+From 65e11372ada8f1c5e27471074048742762406bcf Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 May 2025 18:48:34 +0800
+Subject: [PATCH] Revert "darwin: Drop support for macOS 10.7 and earlier"
+
+This reverts commit db21df4054e3351d14eb7dc1c3216cd23a61cee4.
+---
+ configure.ac                                  |  14 +
+ launchd/Makefile.am                           |   8 +-
+ launchd/console_redirect.c                    | 418 ++++++++++++++++++
+ launchd/console_redirect.h                    |  44 ++
+ launchd/privileged_startx/Makefile.am         |   5 +
+ .../privileged_startx.plist.cpp               |   9 +
+ launchd/privileged_startx/server.c            |   6 +-
+ launchd/user_startx/Makefile.am               |   1 +
+ launchd/user_startx/launchd_startx.c          |   6 +-
+ 9 files changed, 506 insertions(+), 5 deletions(-)
+ create mode 100644 launchd/console_redirect.c
+ create mode 100644 launchd/console_redirect.h
+
+diff --git a/configure.ac b/configure.ac
+index bd99f8a..148ae4f 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -118,12 +118,26 @@ if test "x$LAUNCHD" = "xauto"; then
+ 	AC_CHECK_PROG(LAUNCHD, [launchd], [yes], [no], [$PATH$PATH_SEPARATOR/sbin])
+ fi
+ 
++TIGER_LAUNCHD=no
++if test "x$LAUNCHD" = "xyes" ; then
++	AC_DEFINE(HAVE_LAUNCHD, 1, [launchd support available])
++	case $host_os in
++		darwin8*)
++			TIGER_LAUNCHD=yes
++		;;
++	esac
++        AC_CHECK_FUNC(dispatch_async,
++                              AC_DEFINE([HAVE_LIBDISPATCH], 1, [Define to 1 if you have the libdispatch (GCD) available]),
++                              [])
++fi
++
+ AC_DEFINE_UNQUOTED(BUNDLE_ID_PREFIX, "$bundleidprefix", [Prefix to use for launchd identifiers])
+ AC_SUBST([launchagentsdir])
+ AC_SUBST([launchdaemonsdir])
+ AC_SUBST([bundleidprefix])
+ AC_SUBST([launchagentxserver])
+ AM_CONDITIONAL(LAUNCHD, [test "x$LAUNCHD" = "xyes"])
++AM_CONDITIONAL(TIGER_LAUNCHD, [test "x$TIGER_LAUNCHD" = "xyes"])
+ AM_CONDITIONAL(LAUNCHAGENT_XSERVER, [test "x$launchagentxserver" != "xno"])
+ 
+ # Checks for library functions.
+diff --git a/launchd/Makefile.am b/launchd/Makefile.am
+index 23ca02a..0135b7f 100644
+--- a/launchd/Makefile.am
++++ b/launchd/Makefile.am
+@@ -1,2 +1,8 @@
+ DIST_SUBDIRS = privileged_startx user_startx
+-SUBDIRS = privileged_startx user_startx
++SUBDIRS = privileged_startx 
++
++if !TIGER_LAUNCHD
++SUBDIRS += user_startx
++endif
++
++EXTRA_DIST = console_redirect.h
+diff --git a/launchd/console_redirect.c b/launchd/console_redirect.c
+new file mode 100644
+index 0000000..7ce3626
+--- /dev/null
++++ b/launchd/console_redirect.c
+@@ -0,0 +1,418 @@
++/* Copyright (c) 2011 Apple Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person
++ * obtaining a copy of this software and associated documentation files
++ * (the "Software"), to deal in the Software without restriction,
++ * including without limitation the rights to use, copy, modify, merge,
++ * publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE ABOVE LISTED COPYRIGHT
++ * HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Except as contained in this notice, the name(s) of the above
++ * copyright holders shall not be used in advertising or otherwise to
++ * promote the sale, use or other dealings in this Software without
++ * prior written authorization.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#else
++#define DEBUG_CONSOLE_REDIRECT 1
++#define HAVE_LIBDISPATCH 1
++#endif
++
++#include <assert.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/event.h>
++#include <asl.h>
++#include <errno.h>
++#include <fcntl.h>
++
++#include "console_redirect.h"
++
++#define BUF_SIZE 512
++
++#ifdef HAVE_LIBDISPATCH
++#include <dispatch/dispatch.h>
++
++static dispatch_queue_t redirect_serial_q;
++static dispatch_group_t read_source_group;
++#else
++#include <pthread.h>
++
++static pthread_t redirect_pthread;
++static pthread_mutex_t redirect_fds_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int kq;
++
++/* Notifications to our reader thread */
++#define ASL_REDIRECT_TERMINATE ((void *)(uintptr_t)1)
++#endif
++
++typedef struct {
++    int level;
++    aslclient asl;
++    aslmsg msg;
++
++    /* Buffered reading */
++    char *buf;
++    char *w;
++
++#ifdef HAVE_LIBDISPATCH
++    dispatch_source_t read_source;
++#endif
++} asl_redirect;
++
++static asl_redirect *redirect_fds = NULL;
++static int n_redirect_fds = 0;
++
++/* Read from the FD until there is no more to read and redirect to ASL.
++ * Preconditions:
++ *      1: pthread_mutex_lock lock is held (pthreads) or called
++ *         from the appropriate serial queue for operating on
++ *         redirect_fds
++ *      2: fd corresponds to a valid entry in redirect_fds
++ *
++ * Return values:
++ *      If the pipe is closed, EOF is returned regardless of how many bytes
++ *      were processed.  If the pipe is still open, the number of read bytes
++ *      is returned.
++ */
++static inline int _read_redirect(int fd, int flush) {
++    int total_read = 0;
++    int nbytes;
++    asl_redirect *aslr = &redirect_fds[fd];
++
++    while((nbytes = read(fd, aslr->w, BUF_SIZE - (aslr->w - aslr->buf) - 1)) > 0) {
++        char *s, *p;
++
++        /* Increment our returned number read */
++        total_read += nbytes;
++
++        nbytes += (aslr->w - aslr->buf);
++        aslr->buf[nbytes] = '\0';
++
++        /* One line at a time */
++        for(p=aslr->buf; *p && (p - aslr->buf) < nbytes; p = s + 1) {
++            // Find null or \n
++            for(s=p; *s && *s != '\n'; s++);
++            if(*s == '\n') {
++                *s='\0';
++                asl_log(aslr->asl, aslr->msg, aslr->level, "%s", p);
++            } else if(aslr->buf != p) {
++                memmove(aslr->buf, p, BUF_SIZE - (p - aslr->buf));
++                aslr->w = aslr->buf + (s - p);
++                break;
++            } else if(nbytes == BUF_SIZE - 1) {
++                asl_log(aslr->asl, aslr->msg, aslr->level, "%s", p);
++                aslr->w = aslr->buf;
++                break;
++            }
++        }
++    }
++
++    /* Flush if requested or we're at EOF */
++    if(flush || nbytes == 0) {
++        if(aslr->w > aslr->buf) {
++            *aslr->w = '\0';
++            asl_log(aslr->asl, aslr->msg, aslr->level, "%s", aslr->buf);
++        }
++    }
++
++    if(nbytes == 0)
++        return EOF;
++    return total_read;
++}
++
++#ifdef HAVE_LIBDISPATCH
++static void read_from_source(void *_source) {
++    dispatch_source_t source = (dispatch_source_t)_source;
++    int fd = dispatch_source_get_handle(source);
++    if(_read_redirect(fd, 0) == EOF) {
++        dispatch_source_cancel(source);
++    }
++}
++
++static void cancel_source(void *_source) {
++    dispatch_source_t source = (dispatch_source_t)_source;
++    int fd = dispatch_source_get_handle(source);
++    asl_redirect *aslr = &redirect_fds[fd];
++
++    /* Flush the buffer */
++    _read_redirect(fd, 1);
++
++    close(fd);
++    free(aslr->buf);
++    memset(aslr, 0, sizeof(*aslr));
++    dispatch_release(source);
++    dispatch_group_leave(read_source_group);
++}
++
++#else /* !HAVE_LIBDISPATCH */
++static void *redirect_thread(void *ctx __unused) {
++    struct kevent ev;
++    int n;
++
++    while(1) {
++        n = kevent(kq, NULL, 0, &ev, 1, NULL);
++
++        /* Bail on errors */
++        if(n < 0) {
++            asl_log(NULL, NULL, ASL_LEVEL_ERR, "kevent failure: %s", strerror(errno));
++            break;
++        }
++        
++        /* This should not happen */
++        if(n == 0)
++            continue;
++
++        switch(ev.filter) {
++            case EVFILT_READ:
++                pthread_mutex_lock(&redirect_fds_lock);
++                {
++                    int fd = ev.ident;
++                    int close_fd = 0;
++                    asl_redirect *aslr = &redirect_fds[fd];
++
++                    if(fd < 0 || fd >= n_redirect_fds || aslr->buf == NULL) {
++                        asl_log(NULL, NULL, ASL_LEVEL_ERR, "Unexpected file descriptor: %d", fd);
++                        goto next;
++                    }
++
++                    if(ev.flags & EV_EOF) {
++                        close_fd = 1;
++                        if(EOF != _read_redirect(fd, 1)) {
++                            asl_log(NULL, NULL, ASL_LEVEL_ERR, "kevent reported EOF on %d, but read doesn't concur.", fd);
++                        }
++                    } else {
++                        close_fd = (EOF == _read_redirect(fd, 0));
++                    }
++                    
++                    if(close_fd) {
++                        EV_SET(&ev, fd, EVFILT_READ, EV_DELETE, 0, 0, 0);
++                        kevent(kq, &ev, 1, NULL, 0, NULL);
++                        close(fd);
++                        free(aslr->buf);
++                        memset(aslr, 0, sizeof(*aslr));
++                    }
++                }
++                next:
++                pthread_mutex_unlock(&redirect_fds_lock);
++
++            case EVFILT_TIMER:
++                if(ev.udata == ASL_REDIRECT_TERMINATE)
++                    return NULL;
++
++            default:
++                ;;
++        }
++    }
++
++    return NULL;
++}
++#endif
++
++static void redirect_atexit(void) {
++    /* stdout is linebuffered, so flush the buffer */
++    if(redirect_fds[STDOUT_FILENO].buf)
++        fflush(stdout);
++
++#ifdef HAVE_LIBDISPATCH
++    {
++        int i;
++
++        /* Cancel all of our dispatch sources, so they flush to ASL */
++        for(i=0; i < n_redirect_fds; i++)
++            if(redirect_fds[i].read_source)
++                dispatch_source_cancel(redirect_fds[i].read_source);
++
++        /* Wait at least three seconds for our sources to flush to ASL */
++        dispatch_group_wait(read_source_group, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
++    }
++#else
++    {
++        struct kevent ev;
++
++        /* Tell our reader thread it is time to pack up and go home */
++        EV_SET(&ev, 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 0, ASL_REDIRECT_TERMINATE);
++        kevent(kq, &ev, 1, NULL, 0, NULL);
++    
++        pthread_join(redirect_pthread, NULL);
++    }
++#endif
++}
++
++#ifdef HAVE_LIBDISPATCH
++static void xi_asl_init(void *ctx __unused)
++#else
++static void xi_asl_init(void)
++#endif
++{
++    assert((redirect_fds = calloc(16, sizeof(*redirect_fds))) != NULL);
++    n_redirect_fds = 16;
++
++#ifdef HAVE_LIBDISPATCH
++    redirect_serial_q = dispatch_queue_create("com.apple.asl-redirect", NULL);
++    assert(redirect_serial_q != NULL);
++
++    read_source_group = dispatch_group_create();
++    assert(read_source_group != NULL);
++#else
++    assert((kq = kqueue()) != -1);
++    assert(pthread_create(&redirect_pthread, NULL, redirect_thread, NULL) == 0);
++#endif
++
++    atexit(redirect_atexit);
++}
++
++int xi_asl_log_fd(aslclient asl, aslmsg msg, int level, int fd) {
++#ifdef HAVE_LIBDISPATCH
++    int err __block = 0;
++    static dispatch_once_t once_control;
++    dispatch_once_f(&once_control, NULL, xi_asl_init);
++#else
++    int err = 0;
++    static pthread_once_t once_control = PTHREAD_ONCE_INIT;
++    assert(pthread_once(&once_control, xi_asl_init) == 0);
++#endif
++    
++    if(fd < 0)
++        return EBADF;
++    
++#ifdef HAVE_LIBDISPATCH
++#define BLOCK_DONE return
++    dispatch_sync(redirect_serial_q, ^
++#else
++#define BLOCK_DONE goto done
++    assert(pthread_mutex_lock(&redirect_fds_lock) == 0);
++#endif
++    {
++        /* Reallocate if we need more space */
++        if(fd >= n_redirect_fds) {
++            size_t new_n = 1 << (ffs(fd) + 1);
++            asl_redirect *new_array = realloc(redirect_fds, new_n * sizeof(*redirect_fds));
++            if(!new_array) {
++                err = errno;
++                BLOCK_DONE;
++            }
++            redirect_fds = new_array;
++            memset(redirect_fds + n_redirect_fds, 0, new_n - n_redirect_fds);
++            n_redirect_fds = new_n;
++        }
++        
++        /* If we're already listening on it, return error. */
++        if(redirect_fds[fd].buf != NULL) {
++            err = EBADF;
++            BLOCK_DONE;
++        }
++        
++        /* Initialize our buffer */
++        redirect_fds[fd].buf = (char *)malloc(BUF_SIZE);
++        if(redirect_fds[fd].buf == NULL) {
++            err = errno;
++            BLOCK_DONE;
++        }
++        redirect_fds[fd].w = redirect_fds[fd].buf;
++        
++        /* Store our ASL settings */
++        redirect_fds[fd].level = level;
++        redirect_fds[fd].asl = asl;
++        redirect_fds[fd].msg = msg;
++        
++        /* Don't block on reads from this fd */
++        fcntl(fd, F_SETFL, O_NONBLOCK);
++        
++        /* Start listening */
++#ifdef HAVE_LIBDISPATCH
++        {
++            dispatch_source_t read_source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, redirect_serial_q);
++            redirect_fds[fd].read_source = read_source;
++            dispatch_set_context(read_source, read_source);
++            dispatch_source_set_event_handler_f(read_source, read_from_source);
++            dispatch_source_set_cancel_handler_f(read_source, cancel_source);
++            dispatch_group_enter(read_source_group);
++            dispatch_resume(read_source);
++        }
++#else
++        {
++            struct kevent ev;
++            EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, 0);
++            kevent(kq, &ev, 1, NULL, 0, NULL);
++        }
++#endif
++    }
++#ifdef HAVE_LIBDISPATCH
++    );
++#else
++done:
++    assert(pthread_mutex_unlock(&redirect_fds_lock) == 0);
++#endif
++#undef BLOCK_DONE
++    
++    return err;
++}
++
++int xi_asl_capture_fd(aslclient asl, aslmsg msg, int level, int fd) {
++    int pipepair[2];
++    
++    /* Create pipe */
++    if(pipe(pipepair) == -1)
++        return errno;
++    
++    /* Close the read fd but not the write fd on exec */
++    if(fcntl(pipepair[0], F_SETFD, FD_CLOEXEC) == -1)
++        return errno;
++
++    /* Replace the existing fd */
++    if(dup2(pipepair[1], fd) == -1) {
++        close(pipepair[0]);
++        close(pipepair[1]);
++        return errno;
++    }
++
++    /* If we capture STDOUT_FILENO, make sure we linebuffer stdout */
++    if(fd == STDOUT_FILENO)
++        setlinebuf(stdout);
++    
++    /* Close the duplicate fds since they've been reassigned */
++    close(pipepair[1]);
++
++    /* Hand off the read end of our pipe to xi_asl_log_fd */
++    return xi_asl_log_fd(asl, msg, level, pipepair[0]);
++}
++
++#ifdef DEBUG_CONSOLE_REDIRECT
++int main(int argc __unused, char **argv __unused) {
++    xi_asl_capture_fd(NULL, NULL, ASL_LEVEL_NOTICE, STDOUT_FILENO);
++    xi_asl_capture_fd(NULL, NULL, ASL_LEVEL_ERR, STDERR_FILENO);
++
++    fprintf(stderr, "TEST ERR1\n");
++    fprintf(stdout, "TEST OUT1\n");
++    fprintf(stderr, "TEST ERR2\n");
++    fprintf(stdout, "TEST OUT2\n");
++    system("/bin/echo SYST OUT");
++    system("/bin/echo SYST ERR >&2");
++    fprintf(stdout, "TEST OUT3\n");
++    fprintf(stdout, "TEST OUT4\n");
++    fprintf(stderr, "TEST ERR3\n");
++    fprintf(stderr, "TEST ERR4\n");
++
++    exit(0);
++}
++#endif
+diff --git a/launchd/console_redirect.h b/launchd/console_redirect.h
+new file mode 100644
+index 0000000..134def6
+--- /dev/null
++++ b/launchd/console_redirect.h
+@@ -0,0 +1,44 @@
++/* Copyright (c) 2011 Apple Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person
++ * obtaining a copy of this software and associated documentation files
++ * (the "Software"), to deal in the Software without restriction,
++ * including without limitation the rights to use, copy, modify, merge,
++ * publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE ABOVE LISTED COPYRIGHT
++ * HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Except as contained in this notice, the name(s) of the above
++ * copyright holders shall not be used in advertising or otherwise to
++ * promote the sale, use or other dealings in this Software without
++ * prior written authorization.
++ */
++
++#ifndef _XQUARTZ_CONSOLE_REDIRECT_H_
++#define _XQUARTZ_CONSOLE_REDIRECT_H_
++
++#include <asl.h>
++
++/* The given fd is replaced with a pipe.  Anything written to it will will be
++ * logged to ASL.
++ */
++int xi_asl_capture_fd(aslclient asl, aslmsg msg, int level, int fd);
++
++/* The given fd is read from and passed along to ASL until all write ends of the
++ * pipe are closed. Once the last writer has closed the pipe, we close our end.
++ */
++int xi_asl_log_fd(aslclient asl, aslmsg msg, int level, int fd);
++
++#endif
+diff --git a/launchd/privileged_startx/Makefile.am b/launchd/privileged_startx/Makefile.am
+index ea99005..a6ed492 100644
+--- a/launchd/privileged_startx/Makefile.am
++++ b/launchd/privileged_startx/Makefile.am
+@@ -36,7 +36,12 @@ privstartx_SCRIPTS = 10-tmpdirs 20-font_cache
+ AM_CPPFLAGS = -I$(srcdir)/.. -DXINITDIR=\"$(xinitrcdir)\" -DSCRIPTDIR=\"$(privstartxdir)\" -DBINDIR=\"$(bindir)\"
+ CPP_FILES_FLAGS = -D__libexecdir__="$(libexecdir)" -DXINITDIR="$(xinitrcdir)" -DSCRIPTDIR="$(privstartxdir)" -DBINDIR="$(bindir)" -DBUNDLE_ID_PREFIX="$(bundleidprefix)"
+ 
++if TIGER_LAUNCHD
++CPP_FILES_FLAGS += -DTIGER_LAUNCHD
++endif
++
+ dist_privileged_startx_SOURCES = \
++	$(srcdir)/../console_redirect.c \
+ 	server.c \
+ 	client.c \
+ 	privileged_startx.c
+diff --git a/launchd/privileged_startx/privileged_startx.plist.cpp b/launchd/privileged_startx/privileged_startx.plist.cpp
+index 370350a..e1652b0 100644
+--- a/launchd/privileged_startx/privileged_startx.plist.cpp
++++ b/launchd/privileged_startx/privileged_startx.plist.cpp
+@@ -10,6 +10,14 @@
+ 			<string>-d</string>
+ 			<string>SCRIPTDIR</string>
+ 		</array>
++#ifdef TIGER_LAUNCHD
++	<key>RunAtLoad</key>
++		<true/>
++	<key>KeepAlive</key>
++		<true/>
++	<key>ServiceIPC</key>
++		<true/>
++#else
+ 	<key>MachServices</key>
+ 		<dict>
+ 			<key>BUNDLE_ID_PREFIX.privileged_startx</key>
+@@ -19,5 +27,6 @@
+ 		<integer>120</integer>
+ 	<key>EnableTransactions</key>
+ 		<true/>
++#endif
+ </dict>
+ </plist>
+diff --git a/launchd/privileged_startx/server.c b/launchd/privileged_startx/server.c
+index f37c9b1..005758d 100644
+--- a/launchd/privileged_startx/server.c
++++ b/launchd/privileged_startx/server.c
+@@ -46,6 +46,8 @@
+ #include <asl.h>
+ #include <errno.h>
+ 
++#include "console_redirect.h"
++
+ #include "privileged_startx.h"
+ #include "privileged_startxServer.h"
+ 
+@@ -151,8 +153,8 @@ int server_main(const char *dir) {
+     }
+ 
+     aslc = asl_open(labelstr, BUNDLE_ID_PREFIX, ASL_OPT_NO_DELAY);
+-    asl_log_descriptor(aslc, NULL, ASL_LEVEL_INFO, STDOUT_FILENO, ASL_LOG_DESCRIPTOR_WRITE);
+-    asl_log_descriptor(aslc, NULL, ASL_LEVEL_NOTICE, STDERR_FILENO, ASL_LOG_DESCRIPTOR_WRITE);
++    xi_asl_capture_fd(aslc, NULL, ASL_LEVEL_INFO, STDOUT_FILENO);
++    xi_asl_capture_fd(aslc, NULL, ASL_LEVEL_NOTICE, STDERR_FILENO);
+ 
+ #ifdef LAUNCH_JOBKEY_MACHSERVICES
+     launch_data_t tmv;
+diff --git a/launchd/user_startx/Makefile.am b/launchd/user_startx/Makefile.am
+index 1b18db0..e895ee2 100644
+--- a/launchd/user_startx/Makefile.am
++++ b/launchd/user_startx/Makefile.am
+@@ -26,6 +26,7 @@ libexec_PROGRAMS = launchd_startx
+ AM_CPPFLAGS = -I$(srcdir)/.. -DXINITDIR=\"$(xinitrcdir)\" -DBINDIR=\"$(bindir)\"
+ 
+ dist_launchd_startx_SOURCES = \
++	$(srcdir)/../console_redirect.c \
+ 	launchd_startx.c
+ 
+ CPP_FILES_FLAGS = \
+diff --git a/launchd/user_startx/launchd_startx.c b/launchd/user_startx/launchd_startx.c
+index e2589be..08272cb 100644
+--- a/launchd/user_startx/launchd_startx.c
++++ b/launchd/user_startx/launchd_startx.c
+@@ -39,6 +39,8 @@
+ #include <stdlib.h>
+ #include <spawn.h>
+ 
++#include "console_redirect.h"
++
+ int main(int argc, char **argv, char **envp) {
+     aslclient aslc;
+     pid_t child;
+@@ -51,8 +53,8 @@ int main(int argc, char **argv, char **envp) {
+ 
+     aslc = asl_open(BUNDLE_ID_PREFIX".startx", BUNDLE_ID_PREFIX, ASL_OPT_NO_DELAY);
+ 
+-    asl_log_descriptor(aslc, NULL, ASL_LEVEL_INFO, STDOUT_FILENO, ASL_LOG_DESCRIPTOR_WRITE);
+-    asl_log_descriptor(aslc, NULL, ASL_LEVEL_NOTICE, STDERR_FILENO, ASL_LOG_DESCRIPTOR_WRITE);
++    xi_asl_capture_fd(aslc, NULL, ASL_LEVEL_INFO, STDOUT_FILENO);
++    xi_asl_capture_fd(aslc, NULL, ASL_LEVEL_NOTICE, STDERR_FILENO);
+ 
+     /* https://github.com/XQuartz/XQuartz/issues/114 */
+     char const * const home = getenv("HOME");
+-- 
+2.48.0
+
