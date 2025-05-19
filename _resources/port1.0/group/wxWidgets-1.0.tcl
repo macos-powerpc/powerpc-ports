@@ -277,7 +277,7 @@ proc wxWidgets._set {option action args} {
         wxWidgets.port      "wxWidgets-3.2"
         if {${os.major} < 11} {
             pre-fetch {
-                ui_error "${wxWidgets.port} requires macOS 10.7 or later."
+                ui_error "${wxWidgets.port} requires macOS 10.7 or later. Use wxgtk-3.2 instead."
                 return -code error "incompatible macOS version"
             }
         }
