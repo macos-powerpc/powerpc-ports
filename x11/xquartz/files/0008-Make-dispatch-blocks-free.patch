@@ -1,0 +1,264 @@
+From a1be61b32e3e99e0c24a7fc2a480098389f04299 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <vital.had@gmail.com>
+Date: Fri, 30 May 2025 02:34:30 +0800
+Subject: [PATCH 8/9] Make dispatch blocks-free
+
+---
+ hw/xquartz/X11Application.m   | 22 ++++++--
+ hw/xquartz/console_redirect.c | 97 +++++++++++++++++++++++++----------
+ os/client.c                   | 41 +++++++++------
+ 3 files changed, 111 insertions(+), 49 deletions(-)
+
+diff --git a/hw/xquartz/X11Application.m b/hw/xquartz/X11Application.m
+index 0b1335553..dc5708aca 100644
+--- a/hw/xquartz/X11Application.m
++++ b/hw/xquartz/X11Application.m
+@@ -68,6 +68,19 @@
+ #include <dispatch/dispatch.h>
+ 
+ static dispatch_queue_t eventTranslationQueue;
++
++struct SendEventContext {
++    id self_ref;
++    NSEvent *event;
++};
++
++static void sendX11NSEvent_async(void *context) {
++    struct SendEventContext *ctx = (struct SendEventContext *)context;
++    [ctx->self_ref sendX11NSEvent:ctx->event];
++    [ctx->event release];
++    [ctx->self_ref release];
++    free(ctx);
++}
+ #endif
+ 
+ #ifndef __has_feature
+@@ -555,11 +568,12 @@ - (void) sendEvent:(NSEvent *)e
+ 
+     if (for_x) {
+ #ifdef HAVE_LIBDISPATCH
+-        dispatch_async(eventTranslationQueue, ^{
+-                           [self sendX11NSEvent:e];
+-                       });
++    struct SendEventContext *ctx = malloc(sizeof(struct SendEventContext));
++    ctx->self_ref = [self retain];
++    ctx->event = [e retain];
++    dispatch_async_f(eventTranslationQueue, ctx, sendX11NSEvent_async);
+ #else
+-        [self sendX11NSEvent:e];
++    [self sendX11NSEvent:e];
+ #endif
+     }
+ }
+diff --git a/hw/xquartz/console_redirect.c b/hw/xquartz/console_redirect.c
+index 8fdce4699..5fd94e148 100644
+--- a/hw/xquartz/console_redirect.c
++++ b/hw/xquartz/console_redirect.c
+@@ -330,15 +330,77 @@ static inline int fls(int value) {
+ }
+ #endif
+ 
++#ifdef HAVE_LIBDISPATCH
++struct
++asl_log_fd_ctx {
++    int fd;
++    int level;
++    aslclient asl;
++    aslmsg msg;
++    int *err_ptr;
++};
++
++static void
++asl_log_fd_handler(void *ctx_ptr)
++{
++    struct asl_log_fd_ctx *ctx = (struct asl_log_fd_ctx *)ctx_ptr;
++    int fd = ctx->fd;
++    int level = ctx->level;
++    aslclient asl = ctx->asl;
++    aslmsg msg = ctx->msg;
++    int *err_ptr = ctx->err_ptr;
++
++    if (fd >= n_redirect_fds) {
++        size_t new_n = 1 << (fls(fd) + 1);
++        asl_redirect *new_array = realloc(redirect_fds, new_n * sizeof(*redirect_fds));
++        if (!new_array) {
++            *err_ptr = errno;
++            return;
++        }
++        redirect_fds = new_array;
++        memset(redirect_fds + n_redirect_fds, 0, (new_n - n_redirect_fds) * sizeof(*redirect_fds));
++        n_redirect_fds = new_n;
++    }
++
++    if (redirect_fds[fd].buf != NULL) {
++        *err_ptr = EBADF;
++        return;
++    }
++
++    redirect_fds[fd].buf = (char *)malloc(BUF_SIZE);
++    if (redirect_fds[fd].buf == NULL) {
++        *err_ptr = errno;
++        return;
++    }
++    redirect_fds[fd].w = redirect_fds[fd].buf;
++
++    redirect_fds[fd].level = level;
++    redirect_fds[fd].asl = asl;
++    redirect_fds[fd].msg = msg;
++
++    fcntl(fd, F_SETFL, O_NONBLOCK);
++
++    dispatch_source_t read_source =
++        dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, redirect_serial_q);
++    redirect_fds[fd].read_source = read_source;
++    dispatch_set_context(read_source, read_source);
++    dispatch_source_set_event_handler_f(read_source, read_from_source);
++    dispatch_source_set_cancel_handler_f(read_source, cancel_source);
++    dispatch_group_enter(read_source_group);
++    dispatch_resume(read_source);
++
++    *err_ptr = 0;
++}
++#endif
++
+ int
+ xq_asl_log_fd(aslclient asl, aslmsg msg, int level, int fd)
+ {
++    int err = 0;
+ #ifdef HAVE_LIBDISPATCH
+-    int err __block = 0;
+     static dispatch_once_t once_control;
+     dispatch_once_f(&once_control, NULL, xq_asl_init);
+ #else
+-    int err = 0;
+     static pthread_once_t once_control = PTHREAD_ONCE_INIT;
+     assert(pthread_once(&once_control, xq_asl_init) == 0);
+ #endif
+@@ -347,12 +409,11 @@ xq_asl_log_fd(aslclient asl, aslmsg msg, int level, int fd)
+         return EBADF;
+ 
+ #ifdef HAVE_LIBDISPATCH
+-#define BLOCK_DONE return
+-    dispatch_sync(redirect_serial_q, ^
++    struct asl_log_fd_ctx ctx = { fd, level, asl, msg, &err };
++    dispatch_sync_f(redirect_serial_q, &ctx, asl_log_fd_handler);
+ #else
+-#define BLOCK_DONE goto done
++    #define BLOCK_DONE goto done
+     assert(pthread_mutex_lock(&redirect_fds_lock) == 0);
+-#endif
+                   {
+                       /* Reallocate if we need more space */
+                       if (fd >= n_redirect_fds) {
+@@ -394,36 +455,16 @@ xq_asl_log_fd(aslclient asl, aslmsg msg, int level, int fd)
+                             O_NONBLOCK);
+ 
+                       /* Start listening */
+-#ifdef HAVE_LIBDISPATCH
+-                      {
+-                          dispatch_source_t read_source =
+-                              dispatch_source_create(
+-                                  DISPATCH_SOURCE_TYPE_READ, fd, 0,
+-                                  redirect_serial_q);
+-                          redirect_fds[fd].read_source = read_source;
+-                          dispatch_set_context(read_source, read_source);
+-                          dispatch_source_set_event_handler_f(read_source,
+-                                                              read_from_source);
+-                          dispatch_source_set_cancel_handler_f(read_source,
+-                                                               cancel_source);
+-                          dispatch_group_enter(read_source_group);
+-                          dispatch_resume(read_source);
+-                      }
+-#else
+                       {
+                           struct kevent ev;
+                           EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, 0);
+                           kevent(kq, &ev, 1, NULL, 0, NULL);
+                       }
+-#endif
+                   }
+-#ifdef HAVE_LIBDISPATCH
+-                  );
+-#else
+-done:
++    done:
+                   assert(pthread_mutex_unlock(&redirect_fds_lock) == 0);
++    #undef BLOCK_DONE
+ #endif
+-#undef BLOCK_DONE
+ 
+     return err;
+ }
+diff --git a/os/client.c b/os/client.c
+index 922172cc5..488507f83 100644
+--- a/os/client.c
++++ b/os/client.c
+@@ -74,9 +74,29 @@
+ #endif
+ 
+ #ifdef __APPLE__
++#include <AvailabilityMacros.h>
++
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
+ #include <dispatch/dispatch.h>
+ #include <errno.h>
+ #include <sys/sysctl.h>
++
++static int argmax;
++static void init_argmax(void *context)
++{
++    int mib[2];
++    size_t len;
++
++    mib[0] = CTL_KERN;
++    mib[1] = KERN_ARGMAX;
++
++    len = sizeof(argmax);
++    if (sysctl(mib, 2, &argmax, &len, NULL, 0) == -1) {
++        ErrorF("Unable to dynamically determine kern.argmax, using ARG_MAX (%d)\n", ARG_MAX);
++        argmax = ARG_MAX;
++    }
++}
++#endif
+ #endif
+ 
+ /**
+@@ -136,7 +156,7 @@ DetermineClientPid(struct _Client * client)
+ void
+ DetermineClientCmd(pid_t pid, const char **cmdname, const char **cmdargs)
+ {
+-#if !defined(__APPLE__)
++#if !(defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 1060)
+     char path[PATH_MAX + 1];
+     int totsize = 0;
+     int fd = 0;
+@@ -150,23 +170,10 @@ DetermineClientCmd(pid_t pid, const char **cmdname, const char **cmdargs)
+     if (pid == -1)
+         return;
+ 
+-#if defined (__APPLE__)
++#if defined (__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
+     {
+-        static dispatch_once_t once;
+-        static int argmax;
+-        dispatch_once(&once, ^{
+-            int mib[2];
+-            size_t len;
+-
+-            mib[0] = CTL_KERN;
+-            mib[1] = KERN_ARGMAX;
+-
+-            len = sizeof(argmax);
+-            if (sysctl(mib, 2, &argmax, &len, NULL, 0) == -1) {
+-                ErrorF("Unable to dynamically determine kern.argmax, using ARG_MAX (%d)\n", ARG_MAX);
+-                argmax = ARG_MAX;
+-            }
+-        });
++        static dispatch_once_t once = 0;
++        dispatch_once_f(&once, NULL, init_argmax);
+ 
+         int mib[3];
+         size_t len = argmax;
+-- 
+2.24.3 (Apple Git-128)
+
