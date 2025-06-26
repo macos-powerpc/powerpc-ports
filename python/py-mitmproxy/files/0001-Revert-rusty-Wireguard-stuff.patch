@@ -1,0 +1,440 @@
+From 82acf6066a56598baa4813601405f471d49e12a6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 26 Jun 2025 23:33:16 +0800
+Subject: [PATCH] Revert rusty Wireguard stuff
+
+---
+ mitmproxy/net/udp.py                      |   3 +-
+ mitmproxy/proxy/mode_servers.py           | 133 +---------------------
+ mitmproxy/proxy/mode_specs.py             |  10 --
+ mitmproxy/proxy/server.py                 |   9 +-
+ setup.cfg                                 |   1 -
+ setup.py                                  |   5 +-
+ test/mitmproxy/proxy/test_mode_servers.py |  90 +--------------
+ test/mitmproxy/proxy/test_mode_specs.py   |   3 -
+ 8 files changed, 10 insertions(+), 244 deletions(-)
+
+diff --git mitmproxy/net/udp.py mitmproxy/net/udp.py
+index abec86a58..8cdb85ebd 100644
+--- mitmproxy/net/udp.py
++++ mitmproxy/net/udp.py
+@@ -6,7 +6,6 @@ import socket
+ from typing import Any, Callable, Optional, Union, cast
+ 
+ from mitmproxy.connection import Address
+-from mitmproxy.net import udp_wireguard
+ from mitmproxy.utils import human
+ 
+ logger = logging.getLogger(__name__)
+@@ -183,7 +182,7 @@ class DatagramWriter:
+             self._closed = None
+ 
+     @property
+-    def _protocol(self) -> DrainableDatagramProtocol | udp_wireguard.WireGuardDatagramTransport:
++    def _protocol(self) -> DrainableDatagramProtocol:
+         return self._transport.get_protocol()  # type: ignore
+ 
+     def write(self, data: bytes) -> None:
+diff --git mitmproxy/proxy/mode_servers.py mitmproxy/proxy/mode_servers.py
+index ca00d4389..e025b73ea 100644
+--- mitmproxy/proxy/mode_servers.py
++++ mitmproxy/proxy/mode_servers.py
+@@ -12,24 +12,19 @@ Example:
+ from __future__ import annotations
+ 
+ import asyncio
+-import json
+ import logging
+ import socket
+-import textwrap
+ import typing
+ from abc import ABCMeta, abstractmethod
+ from contextlib import contextmanager
+-from pathlib import Path
+ from typing import ClassVar, Generic, TypeVar, cast, get_args
+ 
+ import errno
+-import mitmproxy_wireguard as wg
+ 
+ from mitmproxy import ctx, flow, platform
+ from mitmproxy.connection import Address
+ from mitmproxy.master import Master
+ from mitmproxy.net import local_ip, udp
+-from mitmproxy.net.udp_wireguard import WireGuardDatagramTransport
+ from mitmproxy.proxy import commands, layers, mode_specs, server
+ from mitmproxy.proxy.context import Context
+ from mitmproxy.proxy.layer import Layer
+@@ -136,8 +131,8 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
+ 
+     async def handle_tcp_connection(
+         self,
+-        reader: asyncio.StreamReader | wg.TcpStream,
+-        writer: asyncio.StreamWriter | wg.TcpStream,
++        reader: asyncio.StreamReader,
++        writer: asyncio.StreamWriter,
+     ) -> None:
+         handler = ProxyConnectionHandler(
+             ctx.master, reader, writer, ctx.options, self.mode
+@@ -154,10 +149,6 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
+             else:
+                 handler.layer.context.client.sockname = original_dst
+                 handler.layer.context.server.address = original_dst
+-        elif isinstance(self.mode, mode_specs.WireGuardMode):
+-            original_dst = writer.get_extra_info("original_dst")
+-            handler.layer.context.client.sockname = original_dst
+-            handler.layer.context.server.address = original_dst
+ 
+         connection_id = (
+             handler.layer.context.client.transport_protocol,
+@@ -185,8 +176,6 @@ class ServerInstance(Generic[M], metaclass=ABCMeta):
+             handler.layer = self.make_top_layer(handler.layer.context)
+             handler.layer.context.client.transport_protocol = "udp"
+             handler.layer.context.server.transport_protocol = "udp"
+-            if isinstance(self.mode, mode_specs.WireGuardMode):
+-                handler.layer.context.server.address = local_addr
+ 
+             # pre-register here - we may get datagrams before the task is executed.
+             self.manager.connections[connection_id] = handler
+@@ -282,124 +271,6 @@ class AsyncioServerInstance(ServerInstance[M], metaclass=ABCMeta):
+         return self._listen_addrs
+ 
+ 
+-class WireGuardServerInstance(ServerInstance[mode_specs.WireGuardMode]):
+-    _server: wg.Server | None = None
+-    _listen_addrs: tuple[Address, ...] = tuple()
+-
+-    server_key: str
+-    client_key: str
+-
+-    def make_top_layer(self, context: Context) -> Layer:
+-        return layers.modes.TransparentProxy(context)
+-
+-    @property
+-    def is_running(self) -> bool:
+-        return self._server is not None
+-
+-    async def start(self) -> None:
+-        assert self._server is None
+-        host = self.mode.listen_host(ctx.options.listen_host)
+-        port = self.mode.listen_port(ctx.options.listen_port)
+-
+-        if self.mode.data:
+-            conf_path = Path(self.mode.data).expanduser()
+-        else:
+-            conf_path = Path(ctx.options.confdir).expanduser() / "wireguard.conf"
+-
+-        try:
+-            if not conf_path.exists():
+-                conf_path.write_text(json.dumps({
+-                    "server_key": wg.genkey(),
+-                    "client_key": wg.genkey(),
+-                }, indent=4))
+-
+-            try:
+-                c = json.loads(conf_path.read_text())
+-                self.server_key = c["server_key"]
+-                self.client_key = c["client_key"]
+-            except Exception as e:
+-                raise ValueError(f"Invalid configuration file ({conf_path}): {e}") from e
+-            # error early on invalid keys
+-            p = wg.pubkey(self.client_key)
+-            _ = wg.pubkey(self.server_key)
+-
+-            self._server = await wg.start_server(
+-                host,
+-                port,
+-                self.server_key,
+-                [p],
+-                self.wg_handle_tcp_connection,
+-                self.wg_handle_udp_datagram,
+-            )
+-            self._listen_addrs = (self._server.getsockname(),)
+-        except Exception as e:
+-            self.last_exception = e
+-            message = f"{self.mode.description} failed to listen on {host or '*'}:{port} with {e}"
+-            raise OSError(message) from e
+-        else:
+-            self.last_exception = None
+-
+-        addrs = " and ".join({human.format_address(a) for a in self.listen_addrs})
+-        conf = self.client_conf()
+-        assert conf
+-        logger.info(
+-            f"{self.mode.description} listening at {addrs}.\n"
+-            + "------------------------------------------------------------\n"
+-            + conf
+-            + "\n------------------------------------------------------------"
+-        )
+-
+-    def client_conf(self) -> str | None:
+-        if not self._server:
+-            return None
+-        host = local_ip.get_local_ip() or local_ip.get_local_ip6()
+-        port = self.mode.listen_port(ctx.options.listen_port)
+-        return textwrap.dedent(f"""
+-            [Interface]
+-            PrivateKey = {self.client_key}
+-            Address = 10.0.0.1/32
+-            DNS = 10.0.0.53
+-
+-            [Peer]
+-            PublicKey = {wg.pubkey(self.server_key)}
+-            AllowedIPs = 0.0.0.0/0
+-            Endpoint = {host}:{port}
+-            """).strip()
+-
+-    def to_json(self) -> dict:
+-        return {
+-            "wireguard_conf": self.client_conf(),
+-            **super().to_json()
+-        }
+-
+-    async def stop(self) -> None:
+-        assert self._server is not None
+-        self._server.close()
+-        await self._server.wait_closed()
+-        self._server = None
+-        self.last_exception = None
+-
+-        addrs = " and ".join({human.format_address(a) for a in self.listen_addrs})
+-        logger.info(f"Stopped {self.mode.description} at {addrs}.")
+-
+-    @property
+-    def listen_addrs(self) -> tuple[Address, ...]:
+-        return self._listen_addrs
+-
+-    async def wg_handle_tcp_connection(self, stream: wg.TcpStream) -> None:
+-        await self.handle_tcp_connection(stream, stream)
+-
+-    def wg_handle_udp_datagram(self, data: bytes, remote_addr: Address, local_addr: Address) -> None:
+-        assert self._server is not None
+-        transport = WireGuardDatagramTransport(self._server, local_addr, remote_addr)
+-        self.handle_udp_datagram(
+-            transport,
+-            data,
+-            remote_addr,
+-            local_addr
+-        )
+-
+-
+ class RegularInstance(AsyncioServerInstance[mode_specs.RegularMode]):
+     def make_top_layer(self, context: Context) -> Layer:
+         return layers.modes.HttpProxy(context)
+diff --git mitmproxy/proxy/mode_specs.py mitmproxy/proxy/mode_specs.py
+index 1e34a4406..f1aa100b7 100644
+--- mitmproxy/proxy/mode_specs.py
++++ mitmproxy/proxy/mode_specs.py
+@@ -245,13 +245,3 @@ class DnsMode(ProxyMode):
+ 
+     def __post_init__(self) -> None:
+         _check_empty(self.data)
+-
+-
+-class WireGuardMode(ProxyMode):
+-    """Proxy Server based on WireGuard"""
+-    description = "WireGuard server"
+-    default_port = 51820
+-    transport_protocol = UDP
+-
+-    def __post_init__(self) -> None:
+-        pass
+diff --git mitmproxy/proxy/server.py mitmproxy/proxy/server.py
+index 1341564ad..5ed711144 100644
+--- mitmproxy/proxy/server.py
++++ mitmproxy/proxy/server.py
+@@ -18,7 +18,6 @@ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from typing import Optional, Union
+ 
+-import mitmproxy_wireguard as wg
+ from OpenSSL import SSL
+ 
+ from mitmproxy import http, options as moptions, tls
+@@ -80,8 +79,8 @@ class TimeoutWatchdog:
+ @dataclass
+ class ConnectionIO:
+     handler: Optional[asyncio.Task] = None
+-    reader: Optional[Union[asyncio.StreamReader, udp.DatagramReader, wg.TcpStream]] = None
+-    writer: Optional[Union[asyncio.StreamWriter, udp.DatagramWriter, wg.TcpStream]] = None
++    reader: Optional[Union[asyncio.StreamReader, udp.DatagramReader]] = None
++    writer: Optional[Union[asyncio.StreamWriter, udp.DatagramWriter]] = None
+ 
+ 
+ class ConnectionHandler(metaclass=abc.ABCMeta):
+@@ -413,8 +412,8 @@ class ConnectionHandler(metaclass=abc.ABCMeta):
+ class LiveConnectionHandler(ConnectionHandler, metaclass=abc.ABCMeta):
+     def __init__(
+         self,
+-        reader: Union[asyncio.StreamReader, wg.TcpStream],
+-        writer: Union[asyncio.StreamWriter, wg.TcpStream],
++        reader: asyncio.StreamReader,
++        writer: asyncio.StreamWriter,
+         options: moptions.Options,
+         mode: mode_specs.ProxyMode,
+     ) -> None:
+diff --git setup.cfg setup.cfg
+index a43c808d5..0a3cb9560 100644
+--- setup.cfg
++++ setup.cfg
+@@ -69,7 +69,6 @@ exclude =
+     mitmproxy/net/http/message.py
+     mitmproxy/net/http/multipart.py
+     mitmproxy/net/tls.py
+-    mitmproxy/net/udp_wireguard.py
+     mitmproxy/options.py
+     mitmproxy/proxy/config.py
+     mitmproxy/proxy/server.py
+diff --git setup.py setup.py
+index 94ef426ed..d88549b83 100644
+--- setup.py
++++ setup.py
+@@ -76,18 +76,17 @@ setup(
+         "asgiref>=3.2.10,<3.6",
+         "Brotli>=1.0,<1.1",
+         "certifi>=2019.9.11",  # no semver here - this should always be on the last release!
+-        "cryptography>=38.0,<38.1",
++        "cryptography>=3.4.8",
+         "flask>=1.1.1,<2.3",
+         "h11>=0.11,<0.15",
+         "h2>=4.1,<5",
+         "hyperframe>=6.0,<7",
+         "kaitaistruct>=0.10,<0.11",
+         "ldap3>=2.8,<2.10",
+-        "mitmproxy_wireguard>=0.1.6,<0.2",
+         "msgpack>=1.0.0, <1.1.0",
+         "passlib>=1.6.5, <1.8",
+         "protobuf>=3.14,<5",
+-        "pyOpenSSL>=22.1,<22.2",
++        "pyOpenSSL>=21.0",
+         "pyparsing>=2.4.2,<3.1",
+         "pyperclip>=1.6.0,<1.9",
+         "ruamel.yaml>=0.16,<0.18",
+diff --git test/mitmproxy/proxy/test_mode_servers.py test/mitmproxy/proxy/test_mode_servers.py
+index c1228b3ca..75a524d94 100644
+--- test/mitmproxy/proxy/test_mode_servers.py
++++ test/mitmproxy/proxy/test_mode_servers.py
+@@ -8,7 +8,7 @@ import pytest
+ import mitmproxy.platform
+ from mitmproxy.addons.proxyserver import Proxyserver
+ from mitmproxy.net import udp
+-from mitmproxy.proxy.mode_servers import DnsInstance, ServerInstance, WireGuardServerInstance
++from mitmproxy.proxy.mode_servers import DnsInstance, ServerInstance
+ from mitmproxy.proxy.server import ConnectionHandler
+ from mitmproxy.test import taddons
+ 
+@@ -25,9 +25,6 @@ def test_make():
+         assert inst.mode.description
+         assert inst.to_json()
+ 
+-    with pytest.raises(ValueError, match="is not a spec for a WireGuardServerInstance server."):
+-        WireGuardServerInstance.make("regular", manager)
+-
+ 
+ async def test_last_exception_and_running(monkeypatch):
+     manager = MagicMock()
+@@ -111,91 +108,6 @@ async def test_transparent(failure, monkeypatch, caplog_async):
+         assert await caplog_async.await_log("Stopped transparent proxy")
+ 
+ 
+-async def test_wireguard(tdata, monkeypatch, caplog):
+-    caplog.set_level("DEBUG")
+-
+-    async def handle_client(self: ConnectionHandler):
+-        t = self.transports[self.client]
+-        data = await t.reader.read(65535)
+-        t.writer.write(data.upper())
+-        await t.writer.drain()
+-        t.writer.close()
+-
+-    monkeypatch.setattr(ConnectionHandler, "handle_client", handle_client)
+-
+-    system = platform.system()
+-    if system == "Linux":
+-        test_client_name = "linux-x86_64"
+-    elif system == "Darwin":
+-        test_client_name = "macos-x86_64"
+-    elif system == "Windows":
+-        test_client_name = "windows-x86_64.exe"
+-    else:
+-        return pytest.skip("Unsupported platform for wg-test-client.")
+-
+-    test_client_path = tdata.path(f"wg-test-client/{test_client_name}")
+-    test_conf = tdata.path(f"wg-test-client/test.conf")
+-
+-    with taddons.context(Proxyserver()):
+-        inst = WireGuardServerInstance.make(f"wireguard:{test_conf}@0", MagicMock())
+-
+-        await inst.start()
+-        assert "WireGuard server listening" in caplog.text
+-
+-        _, port = inst.listen_addrs[0]
+-
+-        assert inst.is_running
+-        proc = await asyncio.create_subprocess_exec(
+-            test_client_path,
+-            str(port),
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.PIPE,
+-        )
+-        stdout, stderr = await proc.communicate()
+-
+-        try:
+-            assert proc.returncode == 0
+-        except AssertionError:
+-            print(stdout)
+-            print(stderr)
+-            raise
+-
+-        await inst.stop()
+-        assert "Stopped WireGuard server" in caplog.text
+-
+-
+-async def test_wireguard_generate_conf(tmp_path):
+-    with taddons.context(Proxyserver()) as tctx:
+-        tctx.options.confdir = str(tmp_path)
+-        inst = WireGuardServerInstance.make(f"wireguard@0", MagicMock())
+-        assert not inst.client_conf()  # should not error.
+-
+-        await inst.start()
+-
+-        assert (tmp_path / "wireguard.conf").exists()
+-        assert inst.client_conf()
+-        assert inst.to_json()["wireguard_conf"]
+-        k = inst.server_key
+-
+-        inst2 = WireGuardServerInstance.make(f"wireguard@0", MagicMock())
+-        await inst2.start()
+-        assert k == inst2.server_key
+-
+-        await inst.stop()
+-        await inst2.stop()
+-
+-
+-async def test_wireguard_invalid_conf(tmp_path):
+-    with taddons.context(Proxyserver()):
+-        # directory instead of filename
+-        inst = WireGuardServerInstance.make(f"wireguard:{tmp_path}", MagicMock())
+-
+-        with pytest.raises(OSError):
+-            await inst.start()
+-
+-        assert "Invalid configuration file" in repr(inst.last_exception)
+-
+-
+ async def test_tcp_start_error():
+     manager = MagicMock()
+ 
+diff --git test/mitmproxy/proxy/test_mode_specs.py test/mitmproxy/proxy/test_mode_specs.py
+index e2e7eecf9..3891a188e 100644
+--- test/mitmproxy/proxy/test_mode_specs.py
++++ test/mitmproxy/proxy/test_mode_specs.py
+@@ -58,9 +58,6 @@ def test_parse_specific_modes():
+     assert ProxyMode.parse("dns")
+     assert ProxyMode.parse("reverse:dns://8.8.8.8")
+     assert ProxyMode.parse("reverse:dtls://127.0.0.1:8004")
+-    assert ProxyMode.parse("wireguard")
+-    assert ProxyMode.parse("wireguard:foo.conf").data == "foo.conf"
+-    assert ProxyMode.parse("wireguard@51821").listen_port() == 51821
+ 
+     with pytest.raises(ValueError, match="invalid port"):
+         ProxyMode.parse("regular@invalid-port")
