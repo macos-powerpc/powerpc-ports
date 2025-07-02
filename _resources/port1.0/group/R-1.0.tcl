@@ -156,29 +156,6 @@ proc R.add_dependencies {} {
     }
 }
 
-# General fixes for PPC:
-global configure.cxx_stdlib os.platform
-if {${os.platform} eq "darwin" && ${configure.cxx_stdlib} ne "libc++"} {
-    # Avoid multiple malloc errors. See: https://github.com/iains/darwin-toolchains-start-here/discussions/20
-    # Normally should not be needed at configure stage,
-    # however R still builds some stuff there occasionally.
-    configure.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    configure.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    build.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    build.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    destroot.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    destroot.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc
-    # With supported_archs set to noarch, Macports wants Clang on 10.6, even when build is for PPC.
-    # Fix this nonsense, until Clang is fixed.
-    compiler.blacklist-append *clang*
-}
-
 global prefix frameworks_dir
 # Please update R version here:
 set Rversion        4.5.1
@@ -205,6 +182,29 @@ pre-build {
 
 build.cmd           ${r.cmd} CMD INSTALL .
 
+# General fixes for PPC:
+global configure.cxx_stdlib os.platform
+if {${os.platform} eq "darwin" && ${configure.cxx_stdlib} ne "libc++"} {
+    # Avoid multiple malloc errors. See: https://github.com/iains/darwin-toolchains-start-here/discussions/20
+    # Normally should not be needed at configure stage,
+    # however R still builds some stuff there occasionally.
+    configure.env-append \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    configure.cmd-prepend \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    build.env-append \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    build.cmd-prepend \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    destroot.env-append \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    destroot.cmd-prepend \
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+    # With supported_archs set to noarch, Macports wants Clang on 10.6, even when build is for PPC.
+    # Fix this nonsense, until Clang is fixed.
+    compiler.blacklist-append *clang*
+}
+
 # Notice that while we install tests to make them available to the user,
 # in a case of testthat running test_check("${R.package}") from within R session will not work.
 # It has been left broken by upstream for years, see: https://github.com/r-lib/testthat/issues/205
@@ -225,3 +225,16 @@ default test.env    _R_CHECK_FORCE_SUGGESTS_=0
 default test.cmd    {${r.cmd}}
 default test.target {CMD check ./${R.package}_${version}${suffix}}
 default test.args   {--no-manual --no-build-vignettes}
+
+global os.platform os.arch
+if {${os.platform} eq "darwin" && ${os.arch} eq "powerpc"} {
+    set javahome    /Library/Java/JavaVirtualMachines/openjdk8/Contents/Home
+    configure.cmd-prepend \
+                    JAVA_HOME=${javahome}
+    build.cmd-prepend \
+                    JAVA_HOME=${javahome}
+    destroot.cmd-prepend \
+                    JAVA_HOME=${javahome}
+    test.cmd-prepend \
+                    JAVA_HOME=${javahome}
+}
