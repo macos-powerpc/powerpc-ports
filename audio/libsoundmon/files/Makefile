@@ -1,8 +1,11 @@
+PREFIX ?= /opt/local
 CC ?= gcc
 CXX ?= g++
 CFLAGS += -Wall -fPIC
 CXXFLAGS += -std=c++11 -Wall -fPIC
 LDFLAGS += -dynamiclib
+INSTALLDIR = $(DESTDIR)$(PREFIX)/lib
+INSTALLNAME = $(PREFIX)/lib/libsoundmon.dylib
 TARGET = libsoundmon.dylib
 
 C_SRCS := $(wildcard libsoundmon/*.c)
@@ -12,7 +15,7 @@ OBJS := $(C_SRCS:.c=.o) $(CPP_SRCS:.cpp=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(LDFLAGS) -o $@ $(OBJS)
+	$(CXX) $(LDFLAGS) -install_name $(INSTALLNAME) -o $@ $(OBJS)
 
 libsoundmon/%.o: libsoundmon/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
