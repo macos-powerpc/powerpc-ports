@@ -1,11 +1,13 @@
+PREFIX   ?= /opt/local
 CXX      ?= g++
 CC       ?= gcc
-AR       = ar
+AR        = ar
 CFLAGS   += -fPIC -Ilibs98 -Wno-incompatible-pointer-types
 CXXFLAGS += -fPIC -Ilibs98
-LDFLAGS  = -dynamiclib -lz
-
-LIBNAME  = libs98.dylib
+LDFLAGS   = -dynamiclib -lz
+LIBNAME   = libs98.dylib
+INSTALLDIR = $(DESTDIR)$(PREFIX)/lib
+INSTALLNAME = $(PREFIX)/lib/$(LIBNAME)
 
 C_SOURCES = \
   libs98/device/emu2413/emu2413.c \
@@ -32,7 +34,7 @@ OBJS = $(C_SOURCES:.c=.o) $(CPP_SOURCES:.cpp=.o)
 all: $(LIBNAME)
 
 $(LIBNAME): $(OBJS)
-	$(CXX) $(LDFLAGS) -o $@ $(OBJS)
+	$(CXX) $(LDFLAGS) -install_name $(INSTALLNAME) -o $@ $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
