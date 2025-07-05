@@ -1,4 +1,7 @@
+PREFIX ?= /opt/local
 CC ?= gcc
+INSTALLDIR = $(DESTDIR)$(PREFIX)/lib
+INSTALLNAME = $(PREFIX)/lib/libsc68.dylib
 
 CFLAGS += -Wall -fPIC \
   -Ilibsc68 \
@@ -83,7 +86,7 @@ SRC = \
 OBJ = $(SRC:.c=.o)
 
 libsc68.dylib: $(OBJ)
-	$(CC) -dynamiclib -o $@ $(OBJ)
+	$(CC) -dynamiclib -install_name $(INSTALLNAME) -o $@ $(OBJ)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
