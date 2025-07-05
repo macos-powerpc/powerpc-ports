@@ -1,6 +1,9 @@
+PREFIX ?= /opt/local
 CC ?= gcc
 CFLAGS += -fPIC -Ilibpsf
 LDFLAGS += -dynamiclib -lz
+INSTALLDIR = $(DESTDIR)$(PREFIX)/lib
+INSTALLNAME = $(PREFIX)/lib/libpsf.dylib
 TARGET = libpsf.dylib
 
 SRCS = \
@@ -41,7 +44,7 @@ OBJS = $(SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(LDFLAGS) -install_name $(INSTALLNAME) -o $@ $(OBJS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
