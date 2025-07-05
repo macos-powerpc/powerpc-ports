@@ -1,7 +1,11 @@
+PREFIX   ?= /opt/local
 CXX      ?= g++
 CC       ?= gcc
 CXXFLAGS += -Wall -fPIC -std=c++11
 CFLAGS   += -Wall -fPIC
+
+INSTALLDIR = $(DESTDIR)$(PREFIX)/lib
+INSTALLNAME = $(PREFIX)/lib/liborganya.dylib
 
 CPP_SRCS := \
   liborganya/organya/decoder.cpp \
@@ -40,7 +44,7 @@ TARGET := liborganya.dylib
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) -dynamiclib -o $@ $(OBJS) $(LDFLAGS)
+	$(CXX) -dynamiclib -o $@ $(OBJS) $(LDFLAGS) -install_name $(INSTALLNAME)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
