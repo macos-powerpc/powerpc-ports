@@ -14,14 +14,18 @@ set_target_properties(alglib PROPERTIES VERSION ${ALGLIB_VERSION} SOVERSION ${AL
 
 add_executable(test_c tests/test_c.cpp)
 add_executable(test_i tests/test_i.cpp)
-add_executable(test_x tests/test_x.cpp)
+# This test is broken in 4.05.0:
+# /opt/local/var/macports/build/_opt_local_ppcports_math_alglib/alglib/work/alglib-cpp/tests/test_x.cpp: In function 'int main()':
+# /opt/local/var/macports/build/_opt_local_ppcports_math_alglib/alglib/work/alglib-cpp/tests/test_x.cpp:2903:84: error: cannot convert 'bool' to 'alglib_impl::ae_state*'
+# 2903 |             alglib_impl::ae_smart_ptr_init(&ptr0, (void**)&p0, &_alglib_env_state, true);
+# add_executable(test_x tests/test_x.cpp)
 set_target_properties(test_c PROPERTIES COMPILE_FLAGS "-DAE_USE_ALLOC_COUNTER -DAE_DEBUG4POSIX")
 set_target_properties(test_i PROPERTIES COMPILE_FLAGS "-DAE_USE_ALLOC_COUNTER -DAE_DEBUG4POSIX")
-set_target_properties(test_x PROPERTIES COMPILE_FLAGS "-DAE_USE_ALLOC_COUNTER -DAE_DEBUG4POSIX")
+# set_target_properties(test_x PROPERTIES COMPILE_FLAGS "-DAE_USE_ALLOC_COUNTER -DAE_DEBUG4POSIX")
 include_directories(src/)
 target_link_libraries(test_c alglib)
 target_link_libraries(test_i alglib)
-target_link_libraries(test_x alglib)
+# target_link_libraries(test_x alglib)
 
 install(TARGETS alglib LIBRARY DESTINATION lib${LIB_SUFFIX})
 install(FILES ${HDR} DESTINATION include/libalglib)
@@ -38,8 +42,7 @@ install(FILES ${HDR} DESTINATION include/libalglib)
 #
 # Gmsh expects headers in include/libalglib, so use that.
 
-
 enable_testing()
 add_test( test_c ${CMAKE_BUILD_DIR}/test_c)
 add_test( test_i ${CMAKE_BUILD_DIR}/test_i)
-add_test( test_x ${CMAKE_BUILD_DIR}/test_x)
+# add_test( test_x ${CMAKE_BUILD_DIR}/test_x)
