@@ -127,12 +127,15 @@ set qt_name             qt4
 # standard lrelease command location
     global qt_lrelease_cmd
 
+## qt4_is_concurrent indicates the mainstream concurrency solution of installing
+## everything into $prefix/libexec/qt4. The variable will remain unset when
+## the MacStrop solution is used.
 global qt4_is_concurrent
 if {![variant_isset exclusive]} {
     if {![info exists building_qt4] || ![info exists name] || (${name} ne "qt4-mac" && ${name} ne "qt4-mac-devel") || ${subport} eq "${name}-transitional"} {
         #exec ls -l ${prefix}/libexec/${qt_name}/bin/qmake
         if {[file exists ${prefix}/libexec/${qt_name}/bin/qmake]} {
-            # we have a "concurrent" install, which means we must look for the various components
+            # We have a "concurrent" install, which means we must look for the various components
             # in different locations (esp. qmake)
             set qt4_is_concurrent   1
             set auto_concurrent 1
@@ -141,7 +144,7 @@ if {![variant_isset exclusive]} {
         if {![info exists qt4_is_concurrent]} {
             ui_debug "NB:\nQt4 has been or will be installed in concurrent mode\n"
         }
-        # we're asking for the standard concurrent install. No need to guess anything, give the user what s/he wants
+        # We're asking for the standard concurrent install. No need to guess anything, give the user what s/he wants
         set qt4_is_concurrent   1
         set auto_concurrent     1
     }
