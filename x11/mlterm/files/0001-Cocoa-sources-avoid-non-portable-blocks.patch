@@ -1,0 +1,247 @@
+From 04c038330c09721e83bc782fc60c812712a5ab03 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <vital.had@gmail.com>
+Date: Sat, 2 Aug 2025 01:15:40 +0800
+Subject: [PATCH 1/4] Cocoa sources: avoid non-portable blocks
+
+---
+ uitoolkit/quartz/cocoa.m                 |  19 +--
+ uitoolkit/quartz/cocoatouch.m            |   9 +-
+ uitoolkit/quartz/ui_event_source-cocoa.m | 140 +++++++++++++----------
+ 3 files changed, 99 insertions(+), 69 deletions(-)
+
+diff --git uitoolkit/quartz/cocoa.m uitoolkit/quartz/cocoa.m
+index c75d2fd7..f4f8f830 100644
+--- uitoolkit/quartz/cocoa.m
++++ uitoolkit/quartz/cocoa.m
+@@ -111,6 +111,15 @@ static void exit_program(void) {
+   }
+ }
+ 
++static void exit_program_dispatch(void *context) {
++    exit_program();
++}
++
++static void monitor_pty_dispatch(void *context) {
++    ui_event_source_process();
++    dispatch_sync_f(dispatch_get_main_queue(), NULL, exit_program_dispatch);
++}
++
+ static void monitor_pty(void) {
+ #if 0
+   /* normal user (Don't call before NSApplicationMain()) */
+@@ -118,12 +127,8 @@ static void monitor_pty(void) {
+   bl_priv_change_egid(bl_getgid());
+ #endif
+ 
+-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+-      ui_event_source_process(); /* See ui_event_source-cocoa.m */
+-      dispatch_sync(dispatch_get_main_queue(), ^{
+-          exit_program();
+-        });
+-    });
++  dispatch_async_f(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
++                  NULL, monitor_pty_dispatch);
+ }
+ 
+ /* Undocumented */
+@@ -299,7 +304,7 @@ - (id)initWithFrame:(NSRect)frame {
+   if (!configMenuItem) {
+     monitor_pty();
+ 
+-#if 1
++#ifdef __clang__
+     [NSEvent addLocalMonitorForEventsMatchingMask:NSKeyDownMask
+                                           handler:^(NSEvent *event) {
+                                             switch (event.keyCode) {
+diff --git uitoolkit/quartz/cocoatouch.m uitoolkit/quartz/cocoatouch.m
+index 5e14936a..8adcf68c 100644
+--- uitoolkit/quartz/cocoatouch.m
++++ uitoolkit/quartz/cocoatouch.m
+@@ -126,6 +126,10 @@ static void exit_program(void) {
+ #endif
+ }
+ 
++static void monitor_pty_dispatch(void *context) {
++  ui_event_source_process();
++}
++
+ static void monitor_pty(void) {
+ #if 0
+   /* normal user (Don't call before UIApplicationMain()) */
+@@ -133,9 +137,8 @@ static void monitor_pty(void) {
+   bl_priv_change_egid(bl_getgid());
+ #endif
+ 
+-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+-      ui_event_source_process();
+-    });
++  dispatch_async_f(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
++                  NULL, monitor_pty_dispatch);
+ }
+ 
+ /* Undocumented */
+diff --git uitoolkit/quartz/ui_event_source-cocoa.m uitoolkit/quartz/ui_event_source-cocoa.m
+index af169dd1..7e0fa5bf 100644
+--- uitoolkit/quartz/ui_event_source-cocoa.m
++++ uitoolkit/quartz/ui_event_source-cocoa.m
+@@ -26,6 +26,82 @@
+ 
+ static u_int num_additional_fds;
+ 
++struct ui_event_source_context {
++  int *ret;
++  fd_set *read_fds;
++  int *maxfd;
++  int *is_cont_read;
++  struct timeval *tval;
++};
++
++static void ui_event_source_process_main(void *ctx_void) {
++  struct ui_event_source_context *ctx = (struct ui_event_source_context *)ctx_void;
++
++  int *ret           = ctx->ret;
++  fd_set *read_fds   = ctx->read_fds;
++  int *maxfd         = ctx->maxfd;
++  int *is_cont_read  = ctx->is_cont_read;
++  struct timeval *tval = ctx->tval;
++
++  vt_close_dead_terms();
++
++  vt_term_t **terms;
++  u_int num_terms = vt_get_all_terms(&terms);
++
++  int count;
++  int ptyfd;
++  if (*ret > 0) {
++    for (count = 0; count < num_additional_fds; count++) {
++      if (additional_fds[count].fd < 0) {
++        (*additional_fds[count].handler)();
++      }
++    }
++
++    for (count = 0; count < num_terms; count++) {
++      if ((ptyfd = vt_term_get_master_fd(terms[count])) >= 0 &&
++          FD_ISSET(ptyfd, read_fds)) {
++        vt_term_parse_vt100_sequence(terms[count]);
++      }
++    }
++
++    if (++(*is_cont_read) >= 2) {
++      [[NSRunLoop currentRunLoop]
++        runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
++    }
++  } else if (*ret == 0) {
++    ui_display_idling(NULL);
++    *is_cont_read = 0;
++  }
++
++  FD_ZERO(read_fds);
++  *maxfd = -1;
++
++  for (count = 0; count < num_terms; count++) {
++    if ((ptyfd = vt_term_get_master_fd(terms[count])) >= 0) {
++      FD_SET(ptyfd, read_fds);
++
++      if (ptyfd > *maxfd) {
++        *maxfd = ptyfd;
++      }
++
++      if (vt_term_is_sending_data(terms[count])) {
++        tval->tv_usec = 0;
++        vt_term_parse_vt100_sequence(terms[count]);
++      }
++    }
++  }
++
++  for (count = 0; count < num_additional_fds; count++) {
++    if (additional_fds[count].fd >= 0) {
++      FD_SET(additional_fds[count].fd, read_fds);
++
++      if (additional_fds[count].fd > *maxfd) {
++        *maxfd = additional_fds[count].fd;
++      }
++    }
++  }
++}
++
+ /* --- global functions --- */
+ 
+ void ui_event_source_init(void) {}
+@@ -39,69 +115,15 @@ int ui_event_source_process(void) {
+   static int is_cont_read;
+   static struct timeval tval;
+ 
++  struct ui_event_source_context ctx = {
++    &ret, &read_fds, &maxfd, &is_cont_read, &tval
++  };
++
+   for (;;) {
+     tval.tv_usec = 100000; /* 0.1 sec */
+     tval.tv_sec = 0;
+ 
+-    dispatch_sync(dispatch_get_main_queue(), ^{
+-        vt_close_dead_terms();
+-
+-        vt_term_t **terms;
+-        u_int num_terms = vt_get_all_terms(&terms);
+-
+-        int count;
+-        int ptyfd;
+-        if (ret > 0) {
+-          for (count = 0; count < num_additional_fds; count++) {
+-            if (additional_fds[count].fd < 0) {
+-              (*additional_fds[count].handler)();
+-            }
+-          }
+-
+-          for (count = 0; count < num_terms; count++) {
+-            if ((ptyfd = vt_term_get_master_fd(terms[count])) >= 0 &&
+-                FD_ISSET(ptyfd, &read_fds)) {
+-              vt_term_parse_vt100_sequence(terms[count]);
+-            }
+-          }
+-
+-          if (++is_cont_read >= 2) {
+-            [[NSRunLoop currentRunLoop]
+-             runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+-          }
+-        } else if (ret == 0) {
+-          ui_display_idling(NULL);
+-          is_cont_read = 0;
+-        }
+-
+-        FD_ZERO(&read_fds);
+-        maxfd = -1;
+-
+-        for (count = 0; count < num_terms; count++) {
+-          if ((ptyfd = vt_term_get_master_fd(terms[count])) >= 0) {
+-            FD_SET(ptyfd, &read_fds);
+-
+-            if (ptyfd > maxfd) {
+-              maxfd = ptyfd;
+-            }
+-
+-            if (vt_term_is_sending_data(terms[count])) {
+-              tval.tv_usec = 0;
+-              vt_term_parse_vt100_sequence(terms[count]);
+-            }
+-          }
+-        }
+-
+-        for (count = 0; count < num_additional_fds; count++) {
+-          if (additional_fds[count].fd >= 0) {
+-            FD_SET(additional_fds[count].fd, &read_fds);
+-
+-            if (additional_fds[count].fd > maxfd) {
+-              maxfd = additional_fds[count].fd;
+-            }
+-          }
+-        }
+-      });
++    dispatch_sync_f(dispatch_get_main_queue(), &ctx, ui_event_source_process_main);
+ 
+     if (maxfd == -1 ||
+         ((ret = select(maxfd + 1, &read_fds, NULL, NULL, &tval)) < 0 &&
+-- 
+2.24.3 (Apple Git-128)
+
