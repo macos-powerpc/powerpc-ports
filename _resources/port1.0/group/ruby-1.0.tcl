@@ -236,6 +236,10 @@ proc ruby.setup {module vers {type "install.rb"} {docs {}} {source "custom"} {im
         }
     }
 
+    if {${ruby.branch} >= 3.0} {
+        compiler.thread_local_storage yes
+    }
+
     distname        ${ruby.filename}-${vers}
     dist_subdir     ruby
 
