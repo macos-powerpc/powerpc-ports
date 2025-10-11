@@ -12,3 +12,5 @@ Using this repository with mainstream MacPorts is possible, but you are on your 
 Commit history is preserved here and PRs are accepted.
 
 R ports have been moved to a separate repository: https://github.com/macos-powerpc/R-ports (PowerPC support is maintained there too).
+
+This repository is accessible at [CodeBerg](https://codeberg.org/macos-powerpc/powerpc-ports) and [GitHub](https://github.com/macos-powerpc/powerpc-ports).
