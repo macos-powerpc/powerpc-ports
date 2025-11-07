@@ -336,7 +336,6 @@ default_variants        +qt5kde
 
 set qt_install_registry     ${qt_dir}/registry
 
-PortGroup                   compiler_blacklist_versions 1.0
 if {${os.platform} eq "darwin"} {
     compiler.whitelist      clang
 #     compiler.whitelist      clang macports-clang-3.7 macports-clang-3.6 macports-clang-3.5 macports-clang-3.4
