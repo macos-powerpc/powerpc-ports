@@ -1,0 +1,361 @@
+From 94d6cd96f935fc00b14b1002b059b1498331fced Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <vital.had@gmail.com>
+Date: Mon, 10 Nov 2025 23:13:40 +0800
+Subject: [PATCH] macOS 10.6: enforce emulated TLS
+
+---
+ src/librustc/session/config.rs                |  3 ++
+ src/librustc_codegen_llvm/back/write.rs       |  3 ++
+ src/librustc_codegen_llvm/llvm/ffi.rs         |  3 +-
+ src/librustc_codegen_ssa/back/linker.rs       | 12 ++++-
+ .../back/symbol_export.rs                     | 51 +++++++++++++++++++
+ src/librustc_target/spec/apple_base.rs        |  3 +-
+ src/librustc_target/spec/mod.rs               |  6 +++
+ src/libstd/build.rs                           |  7 +++
+ src/libstd/sys/unix/fast_thread_local.rs      |  9 ++++
+ src/libsyntax_pos/symbol.rs                   |  1 +
+ src/rustllvm/PassWrapper.cpp                  |  8 ++-
+ 11 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/src/librustc/session/config.rs b/src/librustc/session/config.rs
+index 5eda3df3781..c498d4eda25 100644
+--- a/src/librustc/session/config.rs
++++ b/src/librustc/session/config.rs
+@@ -1513,6 +1513,9 @@ pub fn default_configuration(sess: &Session) -> ast::CrateConfig {
+     if sess.target.target.options.has_elf_tls {
+         ret.insert((sym::target_thread_local, None));
+     }
++    if sess.target.enforce_emulated_tls {
++        ret.insert((sym::target_enforce_emulated_tls, None));
++    }
+     for &i in &[8, 16, 32, 64, 128] {
+         if i >= min_atomic_width && i <= max_atomic_width {
+             let s = i.to_string();
+diff --git a/src/librustc_codegen_llvm/back/write.rs b/src/librustc_codegen_llvm/back/write.rs
+index 253110dcb34..d911a9bd01b 100644
+--- a/src/librustc_codegen_llvm/back/write.rs
++++ b/src/librustc_codegen_llvm/back/write.rs
+@@ -167,6 +167,8 @@ pub fn target_machine_factory(sess: &Session, optlvl: config::OptLevel, find_fea
+ 
+     let asm_comments = sess.asm_comments();
+ 
++    let enforce_emulated_tls = sess.target.enforce_emulated_tls;
++
+     Arc::new(move || {
+         let tm = unsafe {
+             llvm::LLVMRustCreateTargetMachine(
+@@ -182,6 +184,7 @@ pub fn target_machine_factory(sess: &Session, optlvl: config::OptLevel, find_fea
+                 singlethread,
+                 asm_comments,
+                 emit_stack_size_section,
++                enforce_emulated_tls,
+             )
+         };
+ 
+diff --git a/src/librustc_codegen_llvm/llvm/ffi.rs b/src/librustc_codegen_llvm/llvm/ffi.rs
+index b07214fdc03..1477eda907b 100644
+--- a/src/librustc_codegen_llvm/llvm/ffi.rs
++++ b/src/librustc_codegen_llvm/llvm/ffi.rs
+@@ -1694,7 +1694,8 @@ extern "C" {
+                                        TrapUnreachable: bool,
+                                        Singlethread: bool,
+                                        AsmComments: bool,
+-                                       EmitStackSizeSection: bool)
++                                       EmitStackSizeSection: bool,
++                                       EnforceEmulatedTLS: bool)
+                                        -> Option<&'static mut TargetMachine>;
+     pub fn LLVMRustDisposeTargetMachine(T: &'static mut TargetMachine);
+     pub fn LLVMRustAddAnalysisPasses(T: &'a TargetMachine, PM: &PassManager<'a>, M: &'a Module);
+diff --git a/src/librustc_codegen_ssa/back/linker.rs b/src/librustc_codegen_ssa/back/linker.rs
+index c42cd024926..36f0c1cbd68 100644
+--- a/src/librustc_codegen_ssa/back/linker.rs
++++ b/src/librustc_codegen_ssa/back/linker.rs
+@@ -1088,7 +1088,11 @@ fn exported_symbols(tcx: TyCtxt<'_>, crate_type: CrateType) -> Vec<String> {
+     let export_threshold = symbol_export::crates_export_threshold(&[crate_type]);
+     for &(symbol, level) in tcx.exported_symbols(LOCAL_CRATE).iter() {
+         if level.is_below_threshold(export_threshold) {
+-            symbols.push(symbol.symbol_name(tcx).to_string());
++            symbols.push(symbol_export::symbol_name_for_exported_symbol_maybe_emutls(
++                tcx,
++                symbol,
++                LOCAL_CRATE,
++            ));
+         }
+     }
+ 
+@@ -1102,7 +1106,11 @@ fn exported_symbols(tcx: TyCtxt<'_>, crate_type: CrateType) -> Vec<String> {
+             // ... we add its symbol list to our export list.
+             for &(symbol, level) in tcx.exported_symbols(cnum).iter() {
+                 if level.is_below_threshold(export_threshold) {
+-                    symbols.push(symbol.symbol_name(tcx).to_string());
++                    symbols.push(symbol_export::symbol_name_for_exported_symbol_maybe_emutls(
++                        tcx,
++                        symbol,
++                        cnum,
++                    ));
+                 }
+             }
+         }
+diff --git a/src/librustc_codegen_ssa/back/symbol_export.rs b/src/librustc_codegen_ssa/back/symbol_export.rs
+index 7e700e68194..0f0bf6eea32 100644
+--- a/src/librustc_codegen_ssa/back/symbol_export.rs
++++ b/src/librustc_codegen_ssa/back/symbol_export.rs
+@@ -339,6 +339,57 @@ fn is_unreachable_local_definition_provider(tcx: TyCtxt<'_>, def_id: DefId) -> b
+     }
+ }
+ 
++fn maybe_emutls(
++    tcx: TyCtxt<'_>,
++    def_id: DefId,
++    name: String,
++) -> String {
++    if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
++        ["__emutls_v", &name].join(".").to_string()
++    } else {
++        name
++    }
++}
++
++/// This is the symbol name of the given exported symbol, with emulated TLS prefix if needed
++pub fn symbol_name_for_exported_symbol_maybe_emutls<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    symbol: ExportedSymbol<'tcx>,
++    instantiating_crate: CrateNum,
++) -> String {
++    if !tcx.sess.target.target.options.enforce_emulated_tls {
++        return symbol.symbol_name(tcx).to_string();
++    }
++
++    match symbol {
++        ExportedSymbol::NonGeneric(def_id) => {
++            let base_name = if instantiating_crate == LOCAL_CRATE {
++                tcx.symbol_name(Instance::mono(tcx, def_id)).to_string()
++            } else {
++                rustc_symbol_mangling::symbol_name_for_instance_in_crate(
++                    tcx,
++                    Instance::mono(tcx, def_id),
++                    instantiating_crate,
++                )
++            };
++            maybe_emutls(tcx, def_id, base_name)
++        }
++        ExportedSymbol::Generic(def_id, substs) => {
++            let base_name = if instantiating_crate == LOCAL_CRATE {
++                tcx.symbol_name(Instance::new(def_id, substs)).to_string()
++            } else {
++                rustc_symbol_mangling::symbol_name_for_instance_in_crate(
++                    tcx,
++                    Instance::new(def_id, substs),
++                    instantiating_crate,
++                )
++            };
++            maybe_emutls(tcx, def_id, base_name)
++        }
++        ExportedSymbol::NoDefId(symbol_name) => symbol_name.to_string(),
++    }
++}
++
+ pub fn provide(providers: &mut Providers<'_>) {
+     providers.reachable_non_generics = reachable_non_generics_provider;
+     providers.is_reachable_non_generic = is_reachable_non_generic_provider_local;
+diff --git a/src/librustc_target/spec/apple_base.rs b/src/librustc_target/spec/apple_base.rs
+index f7551aa768d..a501e9a8974 100644
+--- a/src/librustc_target/spec/apple_base.rs
++++ b/src/librustc_target/spec/apple_base.rs
+@@ -28,7 +28,8 @@ pub fn opts() -> TargetOptions {
+         dll_suffix: ".dylib".to_string(),
+         archive_format: "bsd".to_string(),
+         pre_link_args: LinkArgs::new(),
+-        has_elf_tls: version >= (10, 7),
++        has_elf_tls: true,
++        enforce_emulated_tls: version < (10, 7),
+         abi_return_struct_as_int: true,
+         emit_debug_gdb_scripts: false,
+         .. Default::default()
+diff --git a/src/librustc_target/spec/mod.rs b/src/librustc_target/spec/mod.rs
+index 626fa374a1b..14830db04df 100644
+--- a/src/librustc_target/spec/mod.rs
++++ b/src/librustc_target/spec/mod.rs
+@@ -695,6 +695,9 @@ pub struct TargetOptions {
+     /// Flag indicating whether ELF TLS (e.g., #[thread_local]) is available for
+     /// this target.
+     pub has_elf_tls: bool,
++    /// Flag indicating whether emulated TLS should be enforced.
++    pub enforce_emulated_tls: bool,
++
+     // This is mainly for easy compatibility with emscripten.
+     // If we give emcc .o files that are actually .bc files it
+     // will 'just work'.
+@@ -851,6 +854,7 @@ impl Default for TargetOptions {
+             custom_unwind_resume: false,
+             allow_asm: true,
+             has_elf_tls: false,
++            enforce_emulated_tls: false,
+             obj_is_bitcode: false,
+             no_integrated_as: false,
+             min_atomic_width: None,
+@@ -1160,6 +1164,7 @@ impl Target {
+         key!(allow_asm, bool);
+         key!(custom_unwind_resume, bool);
+         key!(has_elf_tls, bool);
++        key!(enforce_emulated_tls, bool);
+         key!(obj_is_bitcode, bool);
+         key!(no_integrated_as, bool);
+         key!(max_atomic_width, Option<u64>);
+@@ -1377,6 +1382,7 @@ impl ToJson for Target {
+         target_option_val!(allow_asm);
+         target_option_val!(custom_unwind_resume);
+         target_option_val!(has_elf_tls);
++        target_option_val!(enforce_emulated_tls);
+         target_option_val!(obj_is_bitcode);
+         target_option_val!(no_integrated_as);
+         target_option_val!(min_atomic_width);
+diff --git a/src/libstd/build.rs b/src/libstd/build.rs
+index 8db7bc12cd3..1702244328e 100644
+--- a/src/libstd/build.rs
++++ b/src/libstd/build.rs
+@@ -18,6 +18,13 @@
+         println!("cargo:rustc-link-lib=static={}", name);
+     }
+ 
++    if cfg!(target_os = "macos") && cfg!(target_enforce_emulated_tls) {
++        let mut emutls_cfg = cc::Build::new();
++        emutls_cfg.warnings(false);
++        emutls_cfg.file("../../compiler-rt/lib/builtins/emutls.c")
++           .compile("emutls");
++    }
++
+     let target = env::var("TARGET").expect("TARGET was not set");
+     if target.contains("linux") {
+         if target.contains("android") {
+diff --git a/src/libstd/sys/unix/fast_thread_local.rs b/src/libstd/sys/unix/fast_thread_local.rs
+index 952ba40ee87..47806c4b338 100644
+--- a/src/libstd/sys/unix/fast_thread_local.rs
++++ b/src/libstd/sys/unix/fast_thread_local.rs
+@@ -46,11 +46,19 @@ pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern fn(*mut u8)) {
+ pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern fn(*mut u8)) {
+     use crate::cell::Cell;
+     use crate::ptr;
++    use crate::sys_common::thread_local_key::StaticKey;
++
++    #[thread_local]
++    #[cfg(target_enforce_emulated_tls)]
++    static STATIC_DTORS: StaticKey = StaticKey::new(Some(run_dtors));
+ 
+     #[thread_local]
+     static REGISTERED: Cell<bool> = Cell::new(false);
+     if !REGISTERED.get() {
++        #[cfg(not(target_enforce_emulated_tls))]
+         _tlv_atexit(run_dtors, ptr::null_mut());
++        #[cfg(target_enforce_emulated_tls)]
++        DTORS.set(ptr::null_mut());
+         REGISTERED.set(true);
+     }
+ 
+@@ -64,6 +72,7 @@ pub unsafe fn register_dtor(t: *mut u8, dtor: unsafe extern fn(*mut u8)) {
+     }
+ 
+     extern {
++        #[cfg(not(target_enforce_emulated_tls))]
+         fn _tlv_atexit(dtor: unsafe extern fn(*mut u8),
+                        arg: *mut u8);
+     }
+diff --git a/src/libsyntax_pos/symbol.rs b/src/libsyntax_pos/symbol.rs
+index 189a08b5c18..4ea99f79b96 100644
+--- a/src/libsyntax_pos/symbol.rs
++++ b/src/libsyntax_pos/symbol.rs
+@@ -652,6 +652,7 @@ symbols! {
+         struct_variant,
+         sty,
+         suggestion,
++        target_enforce_emulated_tls,
+         target_feature,
+         target_has_atomic,
+         target_thread_local,
+diff --git a/src/rustllvm/PassWrapper.cpp b/src/rustllvm/PassWrapper.cpp
+index 0cda3465dc0..6ac87628a5a 100644
+--- a/src/rustllvm/PassWrapper.cpp
++++ b/src/rustllvm/PassWrapper.cpp
+@@ -350,7 +350,8 @@ extern "C" LLVMTargetMachineRef LLVMRustCreateTargetMachine(
+     bool TrapUnreachable,
+     bool Singlethread,
+     bool AsmComments,
+-    bool EmitStackSizeSection) {
++    bool EmitStackSizeSection,
++    bool EnforceEmulatedTLS) {
+ 
+   auto OptLevel = fromRust(RustOptLevel);
+   auto RM = fromRust(RustReloc);
+@@ -389,6 +390,11 @@ extern "C" LLVMTargetMachineRef LLVMRustCreateTargetMachine(
+ 
+   Options.EmitStackSizeSection = EmitStackSizeSection;
+ 
++  if (EnforceEmulatedTLS) {
++    Options.EmulatedTLS = true;
++    Options.ExplicitEmulatedTLS = true;
++  }
++
+   Optional<CodeModel::Model> CM;
+   if (RustCM != LLVMRustCodeModel::None)
+     CM = fromRust(RustCM);
+
+--- a/vendor/rustc-ap-syntax_pos/symbol.rs	2019-11-05 01:34:46.000000000 +0800
++++ b/vendor/rustc-ap-syntax_pos/symbol.rs	2025-11-11 00:13:58.000000000 +0800
+@@ -652,6 +652,7 @@
+         struct_variant,
+         sty,
+         suggestion,
++        target_enforce_emulated_tls,
+         target_feature,
+         target_has_atomic,
+         target_thread_local,
+
+--- a/vendor/rustc-ap-rustc_target/spec/apple_base.rs	2019-11-05 01:34:46.000000000 +0800
++++ b/vendor/rustc-ap-rustc_target/spec/apple_base.rs	2025-11-11 00:16:13.000000000 +0800
+@@ -28,7 +28,8 @@
+         dll_suffix: ".dylib".to_string(),
+         archive_format: "bsd".to_string(),
+         pre_link_args: LinkArgs::new(),
+-        has_elf_tls: version >= (10, 7),
++        has_elf_tls: true,
++        enforce_emulated_tls: version < (10, 7),
+         abi_return_struct_as_int: true,
+         emit_debug_gdb_scripts: false,
+         .. Default::default()
+
+--- a/vendor/rustc-ap-rustc_target/spec/mod.rs	2019-11-05 01:34:46.000000000 +0800
++++ b/vendor/rustc-ap-rustc_target/spec/mod.rs	2025-11-11 00:18:12.000000000 +0800
+@@ -692,6 +692,9 @@
+     /// Flag indicating whether ELF TLS (e.g., #[thread_local]) is available for
+     /// this target.
+     pub has_elf_tls: bool,
++    /// Flag indicating whether emulated TLS should be enforced.
++    pub enforce_emulated_tls: bool,
++
+     // This is mainly for easy compatibility with emscripten.
+     // If we give emcc .o files that are actually .bc files it
+     // will 'just work'.
+@@ -847,6 +850,7 @@
+             custom_unwind_resume: false,
+             allow_asm: true,
+             has_elf_tls: false,
++            enforce_emulated_tls: false,
+             obj_is_bitcode: false,
+             no_integrated_as: false,
+             min_atomic_width: None,
+@@ -1155,6 +1159,7 @@
+         key!(allow_asm, bool);
+         key!(custom_unwind_resume, bool);
+         key!(has_elf_tls, bool);
++        key!(enforce_emulated_tls, bool);
+         key!(obj_is_bitcode, bool);
+         key!(no_integrated_as, bool);
+         key!(max_atomic_width, Option<u64>);
+@@ -1371,6 +1376,7 @@
+         target_option_val!(allow_asm);
+         target_option_val!(custom_unwind_resume);
+         target_option_val!(has_elf_tls);
++        target_option_val!(enforce_emulated_tls);
+         target_option_val!(obj_is_bitcode);
+         target_option_val!(no_integrated_as);
+         target_option_val!(min_atomic_width);
