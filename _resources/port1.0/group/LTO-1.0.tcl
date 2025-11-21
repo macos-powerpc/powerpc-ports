@@ -1,75 +1,79 @@
 # -*- coding: utf-8; mode: tcl; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 4; truncate-lines: t -*- vim:fenc=utf-8:et:sw=4:ts=4:sts=4
 #
-# Copyright (c) 2019 R.J.V. Bertin
+# Copyright (c) 2019-25 R.J.V. Bertin
 # All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
-#
-# 1. Redistributions of source code must retain the above copyright
-#    notice, this list of conditions and the following disclaimer.
-# 2. Redistributions in binary form must reproduce the above copyright
-#    notice, this list of conditions and the following disclaimer in the
-#    documentation and/or other materials provided with the distribution.
-# 3. Neither the name of Apple Computer, Inc. nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
 #
 # Usage:
 # PortGroup     LTO 1.0
 
-if {[variant_exists LTO]} {
-    set LTO.disable_LTO yes
-} elseif {![variant_exists LTO]} {
-    if {[tbool LTO.disable_LTO]} {
-        ui_debug "LTO cannot be activated"
-        set LTO.must_be_disabled yes
-        variant LTO description {dummy variant: link-time optimisation disabled for this port} {
-            pre-configure {
-                ui_warn "The +LTO variant has been disabled and thus has no effect"
+namespace eval LTO {}
+
+set LTO.must_be_disabled no
+
+if {![info exists LTO.LTO_variant]} {
+    set LTO.LTO_variant "LTO"
+
+    if {[variant_exists ${LTO.LTO_variant}]} {
+        ui_debug "LTO: the \"${LTO.LTO_variant}\" variant is already defined by the ${subport} Portfile"
+        set LTO.disable_LTO 1
+    } elseif {![variant_exists ${LTO.LTO_variant}]} {
+        if {[tbool LTO.disable_LTO]} {
+            ui_debug "${LTO.LTO_variant} cannot be activated"
+            set LTO.must_be_disabled yes
+            variant ${LTO.LTO_variant} description {dummy variant: link-time optimisation disabled for this port} {
+                pre-configure {
+                    ui_warn "The +${LTO.LTO_variant} variant has been disabled and thus has no effect"
+                }
+                notes-append "Port ${subport} has been installed with a dummy +${LTO.LTO_variant} variant!"
+                # cast the iron while it's hot (takes care of +LTO on the commandline)
+                if {[variant_isset ${LTO.LTO_variant}]} {
+                     ui_warn "Variant +${LTO.LTO_variant} unsetting itself!"
+                     unset ::variations(${LTO.LTO_variant})
+                }
             }
-            notes-append "Port ${subport} has been installed with a dummy +LTO variant!"
             # cast the iron while it's hot (takes care of +LTO on the commandline)
-            if {[variant_isset LTO]} {
-                 ui_warn "Variant +LTO unsetting itself!"
-                 unset ::variations(LTO)
+            if {[variant_isset ${LTO.LTO_variant}]} {
+                 ui_warn "Variant disabled, please don't request +${LTO.LTO_variant}!"
+                 unset ::variations(${LTO.LTO_variant})
             }
+        } else {
+            variant ${LTO.LTO_variant} description {build with link-time optimisation} {}
         }
-        # cast the iron while it's hot (takes care of +LTO on the commandline)
-        if {[variant_isset LTO]} {
-             ui_warn "Variant disabled, please don't request +LTO!"
-             unset ::variations(LTO)
-        }
-    } else {
-        variant LTO description {build with link-time optimisation} {}
     }
+
+} else {
+    ui_debug "LTO: the \"LTO\" variant will be called \"${LTO.LTO_variant}\""
+    ui_debug "     AND is ASSUMED to be provided by the Portfile!!"
+    set LTO::port_provides_LTO_variant yes
+    set LTO.disable_LTO 1
 }
+
 options LTO.supports_i386 \
         LTO.gcc_lto_jobs
 default LTO.supports_i386 yes
-default LTO.gcc_lto_jobs {${build.jobs}}
+if {![string match *make ${build.cmd}]} {
+    # "make" has an internal job server that can be used to control the number of
+    # concurrent LTO jobs spawned by each GCC link command, but other build commands
+    # (like Ninja) don't. It is thus best to let GCC spawn only a single LTO subprocess
+    # rather than having N link commands spawning N such processes.
+    default LTO.gcc_lto_jobs 1
+} elseif {[string match *clang* ${configure.compiler}]} {
+    default LTO.gcc_lto_jobs {${build.jobs}}
+} else {
+    default LTO.gcc_lto_jobs "auto"
+}
 
-namespace eval LTO {}
+if {![info exists LTO_needs_ranlib]} {
+    set LTO_needs_ranlib no
+}
 
 proc LTO::variant_enabled {v} {
-    global LTO.disable_LTO
-    if {${v} eq "LTO" && [tbool LTO.disable_LTO]} {
+    global LTO.disable_LTO LTO.LTO_variant
+    if {${v} eq "${LTO.LTO_variant}" && [tbool LTO.disable_LTO]} {
+        ui_debug "The LTO PG variant ${LTO.LTO_variant} is force-disabled because of LTO.disable_LTO=${LTO.disable_LTO}"
         return 0
     } else {
+        ui_debug "\[variant_isset ${v}\]=[variant_isset ${v}]"
         return [variant_isset ${v}]
     }
 }
@@ -129,13 +133,21 @@ if {${os.platform} eq "darwin"} {
     # and before they inject ${configure.ldflags} where and how that's required.
     proc LTO.set_lto_cache {} {
         global configure.compiler configure.ldflags build.dir
-        if {[LTO::variant_enabled LTO] && ${configure.compiler} ne "clang"} {
+        global muniversal.current_arch merger_configure_ldflags merger_arch_flag
+        if {[LTO::variant_enabled ${LTO.LTO_variant}] && ${configure.compiler} ne "clang"} {
             xinstall -m 755 -d ${build.dir}/.lto_cache
-            configure.ldflags-append    -Wl,-cache_path_lto,${build.dir}/.lto_cache
+            ui_debug "Setting ${LTO.LTO_variant} cache path to ${build.dir}/.lto_cache"
+            if {[info exists muniversal.build_arch] && [variant_isset universal]} {
+                configure.ldflags.${muniversal.current_arch}-append -Wl,-cache_path_lto,${build.dir}/.lto_cache
+            } elseif {[info exists merger_arch_flag] && [variant_isset universal]} {
+                lappend merger_configure_ldflags(${muniversal.current_arch}) -Wl,-cache_path_lto,${build.dir}/.lto_cache
+            } else {
+                configure.ldflags-append -Wl,-cache_path_lto,${build.dir}/.lto_cache
+            }
         }
     }
     post-destroot {
-        if {[LTO::variant_enabled LTO] && ${configure.compiler} ne "clang"} {
+        if {[LTO::variant_enabled ${LTO.LTO_variant}] && ${configure.compiler} ne "clang"} {
             file delete -force ${build.dir}/.lto_cache
             set morecrud [glob -nocomplain -directory ${workpath}/.tmp/ thinlto-* cc-*.o lto-llvm-*.o]
             if {${morecrud} ne {}} {
@@ -145,7 +157,7 @@ if {${os.platform} eq "darwin"} {
     }
 } else {
     post-destroot {
-        if {[LTO::variant_enabled LTO]} {
+        if {[LTO::variant_enabled ${LTO.LTO_variant}]} {
             set morecrud [glob -nocomplain -directory ${workpath}/.tmp/ thinlto-* cc-*.o lto-llvm-*.o]
             if {${morecrud} ne {}} {
                 file delete -force {*}${morecrud}
@@ -177,12 +189,16 @@ proc LTO.configure.flags_append {vars flags} {
 # out-of-line implementation so changes are made *now*.
 # Qt5 has its own mechanism to set LTO flags so don't do anything
 # if we end up being loaded for a build of Qt5 itself.
-if {[LTO::variant_enabled LTO] && ![info exists building_qt5]} {
+if {[variant_isset ${LTO.LTO_variant}] && ![info exists building_qt5]} {
     # some projects have their own configure option for LTO (often --enable-lto);
     # use this if the port tells us to
     if {[info exists LTO.configure_option]} {
-        ui_debug "LTO: setting custom configure option(s) \"${LTO.configure_option}\""
-        configure.args-append           ${LTO.configure_option}
+        if {[LTO::variant_enabled ${LTO.LTO_variant}]} {
+            ui_debug "LTO: setting custom configure option(s) \"${LTO.configure_option}\""
+            configure.args-append       ${LTO.configure_option}
+        } else {
+            ui_warn "LTO PG: LTO.configure_option is set but so is LTO.disable_LTO - seems fishy!"
+        }
     } else {
         if {[string match *clang* ${configure.compiler}]} {
             # detect support for flto=thin but only with MacPorts clang versions (being a bit cheap here)
@@ -193,36 +209,35 @@ if {[LTO::variant_enabled LTO] && ![info exists building_qt5]} {
             } else {
                 set lto_flags           "-flto"
             }
-            if {[tbool LTO.fat_LTO_Objects] && (${LTO::mp_compiler_version} >= 17)} {
-                set lto_flags           "${lto_flags} -ffat-lto-objects"
+            if {[tbool LTO.fat_LTO_Objects]} {
+                if {${LTO::mp_compiler_version} >= 17} {
+                    set lto_flags       "${lto_flags} -ffat-lto-objects"
+                } elseif {[tbool LTO.require_fat_LTO_Objects]} {
+                    ui_error "Port ${subport} requires fat LTO objects which are only supported by clang 17 and up"
+                    return -code error "compiler doesn't support fat LTO objects"
+                }
             }
-            set objc_lto_flags          ${lto_flags}
         } else {
-            # we should probably use -flto=auto when build.cmd=[g]make (forcing it to gmake in that case)
-            # but that would require inserting the lto_flags after the port has had a chance to
-            # set the build.cmd . Catch-22 ...
-            # Easier to define another hook ports can set before including us.
             if {${LTO.gcc_lto_jobs} ne ""} {
                 set LTO::gcc_lto_jobs "=${LTO.gcc_lto_jobs}"
-                if {${LTO.gcc_lto_jobs} eq "auto"} {
-                    build.cmd           gmake
-                    depends_build-append \
-                                        port:gmake
-                }
             } else {
-                set LTO::gcc_lto_jobs ""
+                set LTO::gcc_lto_jobs   "auto"
             }
             if {${os.platform} eq "linux"} {
                 set lto_flags           "-ftracer -flto${LTO::gcc_lto_jobs} -fuse-linker-plugin"
-                set objc_lto_flags      ${lto_flags}
             } elseif {${configure.compiler} ne "cc"} {
                 set lto_flags           "-ftracer -flto${LTO::gcc_lto_jobs}"
-                set objc_lto_flags      ""
             }
             if {[tbool LTO.fat_LTO_Objects]} {
                 set lto_flags           "${lto_flags} -ffat-lto-objects"
-                set objc_lto_flags      ""
             }
+        }
+        # let's see if we can make do with only objc_lto_flags and don't need objcxx_lto_flags as well;
+        # assume that projects use either ObjC or ObjC++
+        if {${configure.objc} eq ${configure.cc} || ${configure.objcxx} eq ${configure.cxx}} {
+            set objc_lto_flags          ${lto_flags}
+        } else {
+            set objc_lto_flags          ""
         }
         ui_debug "LTO: setting LTO compiler and linker option(s) \"${lto_flags}\""
         ui_debug "     ObjC and ObjC++ will use:                 \"${objc_lto_flags}\""
@@ -231,50 +246,55 @@ if {[LTO::variant_enabled LTO] && ![info exists building_qt5]} {
                 ui_warn "Warning: ObjC/++ files will be compiled without LTO because of the main compiler choice!"
             }
         }
-        if {![variant_isset universal] || [tbool LTO.supports_i386]} {
-            # consolidate the current (possibly) default values for ObjC compiler flags
-            # (to make sure they're "unlinked from" the corresponding C/C++ flags!)
-            configure.objcflags             {*}${configure.objcflags}
-            configure.objcxxflags           {*}${configure.objcxxflags}
-            # now we can add the possibly GCC-specific LTO flags into the C/C++ flags
-            # without risk that they also get appended to the ObjC/++ flags.
-            LTO.configure.flags_append      {cflags \
-                                            cxxflags} \
-                                            ${lto_flags}
-            # ObjC may require different LTO flags because on Darwin we may be using clang instead of gcc.
-            LTO.configure.flags_append      {objcflags \
-                                            objcxxflags} \
-                                            ${objc_lto_flags}
-            # ${configure.optflags} is a list, and that can lead to strange effects
-            # in certain situations if we don't treat it as such here.
-            LTO.configure.flags_append      ldflags "${configure.optflags} ${lto_flags}"
-        } else { # checking build_arch probably won't do what I thought here #  if {${build_arch} ne "i386"}
-            if {[info exists merger_configure_cflags(x86_64)]} {
-                set merger_configure_cflags(x86_64) "{*}$merger_configure_cflags(x86_64) ${lto_flags}"
-            } else {
-                set merger_configure_cflags(x86_64) "${lto_flags}"
+        if {[LTO::variant_enabled ${LTO.LTO_variant}]} {
+            # here is the actual venom: insert the LTO flags where they should go!
+            if {![variant_isset universal] || [tbool LTO.supports_i386]} {
+                # consolidate the current (possibly) default values for ObjC compiler flags
+                # (to make sure they're "unlinked from" the corresponding C/C++ flags!)
+                configure.objcflags             {*}${configure.objcflags}
+                configure.objcxxflags           {*}${configure.objcxxflags}
+                # now we can add the possibly GCC-specific LTO flags into the C/C++ flags
+                # without risk that they also get appended to the ObjC/++ flags.
+                LTO.configure.flags_append      {cflags \
+                                                cxxflags} \
+                                                ${lto_flags}
+                # ObjC may require different LTO flags because on Darwin we may be using clang instead of gcc.
+                LTO.configure.flags_append      {objcflags \
+                                                objcxxflags} \
+                                                ${objc_lto_flags}
+                # ${configure.optflags} is a list, and that can lead to strange effects
+                # in certain situations if we don't treat it as such here.
+                LTO.configure.flags_append      ldflags "${configure.optflags} ${lto_flags}"
+            } else { # checking build_arch probably won't do what I thought here #  if {${build_arch} ne "i386"}
+                if {[info exists merger_configure_cflags(x86_64)]} {
+                    set merger_configure_cflags(x86_64) "{*}$merger_configure_cflags(x86_64) ${lto_flags}"
+                } else {
+                    set merger_configure_cflags(x86_64) "${lto_flags}"
+                }
+                if {[info exists merger_configure_cxxflags(x86_64)]} {
+                    set merger_configure_cxxflags(x86_64) "{*}$merger_configure_cxxflags(x86_64) ${lto_flags}"
+                } else {
+                    set merger_configure_cxxflags(x86_64) "${lto_flags}"
+                }
+                if {[info exists merger_configure_objcflags(x86_64)]} {
+                    set merger_configure_objcflags(x86_64) "{*}$merger_configure_objcflags(x86_64) ${objc_lto_flags}"
+                } else {
+                    set merger_configure_objcflags(x86_64) "${objc_lto_flags}"
+                }
+                if {[info exists merger_configure_ldflags(x86_64)]} {
+                    set merger_configure_ldflags(x86_64) "{*}$merger_configure_ldflags(x86_64) ${objc_lto_flags}"
+                } else {
+                    set merger_configure_ldflags(x86_64) "${objc_lto_flags}"
+                }
+                # ${configure.optflags} is a list, and that can lead to strange effects
+                # in certain situations if we don't treat it as such here.
+                foreach opt ${configure.optflags} {
+                    configure.ldflags-append    ${opt}
+                }
+                set merger_arch_flag            yes
             }
-            if {[info exists merger_configure_cxxflags(x86_64)]} {
-                set merger_configure_cxxflags(x86_64) "{*}$merger_configure_cxxflags(x86_64) ${lto_flags}"
-            } else {
-                set merger_configure_cxxflags(x86_64) "${lto_flags}"
-            }
-            if {[info exists merger_configure_objcflags(x86_64)]} {
-                set merger_configure_objcflags(x86_64) "{*}$merger_configure_objcflags(x86_64) ${objc_lto_flags}"
-            } else {
-                set merger_configure_objcflags(x86_64) "${objc_lto_flags}"
-            }
-            if {[info exists merger_configure_ldflags(x86_64)]} {
-                set merger_configure_ldflags(x86_64) "{*}$merger_configure_ldflags(x86_64) ${objc_lto_flags}"
-            } else {
-                set merger_configure_ldflags(x86_64) "${objc_lto_flags}"
-            }
-            # ${configure.optflags} is a list, and that can lead to strange effects
-            # in certain situations if we don't treat it as such here.
-            foreach opt ${configure.optflags} {
-                configure.ldflags-append    ${opt}
-            }
-            set merger_arch_flag            yes
+        } else {
+            ui_debug "Only exporting LTO.ltoflags=${lto_flags} !"
         }
         if {${os.platform} eq "darwin" && ![tbool LTO.allow_ThinLTO]} {
             if {![variant_isset universal] || [tbool LTO.supports_i386]} {
@@ -288,7 +308,7 @@ if {[LTO::variant_enabled LTO] && ![info exists building_qt5]} {
                 }
             }
         }
-        LTO.ltoflags ${lto_flags}
+        LTO.ltoflags {*}${lto_flags}
     }
 }
 
@@ -298,22 +318,37 @@ if {[string match *clang* ${configure.compiler}]} {
         if {![variant_isset universal] || [info exists universal_archs_supported]} {
             default configure.ar "[string map {"clang" "llvm-ar"} ${configure.cc}]"
             default configure.nm "[string map {"clang" "llvm-nm"} ${configure.cc}]"
-#             default configure.ranlib "[string map {"clang" "llvm-ranlib"} ${configure.cc}]"
-            # ranlib is done by llvm-ar
-            default configure.ranlib "/bin/echo"
+            if {[tbool LTO_needs_ranlib]} {
+                default configure.ranlib "[string map {"clang" "llvm-ranlib"} ${configure.cc}]"
+            } else {
+                # ranlib is done by llvm-ar
+                default configure.ranlib "/bin/echo"
+            }
             set LTO.custom_binaries 1
         }
     }
     if {${os.platform} ne "darwin" \
             && [string match macports-clang* ${configure.compiler}]
-            && [LTO::variant_enabled LTO]} {
+            && [LTO::variant_enabled ${LTO.LTO_variant}]} {
         ## clang on ~Darwin doesn't like -Os -flto so remove that flag from the initial C*FLAGS
-        ui_warn "Changing -Os for -O2 because of +LTO"
+        ui_warn "Changing -Os for -O2 because of +${LTO.LTO_variant}"
         configure.cflags-replace -Os -O2
         configure.objcflags-replace -Os -O2
         configure.cxxflags-replace -Os -O2
         configure.objcxxflags-replace -Os -O2
         configure.ldflags-replace -Os -O2
+    }
+} elseif {[string match macports-gcc* ${configure.compiler}]} {
+    if {![variant_isset universal] || [info exists universal_archs_supported]} {
+        default configure.ar "[string map {"gcc" "gcc-ar"} ${configure.cc}]"
+        default configure.nm "[string map {"gcc" "gcc-nm"} ${configure.cc}]"
+        if {[tbool LTO_needs_ranlib]} {
+            default configure.ranlib "[string map {"gcc" "gcc-ranlib"} ${configure.cc}]"
+        } else {
+            # done by gcc-ar
+            default configure.ranlib "/bin/echo"
+        }
+        set LTO.custom_binaries 1
     }
 } elseif {${os.platform} eq "linux"} {
     if {${configure.compiler} eq "cc"} {
@@ -353,9 +388,12 @@ if {[string match *clang* ${configure.compiler}]} {
     } else {
         default configure.ar "[string map {"gcc" "gcc-ar"} ${configure.cc}]"
         default configure.nm "[string map {"gcc" "gcc-nm"} ${configure.cc}]"
-#         default configure.ranlib "[string map {"gcc" "gcc-ranlib"} ${configure.cc}]"
-        # done by gcc-ar
-        default configure.ranlib "/bin/echo"
+        if {[tbool LTO_needs_ranlib]} {
+            default configure.ranlib "[string map {"gcc" "gcc-ranlib"} ${configure.cc}]"
+        } else {
+            # done by gcc-ar
+            default configure.ranlib "/bin/echo"
+        }
         set LTO.custom_binaries 1
     }
 }
@@ -454,12 +492,15 @@ if {[tbool LTO.allow_UseLLD] && ![variant_exists use_lld]} {
         variant use_lld description {use the LLD linker} {}
     }
     if {[variant_isset use_lld]} {
+        # NB: the below assumes that $LLD is always installed by
+        # the latest port:lld-XY which provides the lld linker
+        # for every "MacStropified" port:clang-XY!
         if {${os.platform} eq "darwin"} {
-            depends_build-append path:bin/ld64.lld-mp-17:lld-17
-            set LLD "${prefix}/bin/ld64.lld-mp-17"
+            depends_build-append path:bin/ld64.lld:lld-17
+            set LLD "${prefix}/bin/ld64.lld"
         } else {
-            depends_build-append path:bin/ld.lld-mp-12:lld-12
-            set LLD "${prefix}/bin/ld.lld-mp-12"
+            depends_build-append path:bin/ld.lld:lld-17
+            set LLD "${prefix}/bin/ld.lld"
         }
         if {[string match "macports-clang*" ${configure.compiler}]} {
             # TODO: figure out when --ld-path= was introduced ...
@@ -471,13 +512,13 @@ if {[tbool LTO.allow_UseLLD] && ![variant_exists use_lld]} {
         } else {
             pre-configure {
                 ui_warn "+use_lld : the -fuse-ld may or may not be supported!"
-                LTO.configure.flags_append {ldflags} "-fuse-ld=${LLD}"
+                LTO.configure.flags_append {ldflags} "-fuse-ld=lld"
             }
         }
     }
 }
 if {![variant_exists use_lld] || ![variant_isset use_lld]} {
-    if {[tbool LTO.LTO.maybe_ForceLD] && [string match "macports-clang*" ${configure.compiler}]} {
+    if {(![tbool LTO.allow_UseLLD] || [tbool LTO.LTO.maybe_ForceLD]) && [string match "macports-clang*" ${configure.compiler}]} {
         if {${LTO::mp_compiler_version} >= 5} {
             # simple, unconditional "don't use lld" for clang compilers built to use lld by default
             LTO.configure.flags_append {ldflags} "-fuse-ld=ld"
@@ -486,31 +527,53 @@ if {![variant_exists use_lld] || ![variant_isset use_lld]} {
 }
 
 if {![variant_exists builtwith]} {
-    variant builtwith description {Label the install with the compiler used} {}
+    variant builtwith description {Label the install with the compiler used. Do not use!} {}
+    if {[variant_isset builtwith]} {
+        set LTO::load_compvars yes
+        PortGroup compiler-variants 1.0
+        unset LTO::load_compvars
+    }
 }
 if {[variant_isset builtwith]} {
     set usedCompiler [string map {"-" "_"} [file tail ${configure.cc}]]
     if {![variant_exists ${usedCompiler}]} {
-        variant ${usedCompiler} requires builtwith description "placeholder variant to record the compiler used" {
+        variant ${usedCompiler} requires builtwith description "automatic placeholder variant to record the compiler used" {
             pre-configure {
                 ui_warn "+builtwith+${usedCompiler} are just placeholder variants used only to label the install with the compiler used"
             }
+            notes-append "+${usedCompiler} is an automatic variant which will probably require to use -nf with `port activate` to avoid side-effects!"
         }
-        default_variants-append +${usedCompiler}
     }
+    default_variants-append +${usedCompiler}
 }
 
 proc LTO::callback {} {
     # this callback could really also handle the disable and allow switches!
-    global supported_archs LTO.must_be_disabled
+    global prefix supported_archs LTO.must_be_disabled LTO.gcc_lto_jobs build.cmd configure.cmd LTO.LTO_variant
+
     if {[variant_exists use_lld] && [variant_isset use_lld]} {
         # lld doesn't support 32bit architectures
         supported_archs-delete i386 ppc
     }
     # don't allow the Portfile to activate the LTO variant
-    if {[info exists LTO.must_be_disabled] && [variant_exists LTO] && [variant_isset LTO]} {
-         ui_warn "Unsetting +LTO!"
-         unset ::variations(LTO)
+    if {[tbool LTO.must_be_disabled] && [variant_exists ${LTO.LTO_variant}] && [variant_isset ${LTO.LTO_variant}]} {
+        ui_warn "Unsetting +${LTO.LTO_variant}!"
+        unset ::variations(${LTO.LTO_variant})
+    } elseif {[variant_isset ${LTO.LTO_variant}] && ${LTO.gcc_lto_jobs} eq "auto" && [string match *make ${build.cmd}]} {
+        ui_debug "LTO PG setting build.cmd=gmake!"
+        build.cmd           gmake
+        depends_build-delete \
+                            port:gmake
+        depends_build-append \
+                            port:gmake
+    }
+
+    if {[variant_isset use_lld]} {
+        set ::env(LLVM_SYMBOLIZER_PATH) \
+                            ${prefix}/libexec/lld-17/bin/llvm-symbolizer
+    } elseif {[string match macports-clang* [option configure.compiler]]} {
+        set ::env(LLVM_SYMBOLIZER_PATH) \
+                            [string map {"clang" "llvm-symbolizer"} [option configure.cc]]
     }
 }
 port::register_callback LTO::callback
