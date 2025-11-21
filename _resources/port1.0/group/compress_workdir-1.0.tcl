@@ -88,13 +88,37 @@ platform darwin {
             return 1
         }
 
+        proc hfscompress_bg {target} {
+            global use_parallel_build build.jobs prefix
+            catch {flush_logfile}
+            if {${use_parallel_build}} {
+                set compjobs "-J${build.jobs}"
+            } else {
+                set compjobs ""
+            }
+            # first try compressing in parallel, without backups/verification (this is all "redundant" data)
+            if {[catch {set outfile [get_logfile]} err]} {
+                set outfile "/dev/null"
+            } else {
+                set outfile "${outfile}.[file tail ${target}]"
+                ui_debug "sending background afsctool output to \"${outfile}\""
+            }
+            if {[catch {exec sh -c "${prefix}/bin/afsctool -cfvv -8 ${compjobs} -S -L -n ${target}/ 2>&1 ; exit 0" >& ${outfile} &} result context]} {
+                ui_info "Compression failed: ${result}, ${context}; port:afsctool is probably installed without support for parallel compression"
+                hfscompress ${target}
+            } else {
+                ui_debug "Compressing ${target}: pid ${result}"
+            }
+            return 1
+        }
+
         post-extract {
             if {[file exists ${prefix}/bin/afsctool]} {
                 ui_debug "--->  Compressing the source directory once more..."
                 catch {hfscompress ${worksrcpath}}
                 if {[info exists rustup::home]} {
                     ui_msg "---> Compressing the rustup install directory ${rustup::home}"
-                    catch {hfscompress ${rustup::home}}
+                    catch {hfscompress_bg ${rustup::home}}
                 }
             }
         }
@@ -105,6 +129,7 @@ platform darwin {
             post-build {
                 if {[file exists ${prefix}/bin/afsctool]} {
                     ui_msg "--->  Compressing the build directory ..."
+                    catch {flush_logfile}
                     if {${compress.build_dir} ne "${worksrcpath}"} {
                         set compress.build_dir "${worksrcpath} ${compress.build_dir}"
                     }
@@ -117,24 +142,30 @@ platform darwin {
                             set extradirs "${extradirs} ${workpath}/cargo-cache"
                         }
                         ui_msg "--->  Compressing additional directories [string map [list ${workpath}/ ""] ${extradirs}] ..."
+                        catch {flush_logfile}
                         catch {hfscompress ${extradirs}}
-                        if {[tbool configure.ccache]} {
-                            ui_msg "--->  Compressing the ccache directory ..."
-                            catch {hfscompress ${ccache_dir}}
-                        }
                     }
                 }
             }
             post-destroot {
-                set destroots [glob -nocomplain -type d ${destroot}-*]
-                if {[file exists ${prefix}/bin/afsctool] && ${destroots} ne {}} {
-                    ui_msg "--->  Compressing auxiliary destroot dirs ..."
-                    catch {hfscompress ${destroots}}
+                if {[file exists ${prefix}/bin/afsctool]} {
+                    if {[tbool configure.ccache]} {
+                        ui_msg "--->  Compressing the ccache directory ..."
+                        catch {flush_logfile}
+                        catch {hfscompress_bg ${ccache_dir}}
+                    }
+                    set destroots [glob -nocomplain -type d ${destroot}-*]
+                    if {${destroots} ne {}} {
+                        ui_msg "--->  Compressing auxiliary destroot dirs ..."
+                        catch {flush_logfile}
+                        catch {hfscompress ${destroots}}
+                    }
                 }
             }
             post-activate {
                 if {[option compress.in_applications_dir] ne {}} {
                     ui_msg "--->  Compressing ${compress.in_applications_dir} ..."
+                    catch {flush_logfile}
                     catch {hfscompress ${compress.in_applications_dir}}
                 }
             }
