@@ -7,18 +7,10 @@ PortGroup   qt5_version_info 1.0
 
 # standard install directory
 global qt_dir
+set qt_dir               ${prefix}/libexec/qt5
 if {[info exists qt5.custom_qt_name]} {
-    set qt_dir          ${prefix}/libexec/${qt5.custom_qt_name}
-} else {
-    ###RJVB###
-    if {${os.platform} eq "darwin"} {
-        set qt_dir       ${prefix}/libexec/qt5
-    } else {
-        # let's use this prefix for now...
-        set qt_dir       ${prefix}/libexec/qt512
-    }
+    set qt_dir           ${prefix}/libexec/${qt5.custom_qt_name}
 }
-###RJVB###
 
 # standard Qt non-.app executables directory
 global qt_bins_dir
@@ -114,11 +106,6 @@ set qt_lupdate_cmd     ${qt_dir}/bin/lupdate
 # standard PKGCONFIG path
 global qt_pkg_config_dir
 set qt_pkg_config_dir   ${qt_libs_dir}/pkgconfig
-
-###RJVB###
-global qt_install_registry
-set qt_install_registry ${qt_dir}/registry
-###RJVB###
 
 namespace eval qt5pg {
     ############################################################################### Component Format
@@ -421,12 +408,4 @@ namespace eval qt5pg {
     #
     # qtwebkit: official support dropped in 5.6.0
     #           as of 5.9, still maintained by community
-    if {${os.platform} ne "darwin"} {
-        set qt5_component_lib(qtx11extras) {
-            5.2
-            6.0
-            lib/pkgconfig/Qt5X11Extras.pc
-            ""
-        }
-    }
 }

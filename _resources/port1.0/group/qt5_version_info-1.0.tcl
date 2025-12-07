@@ -4,7 +4,6 @@
 # Separate from the main qt5 portgroup in case a port just wants these
 
 global available_qt_versions
-#     qt514 {qt5-qtbase   5.14}
 array set available_qt_versions {
     qt5   {qt5-qtbase   5.15}
     qt513 {qt513-qtbase 5.13}
@@ -30,13 +29,6 @@ array set custom_qt_versions {
 
 proc qt5.get_default_name {} {
     global os.major
-
-    ###RJVB###
-    global os.platform
-    if {${os.platform} ne "darwin"} {
-        return qt5
-    }
-    ###RJVB###
 
     # see https://doc.qt.io/qt-5/supported-platforms-and-configurations.html
     # for older versions, see https://web.archive.org/web/*/http://doc.qt.io/qt-5/supported-platforms-and-configurations.html
@@ -189,7 +181,6 @@ set qt5.version    [lindex $available_qt_versions(${qt5.name}) 1]
 foreach {qt_test_name qt_test_info} [array get available_qt_versions] {
     set qt_test_base_port [lindex ${qt_test_info} 0]
     if {![catch {set installed [lindex [registry_active ${qt_test_base_port}] 0]}]} {
-        ui_debug "Already installed Qt5 version: ${qt_test_name} (${qt_test_base_port})"
         set qt5.name       ${qt_test_name}
         set qt5.base_port  ${qt_test_base_port}
         set qt5.version    [lindex $installed 1]

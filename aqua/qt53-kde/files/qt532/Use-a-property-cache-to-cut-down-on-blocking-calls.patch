@@ -1,0 +1,4445 @@
+From 1df2cd6af5c40db588fc3ec40c7adfafc1b5eea3 Mon Sep 17 00:00:00 2001
+From: Lorn Potter <lorn.potter@gmail.com>
+Date: Wed, 29 Oct 2014 19:40:43 +1000
+Subject: [PATCH] Use a property cache to cut down on blocking calls
+
+Refactor old code
+Stop memory leaks
+Properly support mobile data (ofono)
+
+Change-Id: I7f23882ee0ee345a049a4a93ddd452b6d2e53710
+---
+ src/plugins/bearer/connman/connman.pro             |   4 +-
+ src/plugins/bearer/connman/qconnmanengine.h        |   2 +-
+ src/plugins/bearer/connman/qofonoservice_linux.cpp | 303 ---------
+ src/plugins/bearer/connman/qofonoservice_linux_p.h | 172 -----
+ .../bearer/linux_common/qofonoservice_linux.cpp    | 370 +++++++++++
+ .../bearer/linux_common/qofonoservice_linux_p.h    | 195 ++++++
+ .../bearer/networkmanager/networkmanager.pro       |   6 +-
+ .../networkmanager/qnetworkmanagerengine.cpp       | 364 +++++------
+ .../bearer/networkmanager/qnetworkmanagerengine.h  |  22 +-
+ .../networkmanager/qnetworkmanagerservice.cpp      | 693 +++++++++++++++------
+ .../bearer/networkmanager/qnetworkmanagerservice.h | 105 +++-
+ .../bearer/networkmanager/qnmdbushelper.cpp        | 140 -----
+ src/plugins/bearer/networkmanager/qnmdbushelper.h  |  73 ---
+ 13 files changed, 1318 insertions(+), 1131 deletions(-)
+ delete mode 100644 src/plugins/bearer/connman/qofonoservice_linux.cpp
+ delete mode 100644 src/plugins/bearer/connman/qofonoservice_linux_p.h
+ create mode 100644 src/plugins/bearer/linux_common/qofonoservice_linux.cpp
+ create mode 100644 src/plugins/bearer/linux_common/qofonoservice_linux_p.h
+ delete mode 100644 src/plugins/bearer/networkmanager/qnmdbushelper.cpp
+ delete mode 100644 src/plugins/bearer/networkmanager/qnmdbushelper.h
+
+--- qtbase/src/plugins/bearer/connman/connman.pro
++++ qtbase/src/plugins/bearer/connman/connman.pro
+@@ -8,14 +8,14 @@
+ CONFIG += link_pkgconfig
+ 
+ HEADERS += qconnmanservice_linux_p.h \
+-           qofonoservice_linux_p.h \
++           ../linux_common/qofonoservice_linux_p.h \
+            qconnmanengine.h \
+            ../qnetworksession_impl.h \
+            ../qbearerengine_impl.h
+ 
+ SOURCES += main.cpp \
+            qconnmanservice_linux.cpp \
+-           qofonoservice_linux.cpp \
++           ../linux_common/qofonoservice_linux.cpp \
+            qconnmanengine.cpp \
+            ../qnetworksession_impl.cpp
+ 
+--- qtbase/src/plugins/bearer/connman/qconnmanengine.h
++++ qtbase/src/plugins/bearer/connman/qconnmanengine.h
+@@ -56,7 +56,7 @@
+ #include "../qbearerengine_impl.h"
+ 
+ #include "qconnmanservice_linux_p.h"
+-#include "qofonoservice_linux_p.h"
++#include "../linux_common/qofonoservice_linux_p.h"
+ 
+ #include <QMap>
+ #include <QVariant>
+--- /dev/null
++++ qtbase/src/plugins/bearer/linux_common/qofonoservice_linux.cpp
+@@ -0,0 +1,370 @@
++/****************************************************************************
++**
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/legal
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL21$
++** Commercial License Usage
++** Licensees holding valid commercial Qt licenses may use this file in
++** accordance with the commercial license agreement provided with the
++** Software or, alternatively, in accordance with the terms contained in
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
++** use the contact form at http://qt.digia.com/contact-us.
++**
++** GNU Lesser General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU Lesser
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Digia gives you certain additional
++** rights. These rights are described in the Digia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#include <QObject>
++#include <QList>
++#include <QtDBus/QtDBus>
++#include <QtDBus/QDBusConnection>
++#include <QtDBus/QDBusError>
++#include <QtDBus/QDBusInterface>
++#include <QtDBus/QDBusMessage>
++#include <QtDBus/QDBusReply>
++#include <QtDBus/QDBusPendingCallWatcher>
++#include <QtDBus/QDBusObjectPath>
++#include <QtDBus/QDBusPendingCall>
++
++#include "qofonoservice_linux_p.h"
++
++#ifndef QT_NO_BEARERMANAGEMENT
++#ifndef QT_NO_DBUS
++
++QDBusArgument &operator<<(QDBusArgument &argument, const ObjectPathProperties &item)
++{
++    argument.beginStructure();
++    argument << item.path << item.properties;
++    argument.endStructure();
++    return argument;
++}
++
++const QDBusArgument &operator>>(const QDBusArgument &argument, ObjectPathProperties &item)
++{
++    argument.beginStructure();
++    argument >> item.path >> item.properties;
++    argument.endStructure();
++    return argument;
++}
++
++QT_BEGIN_NAMESPACE
++
++QOfonoManagerInterface::QOfonoManagerInterface( QObject *parent)
++        : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
++                                 QStringLiteral(OFONO_MANAGER_PATH),
++                                 OFONO_MANAGER_INTERFACE,
++                                 QDBusConnection::systemBus(), parent)
++{
++    qDBusRegisterMetaType<ObjectPathProperties>();
++    qDBusRegisterMetaType<PathPropertiesList>();
++
++    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
++                           QStringLiteral(OFONO_MANAGER_PATH),
++                           QStringLiteral(OFONO_MANAGER_INTERFACE),
++                           QStringLiteral("ModemAdded"),
++                           this,SLOT(modemAdded(QDBusObjectPath, QVariantMap)));
++    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
++                           QStringLiteral(OFONO_MANAGER_PATH),
++                           QStringLiteral(OFONO_MANAGER_INTERFACE),
++                           QStringLiteral("ModemRemoved"),
++                           this,SLOT(modemRemoved(QDBusObjectPath)));
++}
++
++QOfonoManagerInterface::~QOfonoManagerInterface()
++{
++}
++
++QStringList QOfonoManagerInterface::getModems()
++{
++    if (modemList.isEmpty()) {
++        QList<QVariant> argumentList;
++        QDBusPendingReply<PathPropertiesList> reply = callWithArgumentList(QDBus::Block, QLatin1String("GetModems"), argumentList);
++        reply.waitForFinished();
++        if (!reply.isError()) {
++            foreach (ObjectPathProperties modem, reply.value()) {
++                modemList << modem.path.path();
++            }
++        }
++    }
++
++    return modemList;
++}
++
++QString QOfonoManagerInterface::currentModem()
++{
++    QStringList modems = getModems();
++    foreach (const QString &modem, modems) {
++        QOfonoModemInterface device(modem);
++        if (device.isPowered() && device.isOnline())
++        return modem;
++    }
++    return QString();
++}
++
++void QOfonoManagerInterface::modemAdded(const QDBusObjectPath &path, const QVariantMap &/*var*/)
++{
++    if (!modemList.contains(path.path())) {
++        modemList << path.path();
++        Q_EMIT modemChanged();
++    }
++}
++
++void QOfonoManagerInterface::modemRemoved(const QDBusObjectPath &path)
++{
++    if (modemList.contains(path.path())) {
++        modemList.removeOne(path.path());
++        Q_EMIT modemChanged();
++    }
++}
++
++
++QOfonoModemInterface::QOfonoModemInterface(const QString &dbusPathName, QObject *parent)
++    : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
++                             dbusPathName,
++                             OFONO_MODEM_INTERFACE,
++                             QDBusConnection::systemBus(), parent)
++{
++    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
++                                         path(),
++                                         OFONO_MODEM_INTERFACE,
++                                         QStringLiteral("PropertyChanged"),
++                                         this,SLOT(propertyChanged(QString,QDBusVariant)));
++}
++
++QOfonoModemInterface::~QOfonoModemInterface()
++{
++}
++
++void QOfonoModemInterface::propertyChanged(const QString &name,const QDBusVariant &value)
++{
++    propertiesMap[name] = value.variant();
++}
++
++bool QOfonoModemInterface::isPowered()
++{
++    QVariant var = getProperty(QStringLiteral("Powered"));
++    return qdbus_cast<bool>(var);
++}
++
++bool QOfonoModemInterface::isOnline()
++{
++    QVariant var = getProperty(QStringLiteral("Online"));
++    return qdbus_cast<bool>(var);
++}
++
++QVariantMap QOfonoModemInterface::getProperties()
++{
++    if (propertiesMap.isEmpty()) {
++        QList<QVariant> argumentList;
++        QDBusPendingReply<QVariantMap> reply = callWithArgumentList(QDBus::Block, QLatin1String("GetProperties"), argumentList);
++        if (!reply.isError()) {
++            propertiesMap = reply.value();
++        }
++    }
++    return propertiesMap;
++}
++
++QVariant QOfonoModemInterface::getProperty(const QString &property)
++{
++    QVariant var;
++    QVariantMap map = getProperties();
++    if (map.contains(property))
++        var = map.value(property);
++    return var;
++}
++
++
++QOfonoNetworkRegistrationInterface::QOfonoNetworkRegistrationInterface(const QString &dbusPathName, QObject *parent)
++    : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
++                             dbusPathName,
++                             OFONO_NETWORK_REGISTRATION_INTERFACE,
++                             QDBusConnection::systemBus(), parent)
++{
++}
++
++QOfonoNetworkRegistrationInterface::~QOfonoNetworkRegistrationInterface()
++{
++}
++
++QString QOfonoNetworkRegistrationInterface::getTechnology()
++{
++    QVariant var = getProperty(QStringLiteral("Technology"));
++    return qdbus_cast<QString>(var);
++}
++
++QVariant QOfonoNetworkRegistrationInterface::getProperty(const QString &property)
++{
++    QVariant var;
++    QVariantMap map = getProperties();
++    if (map.contains(property))
++        var = map.value(property);
++    return var;
++}
++
++QVariantMap QOfonoNetworkRegistrationInterface::getProperties()
++{
++    if (propertiesMap.isEmpty()) {
++        QList<QVariant> argumentList;
++        QDBusPendingReply<QVariantMap> reply = callWithArgumentList(QDBus::Block, QLatin1String("GetProperties"), argumentList);
++        reply.waitForFinished();
++        if (!reply.isError()) {
++            propertiesMap = reply.value();
++        }
++    }
++    return propertiesMap;
++}
++
++QOfonoDataConnectionManagerInterface::QOfonoDataConnectionManagerInterface(const QString &dbusPathName, QObject *parent)
++    : QDBusAbstractInterface(QLatin1String(OFONO_SERVICE),
++                             dbusPathName,
++                             OFONO_DATA_CONNECTION_MANAGER_INTERFACE,
++                             QDBusConnection::systemBus(), parent)
++{
++    QDBusConnection::systemBus().connect(QLatin1String(OFONO_SERVICE),
++                                         path(),
++                                         QLatin1String(OFONO_MODEM_INTERFACE),
++                                         QLatin1String("PropertyChanged"),
++                                         this,SLOT(propertyChanged(QString,QDBusVariant)));
++}
++
++QOfonoDataConnectionManagerInterface::~QOfonoDataConnectionManagerInterface()
++{
++}
++
++QStringList QOfonoDataConnectionManagerInterface::contexts()
++{
++    if (contextList.isEmpty()) {
++        QDBusPendingReply<PathPropertiesList > reply = call(QLatin1String("GetContexts"));
++        reply.waitForFinished();
++        if (!reply.isError()) {
++            foreach (ObjectPathProperties context, reply.value()) {
++                contextList << context.path.path();
++            }
++        }
++    }
++    return contextList;
++}
++
++bool QOfonoDataConnectionManagerInterface::roamingAllowed()
++{
++    QVariant var = getProperty(QStringLiteral("RoamingAllowed"));
++    return qdbus_cast<bool>(var);
++}
++
++QString QOfonoDataConnectionManagerInterface::bearer()
++{
++    QVariant var = getProperty(QStringLiteral("Bearer"));
++    return qdbus_cast<QString>(var);
++}
++
++QVariant QOfonoDataConnectionManagerInterface::getProperty(const QString &property)
++{
++    QVariant var;
++    QVariantMap map = getProperties();
++    if (map.contains(property))
++        var = map.value(property);
++    return var;
++}
++
++QVariantMap QOfonoDataConnectionManagerInterface::getProperties()
++{
++    if (propertiesMap.isEmpty()) {
++        QList<QVariant> argumentList;
++        QDBusPendingReply<QVariantMap> reply = callWithArgumentList(QDBus::Block, QLatin1String("GetProperties"), argumentList);
++        if (!reply.isError()) {
++            propertiesMap = reply.value();
++        }
++    }
++    return propertiesMap;
++}
++
++void QOfonoDataConnectionManagerInterface::propertyChanged(const QString &name, const QDBusVariant &value)
++{
++    propertiesMap[name] = value.variant();
++    if (name == QLatin1String("RoamingAllowed"))
++        Q_EMIT roamingAllowedChanged(value.variant().toBool());
++}
++
++
++QOfonoConnectionContextInterface::QOfonoConnectionContextInterface(const QString &dbusPathName, QObject *parent)
++    : QDBusAbstractInterface(QLatin1String(OFONO_SERVICE),
++                             dbusPathName,
++                             OFONO_CONNECTION_CONTEXT_INTERFACE,
++                             QDBusConnection::systemBus(), parent)
++{
++    QDBusConnection::systemBus().connect(QLatin1String(OFONO_SERVICE),
++                                         path(),
++                                         QLatin1String(OFONO_MODEM_INTERFACE),
++                                         QLatin1String("PropertyChanged"),
++                                         this,SLOT(propertyChanged(QString,QDBusVariant)));
++}
++
++QOfonoConnectionContextInterface::~QOfonoConnectionContextInterface()
++{
++}
++
++QVariantMap QOfonoConnectionContextInterface::getProperties()
++{
++    if (propertiesMap.isEmpty()) {
++        QList<QVariant> argumentList;
++        QDBusPendingReply<QVariantMap> reply = callWithArgumentList(QDBus::Block, QLatin1String("GetProperties"), argumentList);
++        if (!reply.isError()) {
++            propertiesMap = reply.value();
++        }
++    }
++    return propertiesMap;
++}
++
++void QOfonoConnectionContextInterface::propertyChanged(const QString &name, const QDBusVariant &value)
++{
++    propertiesMap[name] = value.variant();
++}
++
++QVariant QOfonoConnectionContextInterface::getProperty(const QString &property)
++{
++    QVariant var;
++    QVariantMap map = getProperties();
++    if (map.contains(property))
++        var = map.value(property);
++    return var;
++}
++
++bool QOfonoConnectionContextInterface::active()
++{
++    QVariant var = getProperty(QStringLiteral("Active"));
++    return qdbus_cast<bool>(var);
++}
++
++QString QOfonoConnectionContextInterface::accessPointName()
++{
++    QVariant var = getProperty(QStringLiteral("AccessPointName"));
++    return qdbus_cast<QString>(var);
++}
++
++QString QOfonoConnectionContextInterface::name()
++{
++    QVariant var = getProperty(QStringLiteral("Name"));
++    return qdbus_cast<QString>(var);
++}
++
++QT_END_NAMESPACE
++
++#endif // QT_NO_DBUS
++#endif // QT_NO_BEARERMANAGEMENT
+--- /dev/null
++++ qtbase/src/plugins/bearer/linux_common/qofonoservice_linux_p.h
+@@ -0,0 +1,195 @@
++/****************************************************************************
++**
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
++** Contact: http://www.qt-project.org/legal
++**
++** This file is part of the plugins of the Qt Toolkit.
++**
++** $QT_BEGIN_LICENSE:LGPL21$
++** Commercial License Usage
++** Licensees holding valid commercial Qt licenses may use this file in
++** accordance with the commercial license agreement provided with the
++** Software or, alternatively, in accordance with the terms contained in
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
++** use the contact form at http://qt.digia.com/contact-us.
++**
++** GNU Lesser General Public License Usage
++** Alternatively, this file may be used under the terms of the GNU Lesser
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++**
++** In addition, as a special exception, Digia gives you certain additional
++** rights. These rights are described in the Digia Qt LGPL Exception
++** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
++**
++** $QT_END_LICENSE$
++**
++****************************************************************************/
++
++#ifndef QOFONOSERVICE_H
++#define QOFONOSERVICE_H
++
++//
++//  W A R N I N G
++//  -------------
++//
++// This file is not part of the Qt API.  It exists purely as an
++// implementation detail.  This header file may change from version to
++// version without notice, or even be removed.
++//
++// We mean it.
++//
++
++#include <QtDBus/QtDBus>
++#include <QtDBus/QDBusConnection>
++#include <QtDBus/QDBusError>
++#include <QtDBus/QDBusInterface>
++#include <QtDBus/QDBusMessage>
++#include <QtDBus/QDBusReply>
++
++#include <QtDBus/QDBusPendingCallWatcher>
++#include <QtDBus/QDBusObjectPath>
++#include <QtDBus/QDBusContext>
++#include <QMap>
++
++#ifndef QT_NO_BEARERMANAGEMENT
++#ifndef QT_NO_DBUS
++
++#define OFONO_SERVICE                            "org.ofono"
++#define OFONO_MANAGER_INTERFACE                  "org.ofono.Manager"
++#define OFONO_MANAGER_PATH                       "/"
++
++#define OFONO_MODEM_INTERFACE                    "org.ofono.Modem"
++#define OFONO_NETWORK_REGISTRATION_INTERFACE     "org.ofono.NetworkRegistration"
++#define OFONO_DATA_CONNECTION_MANAGER_INTERFACE  "org.ofono.ConnectionManager"
++#define OFONO_CONNECTION_CONTEXT_INTERFACE       "org.ofono.ConnectionContext"
++
++QT_BEGIN_NAMESPACE
++
++QT_END_NAMESPACE
++
++struct ObjectPathProperties
++{
++    QDBusObjectPath path;
++    QVariantMap properties;
++};
++typedef QList<ObjectPathProperties> PathPropertiesList;
++Q_DECLARE_METATYPE(ObjectPathProperties)
++Q_DECLARE_METATYPE (PathPropertiesList)
++
++QT_BEGIN_NAMESPACE
++
++class QOfonoManagerInterface : public  QDBusAbstractInterface
++{
++    Q_OBJECT
++
++public:
++
++    QOfonoManagerInterface( QObject *parent = 0);
++    ~QOfonoManagerInterface();
++
++    QStringList getModems();
++    QString currentModem();
++signals:
++    void modemChanged();
++private:
++    QStringList modemList;
++private slots:
++    void modemAdded(const QDBusObjectPath &path, const QVariantMap &var);
++    void modemRemoved(const QDBusObjectPath &path);
++};
++
++class QOfonoModemInterface : public QDBusAbstractInterface
++{
++    Q_OBJECT
++
++public:
++
++    explicit QOfonoModemInterface(const QString &dbusModemPathName, QObject *parent = 0);
++    ~QOfonoModemInterface();
++
++    bool isPowered();
++    bool isOnline();
++private:
++    QVariantMap getProperties();
++    QVariantMap propertiesMap;
++    QVariant getProperty(const QString &);
++    void propertyChanged(const QString &, const QDBusVariant &value);
++};
++
++
++class QOfonoNetworkRegistrationInterface : public QDBusAbstractInterface
++{
++    Q_OBJECT
++
++public:
++
++    explicit QOfonoNetworkRegistrationInterface(const QString &dbusModemPathName, QObject *parent = 0);
++    ~QOfonoNetworkRegistrationInterface();
++
++    QString getTechnology();
++
++private:
++    QVariantMap getProperties();
++    QVariant getProperty(const QString &);
++    QVariantMap propertiesMap;
++Q_SIGNALS:
++    void propertyChanged(const QString &, const QDBusVariant &value);
++};
++
++class QOfonoDataConnectionManagerInterface : public QDBusAbstractInterface
++{
++    Q_OBJECT
++
++public:
++
++    explicit QOfonoDataConnectionManagerInterface(const QString &dbusPathName, QObject *parent = 0);
++    ~QOfonoDataConnectionManagerInterface();
++
++    QStringList contexts();
++    bool roamingAllowed();
++    QVariant getProperty(const QString &);
++    QString bearer();
++Q_SIGNALS:
++    void roamingAllowedChanged(bool);
++private:
++    QVariantMap getProperties();
++    QVariantMap propertiesMap;
++    QStringList contextList;
++private slots:
++    void propertyChanged(const QString &, const QDBusVariant &value);
++};
++
++class QOfonoConnectionContextInterface : public QDBusAbstractInterface
++{
++    Q_OBJECT
++
++public:
++
++    explicit QOfonoConnectionContextInterface(const QString &dbusPathName, QObject *parent = 0);
++    ~QOfonoConnectionContextInterface();
++
++    QVariant getProperty(const QString &);
++    bool active();
++    QString accessPointName();
++    QString name();
++
++Q_SIGNALS:
++private:
++    QVariantMap getProperties();
++    QVariantMap propertiesMap;
++private slots:
++    void propertyChanged(const QString &, const QDBusVariant &value);
++};
++
++QT_END_NAMESPACE
++
++#endif // QT_NO_DBUS
++#endif // QT_NO_BEARERMANAGEMENT
++
++#endif //QOFONOSERVICE_H
+--- qtbase/src/plugins/bearer/connman/qofonoservice_linux.cpp
++++ /dev/null
+@@ -1,311 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/legal
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
+-** use the contact form at http://qt.digia.com/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#include <QObject>
+-#include <QList>
+-#include <QtDBus/QtDBus>
+-#include <QtDBus/QDBusConnection>
+-#include <QtDBus/QDBusError>
+-#include <QtDBus/QDBusInterface>
+-#include <QtDBus/QDBusMessage>
+-#include <QtDBus/QDBusReply>
+-#include <QtDBus/QDBusPendingCallWatcher>
+-#include <QtDBus/QDBusObjectPath>
+-#include <QtDBus/QDBusPendingCall>
+-
+-#include "qofonoservice_linux_p.h"
+-
+-#ifndef QT_NO_BEARERMANAGEMENT
+-#ifndef QT_NO_DBUS
+-
+-QDBusArgument &operator<<(QDBusArgument &argument, const ObjectPathProperties &item)
+-{
+-    argument.beginStructure();
+-    argument << item.path << item.properties;
+-    argument.endStructure();
+-    return argument;
+-}
+-
+-const QDBusArgument &operator>>(const QDBusArgument &argument, ObjectPathProperties &item)
+-{
+-    argument.beginStructure();
+-    argument >> item.path >> item.properties;
+-    argument.endStructure();
+-    return argument;
+-}
+-
+-QT_BEGIN_NAMESPACE
+-
+-QOfonoManagerInterface::QOfonoManagerInterface( QObject *parent)
+-        : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
+-                                 QStringLiteral(OFONO_MANAGER_PATH),
+-                                 OFONO_MANAGER_INTERFACE,
+-                                 QDBusConnection::systemBus(), parent)
+-{
+-    qDBusRegisterMetaType<ObjectPathProperties>();
+-    qDBusRegisterMetaType<PathPropertiesList>();
+-
+-    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
+-                           QStringLiteral(OFONO_MANAGER_PATH),
+-                           QStringLiteral(OFONO_MANAGER_INTERFACE),
+-                           QStringLiteral("ModemAdded"),
+-                           this,SLOT(modemAdded(QDBusObjectPath, QVariantMap)));
+-    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
+-                           QStringLiteral(OFONO_MANAGER_PATH),
+-                           QStringLiteral(OFONO_MANAGER_INTERFACE),
+-                           QStringLiteral("ModemRemoved"),
+-                           this,SLOT(modemRemoved(QDBusObjectPath)));
+-}
+-
+-QOfonoManagerInterface::~QOfonoManagerInterface()
+-{
+-}
+-
+-QStringList QOfonoManagerInterface::getModems()
+-{
+-    if (modemList.isEmpty()) {
+-        QList<QVariant> argumentList;
+-        QDBusPendingReply<PathPropertiesList> reply = asyncCallWithArgumentList(QLatin1String("GetModems"), argumentList);
+-        reply.waitForFinished();
+-        if (!reply.isError()) {
+-            foreach (ObjectPathProperties modem, reply.value()) {
+-                modemList << modem.path.path();
+-            }
+-        } else {
+-            qDebug() << reply.error().message();
+-        }
+-    }
+-
+-    return modemList;
+-}
+-
+-QString QOfonoManagerInterface::currentModem()
+-{
+-    QStringList modems = getModems();
+-    foreach (const QString &modem, modems) {
+-        QOfonoModemInterface device(modem);
+-        if (device.isPowered() && device.isOnline())
+-        return modem;
+-    }
+-    return QString();
+-}
+-
+-void QOfonoManagerInterface::modemAdded(const QDBusObjectPath &path, const QVariantMap &/*var*/)
+-{
+-    if (!modemList.contains(path.path())) {
+-        modemList << path.path();
+-        Q_EMIT modemChanged();
+-    }
+-}
+-
+-void QOfonoManagerInterface::modemRemoved(const QDBusObjectPath &path)
+-{
+-    if (modemList.contains(path.path())) {
+-        modemList.removeOne(path.path());
+-        Q_EMIT modemChanged();
+-    }
+-}
+-
+-
+-QOfonoModemInterface::QOfonoModemInterface(const QString &dbusPathName, QObject *parent)
+-    : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
+-                             dbusPathName,
+-                             OFONO_MODEM_INTERFACE,
+-                             QDBusConnection::systemBus(), parent)
+-{
+-    QDBusConnection::systemBus().connect(QStringLiteral(OFONO_SERVICE),
+-                                         path(),
+-                                         OFONO_MODEM_INTERFACE,
+-                                         QStringLiteral("PropertyChanged"),
+-                                         this,SLOT(propertyChanged(QString,QDBusVariant)));
+-}
+-
+-QOfonoModemInterface::~QOfonoModemInterface()
+-{
+-}
+-
+-void QOfonoModemInterface::propertyChanged(const QString &name,const QDBusVariant &value)
+-{
+-    propertiesMap[name] = value.variant();
+-}
+-
+-bool QOfonoModemInterface::isPowered()
+-{
+-    QVariant var = getProperty(QStringLiteral("Powered"));
+-    return qdbus_cast<bool>(var);
+-}
+-
+-bool QOfonoModemInterface::isOnline()
+-{
+-    QVariant var = getProperty(QStringLiteral("Online"));
+-    return qdbus_cast<bool>(var);
+-}
+-
+-QVariantMap QOfonoModemInterface::getProperties()
+-{
+-    if (propertiesMap.isEmpty()) {
+-        QList<QVariant> argumentList;
+-        QDBusPendingReply<QVariantMap> reply = asyncCallWithArgumentList(QLatin1String("GetProperties"), argumentList);
+-        if (!reply.isError()) {
+-            propertiesMap = reply.value();
+-        }
+-    }
+-    return propertiesMap;
+-}
+-
+-QVariant QOfonoModemInterface::getProperty(const QString &property)
+-{
+-    QVariant var;
+-    QVariantMap map = getProperties();
+-    var = map.value(property);
+-    return var;
+-}
+-
+-
+-QOfonoNetworkRegistrationInterface::QOfonoNetworkRegistrationInterface(const QString &dbusPathName, QObject *parent)
+-    : QDBusAbstractInterface(QStringLiteral(OFONO_SERVICE),
+-                             dbusPathName,
+-                             OFONO_NETWORK_REGISTRATION_INTERFACE,
+-                             QDBusConnection::systemBus(), parent)
+-{
+-}
+-
+-QOfonoNetworkRegistrationInterface::~QOfonoNetworkRegistrationInterface()
+-{
+-}
+-
+-QString QOfonoNetworkRegistrationInterface::getTechnology()
+-{
+-    QVariant var = getProperty(QStringLiteral("Technology"));
+-    return qdbus_cast<QString>(var);
+-}
+-
+-QVariant QOfonoNetworkRegistrationInterface::getProperty(const QString &property)
+-{
+-    QVariant var;
+-    QVariantMap map = getProperties();
+-    var = map.value(property);
+-    return var;
+-}
+-
+-QVariantMap QOfonoNetworkRegistrationInterface::getProperties()
+-{
+-    if (propertiesMap.isEmpty()) {
+-        QList<QVariant> argumentList;
+-        QDBusPendingReply<QVariantMap> reply = asyncCallWithArgumentList(QLatin1String("GetProperties"), argumentList);
+-        reply.waitForFinished();
+-        if (!reply.isError()) {
+-            propertiesMap = reply.value();
+-        } else {
+-            qDebug() << reply.error().message();
+-        }
+-    }
+-    return propertiesMap;
+-}
+-
+-QOfonoDataConnectionManagerInterface::QOfonoDataConnectionManagerInterface(const QString &dbusPathName, QObject *parent)
+-    : QDBusAbstractInterface(QLatin1String(OFONO_SERVICE),
+-                             dbusPathName,
+-                             OFONO_DATA_CONNECTION_MANAGER_INTERFACE,
+-                             QDBusConnection::systemBus(), parent)
+-{
+-    QDBusConnection::systemBus().connect(QLatin1String(OFONO_SERVICE),
+-                                         path(),
+-                                         QLatin1String(OFONO_MODEM_INTERFACE),
+-                                         QLatin1String("PropertyChanged"),
+-                                         this,SLOT(propertyChanged(QString,QDBusVariant)));
+-}
+-
+-QOfonoDataConnectionManagerInterface::~QOfonoDataConnectionManagerInterface()
+-{
+-}
+-
+-QStringList QOfonoDataConnectionManagerInterface::contexts()
+-{
+-    if (contextList.isEmpty()) {
+-        QDBusPendingReply<PathPropertiesList > reply = call(QLatin1String("GetContexts"));
+-        reply.waitForFinished();
+-        if (!reply.isError()) {
+-            foreach (ObjectPathProperties context, reply.value()) {
+-                contextList << context.path.path();
+-            }
+-        }
+-    }
+-    return contextList;
+-}
+-
+-bool QOfonoDataConnectionManagerInterface::roamingAllowed()
+-{
+-    QVariant var = getProperty(QStringLiteral("RoamingAllowed"));
+-    return qdbus_cast<bool>(var);
+-}
+-
+-QVariant QOfonoDataConnectionManagerInterface::getProperty(const QString &property)
+-{
+-    QVariant var;
+-    QVariantMap map = getProperties();
+-    var = map.value(property);
+-    return var;
+-}
+-
+-QVariantMap QOfonoDataConnectionManagerInterface::getProperties()
+-{
+-    if (propertiesMap.isEmpty()) {
+-        QList<QVariant> argumentList;
+-        QDBusPendingReply<QVariantMap> reply = asyncCallWithArgumentList(QLatin1String("GetProperties"), argumentList);
+-        if (!reply.isError()) {
+-            propertiesMap = reply.value();
+-        }
+-    }
+-    return propertiesMap;
+-}
+-
+-void QOfonoDataConnectionManagerInterface::propertyChanged(const QString &name, const QDBusVariant &value)
+-{
+-    propertiesMap[name] = value.variant();
+-    if (name == QStringLiteral("RoamingAllowed"))
+-        Q_EMIT roamingAllowedChanged(value.variant().toBool());
+-}
+-
+-QT_END_NAMESPACE
+-
+-#endif // QT_NO_DBUS
+-#endif // QT_NO_BEARERMANAGEMENT
+--- qtbase/src/plugins/bearer/connman/qofonoservice_linux_p.h
++++ /dev/null
+@@ -1,180 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/legal
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
+-** use the contact form at http://qt.digia.com/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QOFONOSERVICE_H
+-#define QOFONOSERVICE_H
+-
+-//
+-//  W A R N I N G
+-//  -------------
+-//
+-// This file is not part of the Qt API.  It exists purely as an
+-// implementation detail.  This header file may change from version to
+-// version without notice, or even be removed.
+-//
+-// We mean it.
+-//
+-
+-#include <QtDBus/QtDBus>
+-#include <QtDBus/QDBusConnection>
+-#include <QtDBus/QDBusError>
+-#include <QtDBus/QDBusInterface>
+-#include <QtDBus/QDBusMessage>
+-#include <QtDBus/QDBusReply>
+-
+-#include <QtDBus/QDBusPendingCallWatcher>
+-#include <QtDBus/QDBusObjectPath>
+-#include <QtDBus/QDBusContext>
+-#include <QMap>
+-
+-#ifndef QT_NO_BEARERMANAGEMENT
+-#ifndef QT_NO_DBUS
+-
+-#define OFONO_SERVICE                            "org.ofono"
+-#define OFONO_MANAGER_INTERFACE                  "org.ofono.Manager"
+-#define OFONO_MANAGER_PATH                       "/"
+-
+-#define OFONO_MODEM_INTERFACE                    "org.ofono.Modem"
+-#define OFONO_NETWORK_REGISTRATION_INTERFACE     "org.ofono.NetworkRegistration"
+-#define OFONO_DATA_CONNECTION_MANAGER_INTERFACE  "org.ofono.ConnectionManager"
+-
+-QT_BEGIN_NAMESPACE
+-
+-QT_END_NAMESPACE
+-
+-struct ObjectPathProperties
+-{
+-    QDBusObjectPath path;
+-    QVariantMap properties;
+-};
+-typedef QList<ObjectPathProperties> PathPropertiesList;
+-Q_DECLARE_METATYPE(ObjectPathProperties)
+-Q_DECLARE_METATYPE (PathPropertiesList)
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QOfonoManagerInterface : public  QDBusAbstractInterface
+-{
+-    Q_OBJECT
+-
+-public:
+-
+-    QOfonoManagerInterface( QObject *parent = 0);
+-    ~QOfonoManagerInterface();
+-
+-    QStringList getModems();
+-    QString currentModem();
+-signals:
+-    void modemChanged();
+-private:
+-    QStringList modemList;
+-private slots:
+-    void modemAdded(const QDBusObjectPath &path, const QVariantMap &var);
+-    void modemRemoved(const QDBusObjectPath &path);
+-};
+-
+-class QOfonoModemInterface : public QDBusAbstractInterface
+-{
+-    Q_OBJECT
+-
+-public:
+-
+-    explicit QOfonoModemInterface(const QString &dbusModemPathName, QObject *parent = 0);
+-    ~QOfonoModemInterface();
+-
+-    bool isPowered();
+-    bool isOnline();
+-private:
+-    QVariantMap getProperties();
+-    QVariantMap propertiesMap;
+-    QVariant getProperty(const QString &);
+-    void propertyChanged(const QString &, const QDBusVariant &value);
+-};
+-
+-
+-class QOfonoNetworkRegistrationInterface : public QDBusAbstractInterface
+-{
+-    Q_OBJECT
+-
+-public:
+-
+-    explicit QOfonoNetworkRegistrationInterface(const QString &dbusModemPathName, QObject *parent = 0);
+-    ~QOfonoNetworkRegistrationInterface();
+-
+-    QString getTechnology();
+-
+-private:
+-    QVariantMap getProperties();
+-    QVariant getProperty(const QString &);
+-    QVariantMap propertiesMap;
+-Q_SIGNALS:
+-    void propertyChanged(const QString &, const QDBusVariant &value);
+-};
+-
+-class QOfonoDataConnectionManagerInterface : public QDBusAbstractInterface
+-{
+-    Q_OBJECT
+-
+-public:
+-
+-    explicit QOfonoDataConnectionManagerInterface(const QString &dbusPathName, QObject *parent = 0);
+-    ~QOfonoDataConnectionManagerInterface();
+-
+-    QStringList contexts();
+-    bool roamingAllowed();
+-Q_SIGNALS:
+-    void roamingAllowedChanged(bool);
+-private:
+-    QVariantMap getProperties();
+-    QVariantMap propertiesMap;
+-    QVariant getProperty(const QString &);
+-    QStringList contextList;
+-private slots:
+-    void propertyChanged(const QString &, const QDBusVariant &value);
+-};
+-
+-
+-QT_END_NAMESPACE
+-
+-#endif // QT_NO_DBUS
+-#endif // QT_NO_BEARERMANAGEMENT
+-
+-#endif //QOFONOSERVICE_H
+--- qtbase/src/plugins/bearer/networkmanager/main.cpp
++++ qtbase/src/plugins/bearer/networkmanager/main.cpp
+@@ -1,40 +1,32 @@
+ /****************************************************************************
+ **
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
+ ** Contact: http://www.qt-project.org/legal
+ **
+ ** This file is part of the plugins of the Qt Toolkit.
+ **
+-** $QT_BEGIN_LICENSE:LGPL$
++** $QT_BEGIN_LICENSE:LGPL21$
+ ** Commercial License Usage
+ ** Licensees holding valid commercial Qt licenses may use this file in
+ ** accordance with the commercial license agreement provided with the
+ ** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
+ ** use the contact form at http://qt.digia.com/contact-us.
+ **
+ ** GNU Lesser General Public License Usage
+ ** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+ **
+ ** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
++** rights. These rights are described in the Digia Qt LGPL Exception
+ ** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+ **
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
+--- qtbase/src/plugins/bearer/networkmanager/networkmanager.pro
++++ qtbase/src/plugins/bearer/networkmanager/networkmanager.pro
+@@ -6,16 +6,16 @@
+ 
+ QT = core network-private dbus
+ 
+-HEADERS += qnmdbushelper.h \
+-           qnetworkmanagerservice.h \
++HEADERS += qnetworkmanagerservice.h \
+            qnetworkmanagerengine.h \
++           ../linux_common/qofonoservice_linux_p.h \
+            ../qnetworksession_impl.h \
+            ../qbearerengine_impl.h
+ 
+ SOURCES += main.cpp \
+-           qnmdbushelper.cpp \
+            qnetworkmanagerservice.cpp \
+            qnetworkmanagerengine.cpp \
++           ../linux_common/qofonoservice_linux.cpp \
+            ../qnetworksession_impl.cpp
+ 
+ OTHER_FILES += networkmanager.json
+--- qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerengine.cpp
++++ qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerengine.cpp
+@@ -1,40 +1,32 @@
+ /****************************************************************************
+ **
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
+ ** Contact: http://www.qt-project.org/legal
+ **
+ ** This file is part of the plugins of the Qt Toolkit.
+ **
+-** $QT_BEGIN_LICENSE:LGPL$
++** $QT_BEGIN_LICENSE:LGPL21$
+ ** Commercial License Usage
+ ** Licensees holding valid commercial Qt licenses may use this file in
+ ** accordance with the commercial license agreement provided with the
+ ** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
+ ** use the contact form at http://qt.digia.com/contact-us.
+ **
+ ** GNU Lesser General Public License Usage
+ ** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+ **
+ ** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
++** rights. These rights are described in the Digia Qt LGPL Exception
+ ** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+ **
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
+@@ -55,6 +47,7 @@
+ #include <QDBusInterface>
+ #include <QDBusMessage>
+ #include <QDBusReply>
++#include "../linux_common/qofonoservice_linux_p.h"
+ 
+ #ifndef QT_NO_BEARERMANAGEMENT
+ #ifndef QT_NO_DBUS
+@@ -63,130 +56,113 @@
+ 
+ QNetworkManagerEngine::QNetworkManagerEngine(QObject *parent)
+ :   QBearerEngineImpl(parent),
+-    interface(new QNetworkManagerInterface(this)),
+-    systemSettings(new QNetworkManagerSettings(NM_DBUS_SERVICE_SYSTEM_SETTINGS, this)),
+-    userSettings(new QNetworkManagerSettings(NM_DBUS_SERVICE_USER_SETTINGS, this))
++    managerInterface(new QNetworkManagerInterface(this)),
++    systemSettings(new QNetworkManagerSettings(NM_DBUS_SERVICE, this)),
++    ofonoManager(new QOfonoManagerInterface(this))
+ {
+-    if (!interface->isValid())
++
++    if (!managerInterface->isValid())
+         return;
+ 
+-    interface->setConnections();
+-    connect(interface, SIGNAL(deviceAdded(QDBusObjectPath)),
++    qDBusRegisterMetaType<QNmSettingsMap>();
++
++    connect(managerInterface, SIGNAL(deviceAdded(QDBusObjectPath)),
+             this, SLOT(deviceAdded(QDBusObjectPath)));
+-    connect(interface, SIGNAL(deviceRemoved(QDBusObjectPath)),
++    connect(managerInterface, SIGNAL(deviceRemoved(QDBusObjectPath)),
+             this, SLOT(deviceRemoved(QDBusObjectPath)));
+-#if 0
+-    connect(interface, SIGNAL(stateChanged(QString,quint32)),
+-            this, SIGNAL(configurationsChanged()));
+-#endif
+-    connect(interface, SIGNAL(activationFinished(QDBusPendingCallWatcher*)),
++    connect(managerInterface, SIGNAL(activationFinished(QDBusPendingCallWatcher*)),
+             this, SLOT(activationFinished(QDBusPendingCallWatcher*)));
+-    connect(interface, SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)),
+-            this, SLOT(interfacePropertiesChanged(QString,QMap<QString,QVariant>)));
+-
+-    qDBusRegisterMetaType<QNmSettingsMap>();
++    connect(managerInterface, SIGNAL(propertiesChanged(QMap<QString,QVariant>)),
++            this, SLOT(interfacePropertiesChanged(QMap<QString,QVariant>)));
++    managerInterface->setConnections();
+ 
+-    systemSettings->setConnections();
+     connect(systemSettings, SIGNAL(newConnection(QDBusObjectPath)),
+             this, SLOT(newConnection(QDBusObjectPath)));
+-
+-    userSettings->setConnections();
+-    connect(userSettings, SIGNAL(newConnection(QDBusObjectPath)),
+-            this, SLOT(newConnection(QDBusObjectPath)));
++    systemSettings->setConnections();
+ }
+ 
+ QNetworkManagerEngine::~QNetworkManagerEngine()
+ {
+     qDeleteAll(connections);
++    connections.clear();
+     qDeleteAll(accessPoints);
++    accessPoints.clear();
+     qDeleteAll(wirelessDevices);
+-    qDeleteAll(activeConnections);
++    wirelessDevices.clear();
++    qDeleteAll(activeConnectionsList);
++    activeConnectionsList.clear();
++    qDeleteAll(interfaceDevices);
++    interfaceDevices.clear();
++
++    connectionInterfaces.clear();
++
++    qDeleteAll(ofonoContextManagers);
++    ofonoContextManagers.clear();
++
++    qDeleteAll(wiredDevices);
++    wiredDevices.clear();
+ }
+ 
+ void QNetworkManagerEngine::initialize()
+ {
+     QMutexLocker locker(&mutex);
+ 
+-    // Get current list of access points.
+-    foreach (const QDBusObjectPath &devicePath, interface->getDevices()) {
++    if (ofonoManager->isValid()) {
++        Q_FOREACH (const QString &modem, ofonoManager->getModems()) {
++            QOfonoDataConnectionManagerInterface *ofonoContextManager
++                    = new QOfonoDataConnectionManagerInterface(modem,this);
++            ofonoContextManagers.insert(modem, ofonoContextManager);
++        }
++    }
++    // Get active connections.
++    foreach (const QDBusObjectPath &acPath, managerInterface->activeConnections()) {
++
++        QNetworkManagerConnectionActive *activeConnection =
++                new QNetworkManagerConnectionActive(acPath.path(),this);
++        activeConnectionsList.insert(acPath.path(), activeConnection);
++        connect(activeConnection, SIGNAL(propertiesChanged(QMap<QString,QVariant>)),
++                this, SLOT(activeConnectionPropertiesChanged(QMap<QString,QVariant>)));
++        activeConnection->setConnections();
++
++        QStringList devices = activeConnection->devices();
++        if (!devices.isEmpty()) {
++            QNetworkManagerInterfaceDevice device(devices.at(0),this);
++            connectionInterfaces.insert(activeConnection->connection().path(),device.networkInterface());
++        }
++    }
++
++        // Get current list of access points.
++    foreach (const QDBusObjectPath &devicePath, managerInterface->getDevices()) {
+         locker.unlock();
+-        deviceAdded(devicePath);
++        deviceAdded(devicePath); //add all accesspoints
+         locker.relock();
+     }
+ 
+     // Get connections.
+     foreach (const QDBusObjectPath &settingsPath, systemSettings->listConnections()) {
+         locker.unlock();
+-        newConnection(settingsPath, systemSettings);
+-        locker.relock();
+-    }
+-    foreach (const QDBusObjectPath &settingsPath, userSettings->listConnections()) {
+-        locker.unlock();
+-        newConnection(settingsPath, userSettings);
++        if (!hasIdentifier(settingsPath.path()))
++            newConnection(settingsPath, systemSettings); //add system connection configs
+         locker.relock();
+     }
+ 
+-    // Get active connections.
+-    foreach (const QDBusObjectPath &acPath, interface->activeConnections()) {
+-        QNetworkManagerConnectionActive *activeConnection =
+-            new QNetworkManagerConnectionActive(acPath.path());
+-        activeConnections.insert(acPath.path(), activeConnection);
+-
+-        activeConnection->setConnections();
+-        connect(activeConnection, SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)),
+-                this, SLOT(activeConnectionPropertiesChanged(QString,QMap<QString,QVariant>)));
+-    }
++    Q_EMIT updateCompleted();
+ }
+ 
+ bool QNetworkManagerEngine::networkManagerAvailable() const
+ {
+-    QMutexLocker locker(&mutex);
+-
+-    return interface->isValid();
++    return managerInterface->isValid();
+ }
+ 
+-QString QNetworkManagerEngine::getInterfaceFromId(const QString &id)
++QString QNetworkManagerEngine::getInterfaceFromId(const QString &settingsPath)
+ {
+-    QMutexLocker locker(&mutex);
+-
+-    foreach (const QDBusObjectPath &acPath, interface->activeConnections()) {
+-        QNetworkManagerConnectionActive activeConnection(acPath.path());
+-
+-        const QString identifier = QString::number(qHash(activeConnection.serviceName() + ' ' +
+-                                                         activeConnection.connection().path()));
+-
+-        if (id == identifier) {
+-            QList<QDBusObjectPath> devices = activeConnection.devices();
+-
+-            if (devices.isEmpty())
+-                continue;
+-
+-            QNetworkManagerInterfaceDevice device(devices.at(0).path());
+-            return device.networkInterface();
+-        }
+-    }
+-
+-    return QString();
++    return connectionInterfaces.value(settingsPath);
+ }
+ 
+ bool QNetworkManagerEngine::hasIdentifier(const QString &id)
+ {
+     QMutexLocker locker(&mutex);
+-
+-    if (connectionFromId(id))
+-        return true;
+-
+-    for (int i = 0; i < accessPoints.count(); ++i) {
+-        QNetworkManagerInterfaceAccessPoint *accessPoint = accessPoints.at(i);
+-
+-        const QString identifier =
+-            QString::number(qHash(accessPoint->connectionInterface()->path()));
+-
+-        if (id == identifier)
+-            return true;
+-    }
+-
+-    return false;
++    return accessPointConfigurations.contains(id);
+ }
+ 
+ void QNetworkManagerEngine::connectToId(const QString &id)
+@@ -198,47 +174,54 @@
+     if (!connection)
+         return;
+ 
+-    QNmSettingsMap map = connection->getSettings();
+-    const QString connectionType = map.value("connection").value("type").toString();
++    NMDeviceType connectionType = connection->getType();
+ 
+     QString dbusDevicePath;
+-    foreach (const QDBusObjectPath &devicePath, interface->getDevices()) {
+-        QNetworkManagerInterfaceDevice device(devicePath.path());
+-        if (device.deviceType() == DEVICE_TYPE_802_3_ETHERNET &&
+-            connectionType == QLatin1String("802-3-ethernet")) {
+-            dbusDevicePath = devicePath.path();
++    const QString settingsPath = connection->connectionInterface()->path();
++    QString specificPath = configuredAccessPoints.key(settingsPath);
++
++    QHashIterator<QString, QNetworkManagerInterfaceDevice*> i(interfaceDevices);
++    while (i.hasNext()) {
++        i.next();
++        if (i.value()->deviceType() == DEVICE_TYPE_ETHERNET &&
++            connectionType == DEVICE_TYPE_ETHERNET) {
++            dbusDevicePath = i.key();
+             break;
+-        } else if (device.deviceType() == DEVICE_TYPE_802_11_WIRELESS &&
+-                   connectionType == QLatin1String("802-11-wireless")) {
+-            dbusDevicePath = devicePath.path();
++        } else if (i.value()->deviceType() == DEVICE_TYPE_WIFI &&
++                   connectionType == DEVICE_TYPE_WIFI) {
++            dbusDevicePath = i.key();
+             break;
+-        }
+-        else if (device.deviceType() == DEVICE_TYPE_GSM &&
+-                connectionType == QLatin1String("gsm")) {
+-            dbusDevicePath = devicePath.path();
++        } else if (i.value()->deviceType() == DEVICE_TYPE_MODEM &&
++                connectionType == DEVICE_TYPE_MODEM) {
++            dbusDevicePath = i.key();
+             break;
+         }
+     }
+ 
+-    const QString service = connection->connectionInterface()->service();
+-    const QString settingsPath = connection->connectionInterface()->path();
++    if (specificPath.isEmpty())
++        specificPath = "/";
+ 
+-    interface->activateConnection(service, QDBusObjectPath(settingsPath),
+-                                  QDBusObjectPath(dbusDevicePath), QDBusObjectPath("/"));
++    managerInterface->activateConnection(QDBusObjectPath(settingsPath),
++                                  QDBusObjectPath(dbusDevicePath), QDBusObjectPath(specificPath));
+ }
+ 
+ void QNetworkManagerEngine::disconnectFromId(const QString &id)
+ {
+     QMutexLocker locker(&mutex);
+ 
+-    foreach (const QDBusObjectPath &acPath, interface->activeConnections()) {
+-        QNetworkManagerConnectionActive activeConnection(acPath.path());
+-
+-        const QString identifier = QString::number(qHash(activeConnection.serviceName() + ' ' +
+-                                                         activeConnection.connection().path()));
++    QNetworkManagerSettingsConnection *connection = connectionFromId(id);
++    QNmSettingsMap map = connection->getSettings();
++    bool connectionAutoconnect = map.value("connection").value("autoconnect",true).toBool(); //if not present is true !!
++    if (connectionAutoconnect) { //autoconnect connections will simply be reconnected by nm
++        emit connectionError(id, QBearerEngineImpl::OperationNotSupported);
++        return;
++    }
+ 
+-        if (id == identifier && accessPointConfigurations.contains(id)) {
+-            interface->deactivateConnection(acPath);
++    QHashIterator<QString, QNetworkManagerConnectionActive*> i(activeConnectionsList);
++    while (i.hasNext()) {
++        i.next();
++        if (id == i.value()->connection().path() && accessPointConfigurations.contains(id)) {
++            managerInterface->deactivateConnection(QDBusObjectPath(i.key()));
+             break;
+         }
+     }
+@@ -246,16 +229,24 @@
+ 
+ void QNetworkManagerEngine::requestUpdate()
+ {
++    if (managerInterface->wirelessEnabled()) {
++        QHashIterator<QString, QNetworkManagerInterfaceDeviceWireless *> i(wirelessDevices);
++        while (i.hasNext()) {
++            i.next();
++            i.value()->requestScan();
++        }
++    }
+     QMetaObject::invokeMethod(this, "updateCompleted", Qt::QueuedConnection);
+ }
+ 
+-void QNetworkManagerEngine::interfacePropertiesChanged(const QString &path,
+-                                                       const QMap<QString, QVariant> &properties)
++void QNetworkManagerEngine::scanFinished()
+ {
+-    QMutexLocker locker(&mutex);
+-
+-    Q_UNUSED(path)
++    QMetaObject::invokeMethod(this, "updateCompleted", Qt::QueuedConnection);
++}
+ 
++void QNetworkManagerEngine::interfacePropertiesChanged(const QMap<QString, QVariant> &properties)
++{
++    QMutexLocker locker(&mutex);
+     QMapIterator<QString, QVariant> i(properties);
+     while (i.hasNext()) {
+         i.next();
+@@ -267,35 +258,37 @@
+                 qdbus_cast<QList<QDBusObjectPath> >(i.value().value<QDBusArgument>());
+ 
+             QStringList identifiers = accessPointConfigurations.keys();
+-            foreach (const QString &id, identifiers)
+-                QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+-
+-            QStringList priorActiveConnections = this->activeConnections.keys();
++            QStringList priorActiveConnections = activeConnectionsList.keys();
+ 
+             foreach (const QDBusObjectPath &acPath, activeConnections) {
+                 priorActiveConnections.removeOne(acPath.path());
+                 QNetworkManagerConnectionActive *activeConnection =
+-                    this->activeConnections.value(acPath.path());
++                    activeConnectionsList.value(acPath.path());
++
+                 if (!activeConnection) {
+-                    activeConnection = new QNetworkManagerConnectionActive(acPath.path());
+-                    this->activeConnections.insert(acPath.path(), activeConnection);
++                    activeConnection = new QNetworkManagerConnectionActive(acPath.path(),this);
++                    activeConnectionsList.insert(acPath.path(), activeConnection);
+ 
++                    connect(activeConnection, SIGNAL(propertiesChanged(QMap<QString,QVariant>)),
++                            this, SLOT(activeConnectionPropertiesChanged(QMap<QString,QVariant>)));
+                     activeConnection->setConnections();
+-                    connect(activeConnection, SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)),
+-                            this, SLOT(activeConnectionPropertiesChanged(QString,QMap<QString,QVariant>)));
+                 }
+ 
+-                const QString id = QString::number(qHash(activeConnection->serviceName() + ' ' +
+-                                                         activeConnection->connection().path()));
++                const QString id = activeConnection->connection().path();
+ 
+                 identifiers.removeOne(id);
+ 
+                 QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+                 if (ptr) {
+                     ptr->mutex.lock();
+-                    if (activeConnection->state() == 2 &&
++                    if (activeConnection->state() == NM_ACTIVE_CONNECTION_STATE_ACTIVATED &&
+                         ptr->state != QNetworkConfiguration::Active) {
+                         ptr->state = QNetworkConfiguration::Active;
++
++                        if (activeConnectionsList.value(id) && activeConnectionsList.value(id)->defaultRoute()
++                                && managerInterface->state() < QNetworkManagerInterface::NM_STATE_CONNECTED_GLOBAL) {
++                            ptr->purpose = QNetworkConfiguration::PrivatePurpose;
++                        }
+                         ptr->mutex.unlock();
+ 
+                         locker.unlock();
+@@ -308,16 +301,16 @@
+             }
+ 
+             while (!priorActiveConnections.isEmpty())
+-                delete this->activeConnections.take(priorActiveConnections.takeFirst());
++                delete activeConnectionsList.take(priorActiveConnections.takeFirst());
+ 
+             while (!identifiers.isEmpty()) {
+-                // These configurations are not active
+                 QNetworkConfigurationPrivatePointer ptr =
+                     accessPointConfigurations.value(identifiers.takeFirst());
+ 
+                 ptr->mutex.lock();
+                 if ((ptr->state & QNetworkConfiguration::Active) == QNetworkConfiguration::Active) {
+-                    ptr->state = QNetworkConfiguration::Discovered;
++                    QNetworkConfiguration::StateFlags flag = QNetworkConfiguration::Defined;
++                    ptr->state = (flag | QNetworkConfiguration::Discovered);
+                     ptr->mutex.unlock();
+ 
+                     locker.unlock();
+@@ -331,66 +324,96 @@
+     }
+ }
+ 
+-void QNetworkManagerEngine::activeConnectionPropertiesChanged(const QString &path,
+-                                                              const QMap<QString, QVariant> &properties)
++void QNetworkManagerEngine::activeConnectionPropertiesChanged(const QMap<QString, QVariant> &properties)
+ {
+     QMutexLocker locker(&mutex);
+ 
+     Q_UNUSED(properties)
+ 
+-    QNetworkManagerConnectionActive *activeConnection = activeConnections.value(path);
++    QNetworkManagerConnectionActive *activeConnection = qobject_cast<QNetworkManagerConnectionActive *>(sender());
+ 
+     if (!activeConnection)
+         return;
+ 
+-    const QString id = QString::number(qHash(activeConnection->serviceName() + ' ' +
+-                                             activeConnection->connection().path()));
++    const QString id = activeConnection->connection().path();
+ 
+     QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+     if (ptr) {
+         ptr->mutex.lock();
+-        if (activeConnection->state() == 2 &&
+-            ptr->state != QNetworkConfiguration::Active) {
+-            ptr->state = QNetworkConfiguration::Active;
++        if (properties.value("State").toUInt() == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
++            QStringList devices = activeConnection->devices();
++            if (!devices.isEmpty()) {
++                QNetworkManagerInterfaceDevice device(devices.at(0),this);
++                connectionInterfaces.insert(id,device.networkInterface());
++            }
++
++            ptr->state |= QNetworkConfiguration::Active;
+             ptr->mutex.unlock();
+ 
+             locker.unlock();
+             emit configurationChanged(ptr);
+             locker.relock();
+         } else {
++            connectionInterfaces.remove(id);
+             ptr->mutex.unlock();
+         }
+     }
+ }
+ 
+-void QNetworkManagerEngine::devicePropertiesChanged(const QString &path,
+-                                                    const QMap<QString, QVariant> &properties)
++void QNetworkManagerEngine::deviceConnectionsChanged(const QStringList &connectionsList)
+ {
+-    Q_UNUSED(path);
+-    Q_UNUSED(properties);
++    QMutexLocker locker(&mutex);
++    for (int i = 0; i < connections.count(); ++i) {
++        if (connectionsList.contains(connections.at(i)->connectionInterface()->path()))
++            continue;
++
++        const QString settingsPath = connections.at(i)->connectionInterface()->path();
++
++        QNetworkConfigurationPrivatePointer ptr =
++            accessPointConfigurations.value(settingsPath);
++        ptr->mutex.lock();
++        QNetworkConfiguration::StateFlags flag = QNetworkConfiguration::Defined;
++        ptr->state = (flag | QNetworkConfiguration::Discovered);
++        ptr->mutex.unlock();
++
++        locker.unlock();
++        emit configurationChanged(ptr);
++        locker.relock();
++        Q_EMIT updateCompleted();
++    }
+ }
+ 
+ void QNetworkManagerEngine::deviceAdded(const QDBusObjectPath &path)
+ {
+-    QNetworkManagerInterfaceDevice device(path.path());
+-    if (device.deviceType() == DEVICE_TYPE_802_11_WIRELESS) {
++    QNetworkManagerInterfaceDevice *iDevice;
++    iDevice = new QNetworkManagerInterfaceDevice(path.path(),this);
++    connect(iDevice,SIGNAL(connectionsChanged(QStringList)),
++            this,SLOT(deviceConnectionsChanged(QStringList)));
++
++    iDevice->setConnections();
++    interfaceDevices.insert(path.path(),iDevice);
++    if (iDevice->deviceType() == DEVICE_TYPE_WIFI) {
+         QNetworkManagerInterfaceDeviceWireless *wirelessDevice =
+-            new QNetworkManagerInterfaceDeviceWireless(device.connectionInterface()->path());
++            new QNetworkManagerInterfaceDeviceWireless(iDevice->connectionInterface()->path(),this);
+ 
++        connect(wirelessDevice, SIGNAL(accessPointAdded(QString)),
++                this, SLOT(newAccessPoint(QString)));
++        connect(wirelessDevice, SIGNAL(accessPointRemoved(QString)),
++                this, SLOT(removeAccessPoint(QString)));
++        connect(wirelessDevice,SIGNAL(scanDone()),this,SLOT(scanFinished()));
+         wirelessDevice->setConnections();
+-        connect(wirelessDevice, SIGNAL(accessPointAdded(QString,QDBusObjectPath)),
+-                this, SLOT(newAccessPoint(QString,QDBusObjectPath)));
+-        connect(wirelessDevice, SIGNAL(accessPointRemoved(QString,QDBusObjectPath)),
+-                this, SLOT(removeAccessPoint(QString,QDBusObjectPath)));
+-        connect(wirelessDevice, SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)),
+-                this, SLOT(devicePropertiesChanged(QString,QMap<QString,QVariant>)));
+ 
+         foreach (const QDBusObjectPath &apPath, wirelessDevice->getAccessPoints())
+-            newAccessPoint(QString(), apPath);
++            newAccessPoint(apPath.path());
+ 
+-        mutex.lock();
+         wirelessDevices.insert(path.path(), wirelessDevice);
+-        mutex.unlock();
++    }
++
++    if (iDevice->deviceType() == DEVICE_TYPE_ETHERNET) {
++        QNetworkManagerInterfaceDeviceWired *wiredDevice =
++                new QNetworkManagerInterfaceDeviceWired(iDevice->connectionInterface()->path(),this);
++        connect(wiredDevice,SIGNAL(carrierChanged(bool)),this,SLOT(wiredCarrierChanged(bool)));
++        wiredDevices.insert(iDevice->connectionInterface()->path(), wiredDevice);
+     }
+ }
+ 
+@@ -398,50 +421,126 @@
+ {
+     QMutexLocker locker(&mutex);
+ 
+-    delete wirelessDevices.take(path.path());
++    if (interfaceDevices.contains(path.path())) {
++        locker.unlock();
++        delete interfaceDevices.take(path.path());
++        locker.relock();
++    }
++    if (wirelessDevices.contains(path.path())) {
++        locker.unlock();
++        delete wirelessDevices.take(path.path());
++        locker.relock();
++    }
++    if (wiredDevices.contains(path.path())) {
++        locker.unlock();
++        delete wiredDevices.take(path.path());
++        locker.relock();
++    }
++}
++
++void QNetworkManagerEngine::wiredCarrierChanged(bool carrier)
++{
++    QNetworkManagerInterfaceDeviceWired *deviceWired = qobject_cast<QNetworkManagerInterfaceDeviceWired *>(sender());
++    if (!deviceWired)
++        return;
++    QMutexLocker locker(&mutex);
++    foreach (const QDBusObjectPath &settingsPath, systemSettings->listConnections()) {
++        for (int i = 0; i < connections.count(); ++i) {
++            QNetworkManagerSettingsConnection *connection = connections.at(i);
++            if (connection->getType() == DEVICE_TYPE_ETHERNET
++                    && settingsPath.path() == connection->connectionInterface()->path()) {
++                QNetworkConfigurationPrivatePointer ptr =
++                        accessPointConfigurations.value(settingsPath.path());
++
++                if (ptr) {
++                    ptr->mutex.lock();
++                    if (carrier)
++                        ptr->state |= QNetworkConfiguration::Discovered;
++                    else
++                        ptr->state = QNetworkConfiguration::Defined;
++                    ptr->mutex.unlock();
++                    locker.unlock();
++                    emit configurationChanged(ptr);
++                    return;
++                }
++            }
++        }
++    }
+ }
+ 
+ void QNetworkManagerEngine::newConnection(const QDBusObjectPath &path,
+                                           QNetworkManagerSettings *settings)
+ {
+     QMutexLocker locker(&mutex);
+-
+     if (!settings)
+         settings = qobject_cast<QNetworkManagerSettings *>(sender());
+ 
+-    if (!settings)
++    if (!settings) {
+         return;
++    }
+ 
+     QNetworkManagerSettingsConnection *connection =
+         new QNetworkManagerSettingsConnection(settings->connectionInterface()->service(),
+-                                              path.path());
++                                              path.path(),this);
++    const QString settingsPath = connection->connectionInterface()->path();
++    if (accessPointConfigurations.contains(settingsPath)) {
++        return;
++    }
++
+     connections.append(connection);
+ 
+-    connect(connection, SIGNAL(removed(QString)), this, SLOT(removeConnection(QString)));
+-    connect(connection, SIGNAL(updated(QNmSettingsMap)),
+-            this, SLOT(updateConnection(QNmSettingsMap)));
++    connect(connection,SIGNAL(removed(QString)),this,SLOT(removeConnection(QString)));
++    connect(connection,SIGNAL(updated()),this,SLOT(updateConnection()));
++    connection->setConnections();
+ 
+-    const QString service = connection->connectionInterface()->service();
+-    const QString settingsPath = connection->connectionInterface()->path();
++    NMDeviceType deviceType = connection->getType();
++
++    if (deviceType == DEVICE_TYPE_WIFI) {
++        QString apPath;
++        for (int i = 0; i < accessPoints.count(); ++i) {
++            if (connection->getSsid() == accessPoints.at(i)->ssid()) {
++                // remove the corresponding accesspoint from configurations
++                apPath = accessPoints.at(i)->connectionInterface()->path();
++                QNetworkConfigurationPrivatePointer ptr
++                        = accessPointConfigurations.take(apPath);
++                if (ptr) {
++                    locker.unlock();
++                    emit configurationRemoved(ptr);
++                    locker.relock();
++                }
++            }
++        }
++        if (!configuredAccessPoints.contains(settingsPath))
++            configuredAccessPoints.insert(apPath,settingsPath);
++    }
+ 
+     QNetworkConfigurationPrivate *cpPriv =
+-        parseConnection(service, settingsPath, connection->getSettings());
++        parseConnection(settingsPath, connection->getSettings());
+ 
+     // Check if connection is active.
+-    foreach (const QDBusObjectPath &acPath, interface->activeConnections()) {
+-        QNetworkManagerConnectionActive activeConnection(acPath.path());
+-
+-        if (activeConnection.serviceName() == service &&
+-            activeConnection.connection().path() == settingsPath &&
+-            activeConnection.state() == 2) {
++    QHashIterator<QString, QNetworkManagerConnectionActive*> i(activeConnectionsList);
++    while (i.hasNext()) {
++        i.next();
++        if (i.value()->connection().path() == settingsPath) {
+             cpPriv->state |= QNetworkConfiguration::Active;
+             break;
+         }
+     }
+-
++    if (deviceType == DEVICE_TYPE_ETHERNET) {
++        QHashIterator<QString, QNetworkManagerInterfaceDevice*> i(interfaceDevices);
++        while (i.hasNext()) {
++             i.next();
++             if (i.value()->deviceType() == deviceType) {
++                QNetworkManagerInterfaceDeviceWired *wiredDevice
++                        = wiredDevices.value(i.value()->connectionInterface()->path());
++                 if (wiredDevice->carrier()) {
++                     cpPriv->state |= QNetworkConfiguration::Discovered;
++                 }
++             }
++         }
++     }
+     QNetworkConfigurationPrivatePointer ptr(cpPriv);
+     accessPointConfigurations.insert(ptr->id, ptr);
+-
+     locker.unlock();
+     emit configurationAdded(ptr);
+ }
+@@ -450,27 +549,36 @@
+ {
+     QMutexLocker locker(&mutex);
+ 
+-    Q_UNUSED(path)
+-
+     QNetworkManagerSettingsConnection *connection =
+         qobject_cast<QNetworkManagerSettingsConnection *>(sender());
++
+     if (!connection)
+         return;
+ 
++    connection->deleteLater();
+     connections.removeAll(connection);
+ 
+-    const QString id = QString::number(qHash(connection->connectionInterface()->service() + ' ' +
+-                                             connection->connectionInterface()->path()));
++    const QString id = path;
+ 
+     QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.take(id);
+ 
+-    connection->deleteLater();
+-
+-    locker.unlock();
+-    emit configurationRemoved(ptr);
++    if (ptr) {
++        locker.unlock();
++        emit configurationRemoved(ptr);
++        locker.relock();
++    }
++    // add base AP back into configurations
++    QMapIterator<QString, QString> i(configuredAccessPoints);
++    while (i.hasNext()) {
++        i.next();
++        if (i.value() == path) {
++            configuredAccessPoints.remove(i.key());
++            newAccessPoint(i.key());
++        }
++    }
+ }
+ 
+-void QNetworkManagerEngine::updateConnection(const QNmSettingsMap &settings)
++void QNetworkManagerEngine::updateConnection()
+ {
+     QMutexLocker locker(&mutex);
+ 
+@@ -478,18 +586,15 @@
+         qobject_cast<QNetworkManagerSettingsConnection *>(sender());
+     if (!connection)
+         return;
+-
+-    const QString service = connection->connectionInterface()->service();
+     const QString settingsPath = connection->connectionInterface()->path();
+ 
+-    QNetworkConfigurationPrivate *cpPriv = parseConnection(service, settingsPath, settings);
++    QNetworkConfigurationPrivate *cpPriv = parseConnection(settingsPath, connection->getSettings());
+ 
+     // Check if connection is active.
+-    foreach (const QDBusObjectPath &acPath, interface->activeConnections()) {
++    foreach (const QDBusObjectPath &acPath, managerInterface->activeConnections()) {
+         QNetworkManagerConnectionActive activeConnection(acPath.path());
+ 
+-        if (activeConnection.serviceName() == service &&
+-            activeConnection.connection().path() == settingsPath &&
++        if (activeConnection.connection().path() == settingsPath &&
+             activeConnection.state() == NM_ACTIVE_CONNECTION_STATE_ACTIVATED) {
+             cpPriv->state |= QNetworkConfiguration::Active;
+             break;
+@@ -509,28 +614,29 @@
+ 
+     locker.unlock();
+     emit configurationChanged(ptr);
++    locker.relock();
+     delete cpPriv;
+ }
+ 
+ void QNetworkManagerEngine::activationFinished(QDBusPendingCallWatcher *watcher)
+ {
+     QMutexLocker locker(&mutex);
+-
+     QDBusPendingReply<QDBusObjectPath> reply(*watcher);
++    watcher->deleteLater();
++
+     if (!reply.isError()) {
+         QDBusObjectPath result = reply.value();
+ 
+         QNetworkManagerConnectionActive activeConnection(result.path());
+ 
+-        const QString id = QString::number(qHash(activeConnection.serviceName() + ' ' +
+-                                                 activeConnection.connection().path()));
++        const QString id = activeConnection.connection().path();
+ 
+         QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+         if (ptr) {
+             ptr->mutex.lock();
+-            if (activeConnection.state() == 2 &&
++            if (activeConnection.state() == NM_ACTIVE_CONNECTION_STATE_ACTIVATED &&
+                 ptr->state != QNetworkConfiguration::Active) {
+-                ptr->state = QNetworkConfiguration::Active;
++                ptr->state |= QNetworkConfiguration::Active;
+                 ptr->mutex.unlock();
+ 
+                 locker.unlock();
+@@ -543,42 +649,40 @@
+     }
+ }
+ 
+-void QNetworkManagerEngine::newAccessPoint(const QString &path, const QDBusObjectPath &objectPath)
++void QNetworkManagerEngine::newAccessPoint(const QString &path)
+ {
+     QMutexLocker locker(&mutex);
+ 
+-    Q_UNUSED(path)
+-
+     QNetworkManagerInterfaceAccessPoint *accessPoint =
+-        new QNetworkManagerInterfaceAccessPoint(objectPath.path());
+-    accessPoints.append(accessPoint);
++        new QNetworkManagerInterfaceAccessPoint(path,this);
+ 
+-    accessPoint->setConnections();
+-    connect(accessPoint, SIGNAL(propertiesChanged(QMap<QString,QVariant>)),
+-            this, SLOT(updateAccessPoint(QMap<QString,QVariant>)));
+-
+-    // Check if configuration for this SSID already exists.
++    bool okToAdd = true;
+     for (int i = 0; i < accessPoints.count(); ++i) {
+-        if (accessPoint != accessPoints.at(i) &&
+-            accessPoint->ssid() == accessPoints.at(i)->ssid()) {
+-            return;
++        if (accessPoints.at(i)->connectionInterface()->path() == path) {
++            okToAdd = false;
+         }
+     }
+-
++    if (okToAdd) {
++        accessPoints.append(accessPoint);
++        accessPoint->setConnections();
++    }
+     // Check if configuration exists for connection.
+     if (!accessPoint->ssid().isEmpty()) {
++
+         for (int i = 0; i < connections.count(); ++i) {
+             QNetworkManagerSettingsConnection *connection = connections.at(i);
++            const QString settingsPath = connection->connectionInterface()->path();
+ 
+             if (accessPoint->ssid() == connection->getSsid()) {
+-                const QString service = connection->connectionInterface()->service();
+-                const QString settingsPath = connection->connectionInterface()->path();
+-                const QString connectionId = QString::number(qHash(service + ' ' + settingsPath));
++                if (!configuredAccessPoints.contains(path)) {
++                    configuredAccessPoints.insert(path,settingsPath);
++                }
+ 
+                 QNetworkConfigurationPrivatePointer ptr =
+-                    accessPointConfigurations.value(connectionId);
++                    accessPointConfigurations.value(settingsPath);
+                 ptr->mutex.lock();
+-                ptr->state = QNetworkConfiguration::Discovered;
++                QNetworkConfiguration::StateFlags flag = QNetworkConfiguration::Defined;
++                ptr->state = (flag | QNetworkConfiguration::Discovered);
+                 ptr->mutex.unlock();
+ 
+                 locker.unlock();
+@@ -593,13 +697,9 @@
+ 
+     ptr->name = accessPoint->ssid();
+     ptr->isValid = true;
+-    ptr->id = QString::number(qHash(objectPath.path()));
++    ptr->id = path;
+     ptr->type = QNetworkConfiguration::InternetAccessPoint;
+-    if(accessPoint->flags() == NM_802_11_AP_FLAGS_PRIVACY) {
+-        ptr->purpose = QNetworkConfiguration::PrivatePurpose;
+-    } else {
+-        ptr->purpose = QNetworkConfiguration::PublicPurpose;
+-    }
++    ptr->purpose = QNetworkConfiguration::PublicPurpose;
+     ptr->state = QNetworkConfiguration::Undefined;
+     ptr->bearerType = QNetworkConfiguration::BearerWLAN;
+ 
+@@ -609,30 +709,24 @@
+     emit configurationAdded(ptr);
+ }
+ 
+-void QNetworkManagerEngine::removeAccessPoint(const QString &path,
+-                                              const QDBusObjectPath &objectPath)
++void QNetworkManagerEngine::removeAccessPoint(const QString &path)
+ {
+     QMutexLocker locker(&mutex);
+-
+-    Q_UNUSED(path)
+-
+     for (int i = 0; i < accessPoints.count(); ++i) {
+         QNetworkManagerInterfaceAccessPoint *accessPoint = accessPoints.at(i);
+-
+-        if (accessPoint->connectionInterface()->path() == objectPath.path()) {
++        if (accessPoint->connectionInterface()->path() == path) {
+             accessPoints.removeOne(accessPoint);
+ 
+-            if (configuredAccessPoints.contains(accessPoint)) {
++            if (configuredAccessPoints.contains(accessPoint->connectionInterface()->path())) {
+                 // find connection and change state to Defined
+-                configuredAccessPoints.removeOne(accessPoint);
++                configuredAccessPoints.remove(accessPoint->connectionInterface()->path());
++
+                 for (int i = 0; i < connections.count(); ++i) {
+                     QNetworkManagerSettingsConnection *connection = connections.at(i);
+ 
+-                    if (accessPoint->ssid() == connection->getSsid()) {
+-                        const QString service = connection->connectionInterface()->service();
++                    if (accessPoint->ssid() == connection->getSsid()) {//might not have bssid yet
+                         const QString settingsPath = connection->connectionInterface()->path();
+-                        const QString connectionId =
+-                            QString::number(qHash(service + ' ' + settingsPath));
++                        const QString connectionId = settingsPath;
+ 
+                         QNetworkConfigurationPrivatePointer ptr =
+                             accessPointConfigurations.value(connectionId);
+@@ -648,7 +742,7 @@
+                 }
+             } else {
+                 QNetworkConfigurationPrivatePointer ptr =
+-                    accessPointConfigurations.take(QString::number(qHash(objectPath.path())));
++                    accessPointConfigurations.take(path);
+ 
+                 if (ptr) {
+                     locker.unlock();
+@@ -656,111 +750,74 @@
+                     locker.relock();
+                 }
+             }
+-
+             delete accessPoint;
+-
+             break;
+         }
+     }
+ }
+ 
+-void QNetworkManagerEngine::updateAccessPoint(const QMap<QString, QVariant> &map)
+-{
+-    QMutexLocker locker(&mutex);
+-
+-    Q_UNUSED(map)
+-
+-    QNetworkManagerInterfaceAccessPoint *accessPoint =
+-        qobject_cast<QNetworkManagerInterfaceAccessPoint *>(sender());
+-    if (!accessPoint)
+-        return;
+-
+-    for (int i = 0; i < connections.count(); ++i) {
+-        QNetworkManagerSettingsConnection *connection = connections.at(i);
+-
+-        if (accessPoint->ssid() == connection->getSsid()) {
+-            const QString service = connection->connectionInterface()->service();
+-            const QString settingsPath = connection->connectionInterface()->path();
+-            const QString connectionId = QString::number(qHash(service + ' ' + settingsPath));
+-
+-            QNetworkConfigurationPrivatePointer ptr =
+-                accessPointConfigurations.value(connectionId);
+-            ptr->mutex.lock();
+-            ptr->state = QNetworkConfiguration::Discovered;
+-            ptr->mutex.unlock();
+-
+-            locker.unlock();
+-            emit configurationChanged(ptr);
+-            return;
+-        }
+-    }
+-}
+-
+-QNetworkConfigurationPrivate *QNetworkManagerEngine::parseConnection(const QString &service,
+-                                                                     const QString &settingsPath,
++QNetworkConfigurationPrivate *QNetworkManagerEngine::parseConnection(const QString &settingsPath,
+                                                                      const QNmSettingsMap &map)
+ {
++    QMutexLocker locker(&mutex);
+     QNetworkConfigurationPrivate *cpPriv = new QNetworkConfigurationPrivate;
+     cpPriv->name = map.value("connection").value("id").toString();
++
+     cpPriv->isValid = true;
+-    cpPriv->id = QString::number(qHash(service + ' ' + settingsPath));
++    cpPriv->id = settingsPath;
+     cpPriv->type = QNetworkConfiguration::InternetAccessPoint;
+ 
+     cpPriv->purpose = QNetworkConfiguration::PublicPurpose;
+ 
+     cpPriv->state = QNetworkConfiguration::Defined;
+-
+     const QString connectionType = map.value("connection").value("type").toString();
+ 
+     if (connectionType == QLatin1String("802-3-ethernet")) {
+         cpPriv->bearerType = QNetworkConfiguration::BearerEthernet;
+-        cpPriv->purpose = QNetworkConfiguration::PublicPurpose;
+ 
+-        foreach (const QDBusObjectPath &devicePath, interface->getDevices()) {
+-            QNetworkManagerInterfaceDevice device(devicePath.path());
+-            if (device.deviceType() == DEVICE_TYPE_802_3_ETHERNET) {
+-                QNetworkManagerInterfaceDeviceWired wiredDevice(device.connectionInterface()->path());
+-                if (wiredDevice.carrier()) {
++        foreach (const QDBusObjectPath &devicePath, managerInterface->getDevices()) {
++            QNetworkManagerInterfaceDevice device(devicePath.path(),this);
++            if (device.deviceType() == DEVICE_TYPE_ETHERNET) {
++                QNetworkManagerInterfaceDeviceWired *wiredDevice = wiredDevices.value(device.connectionInterface()->path());
++                if (wiredDevice->carrier()) {
+                     cpPriv->state |= QNetworkConfiguration::Discovered;
+                     break;
+                 }
+-
+             }
+         }
+     } else if (connectionType == QLatin1String("802-11-wireless")) {
+         cpPriv->bearerType = QNetworkConfiguration::BearerWLAN;
+ 
+         const QString connectionSsid = map.value("802-11-wireless").value("ssid").toString();
+-        const QString connectionSecurity = map.value("802-11-wireless").value("security").toString();
+-        if(!connectionSecurity.isEmpty()) {
+-            cpPriv->purpose = QNetworkConfiguration::PrivatePurpose;
+-        } else {
+-            cpPriv->purpose = QNetworkConfiguration::PublicPurpose;
+-        }
+         for (int i = 0; i < accessPoints.count(); ++i) {
+-            if (connectionSsid == accessPoints.at(i)->ssid()) {
++            if (connectionSsid == accessPoints.at(i)->ssid()
++                    && map.value("802-11-wireless").value("seen-bssids").toStringList().contains(accessPoints.at(i)->hwAddress())) {
+                 cpPriv->state |= QNetworkConfiguration::Discovered;
+-                if (!configuredAccessPoints.contains(accessPoints.at(i))) {
+-                    configuredAccessPoints.append(accessPoints.at(i));
++                if (!configuredAccessPoints.contains(accessPoints.at(i)->connectionInterface()->path())) {
++                    configuredAccessPoints.insert(accessPoints.at(i)->connectionInterface()->path(),settingsPath);
+ 
+-                    const QString accessPointId =
+-                        QString::number(qHash(accessPoints.at(i)->connectionInterface()->path()));
++                    const QString accessPointId = accessPoints.at(i)->connectionInterface()->path();
+                     QNetworkConfigurationPrivatePointer ptr =
+                         accessPointConfigurations.take(accessPointId);
+ 
+                     if (ptr) {
+-                        mutex.unlock();
++                        locker.unlock();
+                         emit configurationRemoved(ptr);
+-                        mutex.lock();
++                        locker.relock();
+                     }
+                 }
+                 break;
+             }
+         }
+-    } else if (connectionType == "gsm") {
+-        cpPriv->bearerType = QNetworkConfiguration::Bearer2G;
+-    } else if (connectionType == "cdma") {
+-        cpPriv->bearerType = QNetworkConfiguration::BearerCDMA2000;
++    } else if (connectionType == QLatin1String("gsm")) {
++
++        const QString contextPath = map.value("connection").value("id").toString();
++        cpPriv->name = contextName(contextPath);
++        cpPriv->bearerType = currentBearerType(contextPath);
++
++        if (map.value("connection").contains("timestamp")) {
++            cpPriv->state |= QNetworkConfiguration::Discovered;
++        }
+     }
+ 
+     return cpPriv;
+@@ -770,12 +827,7 @@
+ {
+     for (int i = 0; i < connections.count(); ++i) {
+         QNetworkManagerSettingsConnection *connection = connections.at(i);
+-        const QString service = connection->connectionInterface()->service();
+-        const QString settingsPath = connection->connectionInterface()->path();
+-
+-        const QString identifier = QString::number(qHash(service + ' ' + settingsPath));
+-
+-        if (id == identifier)
++        if (id == connection->connectionInterface()->path())
+             return connection;
+     }
+ 
+@@ -785,7 +837,6 @@
+ QNetworkSession::State QNetworkManagerEngine::sessionStateForId(const QString &id)
+ {
+     QMutexLocker locker(&mutex);
+-
+     QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+ 
+     if (!ptr)
+@@ -794,11 +845,10 @@
+     if (!ptr->isValid)
+         return QNetworkSession::Invalid;
+ 
+-    foreach (const QString &acPath, activeConnections.keys()) {
+-        QNetworkManagerConnectionActive *activeConnection = activeConnections.value(acPath);
++    foreach (const QString &acPath, activeConnectionsList.keys()) {
++        QNetworkManagerConnectionActive *activeConnection = activeConnectionsList.value(acPath);
+ 
+-        const QString identifier = QString::number(qHash(activeConnection->serviceName() + ' ' +
+-                                                         activeConnection->connection().path()));
++        const QString identifier = activeConnection->connection().path();
+ 
+         if (id == identifier) {
+             switch (activeConnection->state()) {
+@@ -828,7 +878,7 @@
+ 
+     QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+     if (ptr && (ptr->state & QNetworkConfiguration::Active) == QNetworkConfiguration::Active) {
+-        const QString networkInterface = getInterfaceFromId(id);
++        const QString networkInterface = connectionInterfaces.value(id);
+         if (!networkInterface.isEmpty()) {
+             const QString devFile = QLatin1String("/sys/class/net/") +
+                                     networkInterface +
+@@ -856,7 +906,7 @@
+ 
+     QNetworkConfigurationPrivatePointer ptr = accessPointConfigurations.value(id);
+     if (ptr && (ptr->state & QNetworkConfiguration::Active) == QNetworkConfiguration::Active) {
+-        const QString networkInterface = getInterfaceFromId(id);
++        const QString networkInterface = connectionInterfaces.value(id);
+         if (!networkInterface.isEmpty()) {
+             const QString devFile = QLatin1String("/sys/class/net/") +
+                                     networkInterface +
+@@ -892,7 +942,8 @@
+ QNetworkConfigurationManager::Capabilities QNetworkManagerEngine::capabilities() const
+ {
+     return QNetworkConfigurationManager::ForcedRoaming |
+-           QNetworkConfigurationManager::CanStartAndStopInterfaces;
++            QNetworkConfigurationManager::DataStatistics |
++            QNetworkConfigurationManager::CanStartAndStopInterfaces;
+ }
+ 
+ QNetworkSessionPrivate *QNetworkManagerEngine::createSessionBackend()
+@@ -902,9 +953,67 @@
+ 
+ QNetworkConfigurationPrivatePointer QNetworkManagerEngine::defaultConfiguration()
+ {
++    QHashIterator<QString, QNetworkManagerConnectionActive*> i(activeConnectionsList);
++    while (i.hasNext()) {
++        i.next();
++        QNetworkManagerConnectionActive *activeConnection = i.value();
++        if ((activeConnection->defaultRoute() || activeConnection->default6Route())) {
++            return accessPointConfigurations.value(activeConnection->connection().path());
++        }
++    }
++
+     return QNetworkConfigurationPrivatePointer();
+ }
+ 
++QNetworkConfiguration::BearerType QNetworkManagerEngine::currentBearerType(const QString &id)
++{
++    if (ofonoManager->isValid()) {
++        QString contextPart = id.section('/', -1);
++
++        QHashIterator<QString, QOfonoDataConnectionManagerInterface*> i(ofonoContextManagers);
++        while (i.hasNext()) {
++            i.next();
++            QString contextPath = i.key() +"/"+contextPart;
++            if (i.value()->contexts().contains(contextPath)) {
++
++                QString bearer = i.value()->bearer();
++                if (bearer == QStringLiteral("gsm")) {
++                    return QNetworkConfiguration::Bearer2G;
++                } else if (bearer == QStringLiteral("edge")) {
++                    return QNetworkConfiguration::Bearer2G;
++                } else if (bearer == QStringLiteral("umts")) {
++                    return QNetworkConfiguration::BearerWCDMA;
++                } else if (bearer == QStringLiteral("hspa")
++                           || bearer == QStringLiteral("hsdpa")
++                           || bearer == QStringLiteral("hsupa")) {
++                    return QNetworkConfiguration::BearerHSPA;
++                } else if (bearer == QStringLiteral("lte")) {
++                    return QNetworkConfiguration::BearerLTE;
++                }
++            }
++        }
++    }
++    return QNetworkConfiguration::BearerUnknown;
++}
++
++QString QNetworkManagerEngine::contextName(const QString &path)
++{
++    if (ofonoManager->isValid()) {
++        QString contextPart = path.section('/', -1);
++        QHashIterator<QString, QOfonoDataConnectionManagerInterface*> i(ofonoContextManagers);
++        while (i.hasNext()) {
++            i.next();
++            Q_FOREACH (const QString &oContext, i.value()->contexts()) {
++                if (oContext.contains(contextPart)) {
++                    QOfonoConnectionContextInterface contextInterface(oContext,this);
++                    return contextInterface.name();
++                }
++            }
++        }
++    }
++    return path;
++}
++
+ QT_END_NAMESPACE
+ 
+ #endif // QT_NO_DBUS
+--- qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerengine.h
++++ qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerengine.h
+@@ -1,40 +1,32 @@
+ /****************************************************************************
+ **
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
+ ** Contact: http://www.qt-project.org/legal
+ **
+ ** This file is part of the plugins of the Qt Toolkit.
+ **
+-** $QT_BEGIN_LICENSE:LGPL$
++** $QT_BEGIN_LICENSE:LGPL21$
+ ** Commercial License Usage
+ ** Licensees holding valid commercial Qt licenses may use this file in
+ ** accordance with the commercial license agreement provided with the
+ ** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
+ ** use the contact form at http://qt.digia.com/contact-us.
+ **
+ ** GNU Lesser General Public License Usage
+ ** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+ **
+ ** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
++** rights. These rights are described in the Digia Qt LGPL Exception
+ ** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+ **
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
+@@ -57,6 +49,8 @@
+ 
+ #include "qnetworkmanagerservice.h"
+ 
++#include "../linux_common/qofonoservice_linux_p.h"
++
+ #include <QMap>
+ #include <QVariant>
+ 
+@@ -97,40 +91,47 @@
+     QNetworkConfigurationPrivatePointer defaultConfiguration();
+ 
+ private Q_SLOTS:
+-    void interfacePropertiesChanged(const QString &path,
+-                                    const QMap<QString, QVariant> &properties);
+-    void activeConnectionPropertiesChanged(const QString &path,
+-                                           const QMap<QString, QVariant> &properties);
+-    void devicePropertiesChanged(const QString &path,
+-                                 const QMap<QString, QVariant> &properties);
++    void interfacePropertiesChanged(const QMap<QString, QVariant> &properties);
++    void activeConnectionPropertiesChanged(const QMap<QString, QVariant> &properties);
+ 
+     void deviceAdded(const QDBusObjectPath &path);
+     void deviceRemoved(const QDBusObjectPath &path);
+ 
+     void newConnection(const QDBusObjectPath &path, QNetworkManagerSettings *settings = 0);
+     void removeConnection(const QString &path);
+-    void updateConnection(const QNmSettingsMap &settings);
++    void updateConnection();
+     void activationFinished(QDBusPendingCallWatcher *watcher);
++    void deviceConnectionsChanged(const QStringList &activeConnectionsList);
+ 
+-    void newAccessPoint(const QString &path, const QDBusObjectPath &objectPath);
+-    void removeAccessPoint(const QString &path, const QDBusObjectPath &objectPath);
+-    void updateAccessPoint(const QMap<QString, QVariant> &map);
++    void newAccessPoint(const QString &path);
++    void removeAccessPoint(const QString &path);
++    void scanFinished();
++
++    void wiredCarrierChanged(bool);
+ 
+ private:
+-    QNetworkConfigurationPrivate *parseConnection(const QString &service,
+-                                                  const QString &settingsPath,
++    QNetworkConfigurationPrivate *parseConnection(const QString &settingsPath,
+                                                   const QNmSettingsMap &map);
+     QNetworkManagerSettingsConnection *connectionFromId(const QString &id) const;
+ 
+-private:
+-    QNetworkManagerInterface *interface;
++    QNetworkManagerInterface *managerInterface;
+     QNetworkManagerSettings *systemSettings;
+-    QNetworkManagerSettings *userSettings;
++    QHash<QString, QNetworkManagerInterfaceDeviceWired *> wiredDevices;
+     QHash<QString, QNetworkManagerInterfaceDeviceWireless *> wirelessDevices;
+-    QHash<QString, QNetworkManagerConnectionActive *> activeConnections;
++
++    QHash<QString, QNetworkManagerConnectionActive *> activeConnectionsList;
+     QList<QNetworkManagerSettingsConnection *> connections;
+     QList<QNetworkManagerInterfaceAccessPoint *> accessPoints;
+-    QList<QNetworkManagerInterfaceAccessPoint *> configuredAccessPoints;
++    QHash<QString, QNetworkManagerInterfaceDevice *> interfaceDevices;
++
++    QMap<QString,QString> configuredAccessPoints; //ap, settings path
++    QHash<QString,QString> connectionInterfaces; // ac, interface
++
++    QOfonoManagerInterface *ofonoManager;
++    QHash <QString, QOfonoDataConnectionManagerInterface *> ofonoContextManagers;
++    QNetworkConfiguration::BearerType currentBearerType(const QString &id);
++    QString contextName(const QString &path);
++
+ };
+ 
+ QT_END_NAMESPACE
+--- qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerservice.cpp
++++ qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerservice.cpp
+@@ -1,40 +1,32 @@
+ /****************************************************************************
+ **
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
+ ** Contact: http://www.qt-project.org/legal
+ **
+ ** This file is part of the plugins of the Qt Toolkit.
+ **
+-** $QT_BEGIN_LICENSE:LGPL$
++** $QT_BEGIN_LICENSE:LGPL21$
+ ** Commercial License Usage
+ ** Licensees holding valid commercial Qt licenses may use this file in
+ ** accordance with the commercial license agreement provided with the
+ ** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
+ ** use the contact form at http://qt.digia.com/contact-us.
+ **
+ ** GNU Lesser General Public License Usage
+ ** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+ **
+ ** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
++** rights. These rights are described in the Digia Qt LGPL Exception
+ ** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+ **
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
+@@ -52,7 +44,6 @@
+ #include <QtDBus/QDBusPendingCall>
+ 
+ #include "qnetworkmanagerservice.h"
+-#include "qnmdbushelper.h"
+ 
+ #ifndef QT_NO_DBUS
+ 
+@@ -72,18 +63,38 @@
+     d->connectionInterface = new QDBusInterface(QLatin1String(NM_DBUS_SERVICE),
+                                                 QLatin1String(NM_DBUS_PATH),
+                                                 QLatin1String(NM_DBUS_INTERFACE),
+-                                                QDBusConnection::systemBus());
++                                                QDBusConnection::systemBus(),parent);
+     if (!d->connectionInterface->isValid()) {
+         d->valid = false;
+         return;
+     }
+     d->valid = true;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForPropertiesChanged(QString,QMap<QString,QVariant>)),
+-                    this,SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)));
+-    connect(nmDBusHelper,SIGNAL(pathForStateChanged(QString,quint32)),
+-            this, SIGNAL(stateChanged(QString,quint32)));
+ 
++    QDBusInterface managerPropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  QLatin1String(NM_DBUS_PATH),
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus());
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE);
++    QDBusPendingReply<QVariantMap> propsReply
++            = managerPropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusPendingReply<QList <QDBusObjectPath> > nmReply
++            = d->connectionInterface->call(QLatin1String("GetDevices"));
++    nmReply.waitForFinished();
++    if (!nmReply.isError()) {
++        devicesPathList = nmReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  QLatin1String(NM_DBUS_PATH),
++                                  QLatin1String(NM_DBUS_INTERFACE),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
+ }
+ 
+ QNetworkManagerInterface::~QNetworkManagerInterface()
+@@ -99,27 +110,24 @@
+ 
+ bool QNetworkManagerInterface::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+-    QDBusConnection dbusConnection = QDBusConnection::systemBus();
+-
+-    bool allOk = false;
+-    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+                                   QLatin1String(NM_DBUS_PATH),
+                                   QLatin1String(NM_DBUS_INTERFACE),
+                                   QLatin1String("PropertiesChanged"),
+-                                nmDBusHelper,SLOT(slotPropertiesChanged(QMap<QString,QVariant>)))) {
+-        allOk = true;
+-    }
+-    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
++
++    bool allOk = false;
++    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+                                   QLatin1String(NM_DBUS_PATH),
+                                   QLatin1String(NM_DBUS_INTERFACE),
+                                   QLatin1String("DeviceAdded"),
+                                 this,SIGNAL(deviceAdded(QDBusObjectPath)))) {
+         allOk = true;
+     }
+-    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+                                   QLatin1String(NM_DBUS_PATH),
+                                   QLatin1String(NM_DBUS_INTERFACE),
+                                   QLatin1String("DeviceRemoved"),
+@@ -135,52 +143,106 @@
+     return d->connectionInterface;
+ }
+ 
+-QList <QDBusObjectPath> QNetworkManagerInterface::getDevices() const
++QList <QDBusObjectPath> QNetworkManagerInterface::getDevices()
+ {
+-    QDBusReply<QList<QDBusObjectPath> > reply =  d->connectionInterface->call(QLatin1String("GetDevices"));
+-    return reply.value();
++    if (devicesPathList.isEmpty()) {
++        qWarning() << "using blocking call!";
++        QDBusReply<QList<QDBusObjectPath> > reply = d->connectionInterface->call(QLatin1String("GetDevices"));
++        devicesPathList = reply.value();
++    }
++    return devicesPathList;
+ }
+ 
+-void QNetworkManagerInterface::activateConnection( const QString &serviceName,
+-                                                  QDBusObjectPath connectionPath,
++void QNetworkManagerInterface::activateConnection(QDBusObjectPath connectionPath,
+                                                   QDBusObjectPath devicePath,
+                                                   QDBusObjectPath specificObject)
+ {
+     QDBusPendingCall pendingCall = d->connectionInterface->asyncCall(QLatin1String("ActivateConnection"),
+-                                                                    QVariant(serviceName),
+                                                                     QVariant::fromValue(connectionPath),
+                                                                     QVariant::fromValue(devicePath),
+                                                                     QVariant::fromValue(specificObject));
+ 
+-   QDBusPendingCallWatcher *callWatcher = new QDBusPendingCallWatcher(pendingCall, this);
++   QDBusPendingCallWatcher *callWatcher = new QDBusPendingCallWatcher(pendingCall);
+    connect(callWatcher, SIGNAL(finished(QDBusPendingCallWatcher*)),
+                     this, SIGNAL(activationFinished(QDBusPendingCallWatcher*)));
+ }
+ 
+ void QNetworkManagerInterface::deactivateConnection(QDBusObjectPath connectionPath)  const
+ {
+-    d->connectionInterface->call(QLatin1String("DeactivateConnection"), QVariant::fromValue(connectionPath));
++    d->connectionInterface->asyncCall(QLatin1String("DeactivateConnection"), QVariant::fromValue(connectionPath));
+ }
+ 
+ bool QNetworkManagerInterface::wirelessEnabled()  const
+ {
+-    return d->connectionInterface->property("WirelessEnabled").toBool();
++    if (propertyMap.contains("WirelessEnabled"))
++        return propertyMap.value("WirelessEnabled").toBool();
++    return false;
+ }
+ 
+ bool QNetworkManagerInterface::wirelessHardwareEnabled()  const
+ {
+-    return d->connectionInterface->property("WirelessHardwareEnabled").toBool();
++    if (propertyMap.contains("WirelessHardwareEnabled"))
++        return propertyMap.value("WirelessHardwareEnabled").toBool();
++    return false;
+ }
+ 
+ QList <QDBusObjectPath> QNetworkManagerInterface::activeConnections() const
+ {
+-    QVariant prop = d->connectionInterface->property("ActiveConnections");
+-    return prop.value<QList<QDBusObjectPath> >();
++    if (propertyMap.contains("ActiveConnections")) {
++
++        const QDBusArgument &dbusArgs = propertyMap.value("ActiveConnections").value<QDBusArgument>();
++        QDBusObjectPath path;
++        QList <QDBusObjectPath> list;
++
++        dbusArgs.beginArray();
++        while (!dbusArgs.atEnd()) {
++            dbusArgs >> path;
++            list.append(path);
++        }
++        dbusArgs.endArray();
++
++        return list;
++    }
++
++    QList <QDBusObjectPath> list;
++    list << QDBusObjectPath();
++    return list;
+ }
+ 
+-quint32 QNetworkManagerInterface::state()
++QNetworkManagerInterface::NMState QNetworkManagerInterface::state()
+ {
+-    return d->connectionInterface->property("State").toUInt();
++    if (propertyMap.contains("State"))
++        return static_cast<QNetworkManagerInterface::NMState>(propertyMap.value("State").toUInt());
++    return QNetworkManagerInterface::NM_STATE_UNKNOWN;
++}
++
++QString QNetworkManagerInterface::version() const
++{
++    if (propertyMap.contains("Version"))
++        return propertyMap.value("Version").toString();
++    return QString();
++}
++
++void QNetworkManagerInterface::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++
++        if (i.key() == QStringLiteral("State")) {
++            quint32 state = i.value().toUInt();
++            if (state == NM_DEVICE_STATE_ACTIVATED
++                || state == NM_DEVICE_STATE_DISCONNECTED
++                || state == NM_DEVICE_STATE_UNAVAILABLE
++                || state == NM_DEVICE_STATE_FAILED) {
++                Q_EMIT propertiesChanged(map);
++                Q_EMIT stateChanged(state);
++            }
++        } else if (i.key() == QStringLiteral("ActiveConnections")) {
++            Q_EMIT propertiesChanged(map);
++        }
++    }
+ }
+ 
+ class QNetworkManagerInterfaceAccessPointPrivate
+@@ -192,18 +254,38 @@
+ };
+ 
+ QNetworkManagerInterfaceAccessPoint::QNetworkManagerInterfaceAccessPoint(const QString &dbusPathName, QObject *parent)
+-        : QObject(parent), nmDBusHelper(0)
++        : QObject(parent)
+ {
+     d = new QNetworkManagerInterfaceAccessPointPrivate();
+     d->path = dbusPathName;
+     d->connectionInterface = new QDBusInterface(QLatin1String(NM_DBUS_SERVICE),
+                                                 d->path,
+                                                 QLatin1String(NM_DBUS_INTERFACE_ACCESS_POINT),
+-                                                QDBusConnection::systemBus());
++                                                QDBusConnection::systemBus(),parent);
+     if (!d->connectionInterface->isValid()) {
+         d->valid = false;
+         return;
+     }
++    QDBusInterface accessPointPropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus());
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_ACCESS_POINT);
++    QDBusPendingReply<QVariantMap> propsReply
++            = accessPointPropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_ACCESS_POINT),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
++
+     d->valid = true;
+ 
+ }
+@@ -221,24 +303,10 @@
+ 
+ bool QNetworkManagerInterfaceAccessPoint::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+-    bool allOk = false;
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForPropertiesChanged(QString,QMap<QString,QVariant>)),
+-            this,SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)));
+-
+-    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
+-                              QLatin1String(NM_DBUS_INTERFACE_ACCESS_POINT),
+-                              QLatin1String("PropertiesChanged"),
+-                              nmDBusHelper,SLOT(slotPropertiesChanged(QMap<QString,QVariant>))) ) {
+-        allOk = true;
+-
+-    }
+-    return allOk;
++    return true;
+ }
+ 
+ QDBusInterface *QNetworkManagerInterfaceAccessPoint::connectionInterface() const
+@@ -248,47 +316,74 @@
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::flags() const
+ {
+-    return d->connectionInterface->property("Flags").toUInt();
++    if (propertyMap.contains("Flags"))
++        return propertyMap.value("Flags").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::wpaFlags() const
+ {
+-    return d->connectionInterface->property("WpaFlags").toUInt();
++    if (propertyMap.contains("WpaFlags"))
++        return propertyMap.value("WpaFlags").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::rsnFlags() const
+ {
+-    return d->connectionInterface->property("RsnFlags").toUInt();
++    if (propertyMap.contains("RsnFlags"))
++        return propertyMap.value("RsnFlags").toUInt();
++    return 0;
+ }
+ 
+ QString QNetworkManagerInterfaceAccessPoint::ssid() const
+ {
+-    return d->connectionInterface->property("Ssid").toString();
++    if (propertyMap.contains("Ssid"))
++        return propertyMap.value("Ssid").toString();
++    return QString();
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::frequency() const
+ {
+-    return d->connectionInterface->property("Frequency").toUInt();
++    if (propertyMap.contains("Frequency"))
++        return propertyMap.value("Frequency").toUInt();
++    return 0;
+ }
+ 
+ QString QNetworkManagerInterfaceAccessPoint::hwAddress() const
+ {
+-    return d->connectionInterface->property("HwAddress").toString();
++    if (propertyMap.contains("HwAddress"))
++        return propertyMap.value("HwAddress").toString();
++    return QString();
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::mode() const
+ {
+-    return d->connectionInterface->property("Mode").toUInt();
++    if (propertyMap.contains("Mode"))
++        return propertyMap.value("Mode").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::maxBitrate() const
+ {
+-    return d->connectionInterface->property("MaxBitrate").toUInt();
++    if (propertyMap.contains("MaxBitrate"))
++        return propertyMap.value("MaxBitrate").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceAccessPoint::strength() const
+ {
+-    return d->connectionInterface->property("Strength").toUInt();
++    if (propertyMap.contains("Strength"))
++        return propertyMap.value("Strength").toUInt();
++    return 0;
++}
++
++void QNetworkManagerInterfaceAccessPoint::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++    }
+ }
+ 
+ class QNetworkManagerInterfaceDevicePrivate
+@@ -300,18 +395,39 @@
+ };
+ 
+ QNetworkManagerInterfaceDevice::QNetworkManagerInterfaceDevice(const QString &deviceObjectPath, QObject *parent)
+-        : QObject(parent), nmDBusHelper(0)
++        : QObject(parent)
+ {
++
+     d = new QNetworkManagerInterfaceDevicePrivate();
+     d->path = deviceObjectPath;
+     d->connectionInterface = new QDBusInterface(QLatin1String(NM_DBUS_SERVICE),
+                                                 d->path,
+                                                 QLatin1String(NM_DBUS_INTERFACE_DEVICE),
+-                                                QDBusConnection::systemBus());
++                                                QDBusConnection::systemBus(),parent);
+     if (!d->connectionInterface->isValid()) {
+         d->valid = false;
+         return;
+     }
++    QDBusInterface devicePropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus(),parent);
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_DEVICE);
++    QDBusPendingReply<QVariantMap> propsReply
++            = devicePropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_DEVICE),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
+     d->valid = true;
+ }
+ 
+@@ -328,22 +444,10 @@
+ 
+ bool QNetworkManagerInterfaceDevice::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+-    bool allOk = false;
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper,SIGNAL(pathForStateChanged(QString,quint32)),
+-            this, SIGNAL(stateChanged(QString,quint32)));
+-    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
+-                              QLatin1String(NM_DBUS_INTERFACE_DEVICE),
+-                              QLatin1String("StateChanged"),
+-                              nmDBusHelper,SLOT(deviceStateChanged(quint32)))) {
+-        allOk = true;
+-    }
+-    return allOk;
++    return true;
+ }
+ 
+ QDBusInterface *QNetworkManagerInterfaceDevice::connectionInterface() const
+@@ -353,33 +457,66 @@
+ 
+ QString QNetworkManagerInterfaceDevice::udi() const
+ {
+-    return d->connectionInterface->property("Udi").toString();
++    if (propertyMap.contains("Udi"))
++        return propertyMap.value("Udi").toString();
++    return QString();
+ }
+ 
+ QString QNetworkManagerInterfaceDevice::networkInterface() const
+ {
+-    return d->connectionInterface->property("Interface").toString();
++    if (propertyMap.contains("Interface"))
++        return propertyMap.value("Interface").toString();
++    return QString();
+ }
+ 
+ quint32 QNetworkManagerInterfaceDevice::ip4Address() const
+ {
+-    return d->connectionInterface->property("Ip4Address").toUInt();
++    if (propertyMap.contains("Ip4Address"))
++        return propertyMap.value("Ip4Address").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceDevice::state() const
+ {
+-    return d->connectionInterface->property("State").toUInt();
++    if (propertyMap.contains("State"))
++        return propertyMap.value("State").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceDevice::deviceType() const
+ {
+-    return d->connectionInterface->property("DeviceType").toUInt();
++    if (propertyMap.contains("DeviceType"))
++        return propertyMap.value("DeviceType").toUInt();
++    return 0;
+ }
+ 
+ QDBusObjectPath QNetworkManagerInterfaceDevice::ip4config() const
+ {
+-    QVariant prop = d->connectionInterface->property("Ip4Config");
+-    return prop.value<QDBusObjectPath>();
++    if (propertyMap.contains("Ip4Config"))
++        return propertyMap.value("Ip4Config").value<QDBusObjectPath>();
++    return QDBusObjectPath();
++}
++
++void QNetworkManagerInterfaceDevice::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        if (i.key() == QStringLiteral("AvailableConnections")) { //Device
++            const QDBusArgument &dbusArgs = i.value().value<QDBusArgument>();
++            QDBusObjectPath path;
++            QStringList paths;
++            dbusArgs.beginArray();
++            while (!dbusArgs.atEnd()) {
++                dbusArgs >> path;
++                paths << path.path();
++            }
++            dbusArgs.endArray();
++            Q_EMIT connectionsChanged(paths);
++        }
++        propertyMap.insert(i.key(),i.value());
++    }
++    Q_EMIT propertiesChanged(map);
+ }
+ 
+ class QNetworkManagerInterfaceDeviceWiredPrivate
+@@ -391,7 +528,7 @@
+ };
+ 
+ QNetworkManagerInterfaceDeviceWired::QNetworkManagerInterfaceDeviceWired(const QString &ifaceDevicePath, QObject *parent)
+-    : QObject(parent), nmDBusHelper(0)
++    : QObject(parent)
+ {
+     d = new QNetworkManagerInterfaceDeviceWiredPrivate();
+     d->path = ifaceDevicePath;
+@@ -403,6 +540,27 @@
+         d->valid = false;
+         return;
+     }
++    QDBusInterface deviceWiredPropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus(),parent);
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRED);
++    QDBusPendingReply<QVariantMap> propsReply
++            = deviceWiredPropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRED),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
++
+     d->valid = true;
+ }
+ 
+@@ -420,23 +578,9 @@
+ 
+ bool QNetworkManagerInterfaceDeviceWired::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+-
+-    bool allOk = false;
+-
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForPropertiesChanged(QString,QMap<QString,QVariant>)),
+-            this,SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)));
+-    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
+-                              QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRED),
+-                              QLatin1String("PropertiesChanged"),
+-                              nmDBusHelper,SLOT(slotPropertiesChanged(QMap<QString,QVariant>))) )  {
+-        allOk = true;
+-    }
+-    return allOk;
++    return true;
+ }
+ 
+ QDBusInterface *QNetworkManagerInterfaceDeviceWired::connectionInterface() const
+@@ -446,17 +590,53 @@
+ 
+ QString QNetworkManagerInterfaceDeviceWired::hwAddress() const
+ {
+-    return d->connectionInterface->property("HwAddress").toString();
++    if (propertyMap.contains("HwAddress"))
++        return propertyMap.value("HwAddress").toString();
++    return QString();
+ }
+ 
+ quint32 QNetworkManagerInterfaceDeviceWired::speed() const
+ {
+-    return d->connectionInterface->property("Speed").toUInt();
++    if (propertyMap.contains("Speed"))
++        return propertyMap.value("Speed").toUInt();
++    return 0;
+ }
+ 
+ bool QNetworkManagerInterfaceDeviceWired::carrier() const
+ {
+-    return d->connectionInterface->property("Carrier").toBool();
++    if (propertyMap.contains("Carrier"))
++        return propertyMap.value("Carrier").toBool();
++    return false;
++}
++
++QStringList QNetworkManagerInterfaceDeviceWired::availableConnections()
++{
++    QStringList list;
++    if (propertyMap.contains("AvailableConnections")) {
++        const QDBusArgument &dbusArgs = propertyMap.value("Carrier").value<QDBusArgument>();
++        QDBusObjectPath path;
++        dbusArgs.beginArray();
++        while (!dbusArgs.atEnd()) {
++            dbusArgs >> path;
++            list << path.path();
++        }
++        dbusArgs.endArray();
++    }
++
++    return list;
++}
++
++void QNetworkManagerInterfaceDeviceWired::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++        if (i.key() == QStringLiteral("Carrier")) {
++            Q_EMIT carrierChanged(i.value().toBool());
++        }
++    }
++    Q_EMIT propertiesChanged(map);
+ }
+ 
+ class QNetworkManagerInterfaceDeviceWirelessPrivate
+@@ -468,7 +648,7 @@
+ };
+ 
+ QNetworkManagerInterfaceDeviceWireless::QNetworkManagerInterfaceDeviceWireless(const QString &ifaceDevicePath, QObject *parent)
+-    : QObject(parent), nmDBusHelper(0)
++    : QObject(parent)
+ {
+     d = new QNetworkManagerInterfaceDeviceWirelessPrivate();
+     d->path = ifaceDevicePath;
+@@ -480,6 +660,34 @@
+         d->valid = false;
+         return;
+     }
++
++
++    QDBusPendingReply<QList <QDBusObjectPath> > nmReply
++            = d->connectionInterface->call(QLatin1String("GetAccessPoints"));
++
++    if (!nmReply.isError()) {
++        accessPointsList = nmReply.value();
++    }
++
++    QDBusInterface deviceWirelessPropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus(),parent);
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS);
++    QDBusPendingReply<QVariantMap> propsReply
++            = deviceWirelessPropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
+     d->valid = true;
+ }
+ 
+@@ -494,50 +702,50 @@
+     return d->valid;
+ }
+ 
++void QNetworkManagerInterfaceDeviceWireless::slotAccessPointAdded(QDBusObjectPath path)
++{
++    if (path.path().length() > 2)
++        Q_EMIT accessPointAdded(path.path());
++}
++
++void QNetworkManagerInterfaceDeviceWireless::slotAccessPointRemoved(QDBusObjectPath path)
++{
++    if (path.path().length() > 2)
++        Q_EMIT accessPointRemoved(path.path());
++}
++
+ bool QNetworkManagerInterfaceDeviceWireless::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+     QDBusConnection dbusConnection = QDBusConnection::systemBus();
+-    bool allOk = false;
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForPropertiesChanged(QString,QMap<QString,QVariant>)),
+-            this,SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)));
++    bool allOk = true;
+ 
+-    connect(nmDBusHelper, SIGNAL(pathForAccessPointAdded(QString,QDBusObjectPath)),
+-            this,SIGNAL(accessPointAdded(QString,QDBusObjectPath)));
+-
+-    connect(nmDBusHelper, SIGNAL(pathForAccessPointRemoved(QString,QDBusObjectPath)),
+-            this,SIGNAL(accessPointRemoved(QString,QDBusObjectPath)));
+-
+-    if(!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
++    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++                                d->path,
+                               QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS),
+                               QLatin1String("AccessPointAdded"),
+-                              nmDBusHelper, SLOT(slotAccessPointAdded(QDBusObjectPath)))) {
+-        allOk = true;
++                              this, SLOT(slotAccessPointAdded(QDBusObjectPath)))) {
++        allOk = false;
+     }
+ 
+ 
+-    if(!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
+                               d->path,
+                               QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS),
+                               QLatin1String("AccessPointRemoved"),
+-                              nmDBusHelper, SLOT(slotAccessPointRemoved(QDBusObjectPath)))) {
+-        allOk = true;
++                              this, SLOT(slotAccessPointRemoved(QDBusObjectPath)))) {
++        allOk = false;
+     }
+ 
+-
+-    if(!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
+-                              QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS),
+-                              QLatin1String("PropertiesChanged"),
+-                              nmDBusHelper,SLOT(slotPropertiesChanged(QMap<QString,QVariant>)))) {
+-        allOk = true;
++    if (!dbusConnection.connect(QLatin1String(NM_DBUS_SERVICE),
++                               d->path,
++                               QLatin1String(NM_DBUS_INTERFACE_DEVICE_WIRELESS),
++                               QLatin1String("ScanDone"),
++                               this, SLOT(scanIsDone()))) {
++        allOk = false;
+     }
+-
+     return allOk;
+ }
+ 
+@@ -548,33 +756,162 @@
+ 
+ QList <QDBusObjectPath> QNetworkManagerInterfaceDeviceWireless::getAccessPoints()
+ {
+-    QDBusReply<QList<QDBusObjectPath> > reply = d->connectionInterface->call(QLatin1String("GetAccessPoints"));
+-    return reply.value();
++    if (accessPointsList.isEmpty()) {
++        qWarning() << "Using blocking call!";
++        QDBusReply<QList<QDBusObjectPath> > reply
++                = d->connectionInterface->call(QLatin1String("GetAccessPoints"));
++        accessPointsList = reply.value();
++    }
++    return accessPointsList;
+ }
+ 
+ QString QNetworkManagerInterfaceDeviceWireless::hwAddress() const
+ {
+-    return d->connectionInterface->property("HwAddress").toString();
++    if (propertyMap.contains("HwAddress"))
++        return propertyMap.value("HwAddress").toString();
++    return QString();
+ }
+ 
+ quint32 QNetworkManagerInterfaceDeviceWireless::mode() const
+ {
+-    return d->connectionInterface->property("Mode").toUInt();
++    if (propertyMap.contains("Mode"))
++        return propertyMap.value("Mode").toUInt();
++    return 0;
+ }
+ 
+ quint32 QNetworkManagerInterfaceDeviceWireless::bitrate() const
+ {
+-    return d->connectionInterface->property("Bitrate").toUInt();
++    if (propertyMap.contains("Bitrate"))
++        return propertyMap.value("Bitrate").toUInt();
++    return 0;
+ }
+ 
+ QDBusObjectPath QNetworkManagerInterfaceDeviceWireless::activeAccessPoint() const
+ {
+-    return d->connectionInterface->property("ActiveAccessPoint").value<QDBusObjectPath>();
++    if (propertyMap.contains("ActiveAccessPoint"))
++        return propertyMap.value("ActiveAccessPoint").value<QDBusObjectPath>();
++    return QDBusObjectPath();
+ }
+ 
+ quint32 QNetworkManagerInterfaceDeviceWireless::wirelessCapabilities() const
+ {
+-    return d->connectionInterface->property("WirelelessCapabilities").toUInt();
++    if (propertyMap.contains("WirelelessCapabilities"))
++        return propertyMap.value("WirelelessCapabilities").toUInt();
++    return 0;
++}
++
++void QNetworkManagerInterfaceDeviceWireless::scanIsDone()
++{
++    Q_EMIT scanDone();
++}
++
++void QNetworkManagerInterfaceDeviceWireless::requestScan()
++{
++    d->connectionInterface->asyncCall(QLatin1String("RequestScan"));
++}
++
++void QNetworkManagerInterfaceDeviceWireless::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++        if (i.key() == QStringLiteral("ActiveAccessPoint")) { //DeviceWireless
++            Q_EMIT propertiesChanged(map);
++        }
++    }
++}
++
++class QNetworkManagerInterfaceDeviceModemPrivate
++{
++public:
++    QDBusInterface *connectionInterface;
++    QString path;
++    bool valid;
++};
++
++QNetworkManagerInterfaceDeviceModem::QNetworkManagerInterfaceDeviceModem(const QString &ifaceDevicePath, QObject *parent)
++    : QObject(parent)
++{
++    d = new QNetworkManagerInterfaceDeviceModemPrivate();
++    d->path = ifaceDevicePath;
++    d->connectionInterface = new QDBusInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                d->path,
++                                                QLatin1String(NM_DBUS_INTERFACE_DEVICE_MODEM),
++                                                QDBusConnection::systemBus(), parent);
++    if (!d->connectionInterface->isValid()) {
++        d->valid = false;
++        return;
++    }
++    QDBusInterface deviceModemPropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus(),parent);
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_DEVICE_MODEM);
++    QDBusPendingReply<QVariantMap> propsReply
++            = deviceModemPropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_DEVICE_MODEM),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
++    d->valid = true;
++}
++
++QNetworkManagerInterfaceDeviceModem::~QNetworkManagerInterfaceDeviceModem()
++{
++    delete d->connectionInterface;
++    delete d;
++}
++
++bool QNetworkManagerInterfaceDeviceModem::isValid()
++{
++
++    return d->valid;
++}
++
++bool QNetworkManagerInterfaceDeviceModem::setConnections()
++{
++    if (!isValid() )
++        return false;
++
++    return true;
++}
++
++QDBusInterface *QNetworkManagerInterfaceDeviceModem::connectionInterface() const
++{
++    return d->connectionInterface;
++}
++
++QNetworkManagerInterfaceDeviceModem::ModemCapabilities QNetworkManagerInterfaceDeviceModem::modemCapabilities() const
++{
++    if (propertyMap.contains("ModemCapabilities"))
++        return static_cast<QNetworkManagerInterfaceDeviceModem::ModemCapabilities>(propertyMap.value("ModemCapabilities").toUInt());
++    return QNetworkManagerInterfaceDeviceModem::None;
++}
++
++QNetworkManagerInterfaceDeviceModem::ModemCapabilities QNetworkManagerInterfaceDeviceModem::currentCapabilities() const
++{
++    if (propertyMap.contains("CurrentCapabilities"))
++        return static_cast<QNetworkManagerInterfaceDeviceModem::ModemCapabilities>(propertyMap.value("CurrentCapabilities").toUInt());
++    return QNetworkManagerInterfaceDeviceModem::None;
++}
++
++void QNetworkManagerInterfaceDeviceModem::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++    }
++    Q_EMIT propertiesChanged(map);
+ }
+ 
+ class QNetworkManagerSettingsPrivate
+@@ -598,6 +935,14 @@
+         d->valid = false;
+         return;
+     }
++
++    QDBusPendingReply<QList <QDBusObjectPath> > nmReply
++            = d->connectionInterface->call(QLatin1String("ListConnections"));
++
++    if (!nmReply.isError()) {
++        connectionsList = nmReply.value();
++    }
++
+     d->valid = true;
+ }
+ 
+@@ -614,12 +959,14 @@
+ 
+ bool QNetworkManagerSettings::setConnections()
+ {
+-    bool allOk = false;
++    bool allOk = true;
+ 
+-    if (!QDBusConnection::systemBus().connect(d->path, QLatin1String(NM_DBUS_PATH_SETTINGS),
+-                           QLatin1String(NM_DBUS_IFACE_SETTINGS), QLatin1String("NewConnection"),
+-                           this, SIGNAL(newConnection(QDBusObjectPath)))) {
+-        allOk = true;
++    if (!QDBusConnection::systemBus().connect(d->path,
++                                             QLatin1String(NM_DBUS_PATH_SETTINGS),
++                                             QLatin1String(NM_DBUS_IFACE_SETTINGS),
++                                             QLatin1String("NewConnection"),
++                                             this, SIGNAL(newConnection(QDBusObjectPath)))) {
++        allOk = false;
+     }
+ 
+     return allOk;
+@@ -627,8 +974,22 @@
+ 
+ QList <QDBusObjectPath> QNetworkManagerSettings::listConnections()
+ {
+-    QDBusReply<QList<QDBusObjectPath> > reply = d->connectionInterface->call(QLatin1String("ListConnections"));
+-    return  reply.value();
++    if (connectionsList.isEmpty()) {
++        qWarning() << "Using blocking call!";
++        QDBusReply<QList<QDBusObjectPath> > reply
++                = d->connectionInterface->call(QLatin1String("ListConnections"));
++        connectionsList = reply.value();
++    }
++    return connectionsList;
++}
++
++
++QString QNetworkManagerSettings::getConnectionByUuid(const QString &uuid)
++{
++    QList<QVariant> argumentList;
++    argumentList << QVariant::fromValue(uuid);
++    QDBusReply<QDBusObjectPath > reply = d->connectionInterface->callWithArgumentList(QDBus::Block,QLatin1String("GetConnectionByUuid"), argumentList);
++    return reply.value().path();
+ }
+ 
+ QDBusInterface *QNetworkManagerSettings::connectionInterface() const
+@@ -648,7 +1009,7 @@
+ };
+ 
+ QNetworkManagerSettingsConnection::QNetworkManagerSettingsConnection(const QString &settingsService, const QString &connectionObjectPath, QObject *parent)
+-    : QObject(parent), nmDBusHelper(0)
++    : QObject(parent)
+ {
+     qDBusRegisterMetaType<QNmSettingsMap>();
+     d = new QNetworkManagerSettingsConnectionPrivate();
+@@ -663,8 +1024,12 @@
+         return;
+     }
+     d->valid = true;
+-    QDBusReply< QNmSettingsMap > rep = d->connectionInterface->call(QLatin1String("GetSettings"));
+-    d->settingsMap = rep.value();
++
++    QDBusPendingReply<QNmSettingsMap> nmReply
++            = d->connectionInterface->call(QLatin1String("GetSettings"));
++    if (!nmReply.isError()) {
++        d->settingsMap = nmReply.value();
++    }
+ }
+ 
+ QNetworkManagerSettingsConnection::~QNetworkManagerSettingsConnection()
+@@ -680,33 +1045,34 @@
+ 
+ bool QNetworkManagerSettingsConnection::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+     QDBusConnection dbusConnection = QDBusConnection::systemBus();
+-    bool allOk = false;
+-    if(!dbusConnection.connect(d->service, d->path,
+-                           QLatin1String(NM_DBUS_IFACE_SETTINGS_CONNECTION), QLatin1String("Updated"),
+-                           this, SIGNAL(updated(QNmSettingsMap)))) {
+-        allOk = true;
+-    } else {
+-        QDBusError error = dbusConnection.lastError();
++    bool allOk = true;
++    if (!dbusConnection.connect(d->service,
++                               d->path,
++                               QLatin1String(NM_DBUS_IFACE_SETTINGS_CONNECTION),
++                               QLatin1String("Updated"),
++                               this, SIGNAL(updated()))) {
++        allOk = false;
+     }
+ 
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForSettingsRemoved(QString)),
+-            this,SIGNAL(removed(QString)));
+-
+-    if (!dbusConnection.connect(d->service, d->path,
+-                           QLatin1String(NM_DBUS_IFACE_SETTINGS_CONNECTION), QLatin1String("Removed"),
+-                           nmDBusHelper, SIGNAL(slotSettingsRemoved()))) {
+-        allOk = true;
++    if (!dbusConnection.connect(d->service,
++                               d->path,
++                               QLatin1String(NM_DBUS_IFACE_SETTINGS_CONNECTION),
++                               QLatin1String("Removed"),
++                               this, SIGNAL(slotSettingsRemoved()))) {
++        allOk = false;
+     }
+-
+     return allOk;
+ }
+ 
++void QNetworkManagerSettingsConnection::slotSettingsRemoved()
++{
++    Q_EMIT removed(d->path);
++}
++
+ QDBusInterface *QNetworkManagerSettingsConnection::connectionInterface() const
+ {
+     return d->connectionInterface;
+@@ -714,8 +1080,11 @@
+ 
+ QNmSettingsMap QNetworkManagerSettingsConnection::getSettings()
+ {
+-    QDBusReply< QNmSettingsMap > rep = d->connectionInterface->call(QLatin1String("GetSettings"));
+-    d->settingsMap = rep.value();
++    if (d->settingsMap.isEmpty()) {
++        qWarning() << "Using blocking call!";
++        QDBusReply<QNmSettingsMap> reply = d->connectionInterface->call(QLatin1String("GetSettings"));
++        d->settingsMap = reply.value();
++    }
+     return d->settingsMap;
+ }
+ 
+@@ -725,9 +1094,11 @@
+         d->settingsMap.value(QLatin1String("connection")).value(QLatin1String("type")).toString();
+ 
+     if (devType == QLatin1String("802-3-ethernet"))
+-        return DEVICE_TYPE_802_3_ETHERNET;
++        return DEVICE_TYPE_ETHERNET;
+     else if (devType == QLatin1String("802-11-wireless"))
+-        return DEVICE_TYPE_802_11_WIRELESS;
++        return DEVICE_TYPE_WIFI;
++    else if (devType == QLatin1String("gsm"))
++        return DEVICE_TYPE_MODEM;
+     else
+         return DEVICE_TYPE_UNKNOWN;
+ }
+@@ -774,10 +1145,10 @@
+ {
+     NMDeviceType type = getType();
+ 
+-    if (type == DEVICE_TYPE_802_3_ETHERNET) {
++    if (type == DEVICE_TYPE_ETHERNET) {
+         return d->settingsMap.value(QLatin1String("802-3-ethernet"))
+                              .value(QLatin1String("mac-address")).toString();
+-    } else if (type == DEVICE_TYPE_802_11_WIRELESS) {
++    } else if (type == DEVICE_TYPE_WIFI) {
+         return d->settingsMap.value(QLatin1String("802-11-wireless"))
+                              .value(QLatin1String("mac-address")).toString();
+     } else {
+@@ -787,7 +1158,7 @@
+ 
+ QStringList QNetworkManagerSettingsConnection::getSeenBssids()
+ {
+-    if (getType() == DEVICE_TYPE_802_11_WIRELESS) {
++    if (getType() == DEVICE_TYPE_WIFI) {
+         return d->settingsMap.value(QLatin1String("802-11-wireless"))
+                              .value(QLatin1String("seen-bssids")).toStringList();
+     } else {
+@@ -803,8 +1174,8 @@
+     bool valid;
+ };
+ 
+-QNetworkManagerConnectionActive::QNetworkManagerConnectionActive( const QString &activeConnectionObjectPath, QObject *parent)
+-    : QObject(parent), nmDBusHelper(0)
++QNetworkManagerConnectionActive::QNetworkManagerConnectionActive(const QString &activeConnectionObjectPath, QObject *parent)
++    : QObject(parent)
+ {
+     d = new QNetworkManagerConnectionActivePrivate();
+     d->path = activeConnectionObjectPath;
+@@ -816,6 +1187,29 @@
+         d->valid = false;
+         return;
+     }
++    QDBusInterface connectionActivePropertiesInterface(QLatin1String(NM_DBUS_SERVICE),
++                                                  d->path,
++                                                  QLatin1String("org.freedesktop.DBus.Properties"),
++                                                  QDBusConnection::systemBus());
++
++
++    QList<QVariant> argumentList;
++    argumentList << QLatin1String(NM_DBUS_INTERFACE_ACTIVE_CONNECTION);
++    QDBusPendingReply<QVariantMap> propsReply
++            = connectionActivePropertiesInterface.callWithArgumentList(QDBus::Block,QLatin1String("GetAll"),
++                                                                       argumentList);
++
++    if (!propsReply.isError()) {
++        propertyMap = propsReply.value();
++    } else {
++        qWarning() << propsReply.error().message();
++    }
++
++    QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
++                                  d->path,
++                                  QLatin1String(NM_DBUS_INTERFACE_ACTIVE_CONNECTION),
++                                  QLatin1String("PropertiesChanged"),
++                                  this,SLOT(propertiesSwap(QMap<QString,QVariant>)));
+     d->valid = true;
+ }
+ 
+@@ -832,23 +1226,10 @@
+ 
+ bool QNetworkManagerConnectionActive::setConnections()
+ {
+-    if(!isValid() )
++    if (!isValid())
+         return false;
+ 
+-    bool allOk = false;
+-    delete nmDBusHelper;
+-    nmDBusHelper = new QNmDBusHelper(this);
+-    connect(nmDBusHelper, SIGNAL(pathForPropertiesChanged(QString,QMap<QString,QVariant>)),
+-            this,SIGNAL(propertiesChanged(QString,QMap<QString,QVariant>)));
+-    if (QDBusConnection::systemBus().connect(QLatin1String(NM_DBUS_SERVICE),
+-                              d->path,
+-                              QLatin1String(NM_DBUS_INTERFACE_ACTIVE_CONNECTION),
+-                              QLatin1String("PropertiesChanged"),
+-                              nmDBusHelper,SLOT(slotPropertiesChanged(QMap<QString,QVariant>))) )  {
+-        allOk = true;
+-    }
+-
+-    return allOk;
++    return true;
+ }
+ 
+ QDBusInterface *QNetworkManagerConnectionActive::connectionInterface() const
+@@ -856,37 +1237,72 @@
+     return d->connectionInterface;
+ }
+ 
+-QString QNetworkManagerConnectionActive::serviceName() const
+-{
+-    return d->connectionInterface->property("ServiceName").toString();
+-}
+-
+ QDBusObjectPath QNetworkManagerConnectionActive::connection() const
+ {
+-    QVariant prop = d->connectionInterface->property("Connection");
+-    return prop.value<QDBusObjectPath>();
++    if (propertyMap.contains("Connection"))
++        return propertyMap.value("Connection").value<QDBusObjectPath>();
++    return QDBusObjectPath();
+ }
+ 
+ QDBusObjectPath QNetworkManagerConnectionActive::specificObject() const
+ {
+-    QVariant prop = d->connectionInterface->property("SpecificObject");
+-    return prop.value<QDBusObjectPath>();
+-}
+-
+-QList<QDBusObjectPath> QNetworkManagerConnectionActive::devices() const
+-{
+-    QVariant prop = d->connectionInterface->property("Devices");
+-    return prop.value<QList<QDBusObjectPath> >();
++    if (propertyMap.contains("SpecificObject"))
++        return propertyMap.value("SpecificObject").value<QDBusObjectPath>();
++    return QDBusObjectPath();
++}
++
++QStringList QNetworkManagerConnectionActive::devices() const
++{
++    QStringList list;
++    if (propertyMap.contains("Devices")) {
++        const QDBusArgument &dbusArgs = propertyMap.value("Devices").value<QDBusArgument>();
++        QDBusObjectPath path;
++
++        dbusArgs.beginArray();
++        while (!dbusArgs.atEnd()) {
++            dbusArgs >> path;
++            list.append(path.path());
++        }
++        dbusArgs.endArray();
++    }
++    return list;
+ }
+ 
+ quint32 QNetworkManagerConnectionActive::state() const
+ {
+-    return d->connectionInterface->property("State").toUInt();
++    if (propertyMap.contains("State"))
++        return propertyMap.value("State").toUInt();
++    return 0;
+ }
+ 
+ bool QNetworkManagerConnectionActive::defaultRoute() const
+ {
+-    return d->connectionInterface->property("Default").toBool();
++    if (propertyMap.contains("Default"))
++        return propertyMap.value("Default").toBool();
++    return false;
++}
++
++bool QNetworkManagerConnectionActive::default6Route() const
++{
++    if (propertyMap.contains("Default6"))
++        return propertyMap.value("Default6").toBool();
++    return false;
++}
++
++void QNetworkManagerConnectionActive::propertiesSwap(QMap<QString,QVariant> map)
++{
++    QMapIterator<QString, QVariant> i(map);
++    while (i.hasNext()) {
++        i.next();
++        propertyMap.insert(i.key(),i.value());
++        if (i.key() == QStringLiteral("State")) {
++            quint32 state = i.value().toUInt();
++            if (state == NM_ACTIVE_CONNECTION_STATE_ACTIVATED
++                || state == NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) {
++                Q_EMIT propertiesChanged(map);
++            }
++        }
++    }
+ }
+ 
+ class QNetworkManagerIp4ConfigPrivate
+--- qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerservice.h
++++ qtbase/src/plugins/bearer/networkmanager/qnetworkmanagerservice.h
+@@ -1,40 +1,32 @@
+ /****************************************************************************
+ **
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
++** Copyright (C) 2014 Digia Plc and/or its subsidiary(-ies).
+ ** Contact: http://www.qt-project.org/legal
+ **
+ ** This file is part of the plugins of the Qt Toolkit.
+ **
+-** $QT_BEGIN_LICENSE:LGPL$
++** $QT_BEGIN_LICENSE:LGPL21$
+ ** Commercial License Usage
+ ** Licensees holding valid commercial Qt licenses may use this file in
+ ** accordance with the commercial license agreement provided with the
+ ** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
++** a written agreement between you and Digia. For licensing terms and
++** conditions see http://qt.digia.com/licensing. For further information
+ ** use the contact form at http://qt.digia.com/contact-us.
+ **
+ ** GNU Lesser General Public License Usage
+ ** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
++** General Public License version 2.1 or version 3 as published by the Free
++** Software Foundation and appearing in the file LICENSE.LGPLv21 and
++** LICENSE.LGPLv3 included in the packaging of this file. Please review the
++** following information to ensure the GNU Lesser General Public License
++** requirements will be met: https://www.gnu.org/licenses/lgpl.html and
++** http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+ **
+ ** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
++** rights. These rights are described in the Digia Qt LGPL Exception
+ ** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+ **
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+ ** $QT_END_LICENSE$
+ **
+ ****************************************************************************/
+@@ -64,7 +56,6 @@
+ #include <QtDBus/QDBusObjectPath>
+ #include <QtDBus/QDBusContext>
+ #include <QMap>
+-#include "qnmdbushelper.h"
+ 
+ #ifndef QT_NO_DBUS
+ 
+@@ -72,31 +63,32 @@
+ typedef enum NMDeviceType
+ {
+     DEVICE_TYPE_UNKNOWN = 0,
+-    DEVICE_TYPE_802_3_ETHERNET,
+-    DEVICE_TYPE_802_11_WIRELESS,
+-    DEVICE_TYPE_GSM,
+-    DEVICE_TYPE_CDMA
++    DEVICE_TYPE_ETHERNET,
++    DEVICE_TYPE_WIFI,
++    DEVICE_TYPE_MODEM = 8
+ } NMDeviceType;
+ 
+ typedef enum
+ {
+     NM_DEVICE_STATE_UNKNOWN = 0,
+-    NM_DEVICE_STATE_UNMANAGED,
+-    NM_DEVICE_STATE_UNAVAILABLE,
+-    NM_DEVICE_STATE_DISCONNECTED,
+-    NM_DEVICE_STATE_PREPARE,
+-    NM_DEVICE_STATE_CONFIG,
+-    NM_DEVICE_STATE_NEED_AUTH,
+-    NM_DEVICE_STATE_IP_CONFIG,
+-    NM_DEVICE_STATE_ACTIVATED,
+-    NM_DEVICE_STATE_FAILED
++    NM_DEVICE_STATE_UNMANAGED = 10,
++    NM_DEVICE_STATE_UNAVAILABLE = 20,
++    NM_DEVICE_STATE_DISCONNECTED = 30,
++    NM_DEVICE_STATE_PREPARE = 40,
++    NM_DEVICE_STATE_CONFIG = 50,
++    NM_DEVICE_STATE_NEED_AUTH = 60,
++    NM_DEVICE_STATE_IP_CONFIG = 70,
++    NM_DEVICE_STATE_ACTIVATED = 100,
++    NM_DEVICE_STATE_DEACTIVATING = 110,
++    NM_DEVICE_STATE_FAILED = 120
+ } NMDeviceState;
+ 
+ typedef enum
+ {
+     NM_ACTIVE_CONNECTION_STATE_UNKNOWN = 0,
+     NM_ACTIVE_CONNECTION_STATE_ACTIVATING,
+-    NM_ACTIVE_CONNECTION_STATE_ACTIVATED
++    NM_ACTIVE_CONNECTION_STATE_ACTIVATED,
++    NM_ACTIVE_CONNECTION_STATE_DEACTIVATED = 4
+ } NMActiveConnectionState;
+ 
+ #define NM_DBUS_SERVICE                     "org.freedesktop.NetworkManager"
+@@ -106,13 +98,14 @@
+ #define NM_DBUS_INTERFACE_DEVICE            NM_DBUS_INTERFACE ".Device"
+ #define NM_DBUS_INTERFACE_DEVICE_WIRED      NM_DBUS_INTERFACE_DEVICE ".Wired"
+ #define NM_DBUS_INTERFACE_DEVICE_WIRELESS   NM_DBUS_INTERFACE_DEVICE ".Wireless"
++#define NM_DBUS_INTERFACE_DEVICE_MODEM      NM_DBUS_INTERFACE_DEVICE ".Modem"
+ #define NM_DBUS_PATH_ACCESS_POINT           NM_DBUS_PATH "/AccessPoint"
+ #define NM_DBUS_INTERFACE_ACCESS_POINT      NM_DBUS_INTERFACE ".AccessPoint"
+ 
+-#define NM_DBUS_PATH_SETTINGS               "/org/freedesktop/NetworkManagerSettings"
++#define NM_DBUS_PATH_SETTINGS               "/org/freedesktop/NetworkManager/Settings"
+ 
+-#define NM_DBUS_IFACE_SETTINGS_CONNECTION   "org.freedesktop.NetworkManagerSettings.Connection"
+-#define NM_DBUS_IFACE_SETTINGS              "org.freedesktop.NetworkManagerSettings"
++#define NM_DBUS_IFACE_SETTINGS_CONNECTION   "org.freedesktop.NetworkManager.Settings.Connection"
++#define NM_DBUS_IFACE_SETTINGS              "org.freedesktop.NetworkManager.Settings"
+ #define NM_DBUS_INTERFACE_ACTIVE_CONNECTION NM_DBUS_INTERFACE ".Connection.Active"
+ #define NM_DBUS_INTERFACE_IP4_CONFIG        NM_DBUS_INTERFACE ".IP4Config"
+ 
+@@ -141,12 +134,23 @@
+     Q_OBJECT
+ 
+ public:
++    typedef enum
++    {
++        NM_STATE_UNKNOWN = 0,
++        NM_STATE_ASLEEP = 10,
++        NM_STATE_DISCONNECTED = 20,
++        NM_STATE_DISCONNECTING = 30,
++        NM_STATE_CONNECTING = 40,
++        NM_STATE_CONNECTED_LOCAL = 50,
++        NM_STATE_CONNECTED_SITE = 60,
++        NM_STATE_CONNECTED_GLOBAL = 70
++    } NMState;
+ 
+     QNetworkManagerInterface(QObject *parent = 0);
+     ~QNetworkManagerInterface();
+ 
+-    QList <QDBusObjectPath> getDevices() const;
+-    void activateConnection(const QString &serviceName, QDBusObjectPath connection, QDBusObjectPath device, QDBusObjectPath specificObject);
++    QList <QDBusObjectPath> getDevices();
++    void activateConnection(QDBusObjectPath connection,QDBusObjectPath device, QDBusObjectPath specificObject);
+     void deactivateConnection(QDBusObjectPath connectionPath) const;
+ 
+     QDBusObjectPath path() const;
+@@ -155,21 +159,28 @@
+     bool wirelessEnabled() const;
+     bool wirelessHardwareEnabled() const;
+     QList <QDBusObjectPath> activeConnections() const;
+-    quint32 state();
++    NMState state();
++    QString version() const;
+     bool setConnections();
+     bool isValid();
+ 
+ Q_SIGNALS:
+     void deviceAdded(QDBusObjectPath);
+     void deviceRemoved(QDBusObjectPath);
+-    void propertiesChanged( const QString &, QMap<QString,QVariant>);
+-    void stateChanged(const QString&, quint32);
++    void propertiesChanged(QMap<QString,QVariant>);
++    void stateChanged(quint32);
+     void activationFinished(QDBusPendingCallWatcher*);
++    void propertiesReady();
++    void devicesListReady();
+ 
+ private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
++
+ private:
+     QNetworkManagerInterfacePrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
++    QVariantMap propertyMap;
++    QList<QDBusObjectPath> devicesPathList;
++
+ };
+ 
+ class QNetworkManagerInterfaceAccessPointPrivate;
+@@ -234,11 +245,14 @@
+ 
+ Q_SIGNALS:
+     void propertiesChanged(QMap <QString,QVariant>);
+-    void propertiesChanged( const QString &, QMap<QString,QVariant>);
++    void propertiesReady();
++
++private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
++
+ private:
+     QNetworkManagerInterfaceAccessPointPrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
+-
++    QVariantMap propertyMap;
+ };
+ 
+ class QNetworkManagerInterfaceDevicePrivate;
+@@ -264,10 +278,14 @@
+ 
+ Q_SIGNALS:
+     void stateChanged(const QString &, quint32);
+-
++    void propertiesChanged(QMap<QString,QVariant>);
++    void connectionsChanged(QStringList);
++    void propertiesReady();
++private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
+ private:
+     QNetworkManagerInterfaceDevicePrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
++    QVariantMap propertyMap;
+ };
+ 
+ class QNetworkManagerInterfaceDeviceWiredPrivate;
+@@ -287,12 +305,19 @@
+     bool carrier() const;
+     bool setConnections();
+     bool isValid();
++    QStringList availableConnections();
+ 
+ Q_SIGNALS:
+-    void propertiesChanged( const QString &, QMap<QString,QVariant>);
++    void propertiesChanged(QMap<QString,QVariant>);
++    void propertiesReady();
++    void carrierChanged(bool);
++
++private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
++
+ private:
+     QNetworkManagerInterfaceDeviceWiredPrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
++    QVariantMap propertyMap;
+ };
+ 
+ class QNetworkManagerInterfaceDeviceWirelessPrivate;
+@@ -328,15 +353,71 @@
+     bool setConnections();
+     bool isValid();
+ 
++    void requestScan();
+ Q_SIGNALS:
+-    void propertiesChanged( const QString &, QMap<QString,QVariant>);
+-    void accessPointAdded(const QString &,QDBusObjectPath);
+-    void accessPointRemoved(const QString &,QDBusObjectPath);
++    void propertiesChanged(QMap<QString,QVariant>);
++    void accessPointAdded(const QString &);
++    void accessPointRemoved(const QString &);
++    void scanDone();
++    void propertiesReady();
++    void accessPointsReady();
++
++private Q_SLOTS:
++    void scanIsDone();
++    void propertiesSwap(QMap<QString,QVariant>);
++
++    void slotAccessPointAdded(QDBusObjectPath);
++    void slotAccessPointRemoved(QDBusObjectPath);
++
+ private:
+     QNetworkManagerInterfaceDeviceWirelessPrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
++    QVariantMap propertyMap;
++    QList <QDBusObjectPath> accessPointsList;
++};
++
++class QNetworkManagerInterfaceDeviceModemPrivate;
++class QNetworkManagerInterfaceDeviceModem : public QObject
++{
++    Q_OBJECT
++
++public:
++
++    enum ModemCapability {
++        None = 0x0,
++        Pots = 0x1,
++        Cmda_Edvo = 0x2,
++        Gsm_Umts = 0x4,
++        Lte = 0x08
++       };
++    Q_DECLARE_FLAGS(ModemCapabilities, ModemCapability)
++
++    explicit QNetworkManagerInterfaceDeviceModem(const QString &ifaceDevicePath,
++                                                    QObject *parent = 0);
++    ~QNetworkManagerInterfaceDeviceModem();
++
++    QDBusObjectPath path() const;
++    QDBusInterface *connectionInterface() const;
++
++    bool setConnections();
++    bool isValid();
++
++    ModemCapabilities modemCapabilities() const;
++    ModemCapabilities currentCapabilities() const;
++
++Q_SIGNALS:
++    void propertiesChanged(QMap<QString,QVariant>);
++    void propertiesReady();
++
++private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
++
++private:
++    QNetworkManagerInterfaceDeviceModemPrivate *d;
++    QVariantMap propertyMap;
+ };
+ 
++Q_DECLARE_OPERATORS_FOR_FLAGS(QNetworkManagerInterfaceDeviceModem::ModemCapabilities)
++
+ class QNetworkManagerSettingsPrivate;
+ class QNetworkManagerSettings : public QObject
+ {
+@@ -349,13 +430,16 @@
+ 
+     QDBusInterface  *connectionInterface() const;
+     QList <QDBusObjectPath> listConnections();
++    QString getConnectionByUuid(const QString &uuid);
+     bool setConnections();
+     bool isValid();
+ 
+ Q_SIGNALS:
+     void newConnection(QDBusObjectPath);
++    void connectionsListReady();
+ private:
+     QNetworkManagerSettingsPrivate *d;
++    QList <QDBusObjectPath> connectionsList;
+ };
+ 
+ class QNetworkManagerSettingsConnectionPrivate;
+@@ -382,12 +466,14 @@
+     bool isValid();
+ 
+ Q_SIGNALS:
+-
+-    void updated(const QNmSettingsMap &settings);
++    void updated();
+     void removed(const QString &path);
++    void settingsReady();
++
++private Q_SLOTS:
++    void slotSettingsRemoved();
+ 
+ private:
+-    QNmDBusHelper *nmDBusHelper;
+     QNetworkManagerSettingsConnectionPrivate *d;
+ };
+ 
+@@ -408,22 +494,26 @@
+     ~ QNetworkManagerConnectionActive();
+ 
+     QDBusInterface  *connectionInterface() const;
+-    QString serviceName() const;
+     QDBusObjectPath connection() const;
+     QDBusObjectPath specificObject() const;
+-    QList<QDBusObjectPath> devices() const;
++    QStringList devices() const;
+     quint32 state() const;
+     bool defaultRoute() const;
++    bool default6Route() const;
+     bool setConnections();
+     bool isValid();
+ 
+ 
+ Q_SIGNALS:
+-    void propertiesChanged(QList<QDBusObjectPath>);
+-    void propertiesChanged( const QString &, QMap<QString,QVariant>);
++    void propertiesChanged(QMap<QString,QVariant>);
++    void propertiesReady();
++
++private Q_SLOTS:
++    void propertiesSwap(QMap<QString,QVariant>);
++
+ private:
+     QNetworkManagerConnectionActivePrivate *d;
+-    QNmDBusHelper *nmDBusHelper;
++    QVariantMap propertyMap;
+ };
+ 
+ class QNetworkManagerIp4ConfigPrivate;
+--- qtbase/src/plugins/bearer/networkmanager/qnmdbushelper.cpp
++++ /dev/null
+@@ -1,130 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/legal
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
+-** use the contact form at http://qt.digia.com/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-// this class is for helping qdbus get stuff
+-
+-#include "qnmdbushelper.h"
+-
+-#include "qnetworkmanagerservice.h"
+-
+-#include <QDBusError>
+-#include <QDBusInterface>
+-#include <QDBusMessage>
+-#include <QDBusReply>
+-
+-#include <QDebug>
+-
+-#ifndef QT_NO_DBUS
+-
+-QT_BEGIN_NAMESPACE
+-
+-QNmDBusHelper::QNmDBusHelper(QObject * parent)
+-        : QObject(parent)
+-{
+-}
+-
+-QNmDBusHelper::~QNmDBusHelper()
+-{
+-}
+-
+-void QNmDBusHelper::deviceStateChanged(quint32 state)
+- {
+-    QDBusMessage msg = this->message();
+-    if(state == NM_DEVICE_STATE_ACTIVATED
+-       || state == NM_DEVICE_STATE_DISCONNECTED
+-       || state == NM_DEVICE_STATE_UNAVAILABLE
+-       || state == NM_DEVICE_STATE_FAILED) {
+-        emit pathForStateChanged(msg.path(), state);
+-    }
+- }
+-
+-void QNmDBusHelper::slotAccessPointAdded(QDBusObjectPath path)
+-{
+-    if(path.path().length() > 2) {
+-        QDBusMessage msg = this->message();
+-        emit pathForAccessPointAdded(msg.path(), path);
+-    }
+-}
+-
+-void QNmDBusHelper::slotAccessPointRemoved(QDBusObjectPath path)
+-{
+-    if(path.path().length() > 2) {
+-        QDBusMessage msg = this->message();
+-        emit pathForAccessPointRemoved(msg.path(), path);
+-    }
+-}
+-
+-void QNmDBusHelper::slotPropertiesChanged(QMap<QString,QVariant> map)
+-{
+-    QDBusMessage msg = this->message();
+-    QMapIterator<QString, QVariant> i(map);
+-    while (i.hasNext()) {
+-        i.next();
+-        if( i.key() == "State") { //state only applies to device interfaces
+-            quint32 state = i.value().toUInt();
+-            if( state == NM_DEVICE_STATE_ACTIVATED
+-                || state == NM_DEVICE_STATE_DISCONNECTED
+-                || state == NM_DEVICE_STATE_UNAVAILABLE
+-                || state == NM_DEVICE_STATE_FAILED) {
+-                emit  pathForPropertiesChanged( msg.path(), map);
+-            }
+-        } else if( i.key() == "ActiveAccessPoint") {
+-            emit pathForPropertiesChanged(msg.path(), map);
+-            //            qWarning()  << __PRETTY_FUNCTION__ << i.key() << ": " << i.value().value<QDBusObjectPath>().path();
+-            //      } else if( i.key() == "Strength")
+-            //            qWarning()  << __PRETTY_FUNCTION__ << i.key() << ": " << i.value().toUInt();
+-            //   else
+-            //            qWarning()  << __PRETTY_FUNCTION__ << i.key() << ": " << i.value();
+-        } else if (i.key() == "ActiveConnections") {
+-            emit pathForPropertiesChanged(msg.path(), map);
+-        }
+-    }
+-}
+-
+-void QNmDBusHelper::slotSettingsRemoved()
+-{
+-    QDBusMessage msg = this->message();
+-    emit pathForSettingsRemoved(msg.path());
+-}
+-
+-QT_END_NAMESPACE
+-
+-#endif // QT_NO_DBUS
+--- qtbase/src/plugins/bearer/networkmanager/qnmdbushelper.h
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/****************************************************************************
+-**
+-** Copyright (C) 2013 Digia Plc and/or its subsidiary(-ies).
+-** Contact: http://www.qt-project.org/legal
+-**
+-** This file is part of the plugins of the Qt Toolkit.
+-**
+-** $QT_BEGIN_LICENSE:LGPL$
+-** Commercial License Usage
+-** Licensees holding valid commercial Qt licenses may use this file in
+-** accordance with the commercial license agreement provided with the
+-** Software or, alternatively, in accordance with the terms contained in
+-** a written agreement between you and Digia.  For licensing terms and
+-** conditions see http://qt.digia.com/licensing.  For further information
+-** use the contact form at http://qt.digia.com/contact-us.
+-**
+-** GNU Lesser General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU Lesser
+-** General Public License version 2.1 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.LGPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU Lesser General Public License version 2.1 requirements
+-** will be met: http://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+-**
+-** In addition, as a special exception, Digia gives you certain additional
+-** rights.  These rights are described in the Digia Qt LGPL Exception
+-** version 1.1, included in the file LGPL_EXCEPTION.txt in this package.
+-**
+-** GNU General Public License Usage
+-** Alternatively, this file may be used under the terms of the GNU
+-** General Public License version 3.0 as published by the Free Software
+-** Foundation and appearing in the file LICENSE.GPL included in the
+-** packaging of this file.  Please review the following information to
+-** ensure the GNU General Public License version 3.0 requirements will be
+-** met: http://www.gnu.org/copyleft/gpl.html.
+-**
+-**
+-** $QT_END_LICENSE$
+-**
+-****************************************************************************/
+-
+-#ifndef QNMDBUSHELPERPRIVATE_H
+-#define QNMDBUSHELPERPRIVATE_H
+-
+-#include <QDBusObjectPath>
+-#include <QDBusContext>
+-#include <QMap>
+-
+-#ifndef QT_NO_DBUS
+-
+-QT_BEGIN_NAMESPACE
+-
+-class QNmDBusHelper: public QObject, protected QDBusContext
+- {
+-     Q_OBJECT
+- public:
+-    QNmDBusHelper(QObject *parent = 0);
+-    ~QNmDBusHelper();
+-
+- public slots:
+-    void deviceStateChanged(quint32);
+-    void slotAccessPointAdded( QDBusObjectPath );
+-    void slotAccessPointRemoved( QDBusObjectPath );
+-    void slotPropertiesChanged( QMap<QString,QVariant>);
+-    void slotSettingsRemoved();
+-
+-Q_SIGNALS:
+-    void pathForStateChanged(const QString &, quint32);
+-    void pathForAccessPointAdded(const QString &,  QDBusObjectPath );
+-    void pathForAccessPointRemoved(const QString &,  QDBusObjectPath );
+-    void pathForPropertiesChanged(const QString &, QMap<QString,QVariant>);
+-    void pathForSettingsRemoved(const QString &);
+-};
+-
+-QT_END_NAMESPACE
+-
+-#endif // QT_NO_DBUS
+-
+-#endif// QNMDBUSHELPERPRIVATE_H

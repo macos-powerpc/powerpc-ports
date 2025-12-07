@@ -1,0 +1,178 @@
+From eb99c28861f5e841f306cfe8689627fe0e9bf2e8 Mon Sep 17 00:00:00 2001
+From: Thiago Macieira <thiago.macieira@intel.com>
+Date: Tue, 28 Oct 2014 19:26:17 -0700
+Subject: [PATCH 2/3] QDBusConnection: Merge the dispatch and the
+ watch-and-timeout locks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+We don't need two anymore because they now protect the same thing: the
+state of the DBusConnection. The difference existed when it was possible
+for two threads to access the DBusConnection at the same time: one doing
+dispatching and one doing something else. Unfortunately, even though
+DBusConnection supports this, QtDBus doesn't.
+
+From d47c05b1889bb4f06203bbc65f4660b8d0128954 (2008-10-08):
+   Details:  if we're removing a timer or a watcher from our list,
+   there's a race condition: one thread (not the QDBusConnection thread)
+   could be asking for the removal (which causes an event to be sent),
+   then deletes the pointer. In the meantime, QDBusConnection will
+   process the timers and socket notifiers and could end up calling
+   lidbus-1 with deleted pointers.
+
+That commit fixed the race condition but introduced a deadlock.
+
+Task-number: QTBUG-42189
+Change-Id: I034038f763cbad3a67398909defd31a23c27c965
+Reviewed-by: Jędrzej Nowacki <jedrzej.nowacki@digia.com>
+Reviewed-by: Albert Astals Cid <albert.astals@canonical.com>
+Reviewed-by: Frederik Gladhorn <frederik.gladhorn@theqtcompany.com>
+---
+ src/dbus/qdbusconnection_p.h  | 16 +++++-----------
+ src/dbus/qdbusintegrator.cpp  | 22 +++++++++++-----------
+ src/dbus/qdbusthreaddebug_p.h |  7 -------
+ 3 files changed, 16 insertions(+), 29 deletions(-)
+
+--- qtbase/src/dbus/qdbusconnection_p.h
++++ qtbase/src/dbus/qdbusconnection_p.h
+@@ -290,24 +290,18 @@
+     QStringList serverConnectionNames;
+ 
+     ConnectionMode mode;
++    QDBusConnectionInterface *busService;
+ 
+-    // members accessed in unlocked mode (except for deletion)
+-    // connection and server provide their own locking mechanisms
+-    // busService doesn't have state to be changed
++    // the dispatch lock protects everything related to the DBusConnection or DBusServer
++    // including the timeouts and watches
++    QMutex dispatchLock;
+     DBusConnection *connection;
+     DBusServer *server;
+-    QDBusConnectionInterface *busService;
+-
+-    // watchers and timeouts are accessed from any thread
+-    // but the corresponding timer and QSocketNotifier must be handled
+-    // only in the object's thread
+-    QMutex watchAndTimeoutLock;
+     WatcherHash watchers;
+     TimeoutHash timeouts;
+     PendingTimeoutList timeoutsPendingAdd;
+ 
+-    // members accessed through a lock
+-    QMutex dispatchLock;
++    // the master lock protects our own internal state
+     QReadWriteLock lock;
+     QDBusError lastError;
+ 
+--- qtbase/src/dbus/qdbusintegrator.cpp
++++ qtbase/src/dbus/qdbusintegrator.cpp
+@@ -155,7 +155,7 @@
+     if (!q_dbus_timeout_get_enabled(timeout))
+         return true;
+ 
+-    QDBusWatchAndTimeoutLocker locker(AddTimeoutAction, d);
++    QDBusDispatchLocker locker(AddTimeoutAction, d);
+     if (QCoreApplication::instance() && QThread::currentThread() == d->thread()) {
+         // correct thread
+         return qDBusRealAddTimeout(d, timeout, q_dbus_timeout_get_interval(timeout));
+@@ -190,7 +190,7 @@
+ 
+     QDBusConnectionPrivate *d = static_cast<QDBusConnectionPrivate *>(data);
+ 
+-    QDBusWatchAndTimeoutLocker locker(RemoveTimeoutAction, d);
++    QDBusDispatchLocker locker(RemoveTimeoutAction, d);
+ 
+     // is it pending addition?
+     QDBusConnectionPrivate::PendingTimeoutList::iterator pit = d->timeoutsPendingAdd.begin();
+@@ -263,7 +263,7 @@
+ {
+     QDBusConnectionPrivate::Watcher watcher;
+ 
+-    QDBusWatchAndTimeoutLocker locker(AddWatchAction, d);
++    QDBusDispatchLocker locker(AddWatchAction, d);
+     if (flags & DBUS_WATCH_READABLE) {
+         //qDebug("addReadWatch %d", fd);
+         watcher.watch = watch;
+@@ -297,7 +297,7 @@
+     QDBusConnectionPrivate *d = static_cast<QDBusConnectionPrivate *>(data);
+     int fd = q_dbus_watch_get_unix_fd(watch);
+ 
+-    QDBusWatchAndTimeoutLocker locker(RemoveWatchAction, d);
++    QDBusDispatchLocker locker(RemoveWatchAction, d);
+     QDBusConnectionPrivate::WatcherHash::iterator i = d->watchers.find(fd);
+     while (i != d->watchers.end() && i.key() == fd) {
+         if (i.value().watch == watch) {
+@@ -341,7 +341,7 @@
+ 
+ static void qDBusRealToggleWatch(QDBusConnectionPrivate *d, DBusWatch *watch, int fd)
+ {
+-    QDBusWatchAndTimeoutLocker locker(ToggleWatchAction, d);
++    QDBusDispatchLocker locker(ToggleWatchAction, d);
+ 
+     QDBusConnectionPrivate::WatcherHash::iterator i = d->watchers.find(fd);
+     while (i != d->watchers.end() && i.key() == fd) {
+@@ -1016,8 +1016,8 @@
+ extern bool qDBusInitThreads();
+ 
+ QDBusConnectionPrivate::QDBusConnectionPrivate(QObject *p)
+-    : QObject(p), ref(1), capabilities(0), mode(InvalidMode), connection(0), server(0), busService(0),
+-      watchAndTimeoutLock(QMutex::Recursive), dispatchLock(QMutex::Recursive),
++    : QObject(p), ref(1), capabilities(0), mode(InvalidMode), busService(0),
++      dispatchLock(QMutex::Recursive), connection(0), server(0),
+       rootNode(QString(QLatin1Char('/'))),
+       anonymousAuthenticationAllowed(false)
+ {
+@@ -1127,7 +1127,7 @@
+ void QDBusConnectionPrivate::timerEvent(QTimerEvent *e)
+ {
+     {
+-        QDBusWatchAndTimeoutLocker locker(TimerEventAction, this);
++        QDBusDispatchLocker locker(TimerEventAction, this);
+         DBusTimeout *timeout = timeouts.value(e->timerId(), 0);
+         if (timeout)
+             q_dbus_timeout_handle(timeout);
+@@ -1146,7 +1146,7 @@
+     switch (ev->subtype)
+     {
+     case QDBusConnectionCallbackEvent::AddTimeout: {
+-        QDBusWatchAndTimeoutLocker locker(RealAddTimeoutAction, this);
++        QDBusDispatchLocker locker(RealAddTimeoutAction, this);
+         while (!timeoutsPendingAdd.isEmpty()) {
+             QPair<DBusTimeout *, int> entry = timeoutsPendingAdd.takeFirst();
+             qDBusRealAddTimeout(this, entry.first, entry.second);
+@@ -1182,7 +1182,7 @@
+     QVarLengthArray<DBusWatch *, 2> pendingWatches;
+ 
+     {
+-        QDBusWatchAndTimeoutLocker locker(SocketReadAction, this);
++        QDBusDispatchLocker locker(SocketReadAction, this);
+         WatcherHash::ConstIterator it = watchers.constFind(fd);
+         while (it != watchers.constEnd() && it.key() == fd) {
+             if (it->watch && it->read && it->read->isEnabled())
+@@ -1202,7 +1202,7 @@
+     QVarLengthArray<DBusWatch *, 2> pendingWatches;
+ 
+     {
+-        QDBusWatchAndTimeoutLocker locker(SocketWriteAction, this);
++        QDBusDispatchLocker locker(SocketWriteAction, this);
+         WatcherHash::ConstIterator it = watchers.constFind(fd);
+         while (it != watchers.constEnd() && it.key() == fd) {
+             if (it->watch && it->write && it->write->isEnabled())
+--- qtbase/src/dbus/qdbusthreaddebug_p.h
++++ qtbase/src/dbus/qdbusthreaddebug_p.h
+@@ -207,13 +207,6 @@
+     { }
+ };
+ 
+-struct QDBusWatchAndTimeoutLocker: QDBusMutexLocker
+-{
+-    inline QDBusWatchAndTimeoutLocker(ThreadAction a, QDBusConnectionPrivate *s)
+-        : QDBusMutexLocker(a, s, &s->watchAndTimeoutLock)
+-    { }
+-};
+-
+ #if QDBUS_THREAD_DEBUG
+ # define SEM_ACQUIRE(action, sem)                                       \
+     do {                                                                \

@@ -67,9 +67,7 @@ set available_qt5_versions {
 
 if {[tbool just_want_qt5_version_info]} {
     PortGroup           qt5 1.0
-    # can't return here anymore since "base" now blocks multiple PG inclusion
-    ui_warn "just_want_qt5_version_info is true, but obsolete and ignored nowadays"
-    #return
+    return
 }
 
 # Check what Qt5 installation flavour already exists, or if not if the port calling us
@@ -336,18 +334,20 @@ default_variants        +qt5kde
 
 set qt_install_registry     ${qt_dir}/registry
 
+PortGroup                   compiler_blacklist_versions 1.0
 if {${os.platform} eq "darwin"} {
-    compiler.whitelist      clang
-#     compiler.whitelist      clang macports-clang-3.7 macports-clang-3.6 macports-clang-3.5 macports-clang-3.4
+#    compiler.whitelist      clang
+     compiler.whitelist      macports-gcc-13 macports-gcc-12 macports-gcc-11
 }
-compiler.blacklist-append   macports-llvm-gcc-4.2 llvm-gcc-4.2
-compiler.blacklist-append   gcc-4.2 apple-gcc-4.2 gcc-4.0
+compiler.blacklist-append   *llvm-gcc-4.2
+compiler.blacklist-append   *gcc-4.2 *gcc-4.0
 compiler.blacklist-append   {clang < 500}
-platform darwin {
-    if {${os.major} >= 13 && [info exists building_qt5]} {
-        compiler.blacklist-append *gcc*
-    }
-}
+compiler.blacklist-append   clang
+# platform darwin {
+#     if {${os.major} >= 13 && [info exists building_qt5]} {
+#         compiler.blacklist-append *gcc*
+#     }
+# }
 
 # # starting with the one-but-newest macports-clang in the whitelist, check it it is
 # # installed and blacklist the other values so that the automatic selection mechanism
@@ -376,7 +376,7 @@ if {[file exists ${qt5::currentportgroupdir}/macports_clang_selection-1.0.tcl]} 
 
 # set Qt understood arch types, based on user preference
 options qt_arch_types
-default qt_arch_types {[string map {i386 x86} [get_canonical_archs]]}
+default qt_arch_types {[string map {ppc ppc64} [get_canonical_archs]]}
 
 # global qt_qmake_spec
 options qt_qmake_spec
@@ -384,15 +384,8 @@ global qt_qmake_spec_32
 global qt_qmake_spec_64
 
 if {${os.platform} eq "darwin"} {
-    if {[string match macports-gcc* ${configure.compiler}]} {
-        # probably no need to test for *gcc* as the system `gcc`/`g++` commands that are
-        # actually GNU GCC most certainly are too old to build modern Qt code.
-        set qt_qmake_spec_32        macx-g++
-        set qt_qmake_spec_64        macx-g++
-    } else {
-        set qt_qmake_spec_32        macx-clang
-        set qt_qmake_spec_64        macx-clang
-    }
+    set qt_qmake_spec_32        macx-g++-32
+    set qt_qmake_spec_64        macx-g++
 } elseif {${os.platform} eq "linux"} {
     if {[string match *clang* ${configure.compiler}]} {
         set qt_qmake_spec_32    linux-clang
@@ -412,6 +405,8 @@ if {${os.platform} eq "darwin"} {
     } else {
         set qt_qmake_spec_32    linux-g++
         set qt_qmake_spec_64    linux-g++-64
+#         compiler.blacklist-append \
+#                                 clang
     }
 } else {
     if {[string match *clang* ${configure.compiler}]} {
@@ -437,7 +432,7 @@ if {${os.platform} eq "darwin"} {
 proc qt5::get_default_spec {} {
     global build_arch qt_qmake_spec_32 qt_qmake_spec_64
     if { ![option universal_variant] || ![variant_isset universal] } {
-        if { ${build_arch} eq "i386" } {
+        if { ${build_arch} eq "ppc" } {
             return ${qt_qmake_spec_32}
         } else {
             return ${qt_qmake_spec_64}
@@ -605,13 +600,13 @@ if {![info exists building_qt5]} {
     }
 }
 
-# if {![tbool QT53] && ![tbool qt5.no_LTO_variant] && ![variant_exists LTO]} {
-#     if {[info exists building_qt5]} {
-#         variant LTO description {Build with Link-Time Optimisation (LTO) (experimental)} {}
-#     } else {
-#         PortGroup LTO 1.0
-#     }
-# }
+if {![tbool QT53] && ![tbool qt5.no_LTO_variant] && ![variant_exists LTO]} {
+    if {[info exists building_qt5]} {
+        variant LTO description {Build with Link-Time Optimisation (LTO) (experimental)} {}
+    } else {
+        PortGroup LTO 1.0
+    }
+}
 
 if {![info exists building_qt5]} {
     if {${os.platform} ne "darwin"} {
@@ -1074,23 +1069,5 @@ proc qt5.rebuild_mp_qthelp_collection {} {
 post-activate {
     qt5.rebuild_mp_qthelp_collection
 }
-
-# (hopefully) override the checking function from the stock Qt5 PG:
-proc qt5pg::check_min_version {} {
-    global qt5.version qt5.min_version
-    # make certain qt5.version is set appropriately
-    set qt5.version [qt5.active_version]
-    if {[vercmp ${qt5.version} ${qt5.min_version}] < 0} {
-        ui_debug "Qt version ${qt5.min_version} or above is required, but Qt version ${qt5.version} is installed"
-        known_fail yes
-        pre-fetch {
-            ui_error "Qt version ${qt5.min_version} or above is required, but Qt version ${qt5.version} is installed"
-            return -code error "Qt version too old"
-        }
-    } else {
-        ui_debug "Qt version ${qt5.version} satifies requirement ${qt5.min_version} or above"
-    }
-}
-port::register_callback qt5pg::check_min_version
 
 # kate: backspace-indents true; indent-pasted-text true; indent-width 4; keep-extra-spaces true; remove-trailing-spaces modified; replace-tabs true; replace-tabs-save true; syntax Tcl/Tk; tab-indents true; tab-width 4;
