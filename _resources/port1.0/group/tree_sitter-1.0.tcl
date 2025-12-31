@@ -17,9 +17,9 @@ build {
     }
 
     if {[file exists ${worksrcpath}/scanner.cc]} {
-        system -W ${worksrcpath} "${configure.cxx} ${configure.cxxflags} ${configure.cflags} [get_canonical_archflags cxx] -fPIC -shared *.o -o libtree-sitter-${tree_sitter.libname}.dylib"
+        system -W ${worksrcpath} "${configure.cxx} ${configure.cxxflags} ${configure.cflags} [get_canonical_archflags cxx] -fPIC -dynamiclib -install_name ${prefix}/lib/libtree-sitter-${tree_sitter.libname}.dylib *.o -o libtree-sitter-${tree_sitter.libname}.dylib"
     } else {
-        system -W ${worksrcpath} "${configure.cc} ${configure.cppflags} ${configure.cflags} [get_canonical_archflags cc] -fPIC -shared *.o -o libtree-sitter-${tree_sitter.libname}.dylib"
+        system -W ${worksrcpath} "${configure.cc} ${configure.cppflags} ${configure.cflags} [get_canonical_archflags cc] -fPIC -dynamiclib -install_name ${prefix}/lib/libtree-sitter-${tree_sitter.libname}.dylib *.o -o libtree-sitter-${tree_sitter.libname}.dylib"
     }
 }
 
