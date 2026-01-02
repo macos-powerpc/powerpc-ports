@@ -28,10 +28,7 @@ default boost_cache_env_vars      ""
 
 proc boost::default_version {} {
     global os.platform os.major
-    # Pin version on Darwin9 and older to pre-c++11 version (1.71)
-    if { ${os.platform} eq "darwin" && ${os.major} == 9 } {
-        return 1.71
-    } else {
+    if { ${os.platform} eq "darwin"} {
         return 1.76
     }
 }
