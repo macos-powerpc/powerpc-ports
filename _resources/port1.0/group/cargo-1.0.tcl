@@ -14,15 +14,32 @@
 # See the cargo_fetch PortGroup for more options
 #
 
-PortGroup rust 1.0
+default use_configure           no
 
-default use_configure       no
-default universal_variant   yes
+global os.arch
 
-default build.cmd           {${cargo.bin} build}
-default build.target        {}
-default build.pre_args      {--release ${cargo.offline_cmd} -v -j${build.jobs}}
-default build.args          {}
+if {${os.arch} eq "powerpc"} {
+    PortGroup                   mrustc 1.0
+
+    default universal_variant   no
+
+    default build.cmd           {MRUSTC_TARGET_VER=1.54 ${cargo.bin} \.}
+    default build.target        {}
+    default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs}}
+    default build.args          {--vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
+} else {
+    PortGroup                   rust 1.0
+
+    default universal_variant   yes
+
+    default build.cmd           {${cargo.bin} build}
+    default build.target        {}
+    default build.pre_args      {--release ${cargo.offline_cmd} -v -j${build.jobs}}
+    default build.args          {}
+}
+
+# build.dir           ${workpath}
+# build.cmd-append    ${worksrcpath}/
 
 destroot {
     ui_error "No destroot phase in the Portfile!"
