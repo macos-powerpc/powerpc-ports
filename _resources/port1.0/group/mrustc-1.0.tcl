@@ -1,10 +1,10 @@
 # -*- coding: utf-8; mode: tcl; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 4; truncate-lines: t -*- vim:fenc=utf-8:et:sw=4:ts=4:sts=4
 #
-# This PortGroup supports the Rust language ecosystem
+# This PortGroup supports the Rust language ecosystem via mrustc.
 #
 # Usage:
 #
-# PortGroup     rust 1.0
+# PortGroup     mrustc 1.0
 #
 # cargo.crates \
 #     foo  1.0.1  abcdef123456... \
@@ -33,16 +33,21 @@
 #    baz    author/baz  branch  abcdef12345678...commit...abcdef12345678  fedcba654321...
 #
 
-PortGroup   muniversal          1.1
+# This portgroup is modelled upon rust 1.0, with extra overrides to support powerpc.
+# It will evolve, currently some portions below are unneeded or mismatching.
+# However, it is already usable in this form.
+
 PortGroup   compiler_wrapper    1.0
-# ideally, we would like to add the openssl PG, however
-#     its use of `option_proc` makes changing the default value of `openssl.branch` difficult, and
-#     it interferes with our intended use of compiler_wrapper PG
-# for now, create an option `openssl.branch` in this PG
+PortGroup   muniversal          1.1
+
+# Ideally, we would like to add the openssl PG, however
+#     its use of `option_proc` makes changing the default value of `openssl.branch` difficult,
+#     and it interferes with our intended use of compiler_wrapper PG
+# For now, create an option `openssl.branch` in this PG
 # Cargo's interaction with OpenSSL is a bit delicate
-# see, e.g., https://trac.macports.org/ticket/65011
+# See, e.g.: https://trac.macports.org/ticket/65011
 #
-# similarly for legacysupport PG
+# Similarly for legacysupport PG
 
 options     cargo.bin \
             cargo.home \
@@ -58,14 +63,14 @@ default     cargo.home          {${workpath}/.home/.cargo}
 default     cargo.crates        {}
 default     cargo.crates_github {}
 
-# if a dependency has been patched, `--offline` might be a reasonable choice
-default     cargo.offline_cmd   {--frozen}
+# If a dependency has been patched, `--offline` might be a reasonable choice
+default     cargo.offline_cmd   {}
 
-# some packags do not provide Cargo.lock,
+# Some packags do not provide Cargo.lock,
 # so offer the option of running cargo-update
 default     cargo.update        {no}
 
-# use `--remap-path-prefix` to prevent build information from being included in installed binaries
+# Use `--remap-path-prefix` to prevent build information from being included in installed binaries
 options     rust.remap
 default     rust.remap          {${cargo.home} "" ${worksrcpath} ""}
 
@@ -85,12 +90,12 @@ default     rust.rt_static_libs     {[rust::get_static_rutime_libraries]}
 options     rust.add_compiler_runtime
 default     rust.add_compiler_runtime   {no}
 
-# the distfiles of the main port will also be stored in this directory,
+# The distfiles of the main port will also be stored in this directory,
 # but this is the only way to allow reusing the same crates across multiple ports.
 default     dist_subdir             {[expr {[llength ${cargo.crates}] > 0 || [llength ${cargo.crates_github}] > 0 ? "cargo-crates" : ${name}}]}
 default     extract.only            {[rust::disttagclean $distfiles]}
 
-# to wrap linker, compiler_wrapper PG required existence of configure.ld
+# To wrap linker, compiler_wrapper PG required existence of configure.ld
 options     configure.ld
 default     configure.ld            {${configure.cc}}
 
@@ -209,7 +214,7 @@ proc rust::configure_ldflags_proc {option action args} {
 }
 option_proc configure.ldflags rust::configure_ldflags_proc
 
-# based on portextract::disttagclean from portextract.tcl
+# Based on portextract::disttagclean from portextract.tcl
 proc rust::disttagclean {list} {
     if {$list eq ""} {
         return $list
@@ -243,7 +248,6 @@ proc rust::handle_crates {} {
         # a combination of crate name and checksum as unique identifier.
         # As the :disttag cannot contain dots, the version number cannot be
         # used.
-        #
         # To download the crate file curl-0.4.11.crate, the URL is
         #    https://crates.io/api/v1/crates/curl/0.4.11/download.
         # Use ?dummy= to ignore ${distfile}
@@ -438,7 +442,7 @@ post-extract {
     if {[llength ${cargo.crates}] > 0 || [llength ${cargo.crates_github}]>0} {
         file mkdir "${cargo.home}/macports"
 
-        # avoid downloading files from online repository during build phase
+        # Avoid downloading files from online repository during build phase,
         # use a replacement for crates.io
         # https://doc.rust-lang.org/cargo/reference/source-replacement.html
         set conf [open "${cargo.home}/config.toml" "w"]
@@ -469,7 +473,7 @@ post-extract {
 
     if {${subport} ne "rust" && [join [lrange [split ${subport} -] 0 1] -] ne "rust-bootstrap"} {
 
-        # see comment below concerning RUSTC and RUSTFLAGS
+        # See comment below concerning RUSTC and RUSTFLAGS
 
         file mkdir "${cargo.home}"
         set conf [open "${cargo.home}/config.toml" "a"]
@@ -496,7 +500,7 @@ proc rust::append_envs { var {phases {configure build destroot}} } {
     }
 }
 
-# utility procedure to find SDK
+# Utility procedure to find SDK
 proc rust::get_sdkroot {sdk_version} {
     if {[option os.platform] ne "darwin"} {
         # only valid empty return
@@ -575,16 +579,6 @@ proc rust::get_sdkroot {sdk_version} {
     ui_error "Rust PG: unable to find SDK for ${sdk_version}"
     return {}
 }
-
-# Is build caching enabled ?
-# WIP for now ...
-#if {[tbool configure.ccache]} {
-#    # Enable sccache for rust caching
-#    depends_build-append port:sccache
-#    rust::append_envs    RUSTC_WRAPPER=${prefix}/bin/sccache
-#    rust::append_envs    SCCACHE_CACHE_SIZE=2G
-#    rust::append_envs    SCCACHE_DIR=${workpath}/.sccache
-#}
 
 proc rust::set_environment {} {
     global prefix configure.pkg_config_path
@@ -689,7 +683,6 @@ proc rust::rust_pg_callback {} {
         configure.ldflags-append        -lunwind
     }
 
-    # Sometimes Cargo.lock does not exist
     post-extract {
         xinstall -d ${worksrcpath}/target/[cargo.rust_platform]/release
     }

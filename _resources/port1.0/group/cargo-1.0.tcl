@@ -2,10 +2,9 @@
 #
 # This PortGroup supports the cargo build system
 #
-# This PortGroup is designed to be used when cargo is the
-#    exclusive build mechanism.
-# Use the cargo_fetch PortGroup if cargo is called from other
-#    build mechanisms (e.g. configure and make).
+# This PortGroup is designed to be used when cargo is the exclusive build mechanism.
+# Use the cargo_fetch PortGroup if cargo is called from other build mechanisms
+# (e.g. configure and make).
 #
 # Usage:
 #
@@ -18,12 +17,17 @@ default use_configure           no
 
 global os.arch
 
+# On powerpc mrustc is used, since the full rustc is still broken:
+# https://github.com/thepowersgang/mrustc/issues/300
 if {${os.arch} eq "powerpc"} {
     PortGroup                   mrustc 1.0
 
+    # Rustc version used by mrustc port:
+    set rustc_target_ver        1.54
+
     default universal_variant   no
 
-    default build.cmd           {MRUSTC_TARGET_VER=1.54 ${cargo.bin} \.}
+    default build.cmd           {MRUSTC_TARGET_VER=${rustc_target_ver} ${cargo.bin} \.}
     default build.target        {}
     default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs}}
     default build.args          {--vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
@@ -38,9 +42,6 @@ if {${os.arch} eq "powerpc"} {
     default build.args          {}
 }
 
-# build.dir           ${workpath}
-# build.cmd-append    ${worksrcpath}/
-
 destroot {
     ui_error "No destroot phase in the Portfile!"
     ui_msg "Here is an example destroot phase:"
@@ -50,6 +51,6 @@ destroot {
     ui_msg {    xinstall -m 0444 ${worksrcpath}/doc/${name}.1 ${destroot}${prefix}/share/man/man1/}
     ui_msg "}"
     ui_msg
-    ui_msg "Please check if there are additional files (configuration, documentation, etc.) that need to be installed."
+    ui_msg "Please check if there are additional files (configuration, documentation etc.) that need to be installed."
     error "destroot phase not implemented"
 }
