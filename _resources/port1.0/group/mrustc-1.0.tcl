@@ -320,7 +320,7 @@ proc rust::old_macos_compatibility {cname cversion} {
             }
         }
         "rustix" {
-            if { [vercmp ${cversion} < 0.38.31] && [vercmp ${cversion} >= 0.0] && "i386" in [option muniversal.architectures] } {
+            if { [vercmp ${cversion} < 0.38.31] && [vercmp ${cversion} >= 0.0] && ("i386" in [option muniversal.architectures] || "ppc" in [option muniversal.architectures]) } {
                 # see https://github.com/bytecodealliance/rustix/issues/991
                 reinplace "s|utimensat_old(dirfd, path, times, flags)|//utimensat_old(dirfd, path, times, flags)|g" \
                     ${cargo.home}/macports/${cname}-${cversion}/src/backend/libc/fs/syscalls.rs
