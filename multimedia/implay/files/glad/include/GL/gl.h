@@ -287,6 +287,7 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
 #define GL_COLOR_ARRAY_SIZE 0x8081
 #define GL_COLOR_ARRAY_STRIDE 0x8083
 #define GL_COLOR_ARRAY_TYPE 0x8082
+#define GL_COLOR_ATTACHMENT0_EXT 0x8CE0
 #define GL_COLOR_BUFFER_BIT 0x00004000
 #define GL_COLOR_CLEAR_VALUE 0x0C22
 #define GL_COLOR_INDEX 0x1900
@@ -447,6 +448,7 @@ typedef void (*GLADpostcallback)(void *ret, const char *name, GLADapiproc apipro
 #define GL_FRAGMENT_DEPTH 0x8452
 #define GL_FRAGMENT_SHADER 0x8B30
 #define GL_FRAGMENT_SHADER_DERIVATIVE_HINT 0x8B8B
+#define GL_FRAMEBUFFER_EXT 0x8D40
 #define GL_FRONT 0x0404
 #define GL_FRONT_AND_BACK 0x0408
 #define GL_FRONT_FACE 0x0B46
@@ -1117,6 +1119,7 @@ typedef void (GLAD_API_PTR *PFNGLBEGINPROC)(GLenum mode);
 typedef void (GLAD_API_PTR *PFNGLBEGINQUERYPROC)(GLenum target, GLuint id);
 typedef void (GLAD_API_PTR *PFNGLBINDATTRIBLOCATIONPROC)(GLuint program, GLuint index, const GLchar * name);
 typedef void (GLAD_API_PTR *PFNGLBINDBUFFERPROC)(GLenum target, GLuint buffer);
+typedef void (GLAD_API_PTR *PFNGLBINDFRAMEBUFFEREXTPROC)(GLenum target, GLuint framebuffer);
 typedef void (GLAD_API_PTR *PFNGLBINDTEXTUREPROC)(GLenum target, GLuint texture);
 typedef void (GLAD_API_PTR *PFNGLBITMAPPROC)(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove, GLfloat ymove, const GLubyte * bitmap);
 typedef void (GLAD_API_PTR *PFNGLBLENDCOLORPROC)(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha);
@@ -1188,6 +1191,7 @@ typedef GLuint (GLAD_API_PTR *PFNGLCREATEPROGRAMPROC)(void);
 typedef GLuint (GLAD_API_PTR *PFNGLCREATESHADERPROC)(GLenum type);
 typedef void (GLAD_API_PTR *PFNGLCULLFACEPROC)(GLenum mode);
 typedef void (GLAD_API_PTR *PFNGLDELETEBUFFERSPROC)(GLsizei n, const GLuint * buffers);
+typedef void (GLAD_API_PTR *PFNGLDELETEFRAMEBUFFERSEXTPROC)(GLsizei n, const GLuint * framebuffers);
 typedef void (GLAD_API_PTR *PFNGLDELETELISTSPROC)(GLuint list, GLsizei range);
 typedef void (GLAD_API_PTR *PFNGLDELETEPROGRAMPROC)(GLuint program);
 typedef void (GLAD_API_PTR *PFNGLDELETEQUERIESPROC)(GLsizei n, const GLuint * ids);
@@ -1239,9 +1243,11 @@ typedef void (GLAD_API_PTR *PFNGLFOGFPROC)(GLenum pname, GLfloat param);
 typedef void (GLAD_API_PTR *PFNGLFOGFVPROC)(GLenum pname, const GLfloat * params);
 typedef void (GLAD_API_PTR *PFNGLFOGIPROC)(GLenum pname, GLint param);
 typedef void (GLAD_API_PTR *PFNGLFOGIVPROC)(GLenum pname, const GLint * params);
+typedef void (GLAD_API_PTR *PFNGLFRAMEBUFFERTEXTURE2DEXTPROC)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
 typedef void (GLAD_API_PTR *PFNGLFRONTFACEPROC)(GLenum mode);
 typedef void (GLAD_API_PTR *PFNGLFRUSTUMPROC)(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear, GLdouble zFar);
 typedef void (GLAD_API_PTR *PFNGLGENBUFFERSPROC)(GLsizei n, GLuint * buffers);
+typedef void (GLAD_API_PTR *PFNGLGENFRAMEBUFFERSEXTPROC)(GLsizei n, GLuint * framebuffers);
 typedef GLuint (GLAD_API_PTR *PFNGLGENLISTSPROC)(GLsizei range);
 typedef void (GLAD_API_PTR *PFNGLGENQUERIESPROC)(GLsizei n, GLuint * ids);
 typedef void (GLAD_API_PTR *PFNGLGENTEXTURESPROC)(GLsizei n, GLuint * textures);
@@ -1673,6 +1679,8 @@ GLAD_API_CALL PFNGLBINDATTRIBLOCATIONPROC glad_glBindAttribLocation;
 #define glBindAttribLocation glad_glBindAttribLocation
 GLAD_API_CALL PFNGLBINDBUFFERPROC glad_glBindBuffer;
 #define glBindBuffer glad_glBindBuffer
+GLAD_API_CALL PFNGLBINDFRAMEBUFFEREXTPROC glad_glBindFramebufferEXT;
+#define glBindFramebufferEXT glad_glBindFramebufferEXT
 GLAD_API_CALL PFNGLBINDTEXTUREPROC glad_glBindTexture;
 #define glBindTexture glad_glBindTexture
 GLAD_API_CALL PFNGLBITMAPPROC glad_glBitmap;
@@ -1815,6 +1823,8 @@ GLAD_API_CALL PFNGLCULLFACEPROC glad_glCullFace;
 #define glCullFace glad_glCullFace
 GLAD_API_CALL PFNGLDELETEBUFFERSPROC glad_glDeleteBuffers;
 #define glDeleteBuffers glad_glDeleteBuffers
+GLAD_API_CALL PFNGLDELETEFRAMEBUFFERSEXTPROC glad_glDeleteFramebuffersEXT;
+#define glDeleteFramebuffersEXT glad_glDeleteFramebuffersEXT
 GLAD_API_CALL PFNGLDELETELISTSPROC glad_glDeleteLists;
 #define glDeleteLists glad_glDeleteLists
 GLAD_API_CALL PFNGLDELETEPROGRAMPROC glad_glDeleteProgram;
@@ -1917,12 +1927,16 @@ GLAD_API_CALL PFNGLFOGIPROC glad_glFogi;
 #define glFogi glad_glFogi
 GLAD_API_CALL PFNGLFOGIVPROC glad_glFogiv;
 #define glFogiv glad_glFogiv
+GLAD_API_CALL PFNGLFRAMEBUFFERTEXTURE2DEXTPROC glad_glFramebufferTexture2DEXT;
+#define glFramebufferTexture2DEXT glad_glFramebufferTexture2DEXT
 GLAD_API_CALL PFNGLFRONTFACEPROC glad_glFrontFace;
 #define glFrontFace glad_glFrontFace
 GLAD_API_CALL PFNGLFRUSTUMPROC glad_glFrustum;
 #define glFrustum glad_glFrustum
 GLAD_API_CALL PFNGLGENBUFFERSPROC glad_glGenBuffers;
 #define glGenBuffers glad_glGenBuffers
+GLAD_API_CALL PFNGLGENFRAMEBUFFERSEXTPROC glad_glGenFramebuffersEXT;
+#define glGenFramebuffersEXT glad_glGenFramebuffersEXT
 GLAD_API_CALL PFNGLGENLISTSPROC glad_glGenLists;
 #define glGenLists glad_glGenLists
 GLAD_API_CALL PFNGLGENQUERIESPROC glad_glGenQueries;
