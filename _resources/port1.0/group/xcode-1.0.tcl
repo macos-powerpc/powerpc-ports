@@ -242,6 +242,7 @@ proc xcode::get_build_args {args} {
         gcc-3.3 {set gcc_version 3.3}
         gcc-4.0 {set gcc_version 4.0}
         gcc-4.2 {set gcc_version 4.2}
+        macports-gcc-14 {set gcc_version 14.3}
         llvm-gcc-4.2 {set gcc_version com.apple.compilers.llvmgcc42}
         clang {set gcc_version com.apple.compilers.llvm.clang.1_0}
     }
