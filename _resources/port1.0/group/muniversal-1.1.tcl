@@ -145,7 +145,17 @@ options triplet.vendor
 default triplet.vendor      {[expr {${os.platform} eq "darwin" ? "apple" : "unknown"}]}
 
 options triplet.os
-default triplet.os          {${os.platform}${os.major}}
+switch ${os.platform} {
+    "darwin" {
+        default triplet.os      {${os.platform}${os.major}}
+    }
+    "linux" {
+        default triplet.os      {linux-gnu}
+    }
+    default {
+        default triplet.os      {${os.platform}}
+    }
+}
 
 options triplet.host_cmd
 default triplet.host_cmd    {--host=}
