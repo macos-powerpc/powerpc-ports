@@ -8,10 +8,22 @@
 # Documentation (sources):
 # https://github.com/macports/macports-guide/blob/master/guide/xml/portgroup-github.xml
 
-options github.author github.project github.version github.tag_prefix github.tag_suffix
+options github.scheme github.provider github.author github.project github.version github.tag_prefix github.tag_suffix
+
+default github.scheme   {https}
+default github.provider {github.com}
+
+proc github.project_url {} {
+    global github.scheme github.provider github.author github.project
+    if {${github.author} ne "" && "${github.author}" ne "{}"} {
+        return "${github.scheme}://${github.provider}/${github.author}/${github.project}"
+    } else {
+        return "${github.scheme}://${github.provider}/${github.project}"
+    }
+}
 
 options github.homepage
-default github.homepage {https://github.com/${github.author}/${github.project}}
+default github.homepage {[github.project_url]}
 
 options github.raw
 default github.raw {https://raw.githubusercontent.com/${github.author}/${github.project}}
@@ -21,7 +33,12 @@ options github.master_sites
 default github.master_sites {[github.get_master_sites]}
 
 proc github.get_master_sites {} {
-    global github.tarball_from github.homepage git.branch
+    global github.tarball_from github.homepage git.branch github.provider fetch.type
+    if {${github.provider} ne "github.com"} {
+        fetch.type git
+        ui_debug "github 1.1 PG : not fetching from github.com so forcing git fetching"
+        return ""
+    }
     switch -- ${github.tarball_from} {
         archive {
             # FIXME: Generate a more specific URL. When a branch and tag
@@ -72,13 +89,14 @@ default github.livecheck.branch master
 
 options github.livecheck.regex
 default github.livecheck.regex {(\[^"]+)}
+#" (This is so certain editors see a closing double-quote)
 
 options git.shallow_since
 default git.shallow_since {}
 
 proc github.setup {gh_author gh_project gh_version {gh_tag_prefix ""} {gh_tag_suffix ""}} {
     global github.author github.project github.version github.tag_prefix github.tag_suffix \
-           github.homepage github.master_sites github.livecheck.branch PortInfo
+           github.homepage github.master_sites github.livecheck.branch PortInfo fetch.type
 
     github.author           ${gh_author}
     github.project          ${gh_project}
@@ -95,7 +113,11 @@ proc github.setup {gh_author gh_project gh_version {gh_tag_prefix ""} {gh_tag_su
     git.url                 ${github.homepage}.git
     git.branch              [join ${github.tag_prefix}]${github.version}[join ${github.tag_suffix}]
     default master_sites    {${github.master_sites}}
-    distname                ${github.project}-${github.version}
+    if {${fetch.type} ne "git"} {
+        distname            ${github.project}-${github.version}
+    } else {
+        distname            ${github.project}-git
+    }
 
     default extract.rename  {[expr {${github.tarball_from} in {archive tarball} && [llength ${extract.only}] == 1}]}
 
@@ -143,7 +165,7 @@ proc portfetch::gitfetch {args} {
 
     if {${git.branch} ne ""} {
         set env "GIT_DIR=[shellescape ${worksrcpath}/.git] GIT_WORK_TREE=[shellescape ${worksrcpath}]"
-        set cmdstring "$env ${git.cmd} checkout -q ${git.branch} 2>&1"
+        set cmdstring "$env ${git.cmd} checkout --recurse-submodules ${git.branch} 2>&1"
         ui_debug "Executing $cmdstring"
         if {[catch {system $cmdstring} result]} {
             return -code error [msgcat::mc "Git checkout failed"]

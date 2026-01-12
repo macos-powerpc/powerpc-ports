@@ -7,7 +7,7 @@ namespace eval configure {
     variable docdir
     proc logfile {} {
         if {[catch {set fn [get_logfile]} err]} {
-            ui_debug "get_logfile not defined or returns empty string: $err
+            ui_debug "get_logfile not defined or returns empty string: $err"
             return ""
         } else {
             return $fn
@@ -52,8 +52,28 @@ namespace eval configure {
         }
     }
 
+    # try to guess the actual compiler command from a command string
+    proc guess_compiler {cmd} {
+        global prefix configure.ccache configure.distcc
+        set nolauncher [string map \
+                    [list "${prefix}/bin/ccache " "" \
+                        "${prefix}/bin/sccache " "" \
+                        "ccache " "" \
+                        "sccache " "" \
+                        "${prefix}/bin/distcc " "" \
+                        "distcc " ""] \
+                    ${cmd}]
+        set compiler [lindex [split ${nolauncher} " "] 0]
+        if {[file executable ${compiler}]} {
+            return ${compiler}
+        } else {
+            ui_debug "guess_compiler failed on \"${cmd}\" (${compiler})"
+            return ${cmd}
+        }
+    }
+
     proc write_configure_cmd {fname} {
-        global configure.env
+        global configure.env prefix
         if {![catch {set fd [open "${fname}" "w"]} err]} {
             foreach var [array names ::env] {
                 puts ${fd} "${var}=$::env(${var})"
@@ -82,18 +102,34 @@ namespace eval configure {
                 puts ${fd} "OBJCXXFLAGS=\"[option configure.objcxxflags]\""
             }
             puts ${fd} "LDFLAGS=\"[option configure.ldflags]\""
-            puts ${fd} "# Commandline configure options:"
+            set CXX [guess_compiler [option configure.cxx]]
+            set OBJCXX [guess_compiler [option configure.objcxx]]
+            if {[string match ${prefix}* ${CXX}] \
+                    || [string match ${prefix}* ${OBJCXX}]} {
+                set port [registry_file_registered ${CXX}]
+                if {${port} != 0} {
+                    puts ${fd} "#    C++ compiler provided by: [lrange [lindex [registry_active ${port}] 0] 0 3]"
+                }
+                if {"${OBJCXX}" ne "${CXX}"} {
+                    set port [registry_file_registered ${OBJCXX}]
+                    if {${port} != 0} {
+                        puts ${fd} "# ObjC++ compiler provided by: [lrange [lindex [registry_active ${port}] 0] 0 3]"
+                    }
+                }
+            }
+            puts ${fd} "\n# Commandline configure options:"
             if {[option configure.optflags] ne ""} {
                 puts -nonewline ${fd} " configure.optflags=\"[option configure.optflags]\""
             }
             if {[option configure.compiler] ne ""} {
                 puts -nonewline ${fd} " configure.compiler=\"[option configure.compiler]\""
             }
-            if {[option configure.objc] ne "[option configure.cc]"} {
-                puts -nonewline ${fd} " configure.objc=\"[option configure.objc]\""
+            set OBJC [guess_compiler [option configure.objc]]
+            if {${OBJC} ne "[guess_compiler [option configure.cc]]"} {
+                puts -nonewline ${fd} " configure.objc=\"${OBJC}\""
             }
-            if {[option configure.objcxx] ne "[option configure.cxx]"} {
-                puts -nonewline ${fd} " configure.objcxx=\"[option configure.objcxx]\""
+            if {"${OBJCXX}" ne "${CXX}"} {
+                puts -nonewline ${fd} " configure.objcxx=\"${OBJCXX}\""
             }
             if {[option configureccache] ne ""} {
                 puts -nonewline ${fd} " configureccache=\"[option configureccache]\""
@@ -102,7 +138,7 @@ namespace eval configure {
                 puts -nonewline ${fd} " configure.cxx_stdlib=\"[option configure.cxx_stdlib]\""
             }
             puts ${fd} ""
-            puts ${fd} "\ncd [option worksrcpath]"
+            puts ${fd} "\ncd [option configure.dir]"
             puts ${fd} "[option configure.cmd] [join [option configure.pre_args]] [join [option configure.args]] [join [option configure.post_args]]"
             close ${fd}
             unset fd
@@ -179,7 +215,7 @@ proc configure.save_configure_cmd {{save_log_too ""}} {
 
 proc configure.save_build_cmd {{save ""}} {
     namespace upvar ::configure configure_cmd_saved statevar2
-    global build.env
+    global build.env prefix
     if {${configure::statevar2}} {
         ui_debug "configure.save_build_cmd already called"
         return;
@@ -215,7 +251,7 @@ proc configure.save_build_cmd {{save ""}} {
                     puts ${fd} "${assignment}"
                 }
             }
-            puts ${fd} "\ncd ${worksrcpath}"
+            puts ${fd} "\ncd ${build.dir}"
             puts ${fd} "${build.cmd} [join ${build.pre_args}] [join ${build.args}] [join ${build.post_args}]"
             close ${fd}
             unset fd
@@ -250,6 +286,19 @@ proc configure.save_build_cmd {{save ""}} {
                 puts ${fd} "OBJCXXFLAGS=\"${configure.objcxxflags}\""
             }
             puts ${fd} "LDFLAGS=\"${configure.ldflags}\""
+            if {[string match ${prefix}* [option configure.cxx]] \
+                    || [string match ${prefix}* [option configure.objcxx]]} {
+                set port [registry_file_registered [option configure.cxx]]
+                if {${port} != 0} {
+                    puts ${fd} "#    C++ compiler provided by: [lrange [lindex [registry_active ${port}] 0] 0 3]"
+                }
+                if {[option configure.objcxx] ne [option configure.cxx]} {
+                    set port [registry_file_registered [option configure.objcxx]]
+                    if {${port} != 0} {
+                        puts ${fd} "# ObjC++ compiler provided by: [lrange [lindex [registry_active ${port}] 0] 0 3]"
+                    }
+                }
+            }
             puts ${fd} "# Commandline configure options:"
             if {${configure.optflags} ne ""} {
                 puts -nonewline ${fd} " configure.optflags=\"${configure.optflags}\""
@@ -264,7 +313,7 @@ proc configure.save_build_cmd {{save ""}} {
                 puts -nonewline ${fd} " configure.cxx_stdlib=\"${configure.cxx_stdlib}\""
             }
             puts ${fd} ""
-            puts ${fd} "\ncd ${worksrcpath}"
+            puts ${fd} "\ncd ${build.dir}"
             puts ${fd} "${build.cmd} [join ${build.pre_args}] [join ${build.args}] [join ${build.post_args}]"
             close ${fd}
             unset fd
@@ -276,8 +325,9 @@ proc configure::callback {} {
     global configure.cmd
     if {${configure::statevar}} {
         ui_debug "[dict get [info frame 0] proc]: save_configure_cmd  already called directly by Portfile"
+    } elseif {${configure::statevar2}} {
+        ui_debug "[dict get [info frame 0] proc]: save_build_cmd  already called directly by Portfile"
     } else {
-        ui_debug "cmake? ${configure.cmd}"
         if {[string match *cmake ${configure.cmd}]} {
             ui_debug "[dict get [info frame 0] proc]: calling `cmake.save_configure_cmd \"install log\"`"
             cmake.save_configure_cmd "install log"
@@ -291,6 +341,12 @@ proc configure::callback {} {
         } else {
             ui_debug "[dict get [info frame 0] proc]: calling `save_configure_cmd \"install log\"`"
             configure.save_configure_cmd "install log"
+            # check if the makefile PG is in use; in that case we also (!) want to save
+            # call save_build_cmd
+            if {[namespace eval [namespace parent] {namespace exists makefile_pg}]} {
+                ui_debug "[dict get [info frame 0] proc]: makefile PG in use; calling `save_build_cmd \"install\"`"
+                configure.save_build_cmd "install"
+            }
         }
     }
 }
