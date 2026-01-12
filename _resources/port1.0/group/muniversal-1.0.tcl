@@ -207,6 +207,11 @@ proc muniversal_get_vendor {} {
 }
 
 variant universal {
+    if {${supported_archs} eq "noarch"} {
+        ui_warn "Port ${subport} is architecture-agnostic and should neither have nor use the +universal variant"
+        return
+    }
+
     foreach arch ${configure.universal_archs} {
         foreach lang {c cxx objc objcxx cpp ld} {
             configure.universal_${lang}flags-delete -arch ${arch}
