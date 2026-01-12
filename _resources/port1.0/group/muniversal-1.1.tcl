@@ -1,5 +1,15 @@
 # -*- coding: utf-8; mode: tcl; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- vim:fenc=utf-8:ft=tcl:et:sw=4:ts=4:sts=4
 
+if {[info exists muniversal::currentportgroupdir]} {
+    ui_debug "[dict get [info frame 0] file] has already been loaded"
+    return
+}
+
+namespace eval muniversal {
+    # our directory:
+    variable currentportgroupdir [file dirname [dict get [info frame 0] file]]
+}
+
 ##########################################################################################
 # change defaults from
 # https://github.com/macports/macports-base/blob/master/src/port1.0/portconfigure.tcl
@@ -615,6 +625,9 @@ proc muniversal::merge {base1 base2 base prefixDir arch1 arch2 merger_dont_diff 
 
 # get default supported architectures then further restrict them depending on muniversal options
 rename portconfigure::choose_supported_archs portconfigure::choose_supported_archs_real
+pre-configure {
+    ui_debug "muniversal-1.1 PG overloaded the choose_supported_archs procedure!"
+}
 proc portconfigure::choose_supported_archs {archs} {
     global  os.arch
 
@@ -813,6 +826,9 @@ proc get_canonical_archflags {{tool cc}} {
 # make use of architecture dependent variations of patch files
 # N.B.: this is a candidate for inclusion in the base code
 rename portpatch::patch_main portpatch::patch_main_real
+pre-patch {
+    ui_debug "muniversal-1.1 PG overloaded the patch_main procedure!"
+}
 proc portpatch::patch_main {args} {
     global UI_PREFIX
 
@@ -850,21 +866,31 @@ proc portpatch::patch_main {args} {
     set bzcat "[findBinary bzip2 $portutil::autoconf::bzip2_path] -dc"
     catch {set xzcat "[findBinary xz $portutil::autoconf::xz_path] -dc"}
 
+    global workpath subport
+    set statefile [file join $workpath .macports.${subport}.state]
+    set target_state_fd [open $statefile a+]
+    flush ${target_state_fd}
     foreach patch $patchlist {
-        ui_info "$UI_PREFIX [format [msgcat::mc "Applying %s"] [file tail $patch]]"
-        switch -- [file extension $patch] {
-            .Z -
-            .gz {command_exec patch "$gzcat \"$patch\" | (" ")"}
-            .bz2 {command_exec patch "$bzcat \"$patch\" | (" ")"}
-            .xz {
-                if {[info exists xzcat]} {
-                    command_exec patch "$xzcat \"$patch\" | (" ")"
-                } else {
-                    return -code error [msgcat::mc "xz binary not found; port needs to add 'depends_patch bin:xz:xz'"]
-                }}
-            default {command_exec patch "" "< '$patch'"}
+        set pfile [file tail $patch]
+        set pfile4arch "${arch}:${pfile}"
+        if {![check_statefile patch $pfile4arch $target_state_fd]} {
+            ui_info "$UI_PREFIX [format [msgcat::mc "Applying %s"] [file tail $patch]]"
+            switch -- [file extension $patch] {
+                .Z -
+                .gz {command_exec patch "$gzcat \"$patch\" | (" ")"}
+                .bz2 {command_exec patch "$bzcat \"$patch\" | (" ")"}
+                .xz {
+                    if {[info exists xzcat]} {
+                        command_exec patch "$xzcat \"$patch\" | (" ")"
+                    } else {
+                        return -code error [msgcat::mc "xz binary not found; port needs to add 'depends_patch bin:xz:xz'"]
+                    }}
+                default {command_exec patch "" "< '$patch'"}
+            }
+            write_statefile patch $pfile4arch $target_state_fd
         }
     }
+    close ${target_state_fd}
     return 0
 }
 
@@ -889,6 +915,14 @@ proc universal_setup {args} {
 ui_debug "muniversal: adding universal variant"
 
 variant universal {
+
+    if {${supported_archs} eq "noarch"} {
+        ui_warn "Port ${subport} is architecture-agnostic and should neither have nor use the +universal variant"
+        return
+    } elseif {${os.platform} ne "darwin"} {
+        ui_warn "Platform \"${os.platform}\" doesn't support universal builds"
+        return
+    }
 
 ##########################################################################################
 # changes if universal variant is set
@@ -1029,6 +1063,8 @@ proc portdestroot::destroot_finish {args} {
             muniversal.combine \
             muniversal.equivalent
 
+    global  UI_PREFIX subport
+
     # GNU diff can merge two C/C++ files
     # See https://www.gnu.org/software/diffutils/manual/html_mono/diff.html#If-then-else
     # See https://www.gnu.org/software/diffutils/manual/html_mono/diff.html#Detailed%20If-then-else
@@ -1068,12 +1104,32 @@ proc portdestroot::destroot_finish {args} {
 %>#endif
 '}
 
+    ui_msg "$UI_PREFIX [format [msgcat::mc " Merging %1\$s destroots"] ${subport}]"
+
     muniversal::merge  ${workpath}/destroot-ppc      ${workpath}/destroot-ppc64     ${workpath}/destroot-powerpc   ""  ppc ppc64      ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatM}
     muniversal::merge  ${workpath}/destroot-i386     ${workpath}/destroot-x86_64    ${workpath}/destroot-intel     ""  i386 x86_64    ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatM}
     muniversal::merge  ${workpath}/destroot-powerpc  ${workpath}/destroot-intel     ${workpath}/destroot-ppc-intel ""  powerpc x86    ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatProc}
     muniversal::merge  ${workpath}/destroot-arm64    ${workpath}/destroot-ppc-intel ${workpath}/destroot           ""  arm64 ppcintel ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatArmElse}
 
+    if {[namespace exists dev]} {
+        global dev::workdir_uuid devport_name
+        if {[info exists dev::workdir_uuid]} {
+            set dwp [get_devport_workpath]
+            ui_msg "$UI_PREFIX [format [msgcat::mc "  Merging %1\$s destroots"] ${devport_name}]"
+            muniversal::merge  ${dwp}/destroot-ppc      ${dwp}/destroot-ppc64     ${dwp}/destroot-powerpc   ""  \
+                ppc ppc64      ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatM}
+            muniversal::merge  ${dwp}/destroot-i386     ${dwp}/destroot-x86_64    ${dwp}/destroot-intel     ""  \
+                i386 x86_64    ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatM}
+            muniversal::merge  ${dwp}/destroot-powerpc  ${dwp}/destroot-intel     ${dwp}/destroot-ppc-intel ""  \
+                powerpc x86    ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatProc}
+            muniversal::merge  ${dwp}/destroot-arm64    ${dwp}/destroot-ppc-intel ${dwp}/destroot           ""  \
+                arm64 ppcintel ${muniversal.dont_diff}  ${muniversal.combine} ${muniversal.equivalent} ${diffFormatArmElse}
+        }
+    }
     portdestroot::destroot_finish_real ${args}
+}
+pre-destroot {
+    ui_debug "muniversal-1.1 PG overloaded the destroot_start & destroot_finishprocedures!"
 }
 }
 }
@@ -1085,9 +1141,8 @@ proc portdestroot::destroot_finish {args} {
 # if base code not modified (i.e. not a universal build), append architecture flag to compiler name if requested
 proc muniversal::add_compiler_flags {} {
     global configure.build_arch
-    if {${configure.build_arch} ne {} && 
-        (![option universal_possible] || ![variant_isset universal]) &&
-        [option muniversal.arch_compiler]
+    if {${configure.build_arch} ne {} && \
+        (![option universal_possible] || ![variant_isset universal]) && [option muniversal.arch_compiler]
     } then {
         # configure.cpp is intentionally left out
         foreach tool {cxx objcxx cc objc fc f90 f77} {
