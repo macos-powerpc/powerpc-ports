@@ -1,0 +1,391 @@
+diff --git a/src/dispatch.c b/src/dispatch.c
+index a593f256..7a2f9577 100644
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -398,17 +398,27 @@ static void generate_shaders(pl_dispatch dp,
+         ADD(pre, "precision highp int; \n");
+     }
+ 
+-    // textureLod() doesn't work on external/rect samplers, simply disable
+-    // LOD sampling in this case. We don't currently support mipmaps anyway.
+-    for (int i = 0; i < sh->descs.num; i++) {
+-        if (pass_params->descriptors[i].type != PL_DESC_SAMPLED_TEX)
+-            continue;
+-        pl_tex tex = sh->descs.elem[i].binding.object;
+-        if (tex->sampler_type != PL_SAMPLER_NORMAL) {
+-            ADD(pre, "#define textureLod(t, p, b) texture(t, p) \n"
+-                     "#define textureLodOffset(t, p, b, o)    \\\n"
+-                     "        textureOffset(t, p, o)            \n");
+-            break;
++    // GLSL < 130 compatibility: Use legacy texture functions
++    if (gpu->glsl.version < 130) {
++        ADD(pre, "// GLSL < 130 texture compatibility layer\n");
++        // Map modern texture() calls to legacy texture2D()
++        ADD(pre, "#define texture(t, p) texture2D(t, p)\n");
++        // For LOD sampling, use texture2DLod if available, otherwise just texture2D
++        ADD(pre, "#define textureLod(t, p, b) texture2D(t, p)\n");
++        ADD(pre, "#define textureLodOffset(t, p, b, o) texture2D(t, p)\n");
++    } else {
++        // textureLod() doesn't work on external/rect samplers, simply disable
++        // LOD sampling in this case. We don't currently support mipmaps anyway.
++        for (int i = 0; i < sh->descs.num; i++) {
++            if (pass_params->descriptors[i].type != PL_DESC_SAMPLED_TEX)
++                continue;
++            pl_tex tex = sh->descs.elem[i].binding.object;
++            if (tex->sampler_type != PL_SAMPLER_NORMAL) {
++                ADD(pre, "#define textureLod(t, p, b) texture(t, p) \n"
++                         "#define textureLodOffset(t, p, b, o)    \\\n"
++                         "        textureOffset(t, p, o)            \n");
++                break;
++            }
+         }
+     }
+ 
+@@ -620,6 +630,9 @@ static void generate_shaders(pl_dispatch dp,
+             if (has_loc) {
+                 ADD(vert_head, "layout(location=%d) in %s "$";\n",
+                     va->location, type, sh_ident_unpack(va->name));
++            } else if (gpu->glsl.version < 130) {
++                // GLSL < 130: use attribute instead of in for vertex inputs
++                ADD(vert_head, "attribute %s "$";\n", type, sh_ident_unpack(va->name));
+             } else {
+                 ADD(vert_head, "in %s "$";\n", type, sh_ident_unpack(va->name));
+             }
+@@ -639,6 +652,10 @@ static void generate_shaders(pl_dispatch dp,
+                         va->location, type, id);
+                     ADD(glsl, "layout(location=%d) in %s "$";\n",
+                         va->location, type, id);
++                } else if (gpu->glsl.version < 130) {
++                    // GLSL < 130: use varying instead of in/out
++                    ADD(vert_head, "varying %s "$";\n", type, id);
++                    ADD(glsl, "varying %s "$";\n", type, id);
+                 } else {
+                     ADD(vert_head, "out %s "$";\n", type, id);
+                     ADD(glsl, "in %s "$";\n", type, id);
+@@ -652,7 +669,10 @@ static void generate_shaders(pl_dispatch dp,
+         pl_hash_merge(&pass->signature, pl_str_builder_hash(vert_head));
+         *out_vert_builder = vert_head;
+ 
+-        if (has_loc) {
++        // GLSL < 130: use gl_FragColor instead of out_color
++        if (gpu->glsl.version < 130) {
++            // No output declaration needed, gl_FragColor is built-in
++        } else if (has_loc) {
+             ADD(glsl, "layout(location=0) out vec4 out_color;\n");
+         } else {
+             ADD(glsl, "out vec4 out_color;\n");
+@@ -676,7 +696,12 @@ static void generate_shaders(pl_dispatch dp,
+     switch (pass_params->type) {
+     case PL_PASS_RASTER:
+         pl_assert(sh->output == PL_SHADER_SIG_COLOR);
+-        ADD(glsl, "out_color = "$"();\n", sh->name);
++        // GLSL < 130: use gl_FragColor instead of out_color
++        if (gpu->glsl.version < 130) {
++            ADD(glsl, "gl_FragColor = "$"();\n", sh->name);
++        } else {
++            ADD(glsl, "out_color = "$"();\n", sh->name);
++        }
+         break;
+     case PL_PASS_COMPUTE:
+         ADD(glsl, $"();\n", sh->name);
+diff --git a/src/meson.build b/src/meson.build
+index e93e800f..0ce5d847 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -206,6 +206,14 @@ endif
+ defs = ''
+ pc_vars = []
+ 
++# Detect endianness (important for PowerPC big-endian support)
++if host_machine.endian() == 'big'
++  defs += '#define PL_HAVE_BIG_ENDIAN 1\n'
++  message('Detected big-endian system (e.g., PowerPC)')
++else
++  defs += '#undef PL_HAVE_BIG_ENDIAN\n'
++endif
++
+ foreach comp : components.keys()
+   found = components.get(comp)
+   varname = comp.underscorify().to_upper()
+diff --git a/src/opengl/context.c b/src/opengl/context.c
+index 8b38e652..37fbf0f9 100644
+--- a/src/opengl/context.c
++++ b/src/opengl/context.c
+@@ -202,7 +202,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+     PL_INFO(p, "    GL_RENDERER: %s", (char *) gl->GetString(GL_RENDERER));
+ 
+     ext_arr_t exts = {0};
+-    if (pl_gl->major >= 3) {
++    if (pl_gl->major >= 3 && gl->GetStringi) {
+         gl->GetIntegerv(GL_NUM_EXTENSIONS, &exts.num);
+         PL_ARRAY_RESIZE(pl_gl, exts, exts.num);
+         for (int i = 0; i < exts.num; i++)
+@@ -217,7 +217,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+             PL_DEBUG(p, "        %s", exts.elem[i]);
+     }
+ 
+-    static const int gl_ver_req = 3;
++    static const int gl_ver_req = 2;
+     if (pl_gl->major < gl_ver_req) {
+         PL_FATAL(p, "OpenGL version too old (%d < %d), please use a newer "
+                  "OpenGL implementation or downgrade libplacebo!",
+diff --git a/src/opengl/formats.c b/src/opengl/formats.c
+index 94154448..6c724825 100644
+--- a/src/opengl/formats.c
++++ b/src/opengl/formats.c
+@@ -372,6 +372,10 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+     if (fmt->caps & PL_FMT_CAP_SAMPLEABLE)
+         fmt->gatherable = p->gather_comps >= fmt->num_components;
+ 
++    // Mask renderable/blittable if no FBOs available (GL 2.0 compatibility)
++    if (!p->has_fbos)
++        fmt->caps &= ~(PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
++
+     bool host_readable = false;
+     if (p->gl_ver && p->has_readback)
+         host_readable = true;
+@@ -388,6 +392,11 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+     if (gpu->glsl.compute && fmt->glsl_format && p->has_storage)
+         fmt->caps |= PL_FMT_CAP_STORABLE | PL_FMT_CAP_READWRITE;
+ 
++    // If no FBO support, renderable/blittable formats are not available
++    if (!p->has_fbos) {
++        fmt->caps &= ~(PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
++    }
++
+     // GLES 2 can't do blitting
+     if (p->gles_ver && p->gles_ver < 30)
+         fmt->caps &= ~PL_FMT_CAP_BLITTABLE;
+diff --git a/src/opengl/gpu.c b/src/opengl/gpu.c
+index a515943f..b60bc0cb 100644
+--- a/src/opengl/gpu.c
++++ b/src/opengl/gpu.c
+@@ -30,6 +30,39 @@
+ #include <sysinfoapi.h>
+ #endif
+ 
++// Fallback definitions for OpenGL constants not available in GL 2.0
++// These will never be used at runtime due to extension checks, but are needed for compilation
++#ifndef GL_TEXTURE_RECTANGLE
++#define GL_TEXTURE_RECTANGLE GL_TEXTURE_RECTANGLE_ARB
++#endif
++#ifndef GL_MAX_PROGRAM_TEXTURE_GATHER_COMPONENTS_ARB
++#define GL_MAX_PROGRAM_TEXTURE_GATHER_COMPONENTS_ARB 0x8F9F
++#endif
++#ifndef GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET_ARB
++#define GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET_ARB 0x8E5E
++#endif
++#ifndef GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET_ARB
++#define GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET_ARB 0x8E5F
++#endif
++#ifndef GL_DYNAMIC_STORAGE_BIT
++#define GL_DYNAMIC_STORAGE_BIT 0x0100
++#endif
++#ifndef GL_MAP_PERSISTENT_BIT
++#define GL_MAP_PERSISTENT_BIT 0x0040
++#endif
++#ifndef GL_MAP_COHERENT_BIT
++#define GL_MAP_COHERENT_BIT 0x0080
++#endif
++#ifndef GL_CLIENT_STORAGE_BIT
++#define GL_CLIENT_STORAGE_BIT 0x0200
++#endif
++#ifndef GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT
++#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
++#endif
++#ifndef GL_TIME_ELAPSED
++#define GL_TIME_ELAPSED 0x88BF
++#endif
++
+ static const struct pl_gpu_fns pl_fns_gl;
+ 
+ static void gl_gpu_destroy(pl_gpu gpu)
+@@ -144,7 +177,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+         }
+     }
+ 
+-    static const int glsl_ver_req = 130;
++    static const int glsl_ver_req = 110;
+     if (glsl->version < glsl_ver_req) {
+         PL_FATAL(gpu, "GLSL version too old (%d < %d), please use a newer "
+                  "OpenGL implementation or downgrade libplacebo!",
+@@ -152,7 +185,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+         goto error;
+     }
+ 
+-    if (params->max_glsl_version && params->max_glsl_version >= glsl_ver_req) {
++    if (params->max_glsl_version && params->max_glsl_version >= 110) {
+         glsl->version = PL_MIN(glsl->version, params->max_glsl_version);
+         PL_INFO(gpu, "Restricting GLSL version to %d... new version is %d",
+                 params->max_glsl_version, glsl->version);
+@@ -246,6 +279,9 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+     p->has_invalidate_tex = gl_test_ext(gpu, "GL_ARB_invalidate_subdata", 43, 0);
+     p->has_queries = gl_test_ext(gpu, "GL_ARB_timer_query", 30, 0);
+     p->has_storage = gl_test_ext(gpu, "GL_ARB_shader_image_load_store", 42, 31);
++    p->has_fbos = gl_test_ext(gpu, "GL_ARB_framebuffer_object", 30, 20);
++    p->has_stride = gl_test_ext(gpu, "GL_EXT_unpack_subimage", 11, 30);
++    p->has_unpack_image_height = p->gl_ver >= 12 || p->gles_ver >= 30;
+     p->has_readback = true;
+ 
+     if (p->has_readback && p->gles_ver) {
+diff --git a/src/opengl/gpu.h b/src/opengl/gpu.h
+index 3681f30b..d9e5482f 100644
+--- a/src/opengl/gpu.h
++++ b/src/opengl/gpu.h
+@@ -59,6 +59,9 @@ struct pl_gl {
+     bool has_readback;
+     bool has_egl_storage;
+     bool has_egl_import;
++    bool has_fbos;        // Framebuffer object support (GL_ARB_framebuffer_object)
++    bool has_stride;      // GL_EXT_unpack_subimage (GL_UNPACK_ROW_LENGTH support)
++    bool has_unpack_image_height; // GL 1.2+ or GLES 3.0+ (GL_UNPACK_IMAGE_HEIGHT)
+     int gather_comps;
+ };
+ 
+diff --git a/src/opengl/gpu_pass.c b/src/opengl/gpu_pass.c
+index 96f15e7d..951744a8 100644
+--- a/src/opengl/gpu_pass.c
++++ b/src/opengl/gpu_pass.c
+@@ -305,10 +305,16 @@ pl_pass gl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
+             break;
+         }
+         case PL_DESC_BUF_STORAGE: {
+-            GLuint idx = gl->GetProgramResourceIndex(pass_gl->program,
+-                                                     GL_SHADER_STORAGE_BLOCK,
+-                                                     desc->name);
+-            gl->ShaderStorageBlockBinding(pass_gl->program, idx, desc->binding);
++            // SSBOs require GL 4.3+ or GL_ARB_shader_storage_buffer_object
++            if (gpu->limits.max_ssbo_size > 0) {
++                GLuint idx = gl->GetProgramResourceIndex(pass_gl->program,
++                                                         GL_SHADER_STORAGE_BLOCK,
++                                                         desc->name);
++                gl->ShaderStorageBlockBinding(pass_gl->program, idx, desc->binding);
++            } else {
++                PL_ERR(gpu, "Pass uses SSBO descriptors but SSBOs are not supported!");
++                goto error;
++            }
+             break;
+         }
+         case PL_DESC_BUF_TEXEL_UNIFORM:
+@@ -479,6 +485,11 @@ static void update_desc(pl_gpu gpu, pl_pass pass, int index,
+         return;
+     }
+     case PL_DESC_BUF_STORAGE: {
++        // Should have been caught during pass creation
++        if (gpu->limits.max_ssbo_size == 0) {
++            PL_ERR(gpu, "SSBO descriptor used but SSBOs not supported!");
++            return;
++        }
+         pl_buf buf = db->object;
+         struct pl_buf_gl *buf_gl = PL_PRIV(buf);
+         gl->BindBufferRange(GL_SHADER_STORAGE_BUFFER, desc->binding, buf_gl->buffer,
+@@ -524,6 +535,11 @@ static void unbind_desc(pl_gpu gpu, pl_pass pass, int index,
+         gl->BindBufferBase(GL_UNIFORM_BUFFER, desc->binding, 0);
+         return;
+     case PL_DESC_BUF_STORAGE: {
++        // Should have been caught during pass creation
++        if (gpu->limits.max_ssbo_size == 0) {
++            PL_ERR(gpu, "SSBO descriptor used but SSBOs not supported!");
++            return;
++        }
+         pl_buf buf = db->object;
+         struct pl_buf_gl *buf_gl = PL_PRIV(buf);
+         gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, desc->binding, 0);
+diff --git a/src/opengl/gpu_tex.c b/src/opengl/gpu_tex.c
+index ca488ee2..b20d0d42 100644
+--- a/src/opengl/gpu_tex.c
++++ b/src/opengl/gpu_tex.c
+@@ -16,6 +16,11 @@
+  */
+ 
+ #include "gpu.h"
++
++// GL 2.0 compatibility: Map non-ARB constant to ARB version
++#ifndef GL_TEXTURE_RECTANGLE
++#define GL_TEXTURE_RECTANGLE GL_TEXTURE_RECTANGLE_ARB
++#endif
+ #include "formats.h"
+ #include "utils.h"
+ 
+diff --git a/src/opengl/include/glad/meson.build b/src/opengl/include/glad/meson.build
+index 05b3f023..fdd70e9a 100644
+--- a/src/opengl/include/glad/meson.build
++++ b/src/opengl/include/glad/meson.build
+@@ -18,7 +18,7 @@ glad = custom_target('gl.h',
+   env: python_env,
+   command: [
+     python, '-m', 'glad', '--out-path=@OUTDIR@/../../',
+-    '--reproducible', '--merge', '--api=gl:core,gles2,egl',
++    '--reproducible', '--merge', '--api=gl:compatibility=2.0,gles2,egl',
+     '--extensions=' + ','.join(gl_extensions), 'c', '--header-only', '--mx'
+   ] + (opengl_link.allowed() ? ['--loader'] : [])
+ )
+diff --git a/src/opengl/meson.build b/src/opengl/meson.build
+index f753628c..e80bdaff 100644
+--- a/src/opengl/meson.build
++++ b/src/opengl/meson.build
+@@ -31,21 +31,32 @@ if opengl_build.allowed()
+ 
+   gl_extensions = [
+     'GL_AMD_pinned_memory',
++    # GL 4.4+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_buffer_storage',
+-    'GL_ARB_compute_shader',
+-    'GL_ARB_framebuffer_object',
+-    'GL_ARB_get_program_binary',
++    # GL 4.3+ extensions - needed for compilation even on GL 2.0
++    # (function pointers will be NULL if not available at runtime)
+     'GL_ARB_invalidate_subdata',
+-    'GL_ARB_pixel_buffer_object',
+     'GL_ARB_program_interface_query',
+-    'GL_ARB_shader_image_load_store',
+     'GL_ARB_shader_storage_buffer_object',
+-    'GL_ARB_sync',
+-    'GL_ARB_texture_float',
++    # Compute shaders not needed for GL 2.0
++    # 'GL_ARB_compute_shader',
++    # GL 4.2+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_shader_image_load_store',
++    # GL 4.1+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_get_program_binary',
++    # GL 4.0+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_texture_gather',
+-    'GL_ARB_texture_rg',
++    # GL 3.3+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_timer_query',
++    # GL 3.1+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_pixel_buffer_object',
+     'GL_ARB_uniform_buffer_object',
++    # GL 2.x compatible extensions
++    'GL_ARB_framebuffer_object',
++    'GL_ARB_sync',
++    'GL_ARB_texture_float',
++    'GL_ARB_texture_rectangle',
++    'GL_ARB_texture_rg',
+     'GL_ARB_vertex_array_object',
+     'GL_ARB_half_float_pixel',
+     'GL_EXT_EGL_image_storage',
+diff --git a/src/shaders.c b/src/shaders.c
+index 73e03ec8..d9573162 100644
+--- a/src/shaders.c
++++ b/src/shaders.c
+@@ -92,8 +92,8 @@ static void init_shader(pl_shader sh, const struct pl_shader_params *params)
+ 
+ pl_shader pl_shader_alloc(pl_log log, const struct pl_shader_params *params)
+ {
+-    static const int glsl_ver_req = 130;
+-    if (params && params->glsl.version && params->glsl.version < 130) {
++    static const int glsl_ver_req = 110;
++    if (params && params->glsl.version && params->glsl.version < 110) {
+         pl_err(log, "Requested GLSL version %d too low (required: %d)",
+                params->glsl.version, glsl_ver_req);
+         return NULL;
+@@ -208,7 +208,7 @@ struct pl_glsl_version sh_glsl(const pl_shader sh)
+     if (SH_GPU(sh))
+         return SH_GPU(sh)->glsl;
+ 
+-    return (struct pl_glsl_version) { .version = 130 };
++    return (struct pl_glsl_version) { .version = 110 };
+ }
+ 
+ bool sh_try_compute(pl_shader sh, int bw, int bh, bool flex, size_t mem)
