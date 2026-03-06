@@ -1,0 +1,177 @@
+From 0ab502cfb6358cc8608243dcd02f937b7ede9b9c Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Thu, 5 Mar 2026 23:13:02 +0000
+Subject: [PATCH] Add UDP tracker support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements UDP tracker protocol (BEP 15):
+- Supports both HTTP and UDP tracker URLs
+- Automatically detects tracker type from URI scheme
+- Implements connect and announce requests for UDP
+- Binary packet encoding/decoding for UDP protocol
+- Falls back to HTTP for non-UDP trackers
+
+No new dependencies required - uses Lwt_unix for UDP sockets.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/lib/peers.ml          | 112 +++++++++++++++++++++++++++++++++++++-
+ src/lib/torrent_client.ml |   8 ++-
+ 2 files changed, 116 insertions(+), 4 deletions(-)
+
+diff --git a/src/lib/peers.ml b/src/lib/peers.ml
+index 1ea6b12..b59d594 100644
+--- a/src/lib/peers.ml
++++ b/src/lib/peers.ml
+@@ -29,7 +29,107 @@ let create peers_bin =
+     { ip; port })
+ ;;
+ 
+-let request_peers uri =
++(* UDP Tracker Protocol (BEP 15) *)
++
++let udp_protocol_id = Int64.of_string "0x41727101980"
++
++let write_int64_be buf offset value =
++  let bytes = Bytes.create 8 in
++  Stdint.Int64.to_bytes_big_endian value bytes 0;
++  Bytes.blit bytes 0 buf offset 8
++;;
++
++let write_int32_be buf offset value =
++  let bytes = Bytes.create 4 in
++  Stdint.Int32.to_bytes_big_endian value bytes 0;
++  Bytes.blit bytes 0 buf offset 4
++;;
++
++let write_int16_be buf offset value =
++  let bytes = Bytes.create 2 in
++  Stdint.Uint16.to_bytes_big_endian value bytes 0;
++  Bytes.blit bytes 0 buf offset 2
++;;
++
++let read_int64_be buf offset =
++  Stdint.Int64.of_bytes_big_endian buf offset
++;;
++
++let read_int32_be buf offset =
++  Stdint.Int32.of_bytes_big_endian buf offset
++;;
++
++let request_peers_udp host port info_hash peer_id client_port left =
++  let open Lwt.Infix in
++  let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_DGRAM 0 in
++
++  (* Resolve host *)
++  Lwt_unix.gethostbyname host >>= fun host_entry ->
++  let addr = host_entry.Unix.h_addr_list.(0) in
++  let sockaddr = Unix.ADDR_INET (addr, port) in
++
++  (* Connect request *)
++  let transaction_id = Random.int32 Int32.max_int in
++  let connect_req = Bytes.create 16 in
++  write_int64_be connect_req 0 udp_protocol_id;
++  write_int32_be connect_req 8 (Stdint.Int32.zero);
++  write_int32_be connect_req 12 transaction_id;
++
++  Lwt_unix.sendto sock connect_req 0 16 [] sockaddr >>= fun _ ->
++
++  (* Connect response *)
++  let connect_resp = Bytes.create 16 in
++  Lwt_unix.recvfrom sock connect_resp 0 16 [] >>= fun (len, _) ->
++
++  if len < 16 then
++    Lwt.fail (Failure "UDP tracker: invalid connect response")
++  else
++    let resp_action = read_int32_be connect_resp 0 in
++    let resp_transaction = read_int32_be connect_resp 4 in
++    if resp_action <> Stdint.Int32.zero || resp_transaction <> transaction_id then
++      Lwt.fail (Failure "UDP tracker: connect response mismatch")
++    else
++      let connection_id = read_int64_be connect_resp 8 in
++
++      (* Announce request *)
++      let announce_transaction = Random.int32 Int32.max_int in
++      let announce_req = Bytes.create 98 in
++      write_int64_be announce_req 0 connection_id;
++      write_int32_be announce_req 8 (Stdint.Int32.one); (* action=1 for announce *)
++      write_int32_be announce_req 12 announce_transaction;
++      Bytes.blit info_hash 0 announce_req 16 20;
++      Bytes.blit peer_id 0 announce_req 36 20;
++      write_int64_be announce_req 56 (Stdint.Int64.zero); (* downloaded *)
++      write_int64_be announce_req 64 left; (* left *)
++      write_int64_be announce_req 72 (Stdint.Int64.zero); (* uploaded *)
++      write_int32_be announce_req 80 (Stdint.Int32.zero); (* event=0 (none) *)
++      write_int32_be announce_req 84 (Stdint.Int32.zero); (* ip=0 (default) *)
++      write_int32_be announce_req 88 (Random.int32 Int32.max_int); (* key *)
++      write_int32_be announce_req 92 (Stdint.Int32.of_int (-1)); (* num_want=-1 *)
++      write_int16_be announce_req 96 (Stdint.Uint16.of_int client_port);
++
++      Lwt_unix.sendto sock announce_req 0 98 [] sockaddr >>= fun _ ->
++
++      (* Announce response *)
++      let announce_resp = Bytes.create 65536 in
++      Lwt_unix.recvfrom sock announce_resp 0 65536 [] >>= fun (len, _) ->
++
++      Lwt_unix.close sock >>= fun () ->
++
++      if len < 20 then
++        Lwt.fail (Failure "UDP tracker: invalid announce response")
++      else
++        let resp_action = read_int32_be announce_resp 0 in
++        let resp_transaction = read_int32_be announce_resp 4 in
++        if resp_action <> Stdint.Int32.one || resp_transaction <> announce_transaction then
++          Lwt.fail (Failure "UDP tracker: announce response mismatch")
++        else
++          let peers_data = Bytes.sub announce_resp 20 (len - 20) in
++          let peers = create peers_data in
++          Lwt.return peers
++;;
++
++let request_peers_http uri =
+   let open Lwt.Infix in
+   Cohttp_lwt_unix.Client.get uri >>= fun (resp, body) ->
+   Cohttp_lwt.Body.to_string body >>= fun body_string ->
+@@ -42,4 +142,14 @@ let request_peers uri =
+   Lwt.return peers
+ ;;
+ 
++let request_peers uri info_hash peer_id client_port left =
++  let scheme = Uri.scheme uri in
++  match scheme with
++  | Some "udp" ->
++    let host = Uri.host uri |> Option.get in
++    let port = Uri.port uri |> Option.value ~default:80 in
++    request_peers_udp host port info_hash peer_id client_port left
++  | _ -> request_peers_http uri
++;;
++
+ let to_string peer = Printf.sprintf "%s:%d" (V4.to_string peer.ip) peer.port
+diff --git a/src/lib/torrent_client.ml b/src/lib/torrent_client.ml
+index e538a84..f89f203 100644
+--- a/src/lib/torrent_client.ml
++++ b/src/lib/torrent_client.ml
+@@ -418,11 +418,13 @@ let download_file output_file torrent_file =
+   in
+   (* Get Peers *)
+   let random_peer = Bytes.create 20 in
+-  let uri = build_tracker_url torrent_file random_peer 6881 in
+-  Peers.request_peers uri >>= fun peers ->
++  let client_port = 6881 in
++  let uri = build_tracker_url torrent_file random_peer client_port in
++  let total_len = total_length torrent_file |> Int64.to_int in
++  let left = Stdint.Int64.of_int total_len in
++  Peers.request_peers uri torrent_file.info_hash random_peer client_port left >>= fun peers ->
+   Logs.debug (fun m -> m "Got %d peers\n" (List.length peers));
+   (* Download *)
+-  let total_len = total_length torrent_file |> Int64.to_int in
+   let pieces_count = Array.length torrent_file.piece_hashes in
+ 
+   (* Load resume state if exists *)
+-- 
+2.43.0
+

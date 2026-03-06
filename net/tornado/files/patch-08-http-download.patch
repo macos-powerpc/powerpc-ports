@@ -1,0 +1,343 @@
+diff --git a/src/bin/cli.ml b/src/bin/cli.ml
+index 4612c82..413f258 100644
+--- a/src/bin/cli.ml
++++ b/src/bin/cli.ml
+@@ -1,40 +1,37 @@
+ open Tornado
+ 
+-let usage = "Usage: tornado [OPTIONS] <torrent_file>\n\
+-             \nDownload files from BitTorrent networks.\n\
++let usage = "Usage: tornado [OPTIONS] <torrent_file_or_url>\n\
++             \nDownload files from BitTorrent networks or HTTP/HTTPS URLs.\n\
+              \n\
+              OPTIONS:\n\
+-             \  -o <name>              Set output file/directory name (default: use torrent name)\n\
+-             \  --timeout <seconds>    Timeout for piece downloads (default: 30.0)\n\
+-             \  --connect-timeout <s>  Timeout for peer connections (default: 10.0)\n\
++             \  -o <name>              Set output file/directory name (default: auto-detect)\n\
++             \  --timeout <seconds>    Timeout for piece downloads (default: 30.0, BitTorrent only)\n\
++             \  --connect-timeout <s>  Timeout for peer connections (default: 10.0, BitTorrent only)\n\
+              \  --tui                  Enable TUI display (WARNING: disables Ctrl+C and scrolling)\n\
+              \  --no-tui               Disable TUI display (default)\n\
+              \  --verbose              Output debug information\n\
+              \  --help, -h             Show this help message\n\
+              \n\
+              FEATURES:\n\
+-             \  • Multi-file torrents - automatically creates directory structure\n\
++             \  • BitTorrent - multi-file torrents, HTTP/UDP trackers, seeding\n\
++             \  • HTTP/HTTPS - direct downloads with resume support (Range requests)\n\
+              \  • Resume/pause - interrupted downloads resume automatically\n\
+-             \  • HTTP and UDP trackers - supports both tracker protocols\n\
+-             \  • Seeding - announces as seeder after completing download\n\
+              \  • TUI display - optional real-time progress (use --tui to enable)\n\
+              \n\
+              EXAMPLES:\n\
++             \  # BitTorrent downloads\n\
+              \  tornado file.torrent                      # Download using torrent's name\n\
+              \  tornado file.torrent -o myfile            # Download with custom name\n\
+-             \  tornado --verbose file.torrent            # Download with debug output\n\
+              \  tornado --timeout 300 file.torrent        # Wait up to 5 minutes per piece\n\
+-             \  tornado --connect-timeout 30 file.torrent # Wait 30s to connect to peers\n\
+-             \  tornado --tui file.torrent                # Download with TUI display\n\
+-             \n\
+-             TIMEOUTS:\n\
+-             \  For torrents with rare seeders, increase timeouts to wait longer:\n\
+-             \    --timeout 600           # 10 minutes per piece\n\
+-             \    --connect-timeout 60    # 1 minute to connect\n\
++             \  \n\
++             \  # HTTP/HTTPS downloads\n\
++             \  tornado https://example.com/file.iso      # Download from URL\n\
++             \  tornado https://example.com/file.iso -o my.iso  # Custom output name\n\
++             \  tornado --tui https://example.com/large.zip     # With TUI display\n\
+              \n\
+              RESUME:\n\
+              \  If a download is interrupted, simply run the same command again.\n\
+-             \  Progress is saved in .tornado-state files and resumes automatically.\n"
++             \  Progress is saved in state files (.tornado-state or .http-state).\n"
+ 
+ let verbose = ref false
+ let output_file : string option ref = ref None
+@@ -60,6 +57,12 @@ let spec_list =
+    When all spec_list are invalid.  *)
+ let anon_fun filename = input_file := filename
+ 
++let is_url str =
++  String.length str >= 7 &&
++  (String.sub str 0 7 = "http://" ||
++   (String.length str >= 8 && String.sub str 0 8 = "https://"))
++;;
++
+ let () =
+   Arg.parse spec_list anon_fun "";
+   if !show_help then (
+@@ -67,11 +70,18 @@ let () =
+     exit 0
+   );
+   if !input_file = "" then (
+-    Printf.eprintf "Error: No torrent file specified\n\n";
++    Printf.eprintf "Error: No torrent file or URL specified\n\n";
+     Printf.eprintf "%s" usage;
+     exit 1
+   );
+   Log.setup_log (Some (if !verbose then Debug else App));
+-  let torrent_file = Torrent_file.open_file !input_file in
+-  Lwt_main.run (Torrent_client.download_file !output_file torrent_file !timeout !connect_timeout !use_tui)
++
++  if is_url !input_file then (
++    (* HTTP/HTTPS download *)
++    Lwt_main.run (Http_download.download_http_file !input_file !output_file !use_tui)
++  ) else (
++    (* BitTorrent download *)
++    let torrent_file = Torrent_file.open_file !input_file in
++    Lwt_main.run (Torrent_client.download_file !output_file torrent_file !timeout !connect_timeout !use_tui)
++  )
+ ;;
+diff --git a/src/lib/http_download.ml b/src/lib/http_download.ml
+new file mode 100644
+index 0000000..bd1ef91
+--- /dev/null
++++ b/src/lib/http_download.ml
+@@ -0,0 +1,243 @@
++open Lwt.Infix
++open Cohttp
++open Cohttp_lwt_unix
++
++(* Chunk size: 256KB *)
++let chunk_size = 262144
++
++type download_info =
++  { url : string
++  ; total_size : int64
++  ; supports_ranges : bool
++  ; filename : string
++  }
++
++let state_file_path output_file =
++  output_file ^ ".http-state"
++;;
++
++let save_http_state output_file downloaded_bytes total_bytes =
++  let state = Printf.sprintf "%Ld/%Ld" downloaded_bytes total_bytes in
++  Lwt_io.with_file
++    ~mode:Lwt_io.Output
++    (state_file_path output_file)
++    (fun oc -> Lwt_io.write oc state)
++;;
++
++let load_http_state output_file total_bytes =
++  let path = state_file_path output_file in
++  if Sys.file_exists path then
++    Lwt.catch
++      (fun () ->
++        Lwt_io.with_file ~mode:Lwt_io.Input path (fun ic ->
++          Lwt_io.read_line ic >>= fun line ->
++          match String.split_on_char '/' line with
++          | [downloaded; total] ->
++            let downloaded_bytes = Int64.of_string downloaded in
++            let total_in_state = Int64.of_string total in
++            if total_in_state = total_bytes then (
++              Logs.info (fun m -> m "Resuming download from %Ld bytes" downloaded_bytes);
++              Lwt.return downloaded_bytes
++            ) else (
++              Logs.warn (fun m -> m "File size changed, restarting download");
++              Lwt.return 0L
++            )
++          | _ -> Lwt.return 0L
++        ))
++      (fun _ -> Lwt.return 0L)
++  else
++    Lwt.return 0L
++;;
++
++let delete_http_state output_file =
++  let path = state_file_path output_file in
++  if Sys.file_exists path then
++    Unix.unlink path
++;;
++
++let extract_filename_from_url url =
++  let uri = Uri.of_string url in
++  match Uri.path uri with
++  | "" | "/" -> "download"
++  | path ->
++    let segments = String.split_on_char '/' path in
++    let last_segment = List.nth segments (List.length segments - 1) in
++    if last_segment = "" then "download" else last_segment
++;;
++
++let get_download_info url =
++  Logs.info (fun m -> m "Fetching file information from %s" url);
++  Client.head (Uri.of_string url) >>= fun resp ->
++  let status = Response.status resp in
++  let headers = Response.headers resp in
++
++  match status with
++  | `OK ->
++    let content_length = Header.get headers "content-length" in
++    let accept_ranges = Header.get headers "accept-ranges" in
++    let supports_ranges = match accept_ranges with
++      | Some "bytes" -> true
++      | _ -> false
++    in
++
++    (match content_length with
++     | Some len ->
++       let total_size = Int64.of_string len in
++       let filename = extract_filename_from_url url in
++       Logs.info (fun m -> m "File size: %Ld bytes, Range support: %b" total_size supports_ranges);
++       Lwt.return (Some { url; total_size; supports_ranges; filename })
++     | None ->
++       Logs.err (fun m -> m "Server did not provide Content-Length");
++       Lwt.return None)
++  | code ->
++    Logs.err (fun m -> m "HEAD request failed with status: %s" (Code.string_of_status code));
++    Lwt.return None
++;;
++
++let download_range url start_byte end_byte =
++  let range_header = Printf.sprintf "bytes=%Ld-%Ld" start_byte end_byte in
++  let headers = Header.init_with "Range" range_header in
++
++  Client.get ~headers (Uri.of_string url) >>= fun (resp, body) ->
++  let status = Response.status resp in
++
++  match status with
++  | `Partial_content | `OK ->
++    Cohttp_lwt.Body.to_string body >>= fun content ->
++    Lwt.return (Some content)
++  | code ->
++    Logs.err (fun m -> m "Range request failed with status: %s" (Code.string_of_status code));
++    Lwt.return None
++;;
++
++let download_full url =
++  Logs.info (fun m -> m "Downloading entire file (server doesn't support ranges)");
++  Client.get (Uri.of_string url) >>= fun (resp, body) ->
++  let status = Response.status resp in
++
++  match status with
++  | `OK ->
++    Cohttp_lwt.Body.to_string body >>= fun content ->
++    Lwt.return (Some content)
++  | code ->
++    Logs.err (fun m -> m "Download failed with status: %s" (Code.string_of_status code));
++    Lwt.return None
++;;
++
++let download_http_file url output_file use_tui =
++  get_download_info url >>= function
++  | None ->
++    Logs.err (fun m -> m "Failed to get file information");
++    Lwt.return_unit
++  | Some info ->
++    let final_output = match output_file with
++      | Some name -> name
++      | None -> info.filename
++    in
++
++    Logs.info (fun m -> m "Downloading to: %s" final_output);
++
++    if info.supports_ranges then (
++      (* Resumable download with ranges *)
++      load_http_state final_output info.total_size >>= fun start_pos ->
++
++      (* Setup TUI if enabled *)
++      let total_chunks = Int64.div (Int64.add info.total_size (Int64.of_int chunk_size)
++                                    |> Int64.sub (Int64.of_int 1)) (Int64.of_int chunk_size) |> Int64.to_int in
++      let completed_chunks = Int64.div start_pos (Int64.of_int chunk_size) |> Int64.to_int in
++
++      (if use_tui then Tui.create_tui final_output total_chunks
++       else Lwt.return (None, ref { Tui.name = final_output; total_pieces = total_chunks;
++                                     completed_pieces = completed_chunks; peers_count = 1; download_speed = 0.0 }))
++      >>= fun (term_opt, stats_ref) ->
++
++      let downloaded = ref start_pos in
++      let start_time = Unix.gettimeofday () in
++      let should_quit = ref false in
++
++      (* Setup Ctrl+C handler *)
++      let sigint_handler = Lwt_unix.on_signal Sys.sigint (fun _ ->
++        should_quit := true;
++      ) in
++
++      (* Update TUI periodically *)
++      (if use_tui && term_opt <> None then
++        let rec update_loop () =
++          Lwt_unix.sleep 0.5 >>= fun () ->
++          if !downloaded < info.total_size && not !should_quit then (
++            let elapsed = Unix.gettimeofday () -. start_time in
++            let bytes_dl = Int64.sub !downloaded start_pos |> Int64.to_float in
++            let speed = if elapsed > 0.0 then bytes_dl /. elapsed else 0.0 in
++            let chunks_done = Int64.div !downloaded (Int64.of_int chunk_size) |> Int64.to_int in
++            Tui.update_stats stats_ref ~completed:chunks_done
++              ~peers:1 ~speed;
++            (match term_opt with
++             | Some term -> Tui.update_display term !stats_ref
++             | None -> Lwt.return_unit) >>= fun () ->
++            update_loop ()
++          ) else
++            Lwt.return_unit
++        in
++        Lwt.async update_loop
++      );
++
++      (* Open file for writing *)
++      Lwt_io.with_file
++        ~mode:Lwt_io.Output
++        ~flags:[Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND]
++        final_output
++        (fun oc ->
++          let rec download_chunks current_pos =
++            if !should_quit then (
++              Lwt_unix.disable_signal_handler sigint_handler;
++              Tui.close_tui term_opt >>= fun () ->
++              Logs.info (fun m -> m "Download cancelled by user");
++              exit 130
++            ) else if current_pos >= info.total_size then
++              Lwt.return_unit
++            else
++              let end_pos = Int64.add current_pos (Int64.of_int chunk_size)
++                            |> Int64.sub (Int64.of_int 1)
++                            |> Int64.min (Int64.sub info.total_size 1L) in
++
++              download_range url current_pos end_pos >>= function
++              | None ->
++                Logs.err (fun m -> m "Failed to download chunk at offset %Ld" current_pos);
++                Lwt.return_unit
++              | Some chunk_data ->
++                Lwt_io.write oc chunk_data >>= fun () ->
++                let new_pos = Int64.add current_pos (Int64.of_int (String.length chunk_data)) in
++                downloaded := new_pos;
++                save_http_state final_output new_pos info.total_size >>= fun () ->
++
++                let percent = Int64.to_float new_pos /. Int64.to_float info.total_size *. 100.0 in
++                if not use_tui then
++                  Logs.app (fun m -> m "Progress: %.1f%% (%Ld / %Ld bytes)"
++                    percent new_pos info.total_size);
++
++                download_chunks new_pos
++          in
++
++          download_chunks start_pos
++        ) >>= fun () ->
++
++      Lwt_unix.disable_signal_handler sigint_handler;
++      Tui.close_tui term_opt >>= fun () ->
++      delete_http_state final_output;
++      Logs.info (fun m -> m "Download completed: %s" final_output);
++      Lwt.return_unit
++    ) else (
++      (* Non-resumable download *)
++      Logs.warn (fun m -> m "Server doesn't support ranges, downloading entire file at once");
++      download_full url >>= function
++      | None ->
++        Logs.err (fun m -> m "Download failed");
++        Lwt.return_unit
++      | Some content ->
++        Lwt_io.with_file ~mode:Lwt_io.Output final_output (fun oc ->
++          Lwt_io.write oc content
++        ) >>= fun () ->
++        Logs.info (fun m -> m "Download completed: %s" final_output);
++        Lwt.return_unit
++    )
++;;

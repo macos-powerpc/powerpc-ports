@@ -1,0 +1,336 @@
+diff --git a/dune-project b/dune-project
+index 93230cc..c602bed 100644
+--- a/dune-project
++++ b/dune-project
+@@ -27,4 +27,6 @@
+   stdint
+   uri
+   ipaddr
+-  ppx_deriving))
++  ppx_deriving
++  notty
++  (notty-lwt (>= 0.2.3))))
+diff --git a/src/bin/cli.ml b/src/bin/cli.ml
+index 9dcdea1..4612c82 100644
+--- a/src/bin/cli.ml
++++ b/src/bin/cli.ml
+@@ -7,6 +7,8 @@ let usage = "Usage: tornado [OPTIONS] <torrent_file>\n\
+              \  -o <name>              Set output file/directory name (default: use torrent name)\n\
+              \  --timeout <seconds>    Timeout for piece downloads (default: 30.0)\n\
+              \  --connect-timeout <s>  Timeout for peer connections (default: 10.0)\n\
++             \  --tui                  Enable TUI display (WARNING: disables Ctrl+C and scrolling)\n\
++             \  --no-tui               Disable TUI display (default)\n\
+              \  --verbose              Output debug information\n\
+              \  --help, -h             Show this help message\n\
+              \n\
+@@ -15,6 +17,7 @@ let usage = "Usage: tornado [OPTIONS] <torrent_file>\n\
+              \  • Resume/pause - interrupted downloads resume automatically\n\
+              \  • HTTP and UDP trackers - supports both tracker protocols\n\
+              \  • Seeding - announces as seeder after completing download\n\
++             \  • TUI display - optional real-time progress (use --tui to enable)\n\
+              \n\
+              EXAMPLES:\n\
+              \  tornado file.torrent                      # Download using torrent's name\n\
+@@ -22,6 +25,7 @@ let usage = "Usage: tornado [OPTIONS] <torrent_file>\n\
+              \  tornado --verbose file.torrent            # Download with debug output\n\
+              \  tornado --timeout 300 file.torrent        # Wait up to 5 minutes per piece\n\
+              \  tornado --connect-timeout 30 file.torrent # Wait 30s to connect to peers\n\
++             \  tornado --tui file.torrent                # Download with TUI display\n\
+              \n\
+              TIMEOUTS:\n\
+              \  For torrents with rare seeders, increase timeouts to wait longer:\n\
+@@ -38,6 +42,7 @@ let input_file = ref ""
+ let show_help = ref false
+ let timeout = ref 30.0
+ let connect_timeout = ref 10.0
++let use_tui = ref false
+ let apply_output_file str = output_file := Some str
+ 
+ let spec_list =
+@@ -45,6 +50,8 @@ let spec_list =
+   ; "-o", Arg.String apply_output_file, ""
+   ; "--timeout", Arg.Set_float timeout, ""
+   ; "--connect-timeout", Arg.Set_float connect_timeout, ""
++  ; "--tui", Arg.Set use_tui, ""
++  ; "--no-tui", Arg.Clear use_tui, ""
+   ; "--help", Arg.Set show_help, ""
+   ; "-h", Arg.Set show_help, "" ]
+ ;;
+@@ -66,5 +73,5 @@ let () =
+   );
+   Log.setup_log (Some (if !verbose then Debug else App));
+   let torrent_file = Torrent_file.open_file !input_file in
+-  Lwt_main.run (Torrent_client.download_file !output_file torrent_file !timeout !connect_timeout)
++  Lwt_main.run (Torrent_client.download_file !output_file torrent_file !timeout !connect_timeout !use_tui)
+ ;;
+diff --git a/src/lib/dune b/src/lib/dune
+index 022afe5..8c17e64 100644
+--- a/src/lib/dune
++++ b/src/lib/dune
+@@ -13,6 +13,8 @@
+   ipaddr
+   ipaddr.unix
+   fmt.tty
+-  progress)
++  progress
++  notty
++  notty.lwt)
+  (preprocess
+   (pps ppx_deriving.show lwt_ppx)))
+diff --git a/src/lib/torrent_client.ml b/src/lib/torrent_client.ml
+index 78ab70e..eb55537 100644
+--- a/src/lib/torrent_client.ml
++++ b/src/lib/torrent_client.ml
+@@ -320,7 +320,7 @@ let remove_state_file output_file =
+     Unix.unlink path
+ ;;
+ 
+-let download_torrent timeout connect_timeout (torrent : t) file_name completed_pieces =
++let download_torrent timeout connect_timeout use_tui (torrent : t) file_name completed_pieces =
+   let open Lwt.Infix in
+   let final_buf = Bytes.create torrent.length in
+   let pieces_hashes_len = Array.length torrent.piece_hashes in
+@@ -367,27 +367,84 @@ let download_torrent timeout connect_timeout (torrent : t) file_name completed_p
+     Logs.info (fun m -> m "Resuming download: %d/%d pieces already completed"
+       !initial_completed pieces_hashes_len);
+ 
++  (* Setup TUI if enabled *)
++  (if use_tui then Tui.create_tui file_name pieces_hashes_len
++   else Lwt.return (None, ref { Tui.name = file_name; total_pieces = pieces_hashes_len;
++                                 completed_pieces = 0; peers_count = 0; download_speed = 0.0 }))
++  >>= fun (term_opt, stats_ref) ->
++
+   (* Collect results *)
+   let done_pieces = ref !initial_completed in
++  let start_time = Unix.gettimeofday () in
++  let bytes_downloaded = ref 0 in
++  let should_quit = ref false in
++
++  (* Setup Ctrl+C handler *)
++  let sigint_handler = Lwt_unix.on_signal Sys.sigint (fun _ ->
++    should_quit := true;
++  ) in
++
++  (* Update TUI periodically *)
++  (if use_tui && term_opt <> None then
++    let rec update_loop () =
++      Lwt_unix.sleep 0.5 >>= fun () ->
++      if !done_pieces < pieces_hashes_len && not !should_quit then (
++        let elapsed = Unix.gettimeofday () -. start_time in
++        let speed = if elapsed > 0.0 then float_of_int !bytes_downloaded /. elapsed else 0.0 in
++        Tui.update_stats stats_ref ~completed:!done_pieces
++          ~peers:(List.length torrent.peers) ~speed;
++        (match term_opt with
++         | Some term -> Tui.update_display term !stats_ref
++         | None -> Lwt.return_unit) >>= fun () ->
++        update_loop ()
++      ) else
++        Lwt.return_unit
++    in
++    Lwt.async update_loop
++  );
++
++  (* Periodic cancellation checker *)
++  let rec cancellation_checker () =
++    Lwt_unix.sleep 0.1 >>= fun () ->
++    if !should_quit then
++      Lwt.return_unit
++    else
++      cancellation_checker ()
++  in
+ 
+   (* Collect all pieces asynchronously *)
+   let rec collect_pieces () =
+-    if !done_pieces < pieces_hashes_len then
+-      Lwt_stream.next result_stream >>= fun piece_result ->
+-      let length = calculate_piece_size torrent piece_result.index in
+-      let start, _ = calculate_bounds_for_piece torrent piece_result.index in
+-      done_pieces := !done_pieces + 1;
+-      Bytes.set completed_pieces piece_result.index '\001';
+-      Bytes.blit piece_result.buf 0 final_buf start length;
+-      (* Save state after each piece *)
+-      save_state file_name torrent.info_hash completed_pieces >>= fun () ->
+-      collect_pieces ()
++    if !should_quit then
++      Lwt.return_unit
++    else if !done_pieces < pieces_hashes_len then
++      (* Race between getting next piece and cancellation check *)
++      Lwt.pick [
++        (Lwt_stream.next result_stream >>= fun piece_result ->
++         let length = calculate_piece_size torrent piece_result.index in
++         let start, _ = calculate_bounds_for_piece torrent piece_result.index in
++         done_pieces := !done_pieces + 1;
++         bytes_downloaded := !bytes_downloaded + length;
++         Bytes.set completed_pieces piece_result.index '\001';
++         Bytes.blit piece_result.buf 0 final_buf start length;
++         (* Save state after each piece *)
++         save_state file_name torrent.info_hash completed_pieces >>= fun () ->
++         Lwt.return `Continue);
++        (cancellation_checker () >>= fun () -> Lwt.return `Cancelled)
++      ] >>= function
++      | `Continue -> collect_pieces ()
++      | `Cancelled -> Lwt.return_unit
+     else
+       Lwt.return_unit
+   in
+ 
+   collect_pieces () >>= fun () ->
+-  Lwt.return final_buf
++  Lwt_unix.disable_signal_handler sigint_handler;
++  Tui.close_tui term_opt >>= fun () ->
++  if !should_quit then (
++    Logs.info (fun m -> m "Download cancelled by user");
++    exit 130
++  ) else
++    Lwt.return final_buf
+ ;;
+ 
+ let write_multifile base_dir files final_buf =
+@@ -421,7 +478,7 @@ let write_multifile base_dir files final_buf =
+   write_files 0 files
+ ;;
+ 
+-let download_file output_file torrent_file timeout connect_timeout =
++let download_file output_file torrent_file timeout connect_timeout use_tui =
+   let open Torrent_file in
+   let base_name =
+     match output_file, torrent_file.name with
+@@ -456,7 +513,7 @@ let download_file output_file torrent_file timeout connect_timeout =
+       (torrent_file.piece_length |> Int64.to_int)
+       total_len
+   in
+-  download_torrent timeout connect_timeout torrent base_name completed_pieces >>= fun final_buf ->
++  download_torrent timeout connect_timeout use_tui torrent base_name completed_pieces >>= fun final_buf ->
+   (* Write File(s) *)
+   (match torrent_file.file_mode with
+   | SingleFile _ ->
+diff --git a/src/lib/tui.ml b/src/lib/tui.ml
+new file mode 100644
+index 0000000..8fee389
+--- /dev/null
++++ b/src/lib/tui.ml
+@@ -0,0 +1,124 @@
++open Lwt.Infix
++open Notty
++open Notty_lwt
++
++type stats =
++  { name : string
++  ; total_pieces : int
++  ; completed_pieces : int
++  ; peers_count : int
++  ; download_speed : float
++  }
++
++let progress_bar ~width pct =
++  let filled = (pct * width) / 100 in
++  let filled = max 0 (min width filled) in
++  let bar_filled = String.make filled '#' in
++  let bar_empty = String.make (width - filled) '-' in
++  I.hcat
++    [ I.string A.(fg green) bar_filled
++    ; I.string A.(fg (gray 8)) bar_empty
++    ]
++;;
++
++let format_speed bytes_per_sec =
++  if bytes_per_sec < 1024.0 then
++    Printf.sprintf "%.0f B/s" bytes_per_sec
++  else if bytes_per_sec < 1024.0 *. 1024.0 then
++    Printf.sprintf "%.1f KB/s" (bytes_per_sec /. 1024.0)
++  else
++    Printf.sprintf "%.2f MB/s" (bytes_per_sec /. 1024.0 /. 1024.0)
++;;
++
++let render stats =
++  let pct = if stats.total_pieces = 0 then 0 else
++    (stats.completed_pieces * 100) / stats.total_pieces in
++
++  let header = I.string A.(st bold) "Tornado BitTorrent Client" in
++  let separator = I.string A.(fg (gray 12)) (String.make 60 '=') in
++
++  let name_line = I.hcat
++    [ I.string A.(fg cyan) "Torrent: "
++    ; I.string A.empty stats.name
++    ] in
++
++  let progress_line = I.hcat
++    [ I.string A.(fg cyan) "Progress: "
++    ; progress_bar ~width:30 pct
++    ; I.strf " %d%%" pct
++    ] in
++
++  let pieces_line = I.hcat
++    [ I.string A.(fg cyan) "Pieces: "
++    ; I.strf "%d / %d" stats.completed_pieces stats.total_pieces
++    ] in
++
++  let peers_line = I.hcat
++    [ I.string A.(fg cyan) "Peers: "
++    ; I.strf "%d" stats.peers_count
++    ] in
++
++  let speed_line = I.hcat
++    [ I.string A.(fg cyan) "Speed: "
++    ; I.string A.empty (format_speed stats.download_speed)
++    ] in
++
++  let footer = I.string A.(fg (gray 12)) "Press Ctrl-C to stop" in
++
++  I.vcat
++    [ I.void 0 1
++    ; header
++    ; I.void 0 1
++    ; separator
++    ; I.void 0 1
++    ; name_line
++    ; I.void 0 1
++    ; progress_line
++    ; I.void 0 1
++    ; pieces_line
++    ; peers_line
++    ; speed_line
++    ; I.void 0 1
++    ; separator
++    ; I.void 0 1
++    ; footer
++    ; I.void 0 1
++    ]
++;;
++
++let update_display term stats =
++  let image = render stats in
++  Term.image term image
++;;
++
++let create_tui name total_pieces =
++  let stats = ref {
++    name;
++    total_pieces;
++    completed_pieces = 0;
++    peers_count = 0;
++    download_speed = 0.0;
++  } in
++
++  let term = Term.create () in
++  Term.cursor term None >>= fun () ->
++  update_display term !stats >>= fun () ->
++  Lwt.return (Some term, stats)
++;;
++
++let update_stats stats_ref ~completed ~peers ~speed =
++  stats_ref := { !stats_ref with
++    completed_pieces = completed;
++    peers_count = peers;
++    download_speed = speed;
++  }
++;;
++
++let close_tui term_opt =
++  match term_opt with
++  | None -> Lwt.return_unit
++  | Some term ->
++    Term.cursor term (Some (0, 0)) >>= fun () ->
++    Term.release term >>= fun () ->
++    Lwt.return_unit
++;;

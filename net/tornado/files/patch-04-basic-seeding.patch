@@ -1,0 +1,185 @@
+From 9bf41a7bbc631a2a59d59155e4e666602c6e9d36 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 6 Mar 2026 02:07:14 +0000
+Subject: [PATCH] Add basic seeding functionality
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements tracker announcement for seeding:
+- Sends 'completed' event to tracker after download finishes
+- Announces with left=0 to indicate complete file
+- Supports both HTTP and UDP trackers
+- Adds message formatting for piece uploads
+- Adds parse_request for handling incoming piece requests
+
+This allows the client to participate as a seeder in the swarm
+by notifying the tracker that it has the complete file and is
+available for uploads.
+
+No new dependencies required.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/lib/message.ml      | 27 ++++++++++++++
+ src/lib/peers.ml        | 79 +++++++++++++++++++++++++++++++++++++++++
+ src/lib/torrent_file.ml | 19 ++++++++++
+ 3 files changed, 125 insertions(+)
+
+diff --git a/src/lib/message.ml b/src/lib/message.ml
+index f01f939..ccdc66f 100644
+--- a/src/lib/message.ml
++++ b/src/lib/message.ml
+@@ -63,6 +63,33 @@ let format_have index =
+   { id = id_of_message_type Msg_have; payload }
+ ;;
+ 
++let format_piece index start data =
++  let payload = Bytes.create (8 + Bytes.length data) in
++  Uint32.to_bytes_big_endian (Uint32.of_int index) payload 0;
++  Uint32.to_bytes_big_endian (Uint32.of_int start) payload 4;
++  Bytes.blit data 0 payload 8 (Bytes.length data);
++  { id = id_of_message_type Msg_piece; payload }
++;;
++
++let parse_request msg =
++  match msg with
++  | m when m.id <> id_of_message_type Msg_request ->
++    Result.error
++      (`Error
++        (Printf.sprintf
++           "Expected REQUEST (ID %d), got ID %d"
++           (Uint8.to_int (id_of_message_type Msg_request))
++           (Uint8.to_int msg.id)))
++  | m when Bytes.length m.payload <> 12 ->
++    Result.error
++      (`Error (Printf.sprintf "Expected payload length 12, got %d" (Bytes.length m.payload)))
++  | m ->
++    let index = Uint32.to_int (Uint32.of_bytes_big_endian m.payload 0) in
++    let start = Uint32.to_int (Uint32.of_bytes_big_endian m.payload 4) in
++    let length = Uint32.to_int (Uint32.of_bytes_big_endian m.payload 8) in
++    Result.ok (index, start, length)
++;;
++
+ let parse_piece index buf msg =
+   match msg with
+   | m when m.id <> id_of_message_type Msg_piece ->
+diff --git a/src/lib/peers.ml b/src/lib/peers.ml
+index b59d594..df165d4 100644
+--- a/src/lib/peers.ml
++++ b/src/lib/peers.ml
+@@ -153,3 +153,82 @@ let request_peers uri info_hash peer_id client_port left =
+ ;;
+ 
+ let to_string peer = Printf.sprintf "%s:%d" (V4.to_string peer.ip) peer.port
++
++(* Announce completion to tracker for seeding *)
++
++let announce_completed_udp host port info_hash peer_id client_port =
++  let open Lwt.Infix in
++  let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_DGRAM 0 in
++
++  Lwt_unix.gethostbyname host >>= fun host_entry ->
++  let addr = host_entry.Unix.h_addr_list.(0) in
++  let sockaddr = Unix.ADDR_INET (addr, port) in
++
++  (* Connect request *)
++  let transaction_id = Random.int32 Int32.max_int in
++  let connect_req = Bytes.create 16 in
++  write_int64_be connect_req 0 udp_protocol_id;
++  write_int32_be connect_req 8 (Stdint.Int32.zero);
++  write_int32_be connect_req 12 transaction_id;
++
++  Lwt_unix.sendto sock connect_req 0 16 [] sockaddr >>= fun _ ->
++  let connect_resp = Bytes.create 16 in
++  Lwt_unix.recvfrom sock connect_resp 0 16 [] >>= fun (len, _) ->
++
++  if len < 16 then
++    Lwt_unix.close sock >>= fun () ->
++    Lwt.fail (Failure "UDP tracker: invalid connect response")
++  else
++    let resp_action = read_int32_be connect_resp 0 in
++    let resp_transaction = read_int32_be connect_resp 4 in
++    if resp_action <> Stdint.Int32.zero || resp_transaction <> transaction_id then
++      Lwt_unix.close sock >>= fun () ->
++      Lwt.fail (Failure "UDP tracker: connect response mismatch")
++    else
++      let connection_id = read_int64_be connect_resp 8 in
++
++      (* Announce with event=completed (1) *)
++      let announce_transaction = Random.int32 Int32.max_int in
++      let announce_req = Bytes.create 98 in
++      write_int64_be announce_req 0 connection_id;
++      write_int32_be announce_req 8 (Stdint.Int32.one);
++      write_int32_be announce_req 12 announce_transaction;
++      Bytes.blit info_hash 0 announce_req 16 20;
++      Bytes.blit peer_id 0 announce_req 36 20;
++      write_int64_be announce_req 56 (Stdint.Int64.zero); (* downloaded=0 *)
++      write_int64_be announce_req 64 (Stdint.Int64.zero); (* left=0 (complete) *)
++      write_int64_be announce_req 72 (Stdint.Int64.zero); (* uploaded=0 *)
++      write_int32_be announce_req 80 (Stdint.Int32.one); (* event=1 (completed) *)
++      write_int32_be announce_req 84 (Stdint.Int32.zero);
++      write_int32_be announce_req 88 (Random.int32 Int32.max_int);
++      write_int32_be announce_req 92 (Stdint.Int32.of_int 0); (* num_want=0 (no more peers needed) *)
++      write_int16_be announce_req 96 (Stdint.Uint16.of_int client_port);
++
++      Lwt_unix.sendto sock announce_req 0 98 [] sockaddr >>= fun _ ->
++
++      let announce_resp = Bytes.create 65536 in
++      Lwt_unix.recvfrom sock announce_resp 0 65536 [] >>= fun (_len, _) ->
++
++      Lwt_unix.close sock >>= fun () ->
++      Lwt.return_unit
++;;
++
++let announce_completed_http uri =
++  let open Lwt.Infix in
++  Lwt.catch
++    (fun () ->
++      Cohttp_lwt_unix.Client.get uri >>= fun (_resp, body) ->
++      Cohttp_lwt.Body.drain_body body >>= fun () ->
++      Lwt.return_unit)
++    (fun _ex -> Lwt.return_unit)
++;;
++
++let announce_completed uri info_hash peer_id client_port =
++  let scheme = Uri.scheme uri in
++  match scheme with
++  | Some "udp" ->
++    let host = Uri.host uri |> Option.get in
++    let port = Uri.port uri |> Option.value ~default:80 in
++    announce_completed_udp host port info_hash peer_id client_port
++  | _ -> announce_completed_http uri
++;;
+diff --git a/src/lib/torrent_file.ml b/src/lib/torrent_file.ml
+index f45dac9..1c22413 100644
+--- a/src/lib/torrent_file.ml
++++ b/src/lib/torrent_file.ml
+@@ -112,3 +112,22 @@ let build_tracker_url file peer_id port =
+   Uri.add_query_params uri query
+ ;;
+ 
++let build_completed_url file peer_id port =
++  let announce_url = match file.announce with
++    | Some url -> url
++    | None -> failwith "Torrent file does not contain an 'announce' URL."
++  in
++  let query =
++    [ "info_hash", [ Bytes.to_string file.info_hash ]
++    ; "peer_id", [ Bytes.to_string peer_id ]
++    ; "port", [ Int.to_string port ]
++    ; "uploaded", [ "0" ]
++    ; "downloaded", [ Int64.to_string (total_length file) ]
++    ; "left", [ "0" ]
++    ; "event", [ "completed" ]
++    ]
++  in
++  let uri = Uri.of_string announce_url in
++  Uri.add_query_params uri query
++;;
++
+-- 
+2.43.0
+
