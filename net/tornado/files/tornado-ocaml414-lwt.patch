@@ -1,0 +1,1061 @@
+diff --git a/README.md b/README.md
+index 13005ec..2a7562a 100644
+--- a/README.md
++++ b/README.md
+@@ -22,7 +22,7 @@ nix develop -c $SHELL
+ First, create a switch like so:
+ 
+ ```bash
+-opam switch create . 5.0.0~alpha1+options --no-install
++opam switch create . 4.14.2 --no-install
+ ```
+ 
+ Then you can run:
+@@ -34,6 +34,8 @@ opam install ocaml-lsp-server
+ opam install . --deps-only --with-test
+ ```
+ 
++Note: The project now uses Lwt for concurrency instead of Eio, making it compatible with OCaml 4.14+.
++
+ ## Build, tests and Downloading a file
+ 
+ Build the codebase with:
+diff --git a/dune-project b/dune-project
+index 2ff541c..93230cc 100644
+--- a/dune-project
++++ b/dune-project
+@@ -18,11 +18,13 @@
+    (and
+     :build
+     (>= 3.1.1)))
+-  piaf
++  (ocaml (>= 4.14))
++  lwt
++  lwt_ppx
++  cohttp-lwt-unix
+   progress
+-  eio
+-  eio_main
+   bencode
+   stdint
+   uri
++  ipaddr
+   ppx_deriving))
+diff --git a/nix/default.nix b/nix/default.nix
+index c10aa86..39c89ea 100644
+--- a/nix/default.nix
++++ b/nix/default.nix
+@@ -20,7 +20,7 @@ buildDunePackage rec {
+   ];
+ 
+   buildInputs =
+-    [ eio piaf eio_main bencode stdint uri ppx_deriving progress ipaddr ];
++    [ lwt lwt_ppx cohttp-lwt-unix bencode stdint uri ppx_deriving progress ipaddr ];
+ 
+   inherit doCheck;
+ 
+diff --git a/src/bin/cli.ml b/src/bin/cli.ml
+index 712cf78..bd50fe1 100644
+--- a/src/bin/cli.ml
++++ b/src/bin/cli.ml
+@@ -17,8 +17,12 @@ let anon_fun filename = input_file := filename
+ 
+ let () =
+   Arg.parse spec_list anon_fun usage;
++  if !input_file = "" then (
++    Printf.eprintf "Error: No torrent file specified\n";
++    Printf.eprintf "Usage: %s\n" usage;
++    exit 1
++  );
+   Log.setup_log (Some (if !verbose then Debug else App));
+   let torrent_file = Torrent_file.open_file !input_file in
+-  Eio_main.run
+-  @@ fun env -> Torrent_client.download_file !output_file torrent_file env
++  Lwt_main.run (Torrent_client.download_file !output_file torrent_file)
+ ;;
+diff --git a/src/bin/dune b/src/bin/dune
+index dbb721d..a2ed217 100644
+--- a/src/bin/dune
++++ b/src/bin/dune
+@@ -1,5 +1,5 @@
+ (executable
+  (name cli)
+  (package tornado)
+- (public_name tornado_cli.exe)
++ (public_name tornado_cli)
+  (libraries tornado))
+diff --git a/src/lib/bencode_utils.ml b/src/lib/bencode_utils.ml
+index 1c21875..9aa3e4d 100644
+--- a/src/lib/bencode_utils.ml
++++ b/src/lib/bencode_utils.ml
+@@ -1,15 +1,13 @@
+ let bencode_to_string bencode field =
+-  let bencode_opt = Bencode.dict_get bencode field in
+-  (* TODO improve this *)
+-  let bencode_field = Option.get bencode_opt in
+-  Bencode.as_string bencode_field
++  match Bencode.dict_get bencode field with
++  | None -> None
++  | Some bencode_field -> Bencode.as_string bencode_field
+ ;;
+ 
+ let bencode_to_int bencode field =
+-  let bencode_opt = Bencode.dict_get bencode field in
+-  (* TODO improve this *)
+-  let bencode_field = Option.get bencode_opt in
+-  Bencode.as_int bencode_field
++  match Bencode.dict_get bencode field with
++  | None -> None
++  | Some bencode_field -> Bencode.as_int bencode_field
+ ;;
+ 
+ let sha1_of_bencode benconde =
+diff --git a/src/lib/client.ml b/src/lib/client.ml
+index ec2f1a7..6ac3cf4 100644
+--- a/src/lib/client.ml
++++ b/src/lib/client.ml
+@@ -1,7 +1,8 @@
+ open Stdint
++open Lwt.Infix
+ 
+ type t =
+-  { flow : Eio.Flow.two_way_ty Eio.Flow.two_way
++  { flow : Lwt_io.input_channel * Lwt_io.output_channel
+   ; choked : bool ref
+   ; bitfield : Bitfield.t
+   ; peer : Peers.t
+@@ -10,10 +11,10 @@ type t =
+   }
+ 
+ let read flow =
+-  let length_buf = Tcp.Client.read_bytes flow 4 in
++  Tcp.Client.read_bytes flow 4 >>= fun length_buf ->
+   let length = Uint32.to_int (Uint32.of_bytes_big_endian length_buf 0) in
+-  let msg_bytes = Tcp.Client.read_bytes flow length in
+-  Message.read length_buf msg_bytes
++  Tcp.Client.read_bytes flow length >>= fun msg_bytes ->
++  Lwt.return (Message.read length_buf msg_bytes)
+ ;;
+ 
+ let send_request t index start length =
+@@ -56,66 +57,70 @@ let send_have client index =
+   Tcp.Client.write_bytes client.flow msg_bytes
+ ;;
+ 
+-let complete_handshake env flow info_hash peerID =
+-  let clock = Eio.Stdenv.clock env in
+-  Eio.Time.with_timeout_exn clock 3. (fun () ->
++let with_timeout timeout f =
++  Lwt.pick
++    [ f ()
++    ; (Lwt_unix.sleep timeout >>= fun () -> Lwt.fail (Failure "Timeout"))
++    ]
++;;
++
++let complete_handshake flow info_hash peerID =
++  with_timeout 3.0 (fun () ->
+     let handshake = Handshake.create info_hash peerID in
+     let handshake_bytes = Handshake.serialize_to_bytes handshake in
+-    Tcp.Client.write_bytes flow handshake_bytes;
+-    let pstrlen_buf = Tcp.Client.read_bytes flow 1 in
++    Tcp.Client.write_bytes flow handshake_bytes >>= fun () ->
++    Tcp.Client.read_bytes flow 1 >>= fun pstrlen_buf ->
+     let pstrlen = Bytes.get_uint8 pstrlen_buf 0 in
+-    let handshake_bytes = Tcp.Client.read_bytes flow (pstrlen + 48) in
++    Tcp.Client.read_bytes flow (pstrlen + 48) >>= fun handshake_bytes ->
+     let handshake_result = Handshake.read pstrlen handshake_bytes in
+     match handshake_result with
+     | Ok h when h.info_hash <> info_hash ->
+-      Result.error `Info_hash_is_not_equal
+-    | Ok h -> Result.ok h
+-    | Error e -> Result.error e)
++      Lwt.return (Result.error `Info_hash_is_not_equal)
++    | Ok h -> Lwt.return (Result.ok h)
++    | Error e -> Lwt.return (Result.error e))
+ ;;
+ 
+-let recv_bitfield flow env =
+-  let clock = Eio.Stdenv.clock env in
+-  Eio.Time.with_timeout clock 6. (fun () ->
+-    let msg_result = read flow in
++let recv_bitfield flow =
++  with_timeout 6.0 (fun () ->
++    read flow >>= fun msg_result ->
+     match msg_result with
+     | None ->
+-      Result.error
+-        (`Error
+-          (Printf.sprintf
+-             "Expected bitfield but got %s"
+-             (Message.to_string msg_result)))
++      Lwt.return
++        (Result.error
++          (`Error
++            (Printf.sprintf
++               "Expected bitfield but got %s"
++               (Message.to_string msg_result))))
+     | Some m when m.id <> Message.id_of_message_type Msg_bitfield ->
+-      Result.error
+-        (`Error
+-          (Printf.sprintf
+-             "Expected bitfield but got ID %d"
+-             (Uint8.to_int m.id)))
+-    | Some m -> Result.ok m.payload)
++      Lwt.return
++        (Result.error
++          (`Error
++            (Printf.sprintf
++               "Expected bitfield but got ID %d"
++               (Uint8.to_int m.id))))
++    | Some m -> Lwt.return (Result.ok m.payload))
+ ;;
+ 
+-let connect (peer : Peers.t) info_hash peer_id env sw =
++let connect (peer : Peers.t) info_hash peer_id =
+   (* Log.debug "Connecting to %s" (Peers.show peer); *)
+-  let flow =
+-    Tcp.Client.open_connection ~env ~sw ~host:peer.ip ~port:peer.port
+-  in
++  Tcp.Client.open_connection ~host:peer.ip ~port:peer.port >>= fun flow ->
+   (* Logs.debug (fun m -> m "Connected to %s" (Peers.show peer)); *)
+-  let complete_handshake_result =
+-    complete_handshake env flow info_hash peer_id
+-  in
++  complete_handshake flow info_hash peer_id >>= fun complete_handshake_result ->
+   match complete_handshake_result with
+-  | Error e -> Result.error e
++  | Error e -> Lwt.return (Result.error e)
+   | Ok _ ->
+     let () = Logs.debug (fun m -> m "Completed handshake") in
+-    let recv_bitfield_result = recv_bitfield flow env in
++    recv_bitfield flow >>= fun recv_bitfield_result ->
+     (match recv_bitfield_result with
+-     | Error e -> Result.error e
++     | Error e -> Lwt.return (Result.error e)
+      | Ok bitfield ->
+-       Result.ok
+-         { flow
+-         ; choked = ref true
+-         ; bitfield = Bitfield.of_bytes bitfield
+-         ; peer
+-         ; info_hash
+-         ; peer_id
+-         })
++       Lwt.return
++         (Result.ok
++           { flow
++           ; choked = ref true
++           ; bitfield = Bitfield.of_bytes bitfield
++           ; peer
++           ; info_hash
++           ; peer_id
++           }))
+ ;;
+diff --git a/src/lib/dune b/src/lib/dune
+index 61101fc..022afe5 100644
+--- a/src/lib/dune
++++ b/src/lib/dune
+@@ -3,15 +3,16 @@
+  (package tornado)
+  (libraries
+   bencode
+-  eio
+-  eio_main
++  lwt
++  lwt.unix
++  cohttp-lwt-unix
+   uri
+   stdint
+   fmt
+   logs.fmt
+   ipaddr
+-  piaf
++  ipaddr.unix
+   fmt.tty
+   progress)
+  (preprocess
+-  (pps ppx_deriving.show)))
++  (pps ppx_deriving.show lwt_ppx)))
+diff --git a/src/lib/peers.ml b/src/lib/peers.ml
+index ef7e343..1ea6b12 100644
+--- a/src/lib/peers.ml
++++ b/src/lib/peers.ml
+@@ -29,16 +29,17 @@ let create peers_bin =
+     { ip; port })
+ ;;
+ 
+-let request_peers ~env ~sw uri =
+-  let response = Piaf.Client.Oneshot.get env ~sw uri |> Result.get_ok in
+-  let body_string = Piaf.Body.to_string response.body |> Result.get_ok in
++let request_peers uri =
++  let open Lwt.Infix in
++  Cohttp_lwt_unix.Client.get uri >>= fun (resp, body) ->
++  Cohttp_lwt.Body.to_string body >>= fun body_string ->
+   let tracker_bencode = Bencode.decode (`String body_string) in
+   let peers_string =
+     Bencode_utils.bencode_to_string tracker_bencode "peers" |> Option.get
+   in
+   let peers_bytes = peers_string |> Bytes.of_string in
+   let peers = create peers_bytes in
+-  peers
++  Lwt.return peers
+ ;;
+ 
+ let to_string peer = Printf.sprintf "%s:%d" (V4.to_string peer.ip) peer.port
+diff --git a/src/lib/tcp.ml b/src/lib/tcp.ml
+index 515d617..d2b7824 100644
+--- a/src/lib/tcp.ml
++++ b/src/lib/tcp.ml
+@@ -1,43 +1,40 @@
+ module Client = struct
+-  let open_connection
+-    ~(env : Eio_unix.Stdenv.base)
+-    ~sw
+-    ~(host : Ipaddr.V4.t)
+-    ~port
+-    =
+-    let ip = Ipaddr.V4.to_octets host in
+-    let addr = `Tcp (Eio.Net.Ipaddr.of_raw ip, port) in
+-    let net = Eio.Stdenv.net env in
+-    match Eio.Net.connect ~sw net addr with
+-    | socket_flow ->
+-      let fd = Eio_unix.Resource.fd_opt socket_flow |> Option.get in
+-      Eio_unix.Fd.use_exn "Client.open_connection" fd (fun fd ->
+-        Unix.setsockopt fd TCP_NODELAY false;
+-        Logs.debug (fun m -> m "TCP_NODELAY Disabled"));
+-      (socket_flow :> Eio.Flow.two_way_ty Eio.Flow.two_way)
+-    | exception exn ->
+-      Logs.err (fun m ->
+-        m
+-          "Failed to connect to %a:%d: %s"
+-          Ipaddr.V4.pp
+-          host
+-          port
+-          (Printexc.to_string exn));
+-      raise exn
++  let open_connection ~(host : Ipaddr.V4.t) ~port =
++    let open Lwt.Infix in
++    let addr = Unix.ADDR_INET (Ipaddr_unix.V4.to_inet_addr host, port) in
++    (* Create socket with Lwt_unix *)
++    let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
++    (* Set socket options before connecting *)
++    Unix.setsockopt (Lwt_unix.unix_file_descr sock) Unix.TCP_NODELAY false;
++    Logs.debug (fun m -> m "TCP_NODELAY Disabled");
++    (* Connect the socket *)
++    Lwt_unix.connect sock addr >>= fun () ->
++    (* Create I/O channels from the socket *)
++    let ic = Lwt_io.of_fd ~mode:Lwt_io.Input sock in
++    let oc = Lwt_io.of_fd ~mode:Lwt_io.Output sock in
++    Lwt.return (ic, oc)
+   ;;
+ 
+-  let write_bytes socket_flow buf =
+-    Eio.Buf_write.with_flow socket_flow (fun buf_write ->
+-      Eio.Buf_write.bytes buf_write buf)
++  let write_bytes (_ic, oc) buf =
++    let open Lwt.Infix in
++    Lwt_io.write_from_exactly oc buf 0 (Bytes.length buf) >>= fun () ->
++    Lwt_io.flush oc
+   ;;
+ 
+-  let write socket_flow str = Eio.Flow.copy_string str socket_flow
++  let write socket_flow str =
++    write_bytes socket_flow (Bytes.unsafe_of_string str)
++  ;;
+ 
+-  let read_bytes socket_flow size =
+-    let buf = Cstruct.create size in
+-    Eio.Flow.read_exact socket_flow buf;
+-    Cstruct.to_bytes buf
++  let read_bytes (ic, _oc) size =
++    let open Lwt.Infix in
++    let buf = Bytes.create size in
++    Lwt_io.read_into_exactly ic buf 0 size >>= fun () ->
++    Lwt.return buf
+   ;;
+ 
+-  let read socket_flow size = Bytes.to_string (read_bytes socket_flow size)
++  let read socket_flow size =
++    let open Lwt.Infix in
++    read_bytes socket_flow size >>= fun bytes ->
++    Lwt.return (Bytes.to_string bytes)
++  ;;
+ end
+diff --git a/src/lib/torrent_client.ml b/src/lib/torrent_client.ml
+index c6d8ab9..f2aab14 100644
+--- a/src/lib/torrent_client.ml
++++ b/src/lib/torrent_client.ml
+@@ -1,3 +1,5 @@
++open Lwt.Infix
++
+ type t =
+   { peers : Peers.t list
+   ; peer_id : bytes
+@@ -50,55 +52,66 @@ let calculate_block_size piece_length requested =
+ ;;
+ 
+ let read_message (client : Client.t) (pw : piece_work) _torrent state =
+-  let message = Client.read client.flow in
++  Client.read client.flow >>= fun message ->
+   match message with
+-  | None -> ()
++  | None -> Lwt.return_unit
+   | Some msg ->
+     (* let () = *)
+     (*   Logs.debug (fun m -> m "There is msg %s" (Message.to_string message)) *)
+     (* in *)
+     (match Stdint.Uint8.to_int msg.id with
+-     | 0 -> client.choked := true
+-     | 1 -> client.choked := false
++     | 0 ->
++       client.choked := true;
++       Lwt.return_unit
++     | 1 ->
++       client.choked := false;
++       Lwt.return_unit
+      | 4 ->
+        (match Message.parse_have msg with
+-        | Error (`Error _e) -> ()
+-        | Ok index -> Bitfield.set_piece client.bitfield index)
++        | Error (`Error _e) -> Lwt.return_unit
++        | Ok index ->
++          Bitfield.set_piece client.bitfield index;
++          Lwt.return_unit)
+      | 7 ->
+        (match Message.parse_piece pw.index state.buf msg with
+-        | Error (`Error _e) -> ()
++        | Error (`Error _e) -> Lwt.return_unit
+         | Ok buf_len ->
+           state.backlog := !(state.backlog) - 1;
+-          state.downloaded := !(state.downloaded) + buf_len)
+-     | _ -> ())
++          state.downloaded := !(state.downloaded) + buf_len;
++          Lwt.return_unit)
++     | _ -> Lwt.return_unit)
+ ;;
+ 
+ let rec request (client : Client.t) state (pw : piece_work) =
+   if !(state.backlog) < 5 && !(state.requested) < pw.length
+   then (
+-    let () =
+-      let block_size = calculate_block_size pw.length !(state.requested) in
+-      let () =
+-        Client.send_request client pw.index !(state.requested) block_size
+-      in
+-      state.requested := !(state.requested) + block_size;
+-      state.backlog := !(state.backlog) + 1;
+-      ()
+-    in
++    let block_size = calculate_block_size pw.length !(state.requested) in
++    Client.send_request client pw.index !(state.requested) block_size
++    >>= fun () ->
++    state.requested := !(state.requested) + block_size;
++    state.backlog := !(state.backlog) + 1;
+     request client state pw)
+-  else ()
++  else Lwt.return_unit
+ ;;
+ 
+ let rec download_piece (client : Client.t) (pw : piece_work) torrent state =
+   if !(state.downloaded) < pw.length
+   then (
+-    let () = if not !(client.choked) then request client state pw else () in
+-    let _ = read_message client pw torrent state in
++    (if not !(client.choked) then request client state pw else Lwt.return_unit)
++    >>= fun () ->
++    read_message client pw torrent state >>= fun () ->
+     download_piece client pw torrent state)
+-  else state.buf
++  else Lwt.return state.buf
++;;
++
++let with_timeout timeout f =
++  Lwt.pick
++    [ f ()
++    ; (Lwt_unix.sleep timeout >>= fun () -> Lwt.fail (Failure "Timeout"))
++    ]
+ ;;
+ 
+-let try_download_piece env (client : Client.t) (pw : piece_work) torrent =
++let try_download_piece (client : Client.t) (pw : piece_work) torrent =
+   let state =
+     { requested = ref 0
+     ; downloaded = ref 0
+@@ -111,16 +124,15 @@ let try_download_piece env (client : Client.t) (pw : piece_work) torrent =
+       "Try to download piece %d of %d"
+       (pw.index + 1)
+       (Array.length torrent.piece_hashes));
+-  let clock = Eio.Stdenv.clock env in
+-  Eio.Time.with_timeout_exn clock 30. (fun () ->
+-    let piece_buf = download_piece client pw torrent state in
++  with_timeout 30.0 (fun () ->
++    download_piece client pw torrent state >>= fun piece_buf ->
+     Logs.info (fun m ->
+       m
+         "Downloaded piece (%d of %d) with size %d"
+         (pw.index + 1)
+         (Array.length torrent.piece_hashes)
+         (Bytes.length piece_buf));
+-    piece_buf)
++    Lwt.return piece_buf)
+ ;;
+ 
+ let check_integrity (pw : piece_work) buf =
+@@ -130,153 +142,171 @@ let check_integrity (pw : piece_work) buf =
+   else Result.Error (`Error "Hash mismatch")
+ ;;
+ 
+-let send_pw pieces_work_chan pw =
+-  Logs.debug (fun m -> m "Try send pw \n");
+-  Eio.Stream.add pieces_work_chan pw;
+-  Logs.debug (fun m -> m "sent pw \n")
+-;;
+-
+-let download_piece env client torrent pieces_work_chan pieces_result_chan pw =
+-  let piece_buf = try_download_piece env client pw torrent in
++let download_piece_task
++  client
++  torrent
++  (push_work : piece_work option -> unit)
++  (push_result : piece_result option -> unit)
++  pw
++  =
++  try_download_piece client pw torrent >>= fun piece_buf ->
+   let integrity_result = check_integrity pw piece_buf in
+   match integrity_result with
+   | Error (`Error e) ->
+-    send_pw pieces_work_chan pw;
+-    Logs.err (fun m -> m "Error: %s" e)
++    Logs.debug (fun m -> m "Try send pw \n");
++    push_work (Some pw);
++    Logs.debug (fun m -> m "sent pw \n");
++    Logs.err (fun m -> m "Error: %s" e);
++    Lwt.return_unit
+   | Ok () ->
+     Log.debug "Integrity of piece %d is ok." pw.index;
+     let piece_result =
+       { buf = piece_buf; length = pw.length; index = pw.index }
+     in
+     Log.debug "Try send result %d." pw.index;
+-    Eio.Stream.add pieces_result_chan piece_result;
++    push_result (Some piece_result);
+     Log.debug "Sent result %d." pw.index;
+     Client.send_have client pw.index
+ ;;
+ 
+-let rec download_torrent
+-  env
++let rec download_torrent_worker
+   (torrent : t)
+   (client : Client.t)
+-  (pieces_work_chan : piece_work Eio.Stream.t)
+-  pieces_result_chan
++  (work_stream : piece_work Lwt_stream.t)
++  (push_work : piece_work option -> unit)
++  (push_result : piece_result option -> unit)
+   =
+   Logs.debug (fun m -> m "Try receive pw \n");
+-  let pw = Eio.Stream.take pieces_work_chan in
+-  match
+-    Logs.debug (fun m ->
+-      m "With peer_id %s\n" (client.peer.ip |> Ipaddr.V4.to_string));
+-    if not (Bitfield.has_piece client.bitfield pw.index)
+-    then (
+-      send_pw pieces_work_chan pw;
+-      Logs.debug (fun m -> m "This client does NOT have piece %d\n" pw.index))
+-    else
+-      download_piece env client torrent pieces_work_chan pieces_result_chan pw
+-  with
+-  | () ->
+-    download_torrent env torrent client pieces_work_chan pieces_result_chan
+-  | exception ex ->
+-    send_pw pieces_work_chan pw;
+-    Logs.err (fun m -> m "%a" Fmt.exn ex)
++  Lwt_stream.get work_stream >>= fun pw_opt ->
++  match pw_opt with
++  | None -> Lwt.return_unit
++  | Some pw ->
++    Lwt.catch
++      (fun () ->
++        Logs.debug (fun m ->
++          m "With peer_id %s\n" (client.peer.ip |> Ipaddr.V4.to_string));
++        if not (Bitfield.has_piece client.bitfield pw.index)
++        then (
++          Logs.debug (fun m -> m "Try send pw \n");
++          push_work (Some pw);
++          Logs.debug (fun m -> m "sent pw \n");
++          Logs.debug (fun m -> m "This client does NOT have piece %d\n" pw.index);
++          Lwt.return_unit)
++        else
++          download_piece_task
++            client
++            torrent
++            push_work
++            push_result
++            pw)
++      (fun ex ->
++        Logs.debug (fun m -> m "Try send pw \n");
++        push_work (Some pw);
++        Logs.debug (fun m -> m "sent pw \n");
++        Logs.err (fun m -> m "%a" Fmt.exn ex);
++        Lwt.return_unit)
++    >>= fun () ->
++    download_torrent_worker torrent client work_stream push_work push_result
+ ;;
+ 
+ let connect_and_download_torrent
+-  (env : Eio_unix.Stdenv.base)
+-  sw
+   torrent
+   peer
+-  pieces_work_chan
+-  pieces_result_chan
++  (work_stream : piece_work Lwt_stream.t)
++  (push_work : piece_work option -> unit)
++  (push_result : piece_result option -> unit)
+   =
+-  let client_result =
+-    let clock = Eio.Stdenv.clock env in
+-    Eio.Time.with_timeout_exn clock 4. (fun () ->
+-      Client.connect peer torrent.info_hash torrent.peer_id env sw)
+-  in
++  with_timeout 4.0 (fun () -> Client.connect peer torrent.info_hash torrent.peer_id)
++  >>= fun client_result ->
+   let client = Result.get_ok client_result in
+   Logs.debug (fun m ->
+     m "Completed handshake with %s\n" (Ipaddr.V4.to_string peer.ip));
+-  Client.send_unchoke client;
+-  Client.send_interested client;
+-  download_torrent env torrent client pieces_work_chan pieces_result_chan
++  Client.send_unchoke client >>= fun () ->
++  Client.send_interested client >>= fun () ->
++  download_torrent_worker torrent client work_stream push_work push_result
+ ;;
+ 
+ let rec download_torrent_by_peers
+-  env
+-  sw
+   torrent
+   (peers : Peers.t list)
+-  pieces_work_chan
+-  pieces_result_chan
++  (work_stream : piece_work Lwt_stream.t)
++  (push_work : piece_work option -> unit)
++  (push_result : piece_result option -> unit)
+   =
+   match peers with
+-  | [] -> ()
++  | [] -> Lwt.return_unit
+   | peers_head :: peers_tail ->
+-    let () =
+-      Eio.Fiber.fork ~sw (fun _ ->
+-        Eio.Switch.run_protected (fun sw ->
++    Lwt.async (fun () ->
++      Lwt.catch
++        (fun () ->
+           connect_and_download_torrent
+-            env
+-            sw
+             torrent
+             peers_head
+-            pieces_work_chan
+-            pieces_result_chan))
+-    in
++            work_stream
++            push_work
++            push_result)
++        (fun _ex -> Lwt.return_unit));
+     download_torrent_by_peers
+-      env
+-      sw
+       torrent
+       peers_tail
+-      pieces_work_chan
+-      pieces_result_chan
++      work_stream
++      push_work
++      push_result
+ ;;
+ 
+-let download_torrent ~env ~sw (torrent : t) file_name =
++let download_torrent (torrent : t) file_name =
++  let open Lwt.Infix in
+   let final_buf = Bytes.create torrent.length in
+   let pieces_hashes_len = Array.length torrent.piece_hashes in
+-  let pieces_work_chan = Eio.Stream.create 1 in
+-  let pieces_result_chan = Eio.Stream.create pieces_hashes_len in
+-  let domain_mgr = Eio.Stdenv.domain_mgr env in
+-  let run f = Eio.Domain_manager.run domain_mgr f in
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    let _ =
+-      Array.init pieces_hashes_len (fun index ->
++
++  (* Create work and result streams with explicit types *)
++  let work_stream, work_push =
++    (Lwt_stream.create () : piece_work Lwt_stream.t * (piece_work option -> unit)) in
++  let result_stream, result_push =
++    (Lwt_stream.create () : piece_result Lwt_stream.t * (piece_result option -> unit)) in
++
++  (* Initialize work queue *)
++  Lwt.async (fun () ->
++    Lwt_list.iter_s
++      (fun index ->
+         let hash = torrent.piece_hashes.(index) in
+         let length = calculate_piece_size torrent index in
+         let pw = { index; length; hash } in
+-        Eio.Stream.add pieces_work_chan pw)
+-    in
+-    ());
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    run (fun _ ->
+-      Eio.Switch.run (fun sub_sw ->
+-        download_torrent_by_peers
+-          env
+-          sub_sw
+-          torrent
+-          torrent.peers
+-          pieces_work_chan
+-          pieces_result_chan)));
++        work_push (Some pw);
++        Lwt.return_unit)
++      (List.init pieces_hashes_len (fun i -> i)));
++
++  (* Start peer download tasks *)
++  Lwt.async (fun () ->
++    download_torrent_by_peers
++      torrent
++      torrent.peers
++      work_stream
++      work_push
++      result_push);
++
++  (* Collect results *)
+   let done_pieces = ref 0 in
+-  let total = Int64.of_int torrent.length in
+-  let progress = Download_bar.create_bars file_name total in
+-  progress (fun file_layout ->
+-    while !done_pieces < pieces_hashes_len do
+-      let piece_result = Eio.Stream.take pieces_result_chan in
++
++  (* Collect all pieces asynchronously *)
++  let rec collect_pieces () =
++    if !done_pieces < pieces_hashes_len then
++      Lwt_stream.next result_stream >>= fun piece_result ->
+       let length = calculate_piece_size torrent piece_result.index in
+       let start, _ = calculate_bounds_for_piece torrent piece_result.index in
+       done_pieces := !done_pieces + 1;
+-      file_layout (Int64.of_int piece_result.length);
+-      Bytes.blit piece_result.buf 0 final_buf start length
+-    done);
+-  final_buf
++      Bytes.blit piece_result.buf 0 final_buf start length;
++      collect_pieces ()
++    else
++      Lwt.return_unit
++  in
++
++  collect_pieces () >>= fun () ->
++  Lwt.return final_buf
+ ;;
+ 
+-let download_file output_file torrent_file env =
++let download_file output_file torrent_file =
+   let open Torrent_file in
+-  Eio.Switch.run
+-  @@ fun sw ->
+   let file_name =
+     match output_file, torrent_file.name with
+     | Some file, _ -> file
+@@ -286,7 +316,7 @@ let download_file output_file torrent_file env =
+   (* Get Peers *)
+   let random_peer = Bytes.create 20 in
+   let uri = build_tracker_url torrent_file random_peer 6881 in
+-  let peers = Peers.request_peers ~env ~sw uri in
++  Peers.request_peers uri >>= fun peers ->
+   Logs.debug (fun m -> m "Got %d peers\n" (List.length peers));
+   (* Download *)
+   let torrent =
+@@ -298,12 +328,12 @@ let download_file output_file torrent_file env =
+       (torrent_file.piece_length |> Int64.to_int)
+       (torrent_file.length |> Int64.to_int)
+   in
+-  let final_buf = download_torrent ~env ~sw torrent file_name in
++  download_torrent torrent file_name >>= fun final_buf ->
+   (* Write File *)
+-  let open Eio.Path in
+-  let dir = Eio.Stdenv.cwd env in
+-  let path = dir / file_name in
+-  let out_ch = Eio.Path.open_out ~sw ~create:(`Or_truncate 0o644) path in
+-  let source = Eio.Flow.cstruct_source [ Cstruct.of_bytes final_buf ] in
+-  Eio.Flow.copy source out_ch
++  Lwt_io.with_file
++    ~mode:Lwt_io.Output
++    ~flags:[ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ]
++    ~perm:0o644
++    file_name
++    (fun oc -> Lwt_io.write_from_exactly oc final_buf 0 (Bytes.length final_buf))
+ ;;
+diff --git a/src/lib/torrent_file.ml b/src/lib/torrent_file.ml
+index 127b0c5..66cefc8 100644
+--- a/src/lib/torrent_file.ml
++++ b/src/lib/torrent_file.ml
+@@ -12,12 +12,31 @@ type t =
+ 
+ let create_with_beencode bencode_root =
+   let announce = bencode_to_string bencode_root "announce" in
+-  let info_beencode = Bencode.dict_get bencode_root "info" |> Option.get in
+-  let length = bencode_to_int info_beencode "length" |> Option.get in
++  let info_beencode =
++    match Bencode.dict_get bencode_root "info" with
++    | None -> failwith "Torrent file is missing required 'info' dictionary"
++    | Some x -> x
++  in
++  (* Check if this is a multi-file torrent *)
++  let is_multi_file = Bencode.dict_get info_beencode "files" <> None in
++  if is_multi_file then
++    failwith "Multi-file torrents are not supported. This torrent contains multiple files. Please use a single-file torrent."
++  ;
++  let length =
++    match bencode_to_int info_beencode "length" with
++    | None -> failwith "Torrent file is missing required 'length' field in info dictionary"
++    | Some x -> x
++  in
+   let piece_length =
+-    bencode_to_int info_beencode "piece length" |> Option.get
++    match bencode_to_int info_beencode "piece length" with
++    | None -> failwith "Torrent file is missing required 'piece length' field in info dictionary"
++    | Some x -> x
++  in
++  let pieces =
++    match Bencode.dict_get info_beencode "pieces" with
++    | None -> failwith "Torrent file is missing required 'pieces' field in info dictionary"
++    | Some x -> x
+   in
+-  let pieces = Bencode.dict_get info_beencode "pieces" |> Option.get in
+   let name = bencode_to_string info_beencode "name" in
+   let info_hash = sha1_of_bencode info_beencode in
+   let piece_hashes = split_piece_hashes pieces in
+@@ -30,7 +49,10 @@ let open_file input_file =
+ ;;
+ 
+ let build_tracker_url file peer_id port =
+-  let announce_url = file.announce |> Option.get in
++  let announce_url = match file.announce with
++    | Some url -> url
++    | None -> failwith "Torrent file does not contain an 'announce' URL. This torrent may use 'announce-list' which is not yet supported."
++  in
+   let query =
+     [ "info_hash", [ Bytes.to_string file.info_hash ]
+     ; "peer_id", [ Bytes.to_string peer_id ]; "port", [ Int.to_string port ]
+diff --git a/test/e2e/client_test.ml b/test/e2e/client_test.ml
+index 40318f0..d1bf49b 100644
+--- a/test/e2e/client_test.ml
++++ b/test/e2e/client_test.ml
+@@ -1,5 +1,6 @@
+ open Tornado
+ open Shared
++open Lwt.Infix
+ 
+ let find_port () =
+   Random.self_init ();
+@@ -7,8 +8,8 @@ let find_port () =
+ ;;
+ 
+ let handler server_handshake flow =
+-  Tcp.Client.write_bytes flow server_handshake;
+-  let msg = Tcp.Client.read flow 5 in
++  Tcp.Client.write_bytes flow server_handshake >>= fun () ->
++  Tcp.Client.read flow 5 >>= fun msg ->
+   let msg_uppercase = String.uppercase_ascii msg in
+   Tcp.Client.write flow msg_uppercase
+ ;;
+@@ -37,24 +38,21 @@ let successful_handshake_test () =
+     ; 253; 168; 193; 19 ]
+     |> Utils.ints_to_bytes
+   in
+-  Eio_main.run
+-  @@ fun env ->
+-  Eio.Switch.run
+-  @@ fun sw ->
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    let flow, _addr = Tcp_server.listen ~net:(Eio.Stdenv.net env) ~sw ~port in
+-    handler server_handshake flow);
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    let host = Ipaddr.V4.localhost in
+-    let flow = Tcp.Client.open_connection ~env ~sw ~host ~port in
+-    let handshake_result =
+-      Client.complete_handshake env flow info_hash client_peer_id
+-    in
+-    let h = Result.get_ok handshake_result in
+-    let exp = Handshake.create info_hash expected_peer_id in
+-    Check.check_string exp.pstr h.pstr;
+-    Check.check_bytes exp.info_hash h.info_hash;
+-    Check.check_bytes exp.peer_id h.peer_id)
++  Lwt_main.run
++    (Lwt.join
++       [ (Tcp_server.listen ~port >>= fun (flow, _addr) ->
++          handler server_handshake flow)
++       ; (let host = Ipaddr.V4.localhost in
++          Tcp.Client.open_connection ~host ~port >>= fun flow ->
++          Client.complete_handshake flow info_hash client_peer_id
++          >>= fun handshake_result ->
++          let h = Result.get_ok handshake_result in
++          let exp = Handshake.create info_hash expected_peer_id in
++          Check.check_string exp.pstr h.pstr;
++          Check.check_bytes exp.info_hash h.info_hash;
++          Check.check_bytes exp.peer_id h.peer_id;
++          Lwt.return_unit)
++       ])
+ ;;
+ 
+ let failed_handshake_test () =
+@@ -76,22 +74,19 @@ let failed_handshake_test () =
+     [ 1; 2; 3; 4; 5; 6; 7; 8; 9; 10; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20 ]
+     |> Utils.ints_to_bytes
+   in
+-  Eio_main.run
+-  @@ fun env ->
+-  Eio.Switch.run
+-  @@ fun sw ->
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    let flow, _addr = Tcp_server.listen ~net:(Eio.Stdenv.net env) ~sw ~port in
+-    handler server_handshake flow);
+-  Eio.Fiber.fork ~sw (fun _ ->
+-    let host = Ipaddr.V4.localhost in
+-    let flow = Tcp.Client.open_connection ~env ~sw ~host ~port in
+-    let handshake_result =
+-      Client.complete_handshake env flow info_hash client_peer_id
+-    in
+-    let error = Result.get_error handshake_result in
+-    let is_info_hash_error = error == `Info_hash_is_not_equal in
+-    Check.check_bool true is_info_hash_error)
++  Lwt_main.run
++    (Lwt.join
++       [ (Tcp_server.listen ~port >>= fun (flow, _addr) ->
++          handler server_handshake flow)
++       ; (let host = Ipaddr.V4.localhost in
++          Tcp.Client.open_connection ~host ~port >>= fun flow ->
++          Client.complete_handshake flow info_hash client_peer_id
++          >>= fun handshake_result ->
++          let error = Result.get_error handshake_result in
++          let is_info_hash_error = error == `Info_hash_is_not_equal in
++          Check.check_bool true is_info_hash_error;
++          Lwt.return_unit)
++       ])
+ ;;
+ 
+ let tests =
+diff --git a/test/e2e/tcp_server.ml b/test/e2e/tcp_server.ml
+index 140ef99..078996e 100644
+--- a/test/e2e/tcp_server.ml
++++ b/test/e2e/tcp_server.ml
+@@ -1,6 +1,12 @@
+-let listen ~net ~sw ~port =
+-  let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+-  let socket = Eio.Net.listen net ~sw ~reuse_addr:true ~backlog:5 addr in
+-  let flow, addr = Eio.Net.accept ~sw socket in
+-  flow, addr
++let listen ~port =
++  let open Lwt.Infix in
++  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, port) in
++  let sock = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
++  Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
++  Lwt_unix.bind sock addr >>= fun () ->
++  Lwt_unix.listen sock 5;
++  Lwt_unix.accept sock >>= fun (client_sock, client_addr) ->
++  Lwt_io.of_fd ~mode:Lwt_io.Input client_sock >>= fun ic ->
++  Lwt_io.of_fd ~mode:Lwt_io.Output client_sock >>= fun oc ->
++  Lwt.return ((ic, oc), client_addr)
+ ;;
+diff --git a/test/e2e/tcp_test.ml b/test/e2e/tcp_test.ml
+index c95da19..1f9525a 100644
+--- a/test/e2e/tcp_test.ml
++++ b/test/e2e/tcp_test.ml
+@@ -1,5 +1,6 @@
+ open Shared
+ open Tornado
++open Lwt.Infix
+ 
+ let port =
+   Random.self_init ();
+@@ -9,26 +10,22 @@ let port =
+ let config = `Port port
+ 
+ let handler flow =
+-  let msg = Tcp.Client.read flow 5 in
++  Tcp.Client.read flow 5 >>= fun msg ->
+   let msg_uppercase = String.uppercase_ascii msg in
+   Tcp.Client.write flow msg_uppercase
+ ;;
+ 
+ let tcp_test () =
+-  Eio_main.run
+-  @@ fun env ->
+-  Eio.Switch.run
+-  @@ fun sw ->
+-  Eio.Fiber.fork ~sw (fun () ->
+-    let flow, _addr = Tcp_server.listen ~net:(Eio.Stdenv.net env) ~sw ~port in
+-    handler flow);
+-  Eio.Fiber.fork ~sw (fun () ->
+-    let host = Ipaddr.V4.localhost in
+-    let flow = Tcp.Client.open_connection ~env ~sw ~host ~port in
+-    Tcp.Client.write flow "hello";
+-    let msg = Tcp.Client.read flow 5 in
+-    Check.check_string "HELLO" msg);
+-  ()
++  Lwt_main.run
++    (Lwt.join
++       [ (Tcp_server.listen ~port >>= fun (flow, _addr) -> handler flow)
++       ; (let host = Ipaddr.V4.localhost in
++          Tcp.Client.open_connection ~host ~port >>= fun flow ->
++          Tcp.Client.write flow "hello" >>= fun () ->
++          Tcp.Client.read flow 5 >>= fun msg ->
++          Check.check_string "HELLO" msg;
++          Lwt.return_unit)
++       ])
+ ;;
+ 
+ let tests =
+diff --git a/tornado.opam b/tornado.opam
+index 2ad973d..652b547 100644
+--- a/tornado.opam
++++ b/tornado.opam
+@@ -7,13 +7,15 @@ maintainer: ["fraifelipe@gmail.com"]
+ depends: [
+   "alcotest" {with-test}
+   "dune" {>= "3.2" & build & >= "3.1.1"}
+-  "piaf"
++  "ocaml" {>= "4.14"}
++  "lwt"
++  "lwt_ppx"
++  "cohttp-lwt-unix"
+   "progress"
+-  "eio"
+-  "eio_main"
+   "bencode"
+   "stdint"
+   "uri"
++  "ipaddr"
+   "ppx_deriving"
+   "odoc" {with-doc}
+ ]
+@@ -30,18 +32,4 @@ build: [
+     "@runtest" {with-test}
+     "@doc" {with-doc}
+   ]
+-]
+-pin-depends: [
+-  [ "piaf.dev" "git+https://github.com/anmonteiro/piaf.git" ]
+-  [ "gluten.dev" "git+https://github.com/anmonteiro/gluten.git" ]
+-  [ "gluten-eio.dev" "git+https://github.com/anmonteiro/gluten.git" ]
+-  [ "httpaf.dev" "git+https://github.com/anmonteiro/httpaf.git" ]
+-  [ "httpaf-eio.dev" "git+https://github.com/anmonteiro/httpaf.git" ]
+-  [ "hpack.dev" "git+https://github.com/anmonteiro/ocaml-h2.git" ]
+-  [ "h2.dev" "git+https://github.com/anmonteiro/ocaml-h2.git" ]
+-  [ "h2-eio.dev" "git+https://github.com/anmonteiro/ocaml-h2.git" ]
+-  [ "ssl.dev" "git+https://github.com/savonet/ocaml-ssl.git" ]
+-  [ "eio-ssl.dev" "git+https://github.com/anmonteiro/eio-ssl.git" ]
+-  [ "websocketaf.dev" "git+https://github.com/anmonteiro/websocketaf.git" ]
+-  [ "multipart_form.dev" "git+https://github.com/anmonteiro/multipart_form.git" ]
+ ]
+\ No newline at end of file
