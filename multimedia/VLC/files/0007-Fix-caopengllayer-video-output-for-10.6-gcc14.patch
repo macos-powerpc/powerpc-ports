@@ -1,0 +1,301 @@
+--- modules/video_output/caopengllayer.m
++++ modules/video_output/caopengllayer.m	2026-03-12 17:55:40.499814657 +0000
+@@ -37,7 +37,7 @@
+ #include <vlc_plugin.h>
+ #include <vlc_vout_display.h>
+ #include <vlc_opengl.h>
+-#include <vlc_atomic.h>
++/* Don't include vlc_atomic.h - GCC 14's _Atomic incompatible with ObjC */
+ 
+ #import <QuartzCore/QuartzCore.h>
+ #import <Cocoa/Cocoa.h>
+@@ -90,7 +90,7 @@
+ // macOS SDKs lower than 10.14 did not have a NSViewLayerContentScaleDelegate
+ // protocol definition, but its not needed, it will work fine without it as the
+ // delegate method even existed before, just not the protocol.
+-@interface VLCVideoLayerView : NSView <CALayerDelegate>
++@interface VLCVideoLayerView : NSView /* CALayerDelegate is 10.7+ */
+ #else
+ @interface VLCVideoLayerView : NSView <CALayerDelegate, NSViewLayerContentScaleDelegate>
+ #endif
+@@ -118,7 +118,8 @@
+     vout_display_place_t place;
+     vout_display_cfg_t cfg;
+ 
+-    atomic_bool is_ready;
++    /* Use volatile instead of atomic_bool - GCC 14's _Atomic incompatible with ObjC */
++    volatile bool is_ready;
+ };
+ 
+ #pragma mark -
+@@ -148,14 +149,6 @@
+         0, // If ever extending this list, adjust the offset below!
+         0
+     };
+-
+-    if (@available(macOS 10.8, *)) {
+-        // Enable automatic graphics switching support, important on Macs
+-        // with dedicated GPUs, as it allows to not always use the dedicated
+-        // GPU which has more power consumption
+-        attribs[10] = kCGLPFASupportsAutomaticGraphicsSwitching;
+-    }
+-
+     err = CGLChoosePixelFormat(attribs, &pix, &npix);
+     if (err != kCGLNoError || pix == NULL) {
+         return NULL;
+@@ -262,9 +255,45 @@
+ #pragma mark -
+ #pragma mark Module functions
+ 
++
++/* Helper function for dispatch_sync_f - sets up video view on main thread */
++static void setup_video_view_on_main_thread(void *context)
++{
++    vout_display_t *vd = (vout_display_t *)context;
++    vout_display_sys_t *sys = vd->sys;
++    id container = sys->container;
++
++    // Reverse vertical alignment as the GL tex are Y inverted
++    sys->cfg = *vd->cfg;
++    if (sys->cfg.align.vertical == VOUT_DISPLAY_ALIGN_TOP)
++        sys->cfg.align.vertical = VOUT_DISPLAY_ALIGN_BOTTOM;
++    else if (sys->cfg.align.vertical == VOUT_DISPLAY_ALIGN_BOTTOM)
++        sys->cfg.align.vertical = VOUT_DISPLAY_ALIGN_TOP;
++
++    // Create video view
++    sys->videoView = [[VLCVideoLayerView alloc] initWithVoutDisplay:vd];
++    sys->videoLayer = (VLCCAOpenGLLayer*)[[sys->videoView layer] retain];
++    // Add video view to container
++    if ([container respondsToSelector:@selector(addVoutSubview:)]) {
++        [container addVoutSubview:sys->videoView];
++    } else if ([container isKindOfClass:[NSView class]]) {
++        NSView *containerView = container;
++        [containerView addSubview:sys->videoView];
++        [sys->videoView setFrame:containerView.bounds];
++        [sys->videoLayer reportCurrentLayerSize];
++    } else {
++        [sys->videoView release];
++        [sys->videoLayer release];
++        sys->videoView = nil;
++        sys->videoLayer = nil;
++    }
++
++    vout_display_PlacePicture(&sys->place, &vd->source, &sys->cfg, false);
++}
++
+ static int Open(vlc_object_t *this)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+         vout_display_t *vd = (vout_display_t *)this;
+         vout_display_sys_t *sys;
+ 
+@@ -272,18 +301,6 @@
+         if (sys == NULL)
+             return VLC_ENOMEM;
+ 
+-        // Only use this video output on macOS 10.14 or higher
+-        // currently, as it has some issues on at least macOS 10.7
+-        // and the old NSView based output still works fine on old
+-        // macOS versions.
+-        if (@available(macOS 10.14, *)) {
+-            // This is intentionally left empty, as the check
+-            // can not be negated or combined with other conditions!
+-        } else {
+-            if (!vd->obj.force)
+-                return VLC_EGENERIC;
+-        }
+-
+         // Obtain container NSObject
+         id container = var_CreateGetAddress(vd, "drawable-nsobject");
+         if (container) {
+@@ -334,34 +351,9 @@
+         var_Create(vd->obj.parent, "macosx-glcontext", VLC_VAR_ADDRESS);
+         var_SetAddress(vd->obj.parent, "macosx-glcontext", cgl_ctx);
+ 
+-        dispatch_sync(dispatch_get_main_queue(), ^{
+-            // Reverse vertical alignment as the GL tex are Y inverted
+-           sys->cfg = *vd->cfg;
+-           if (sys->cfg.align.vertical == VOUT_DISPLAY_ALIGN_TOP)
+-               sys->cfg.align.vertical = VOUT_DISPLAY_ALIGN_BOTTOM;
+-           else if (sys->cfg.align.vertical == VOUT_DISPLAY_ALIGN_BOTTOM)
+-               sys->cfg.align.vertical = VOUT_DISPLAY_ALIGN_TOP;
+-
+-            // Create video view
+-            sys->videoView = [[VLCVideoLayerView alloc] initWithVoutDisplay:vd];
+-            sys->videoLayer = (VLCCAOpenGLLayer*)[[sys->videoView layer] retain];
+-            // Add video view to container
+-            if ([container respondsToSelector:@selector(addVoutSubview:)]) {
+-                [container addVoutSubview:sys->videoView];
+-            } else if ([container isKindOfClass:[NSView class]]) {
+-                NSView *containerView = container;
+-                [containerView addSubview:sys->videoView];
+-                [sys->videoView setFrame:containerView.bounds];
+-                [sys->videoLayer reportCurrentLayerSize];
+-            } else {
+-                [sys->videoView release];
+-                [sys->videoLayer release];
+-                sys->videoView = nil;
+-                sys->videoLayer = nil;
+-            }
+-
+-            vout_display_PlacePicture(&sys->place, &vd->source, &sys->cfg, false);
+-        });
++    // Use dispatch_sync_f to ensure view creation on main thread (no blocks needed)
++    sys->container = container;
++    dispatch_sync_f(dispatch_get_main_queue(), vd, setup_video_view_on_main_thread);
+ 
+         if (sys->videoView == nil) {
+             msg_Err(vd,
+@@ -393,13 +385,39 @@
+         vd->display = PictureDisplay;
+         vd->control = Control;
+ 
+-        atomic_init(&sys->is_ready, false);
++    sys->is_ready = false;
++    [pool release];
+         return VLC_SUCCESS;
+ 
+-    error:
+-        Close(this);
+-        return VLC_EGENERIC;
+-    }
++error:
++    [pool release];
++    Close(this);
++    return VLC_EGENERIC;
++}
++
++
++/* Helper function for dispatch_async_f - cleanup views on main thread */
++struct cleanup_context {
++    id container;
++    VLCVideoLayerView *videoView;
++    VLCCAOpenGLLayer *videoLayer;
++};
++
++static void cleanup_views_on_main_thread(void *context)
++{
++    struct cleanup_context *ctx = (struct cleanup_context *)context;
++    
++    // Remove vout subview from container
++    if ([ctx->container respondsToSelector:@selector(removeVoutSubview:)]) {
++        [ctx->container removeVoutSubview:ctx->videoView];
++    }
++    [ctx->videoView removeFromSuperview];
++
++    [ctx->videoView release];
++    [ctx->container release];
++    [ctx->videoLayer release];
++    
++    free(ctx);
+ }
+ 
+ static void Close(vlc_object_t *p_this)
+@@ -407,7 +425,7 @@
+     vout_display_t *vd = (vout_display_t *)p_this;
+     vout_display_sys_t *sys = vd->sys;
+ 
+-    atomic_store(&sys->is_ready, false);
++    sys->is_ready = false;
+     [sys->videoLayer vlcClose];
+     [sys->videoView vlcClose];
+ 
+@@ -438,17 +456,12 @@
+     VLCVideoLayerView *videoView = sys->videoView;
+     VLCCAOpenGLLayer *videoLayer = sys->videoLayer;
+ 
+-    dispatch_async(dispatch_get_main_queue(), ^{
+-        // Remove vout subview from container
+-        if ([container respondsToSelector:@selector(removeVoutSubview:)]) {
+-            [container removeVoutSubview:videoView];
+-        }
+-        [videoView removeFromSuperview];
+-
+-        [videoView release];
+-        [container release];
+-        [videoLayer release];
+-    });
++    // Use dispatch_async_f for cleanup on main thread (no blocks needed)
++    struct cleanup_context *ctx = malloc(sizeof(struct cleanup_context));
++    ctx->container = container;
++    ctx->videoView = videoView;
++    ctx->videoLayer = videoLayer;
++    dispatch_async_f(dispatch_get_main_queue(), ctx, cleanup_views_on_main_thread);
+ }
+ 
+ static picture_pool_t *Pool(vout_display_t *vd, unsigned count)
+@@ -472,7 +485,7 @@
+         vout_display_opengl_Prepare(sys->vgl, pic, subpicture);
+         vlc_gl_ReleaseCurrent(sys->gl);
+ 
+-        atomic_store(&sys->is_ready, true);
++        sys->is_ready = true;
+     }
+ }
+ 
+@@ -725,7 +738,15 @@
+         NSPoint pointInView = [self convertPoint:event.locationInWindow fromView:nil];
+ 
+         // Convert to pixels
+-        NSPoint pointInBacking = [self convertPointToBacking:pointInView];
++        NSPoint pointInBacking;
++        if ([self respondsToSelector:@selector(convertPointToBacking:)]) {
++            typedef NSPoint (*ConvertPointFunc)(id, SEL, NSPoint);
++            SEL selector = @selector(convertPointToBacking:);
++            ConvertPointFunc convertFunc = (ConvertPointFunc)[self methodForSelector:selector];
++            pointInBacking = convertFunc(self, selector, pointInView);
++        } else {
++            pointInBacking = pointInView;
++        }
+ 
+         vout_display_SendMouseMovedDisplayCoordinates(_vlc_vd, ORIENT_VFLIPPED,
+                                                       pointInBacking.x, pointInBacking.y,
+@@ -850,7 +871,15 @@
+ 
+ - (void)reportCurrentLayerSize
+ {
+-    CGFloat scale = self.contentsScale;
++    CGFloat scale;
++    if ([self respondsToSelector:@selector(contentsScale)]) {
++        typedef CGFloat (*ContentsScaleFunc)(id, SEL);
++        SEL selector = @selector(contentsScale);
++        ContentsScaleFunc scaleFunc = (ContentsScaleFunc)[self methodForSelector:selector];
++        scale = scaleFunc(self, selector);
++    } else {
++        scale = 1.0;
++    }
+     [self reportCurrentLayerSizeWithScale:scale];
+ }
+ 
+@@ -888,7 +917,7 @@
+         if (!_voutDisplay)
+             return NO;
+ 
+-        return (atomic_load(&_voutDisplay->sys->is_ready));
++        return _voutDisplay->sys->is_ready;
+     }
+ }
+ 
+@@ -911,8 +940,19 @@
+         NSSize newSize = NSMakeSize(dims[2], dims[3]);
+ 
+         if (NSEqualSizes(newSize, NSZeroSize)) {
+-            newSize = self.bounds.size;
+-            CGFloat scale = self.contentsScale;
++            /* Fix NSSize/CGSize mismatch on 10.6 SDK */
++            newSize = NSMakeSize(self.bounds.size.width, self.bounds.size.height);
++
++            /* Make contentsScale conditional for 10.6 compatibility */
++            CGFloat scale;
++            if ([self respondsToSelector:@selector(contentsScale)]) {
++                typedef CGFloat (*ContentsScaleFunc)(id, SEL);
++                SEL selector = @selector(contentsScale);
++                ContentsScaleFunc scaleFunc = (ContentsScaleFunc)[self methodForSelector:selector];
++                scale = scaleFunc(self, selector);
++            } else {
++                scale = 1.0;
++            }
+             newSize.width *= scale;
+             newSize.height *= scale;
+         }
