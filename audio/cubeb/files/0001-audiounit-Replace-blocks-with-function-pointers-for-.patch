@@ -1,0 +1,236 @@
+--- src/cubeb_audiounit.cpp
++++ src/cubeb_audiounit.cpp	2026-03-17 20:55:48.000000000 +0800
+@@ -9,6 +9,7 @@
+ #include <AudioUnit/AudioUnit.h>
+ #include <TargetConditionals.h>
+ #include <assert.h>
++#include <dispatch/dispatch.h>
+ #include <mach/mach_time.h>
+ #include <pthread.h>
+ #include <stdlib.h>
+@@ -47,23 +48,20 @@
+ const char * DISPATCH_QUEUE_LABEL = "org.mozilla.cubeb";
+ const char * PRIVATE_AGGREGATE_DEVICE_NAME = "CubebAggregateDevice";
+ 
++/* kAudioAggregateDeviceIsStackedKey is only available on macOS 10.8+ */
++#if !defined(kAudioAggregateDeviceIsStackedKey)
++#define kAudioAggregateDeviceIsStackedKey "stacked"
++#endif
++
+ #ifdef ALOGV
+ #undef ALOGV
+ #endif
+-#define ALOGV(msg, ...)                                                        \
+-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),   \
+-                 ^{                                                            \
+-                   LOGV(msg, ##__VA_ARGS__);                                   \
+-                 })
++#define ALOGV(msg, ...) LOGV(msg, ##__VA_ARGS__)
+ 
+ #ifdef ALOG
+ #undef ALOG
+ #endif
+-#define ALOG(msg, ...)                                                         \
+-  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),   \
+-                 ^{                                                            \
+-                   LOG(msg, ##__VA_ARGS__);                                    \
+-                 })
++#define ALOG(msg, ...) LOG(msg, ##__VA_ARGS__)
+ 
+ /* Testing empirically, some headsets report a minimal latency that is very
+  * low, but this does not work in practice. Lie and say the minimum is 256
+@@ -149,7 +147,7 @@
+   vector<AudioObjectID> output_device_array;
+   // The queue should be released when it’s no longer needed.
+   dispatch_queue_t serial_queue =
+-      dispatch_queue_create(DISPATCH_QUEUE_LABEL, DISPATCH_QUEUE_SERIAL);
++      dispatch_queue_create(DISPATCH_QUEUE_LABEL, NULL);
+   // Current used channel layout
+   atomic<cubeb_channel_layout> layout{CUBEB_LAYOUT_UNDEFINED};
+   uint32_t channels = 0;
+@@ -903,6 +901,35 @@
+   return CUBEB_OK;
+ }
+ 
++struct reinit_async_context {
++  cubeb_stream * stm;
++  device_flags_value flags;
++};
++
++static void
++audiounit_reinit_stream_async_func(void * context)
++{
++  reinit_async_context * ctx = static_cast<reinit_async_context *>(context);
++  cubeb_stream * stm = ctx->stm;
++  device_flags_value flags = ctx->flags;
++  delete ctx;
++
++  if (stm->destroy_pending) {
++    ALOG("(%p) stream pending destroy, cancelling reinit task", stm);
++    return;
++  }
++
++  if (audiounit_reinit_stream(stm, flags) != CUBEB_OK) {
++    if (audiounit_uninstall_system_changed_callback(stm) != CUBEB_OK) {
++      LOG("(%p) Could not uninstall system changed callback", stm);
++    }
++    stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
++    LOG("(%p) Could not reopen the stream after switching.", stm);
++  }
++  stm->switching_device = false;
++  stm->reinit_pending = false;
++}
++
+ static void
+ audiounit_reinit_stream_async(cubeb_stream * stm, device_flags_value flags)
+ {
+@@ -914,22 +941,11 @@
+ 
+   // Use a new thread, through the queue, to avoid deadlock when calling
+   // Get/SetProperties method from inside notify callback
+-  dispatch_async(stm->context->serial_queue, ^() {
+-    if (stm->destroy_pending) {
+-      ALOG("(%p) stream pending destroy, cancelling reinit task", stm);
+-      return;
+-    }
+-
+-    if (audiounit_reinit_stream(stm, flags) != CUBEB_OK) {
+-      if (audiounit_uninstall_system_changed_callback(stm) != CUBEB_OK) {
+-        LOG("(%p) Could not uninstall system changed callback", stm);
+-      }
+-      stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
+-      LOG("(%p) Could not reopen the stream after switching.", stm);
+-    }
+-    stm->switching_device = false;
+-    stm->reinit_pending = false;
+-  });
++  reinit_async_context * ctx = new reinit_async_context;
++  ctx->stm = stm;
++  ctx->flags = flags;
++  dispatch_async_f(stm->context->serial_queue, ctx,
++                   audiounit_reinit_stream_async_func);
+ }
+ 
+ static char const *
+@@ -1560,7 +1576,7 @@
+ 
+   // We do not use CoreAudio standard layout for lack of documentation on what
+   // the actual channel orders are. So we set a custom layout.
+-  size_t size = offsetof(AudioChannelLayout, mChannelDescriptions[nb_channels]);
++  size_t size = sizeof(AudioChannelLayout) + (nb_channels - 1) * sizeof(AudioChannelDescription);
+   auto au_layout = make_sized_audio_channel_layout(size);
+   au_layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+   au_layout->mNumberChannelDescriptions = nb_channels;
+@@ -1585,7 +1601,7 @@
+                            size);
+   if (r != noErr) {
+     LOG("AudioUnitSetProperty/%s/kAudioUnitProperty_AudioChannelLayout rv=%d",
+-        to_string(side), r);
++        to_string(side), (int)r);
+     return CUBEB_ERROR;
+   }
+ 
+@@ -2926,6 +2942,14 @@
+ }
+ 
+ static void
++audiounit_stream_destroy_sync_func(void * context)
++{
++  cubeb_stream * stm = static_cast<cubeb_stream *>(context);
++  auto_lock context_lock(stm->context->mutex);
++  audiounit_stream_destroy_internal(stm);
++}
++
++static void
+ audiounit_stream_destroy(cubeb_stream * stm)
+ {
+   int r = audiounit_uninstall_system_changed_callback(stm);
+@@ -2946,10 +2970,8 @@
+   stm->destroy_pending = true;
+   // Execute close in serial queue to avoid collision
+   // with reinit when un/plug devices
+-  dispatch_sync(stm->context->serial_queue, ^() {
+-    auto_lock context_lock(stm->context->mutex);
+-    audiounit_stream_destroy_internal(stm);
+-  });
++  dispatch_sync_f(stm->context->serial_queue, stm,
++                  audiounit_stream_destroy_sync_func);
+ 
+   LOG("Cubeb stream (%p) destroyed successful.", stm);
+   delete stm;
+@@ -3557,6 +3579,38 @@
+   return devices_in_scope;
+ }
+ 
++static void
++audiounit_collection_changed_func(void * context_ptr)
++{
++  cubeb * context = static_cast<cubeb *>(context_ptr);
++  auto_lock lock(context->mutex);
++  if (!context->input_collection_changed_callback &&
++      !context->output_collection_changed_callback) {
++    /* Listener removed while waiting in mutex, abort. */
++    return;
++  }
++  if (context->input_collection_changed_callback) {
++    vector<AudioObjectID> devices =
++        audiounit_get_devices_of_type(CUBEB_DEVICE_TYPE_INPUT);
++    /* Elements in the vector expected sorted. */
++    if (context->input_device_array != devices) {
++      context->input_device_array = devices;
++      context->input_collection_changed_callback(
++          context, context->input_collection_changed_user_ptr);
++    }
++  }
++  if (context->output_collection_changed_callback) {
++    vector<AudioObjectID> devices =
++        audiounit_get_devices_of_type(CUBEB_DEVICE_TYPE_OUTPUT);
++    /* Elements in the vector expected sorted. */
++    if (context->output_device_array != devices) {
++      context->output_device_array = devices;
++      context->output_collection_changed_callback(
++          context, context->output_collection_changed_user_ptr);
++    }
++  }
++}
++
+ static OSStatus
+ audiounit_collection_changed_callback(
+     AudioObjectID /* inObjectID */, UInt32 /* inNumberAddresses */,
+@@ -3566,34 +3620,8 @@
+ 
+   // This can be called from inside an AudioUnit function, dispatch to another
+   // queue.
+-  dispatch_async(context->serial_queue, ^() {
+-    auto_lock lock(context->mutex);
+-    if (!context->input_collection_changed_callback &&
+-        !context->output_collection_changed_callback) {
+-      /* Listener removed while waiting in mutex, abort. */
+-      return;
+-    }
+-    if (context->input_collection_changed_callback) {
+-      vector<AudioObjectID> devices =
+-          audiounit_get_devices_of_type(CUBEB_DEVICE_TYPE_INPUT);
+-      /* Elements in the vector expected sorted. */
+-      if (context->input_device_array != devices) {
+-        context->input_device_array = devices;
+-        context->input_collection_changed_callback(
+-            context, context->input_collection_changed_user_ptr);
+-      }
+-    }
+-    if (context->output_collection_changed_callback) {
+-      vector<AudioObjectID> devices =
+-          audiounit_get_devices_of_type(CUBEB_DEVICE_TYPE_OUTPUT);
+-      /* Elements in the vector expected sorted. */
+-      if (context->output_device_array != devices) {
+-        context->output_device_array = devices;
+-        context->output_collection_changed_callback(
+-            context, context->output_collection_changed_user_ptr);
+-      }
+-    }
+-  });
++  dispatch_async_f(context->serial_queue, context,
++                   audiounit_collection_changed_func);
+   return noErr;
+ }
+ 
