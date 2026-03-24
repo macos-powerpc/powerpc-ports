@@ -1,0 +1,173 @@
+diff --git a/gwenview/lib/document/loadingdocumentimpl.cpp b/gwenview/lib/document/loadingdocumentimpl.cpp
+index 0928ce9..c57f22a 100644
+--- gwenview/lib/document/loadingdocumentimpl.cpp
++++ gwenview/lib/document/loadingdocumentimpl.cpp
+@@ -58,6 +58,12 @@ namespace Gwenview
+ 
+ const int HEADER_SIZE = 256;
+ 
++// Null message handler for threads - suppresses all Qt debug output
++static void nullMessageHandler(QtMsgType, const char*)
++{
++    // Ignore all messages from threads to avoid KDE debug infrastructure
++}
++
+ struct LoadingDocumentImplPrivate
+ {
+     LoadingDocumentImpl* q;
+@@ -121,11 +127,13 @@ struct LoadingDocumentImplPrivate
+             //   image using plugins matching this format first.
+             mFormatHint = q->document()->url().fileName()
+                 .section('.', -1).toAscii().toLower();
+-            mMetaInfoFutureWatcher.reset(new BoolThread(q, std::bind(&LoadingDocumentImplPrivate::loadMetaInfo, this)));
++            mMetaInfoFutureWatcher.reset(new BoolThread(nullptr, std::bind(&LoadingDocumentImplPrivate::loadMetaInfo, this)));
+             q->connect(
+                 mMetaInfoFutureWatcher.data(), SIGNAL(finished()),
+                 q, SLOT(slotMetaInfoLoaded())
+             );
++            // Increase stack size for LibRaw which allocates large structures on stack
++            mMetaInfoFutureWatcher->setStackSize(4 * 1024 * 1024); // 4MB
+             mMetaInfoFutureWatcher->start();
+             break;
+ 
+@@ -141,17 +149,22 @@ struct LoadingDocumentImplPrivate
+         Q_ASSERT(mMetaInfoLoaded);
+         Q_ASSERT(mImageDataInvertedZoom != 0);
+         Q_ASSERT(!mImageDataFutureWatcher->isRunning());
+-        mImageDataFutureWatcher.reset(new VoidThread(q, std::bind(&LoadingDocumentImplPrivate::loadImageData, this)));
++        mImageDataFutureWatcher.reset(new VoidThread(nullptr, std::bind(&LoadingDocumentImplPrivate::loadImageData, this)));
+         q->connect(
+             mImageDataFutureWatcher.data(), SIGNAL(finished()),
+             q, SLOT(slotImageLoaded())
+         );
++        // Increase stack size for LibRaw and image decoding
++        mImageDataFutureWatcher->setStackSize(4 * 1024 * 1024); // 4MB
+         mImageDataFutureWatcher->start();
+     }
+ 
+     bool loadMetaInfo()
+     {
+-        kDebug() << "mFormatHint" << mFormatHint;
++        // Note: No kDebug()/kWarning() calls - runs in thread, not thread-safe
++        // Install null message handler to suppress Qt internal warnings/debug from QImageReader
++        QtMsgHandler oldHandler = qInstallMsgHandler(nullMessageHandler);
++
+         QBuffer buffer;
+         buffer.setBuffer(&mData);
+         buffer.open(QIODevice::ReadOnly);
+@@ -160,39 +173,38 @@ struct LoadingDocumentImplPrivate
+         mImageSize = reader.size();
+ 
+         if (!reader.canRead()) {
+-            kWarning() << "QImageReader::read() using format hint" << mFormatHint << "failed:" << reader.errorString();
+             if (buffer.pos() != 0) {
+-                kWarning() << "A bad Katie image decoder moved the buffer to" << buffer.pos() << "in a call to canRead()! Rewinding.";
+                 buffer.seek(0);
+             }
+             reader.setFormat(QByteArray());
+             // Set buffer again, otherwise QImageReader won't restart from scratch
+             reader.setDevice(&buffer);
+             if (!reader.canRead()) {
+-                kWarning() << "QImageReader::read() without format hint failed:" << reader.errorString();
+                 return false;
+             }
+-            kWarning() << "Image format is actually" << reader.format() << "not" << mFormatHint;
+         }
+ 
+         mFormat = reader.format();
+ 
+-        kDebug() << "mFormat" << mFormat;
+-        GV_RETURN_VALUE_IF_FAIL(!mFormat.isEmpty(), false);
++        qInstallMsgHandler(oldHandler);
+ 
+-        kDebug() << "mImageSize" << mImageSize;
++        if (mFormat.isEmpty()) {
++            return false;
++        }
+ 
+         return true;
+     }
+ 
+     void loadImageData()
+     {
++        // Note: No kDebug()/kWarning() calls - runs in thread, not thread-safe
++        // Install null message handler to suppress Qt internal warnings/debug from QImageReader
++        QtMsgHandler oldHandler = qInstallMsgHandler(nullMessageHandler);
++
+         QBuffer buffer;
+         buffer.setBuffer(&mData);
+         buffer.open(QIODevice::ReadOnly);
+         QImageReader reader(&buffer, mFormat);
+-
+-        kDebug() << "mImageDataInvertedZoom=" << mImageDataInvertedZoom;
+         if (mImageSize.isValid()
+                 && mImageDataInvertedZoom != 1
+                 && reader.supportsOption(QImageIOHandler::ScaledSize)
+@@ -201,26 +213,19 @@ struct LoadingDocumentImplPrivate
+             // image size
+             QSize size = reader.size() / mImageDataInvertedZoom;
+             if (!size.isEmpty()) {
+-                kDebug() << "Setting scaled size to" << size;
+                 reader.setScaledSize(size);
+-            } else {
+-                kDebug() << "Not setting scaled size as it is empty" << size;
+             }
+         }
+ 
+         if (reader.supportsAnimation() && reader.jumpToImage(0)) {
+             if (reader.imageCount() > 0) {
+-                kDebug() << "Really an animated image";
+                 mAnimated = true;
+-            } else {
+-                kWarning() << q->document()->url() << "is not really an animated image (only one frame)";
+             }
+         }
+ 
+-        bool ok = reader.read(&mImage);
+-        if (!ok) {
+-            kWarning() << "QImageReader::read() failed";
+-        }
++        reader.read(&mImage);
++
++        qInstallMsgHandler(oldHandler);
+     }
+ };
+ 
+@@ -237,24 +242,26 @@ LoadingDocumentImpl::LoadingDocumentImpl(Document* document)
+ 
+ LoadingDocumentImpl::~LoadingDocumentImpl()
+ {
+-    // Disconnect watchers to make sure they do not trigger further work
+-    if (d->mMetaInfoFutureWatcher) {
+-        d->mMetaInfoFutureWatcher->disconnect();
+-    }
+-    if (d->mImageDataFutureWatcher) {
+-        d->mImageDataFutureWatcher->disconnect();
++    // CRITICAL: Disconnect transfer job signals first to prevent callbacks to deleted object
++    if (d->mTransferJob) {
++        disconnect(d->mTransferJob, 0, this, 0);
++        // Don't call kill() - it accesses KIO scheduler which may be destroyed
+     }
+ 
++    // Disconnect and wait for threads
+     if (d->mMetaInfoFutureWatcher) {
+-        d->mMetaInfoFutureWatcher->wait();
++        d->mMetaInfoFutureWatcher->disconnect();
++        if (d->mMetaInfoFutureWatcher->isRunning()) {
++            d->mMetaInfoFutureWatcher->wait();
++        }
+     }
+     if (d->mImageDataFutureWatcher) {
+-        d->mImageDataFutureWatcher->wait();
++        d->mImageDataFutureWatcher->disconnect();
++        if (d->mImageDataFutureWatcher->isRunning()) {
++            d->mImageDataFutureWatcher->wait();
++        }
+     }
+ 
+-    if (d->mTransferJob) {
+-        d->mTransferJob->kill();
+-    }
+     delete d;
+ }
+ 
