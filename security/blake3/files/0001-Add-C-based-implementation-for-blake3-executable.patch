@@ -1,0 +1,783 @@
+From 5b9a834ca1e36dc6378904c555ec3a11a9d580ff Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <vital.had@gmail.com>
+Date: Tue, 24 Mar 2026 15:05:32 +0800
+Subject: [PATCH] Add C-based implementation for blake3 executable
+
+---
+ c/CMakeLists.txt |  17 ++
+ c/b3sum.c        | 724 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 741 insertions(+)
+ create mode 100644 c/b3sum.c
+
+diff --git a/c/CMakeLists.txt b/c/CMakeLists.txt
+index 28127d4..9b37d27 100644
+--- c/CMakeLists.txt
++++ c/CMakeLists.txt
+@@ -19,6 +19,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+ 
+ option(BLAKE3_USE_TBB "Enable oneTBB parallelism" OFF)
+ option(BLAKE3_FETCH_TBB "Allow fetching oneTBB from GitHub if not found on system" OFF)
++option(BLAKE3_BUILD_B3SUM "Build b3sum executable (C implementation)" OFF)
+ 
+ include(CTest)
+ include(FeatureSummary)
+@@ -281,6 +282,21 @@ if(BLAKE3_USE_TBB)
+   unset(BLAKE3_CXXFLAGS_MSVC)
+ endif()
+ 
++# b3sum executable target
++if(BLAKE3_BUILD_B3SUM)
++  add_executable(b3sum b3sum.c)
++  target_link_libraries(b3sum PRIVATE blake3)
++  target_compile_features(b3sum PRIVATE c_std_99)
++  set_target_properties(b3sum PROPERTIES
++    C_EXTENSIONS OFF
++  )
++
++  # Install b3sum executable
++  install(TARGETS b3sum
++    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
++  )
++endif()
++
+ # cmake install support
+ install(FILES blake3.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+ install(TARGETS blake3 EXPORT blake3-targets
+@@ -366,6 +382,7 @@ add_feature_info("AMD64 assembly" BLAKE3_SIMD_AMD64_ASM "The library uses hand w
+ add_feature_info("x86 SIMD intrinsics" BLAKE3_SIMD_X86_INTRINSICS "The library uses x86 SIMD intrinsics.")
+ add_feature_info("NEON SIMD intrinsics" BLAKE3_SIMD_NEON_INTRINSICS "The library uses NEON SIMD intrinsics.")
+ add_feature_info("oneTBB parallelism" BLAKE3_USE_TBB "The library uses oneTBB parallelism.")
++add_feature_info("b3sum executable" BLAKE3_BUILD_B3SUM "Build the C-based b3sum checksum utility.")
+ feature_summary(WHAT ENABLED_FEATURES)
+ 
+ if(BLAKE3_EXAMPLES)
+diff --git a/c/b3sum.c b/c/b3sum.c
+new file mode 100644
+index 0000000..9b0f217
+--- /dev/null
++++ c/b3sum.c
+@@ -0,0 +1,724 @@
++/*
++ * b3sum - BLAKE3 checksum utility
++ *
++ * A portable C implementation compatible with macOS 10.6 and other Unix systems.
++ * This is a replacement for the Rust-based b3sum executable.
++ */
++
++#define _POSIX_C_SOURCE 200809L
++#define _DEFAULT_SOURCE
++
++#include "blake3.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <getopt.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/mman.h>
++
++#define BUFFER_SIZE 65536
++#define NAME "b3sum"
++
++// Command line options
++struct options {
++    bool keyed;
++    const char *derive_key_context;
++    uint64_t length;
++    uint64_t seek;
++    bool no_mmap;
++    bool no_names;
++    bool raw;
++    bool tag;
++    bool check;
++    bool quiet;
++};
++
++// Print usage information
++static void usage(const char *program_name) {
++    fprintf(stderr, "Usage: %s [OPTIONS] [FILE]...\n", program_name);
++    fprintf(stderr, "\n");
++    fprintf(stderr, "Options:\n");
++    fprintf(stderr, "  --keyed              Use keyed mode (read 32-byte key from stdin)\n");
++    fprintf(stderr, "  --derive-key CTX     Use key derivation mode with context string\n");
++    fprintf(stderr, "  -l, --length LEN     Output length in bytes (default: 32)\n");
++    fprintf(stderr, "  --seek SEEK          Starting output byte offset (default: 0)\n");
++    fprintf(stderr, "  --no-mmap            Disable memory mapping\n");
++    fprintf(stderr, "  --no-names           Omit filenames in output\n");
++    fprintf(stderr, "  --raw                Write raw output bytes to stdout\n");
++    fprintf(stderr, "  --tag                Output BSD-style checksums\n");
++    fprintf(stderr, "  -c, --check          Read BLAKE3 sums from files and check them\n");
++    fprintf(stderr, "  --quiet              Don't print OK for each checked file\n");
++    fprintf(stderr, "  -h, --help           Show this help message\n");
++    fprintf(stderr, "  -v, --version        Show version information\n");
++    fprintf(stderr, "\n");
++    fprintf(stderr, "When no file is given, or when - is given, read standard input.\n");
++}
++
++// Print version information
++static void version(void) {
++    printf("%s %s\n", NAME, blake3_version());
++}
++
++// Parse hex character to value
++static bool hex_char_to_value(char c, uint8_t *value) {
++    if (c >= '0' && c <= '9') {
++        *value = c - '0';
++        return true;
++    } else if (c >= 'a' && c <= 'f') {
++        *value = c - 'a' + 10;
++        return true;
++    } else if (c >= 'A' && c <= 'F') {
++        *value = c - 'A' + 10;
++        return true;
++    }
++    return false;
++}
++
++// Read key from stdin
++static bool read_key_from_stdin(uint8_t key[BLAKE3_KEY_LEN]) {
++    size_t total_read = 0;
++    while (total_read < BLAKE3_KEY_LEN) {
++        ssize_t n = read(STDIN_FILENO, key + total_read, BLAKE3_KEY_LEN - total_read);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            fprintf(stderr, "%s: error reading key from stdin: %s\n", NAME, strerror(errno));
++            return false;
++        }
++        if (n == 0) {
++            fprintf(stderr, "%s: expected %d key bytes from stdin, found %zu\n",
++                    NAME, BLAKE3_KEY_LEN, total_read);
++            return false;
++        }
++        total_read += n;
++    }
++
++    // Check if there are extra bytes
++    uint8_t extra;
++    ssize_t n = read(STDIN_FILENO, &extra, 1);
++    if (n > 0) {
++        fprintf(stderr, "%s: read more than %d key bytes from stdin\n", NAME, BLAKE3_KEY_LEN);
++        return false;
++    }
++
++    return true;
++}
++
++// Initialize hasher based on mode
++static void init_hasher(blake3_hasher *hasher, const struct options *opts, const uint8_t *key) {
++    if (opts->keyed) {
++        blake3_hasher_init_keyed(hasher, key);
++    } else if (opts->derive_key_context) {
++        blake3_hasher_init_derive_key(hasher, opts->derive_key_context);
++    } else {
++        blake3_hasher_init(hasher);
++    }
++}
++
++// Write hex output
++static void write_hex_output(const uint8_t *hash, uint64_t length) {
++    for (uint64_t i = 0; i < length; i++) {
++        printf("%02x", hash[i]);
++    }
++}
++
++// Write raw output
++static bool write_raw_output(const uint8_t *hash, uint64_t length) {
++    uint64_t written = 0;
++    while (written < length) {
++        ssize_t n = write(STDOUT_FILENO, hash + written, length - written);
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            fprintf(stderr, "%s: error writing output: %s\n", NAME, strerror(errno));
++            return false;
++        }
++        written += n;
++    }
++    return true;
++}
++
++// Escape special characters in filename for output
++static char *escape_filename(const char *filename, bool *is_escaped) {
++    *is_escaped = false;
++
++    // Check if escaping is needed
++    bool needs_escape = false;
++    for (const char *p = filename; *p; p++) {
++        if (*p == '\\' || *p == '\n' || *p == '\r') {
++            needs_escape = true;
++            break;
++        }
++    }
++
++    if (!needs_escape) {
++        return strdup(filename);
++    }
++
++    *is_escaped = true;
++
++    // Allocate buffer (worst case: every char is escaped)
++    size_t len = strlen(filename);
++    char *escaped = malloc(len * 2 + 1);
++    if (!escaped) return NULL;
++
++    char *out = escaped;
++    for (const char *p = filename; *p; p++) {
++        if (*p == '\\') {
++            *out++ = '\\';
++            *out++ = '\\';
++        } else if (*p == '\n') {
++            *out++ = '\\';
++            *out++ = 'n';
++        } else if (*p == '\r') {
++            *out++ = '\\';
++            *out++ = 'r';
++        } else {
++            *out++ = *p;
++        }
++    }
++    *out = '\0';
++
++    return escaped;
++}
++
++// Hash data from file descriptor using read()
++static bool hash_fd(blake3_hasher *hasher, int fd) {
++    uint8_t buffer[BUFFER_SIZE];
++
++    while (true) {
++        ssize_t n = read(fd, buffer, sizeof(buffer));
++        if (n < 0) {
++            if (errno == EINTR) continue;
++            fprintf(stderr, "%s: read error: %s\n", NAME, strerror(errno));
++            return false;
++        }
++        if (n == 0) break;
++
++        blake3_hasher_update(hasher, buffer, n);
++    }
++
++    return true;
++}
++
++// Hash a file
++static bool hash_file(const char *filepath, const struct options *opts,
++                     const uint8_t *key, uint8_t **output) {
++    blake3_hasher hasher;
++    init_hasher(&hasher, opts, key);
++
++    // Handle stdin
++    if (strcmp(filepath, "-") == 0) {
++        if (opts->keyed) {
++            fprintf(stderr, "%s: cannot read from stdin in keyed mode\n", NAME);
++            return false;
++        }
++        if (!hash_fd(&hasher, STDIN_FILENO)) {
++            return false;
++        }
++    } else {
++        // Open file
++        int fd = open(filepath, O_RDONLY);
++        if (fd < 0) {
++            fprintf(stderr, "%s: %s: %s\n", NAME, filepath, strerror(errno));
++            return false;
++        }
++
++        bool success = false;
++
++        // Try mmap if enabled
++        if (!opts->no_mmap) {
++            struct stat st;
++            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
++                void *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++                if (data != MAP_FAILED) {
++                    blake3_hasher_update(&hasher, data, st.st_size);
++                    munmap(data, st.st_size);
++                    success = true;
++                }
++            }
++        }
++
++        // Fall back to read() if mmap failed or was disabled
++        if (!success) {
++            success = hash_fd(&hasher, fd);
++        }
++
++        close(fd);
++
++        if (!success) {
++            return false;
++        }
++    }
++
++    // Allocate output buffer
++    *output = malloc(opts->length);
++    if (!*output) {
++        fprintf(stderr, "%s: out of memory\n", NAME);
++        return false;
++    }
++
++    // Finalize hash
++    blake3_hasher_finalize_seek(&hasher, opts->seek, *output, opts->length);
++
++    return true;
++}
++
++// Hash a single input and print result
++static bool hash_one_input(const char *filepath, const struct options *opts, const uint8_t *key) {
++    uint8_t *hash = NULL;
++
++    if (!hash_file(filepath, opts, key, &hash)) {
++        return false;
++    }
++
++    // Output in raw mode
++    if (opts->raw) {
++        bool success = write_raw_output(hash, opts->length);
++        free(hash);
++        return success;
++    }
++
++    // Output with no names
++    if (opts->no_names) {
++        write_hex_output(hash, opts->length);
++        printf("\n");
++        free(hash);
++        return true;
++    }
++
++    // Escape filename if needed
++    bool is_escaped;
++    char *display_name = escape_filename(filepath, &is_escaped);
++    if (!display_name) {
++        free(hash);
++        return false;
++    }
++
++    // Output in tag format
++    if (opts->tag) {
++        if (is_escaped) printf("\\");
++        printf("BLAKE3 (%s) = ", display_name);
++        write_hex_output(hash, opts->length);
++        printf("\n");
++    } else {
++        // Standard format: hash  filename
++        if (is_escaped) printf("\\");
++        write_hex_output(hash, opts->length);
++        printf("  %s\n", display_name);
++    }
++
++    free(display_name);
++    free(hash);
++    return true;
++}
++
++// Unescape a filename from check file
++static char *unescape_filename(const char *escaped) {
++    size_t len = strlen(escaped);
++    char *unescaped = malloc(len + 1);
++    if (!unescaped) return NULL;
++
++    char *out = unescaped;
++    for (const char *p = escaped; *p; p++) {
++        if (*p == '\\') {
++            p++;
++            if (!*p) {
++                free(unescaped);
++                return NULL;
++            }
++            if (*p == 'n') {
++                *out++ = '\n';
++            } else if (*p == 'r') {
++                *out++ = '\r';
++            } else if (*p == '\\') {
++                *out++ = '\\';
++            } else {
++                free(unescaped);
++                return NULL;
++            }
++        } else {
++            *out++ = *p;
++        }
++    }
++    *out = '\0';
++
++    return unescaped;
++}
++
++// Parse a check line
++static bool parse_check_line(const char *line, char **filepath, uint8_t hash[BLAKE3_OUT_LEN],
++                            bool *was_escaped) {
++    *was_escaped = false;
++    *filepath = NULL;
++
++    // Skip empty lines
++    if (*line == '\0' || *line == '\n' || *line == '\r') {
++        return false;
++    }
++
++    // Check for escape character
++    if (*line == '\\') {
++        *was_escaped = true;
++        line++;
++    }
++
++    // Try to parse tag format: BLAKE3 (filename) = hash
++    if (strncmp(line, "BLAKE3 (", 8) == 0) {
++        const char *filename_start = line + 8;
++        const char *filename_end = strstr(filename_start, ") = ");
++        if (!filename_end) {
++            fprintf(stderr, "%s: invalid check line format\n", NAME);
++            return false;
++        }
++
++        // Extract filename
++        size_t filename_len = filename_end - filename_start;
++        char *filename = malloc(filename_len + 1);
++        if (!filename) return false;
++        memcpy(filename, filename_start, filename_len);
++        filename[filename_len] = '\0';
++
++        // Parse hash
++        const char *hash_str = filename_end + 4;
++        if (strlen(hash_str) < 2 * BLAKE3_OUT_LEN) {
++            free(filename);
++            fprintf(stderr, "%s: invalid hash length\n", NAME);
++            return false;
++        }
++
++        for (size_t i = 0; i < BLAKE3_OUT_LEN; i++) {
++            uint8_t high, low;
++            if (!hex_char_to_value(hash_str[i * 2], &high) ||
++                !hex_char_to_value(hash_str[i * 2 + 1], &low)) {
++                free(filename);
++                fprintf(stderr, "%s: invalid hex character\n", NAME);
++                return false;
++            }
++            hash[i] = (high << 4) | low;
++        }
++
++        if (*was_escaped) {
++            *filepath = unescape_filename(filename);
++            free(filename);
++            if (!*filepath) {
++                fprintf(stderr, "%s: invalid escape sequence\n", NAME);
++                return false;
++            }
++        } else {
++            *filepath = filename;
++        }
++
++        return true;
++    }
++
++    // Try to parse standard format: hash  filename
++    const char *space_pos = strstr(line, "  ");
++    if (!space_pos) {
++        fprintf(stderr, "%s: invalid check line format\n", NAME);
++        return false;
++    }
++
++    // Parse hash
++    size_t hash_len = space_pos - line;
++    if (hash_len != 2 * BLAKE3_OUT_LEN) {
++        fprintf(stderr, "%s: invalid hash length\n", NAME);
++        return false;
++    }
++
++    for (size_t i = 0; i < BLAKE3_OUT_LEN; i++) {
++        uint8_t high, low;
++        if (!hex_char_to_value(line[i * 2], &high) ||
++            !hex_char_to_value(line[i * 2 + 1], &low)) {
++            fprintf(stderr, "%s: invalid hex character\n", NAME);
++            return false;
++        }
++        hash[i] = (high << 4) | low;
++    }
++
++    // Extract filename (skip the two spaces)
++    const char *filename = space_pos + 2;
++    // Trim trailing newline
++    size_t filename_len = strlen(filename);
++    while (filename_len > 0 && (filename[filename_len - 1] == '\n' ||
++                                filename[filename_len - 1] == '\r')) {
++        filename_len--;
++    }
++
++    char *filename_copy = malloc(filename_len + 1);
++    if (!filename_copy) return false;
++    memcpy(filename_copy, filename, filename_len);
++    filename_copy[filename_len] = '\0';
++
++    if (*was_escaped) {
++        *filepath = unescape_filename(filename_copy);
++        free(filename_copy);
++        if (!*filepath) {
++            fprintf(stderr, "%s: invalid escape sequence\n", NAME);
++            return false;
++        }
++    } else {
++        *filepath = filename_copy;
++    }
++
++    return true;
++}
++
++// Check one line from checkfile
++static bool check_one_line(const char *line, const struct options *opts, const uint8_t *key) {
++    char *filepath = NULL;
++    uint8_t expected_hash[BLAKE3_OUT_LEN];
++    bool was_escaped;
++
++    if (!parse_check_line(line, &filepath, expected_hash, &was_escaped)) {
++        return false;
++    }
++
++    if (!filepath) {
++        return true; // Empty line, skip
++    }
++
++    // Create display name
++    bool display_escaped;
++    char *display_name = escape_filename(filepath, &display_escaped);
++    if (!display_name) {
++        free(filepath);
++        return false;
++    }
++
++    // Hash the file
++    struct options check_opts = *opts;
++    check_opts.length = BLAKE3_OUT_LEN;
++    check_opts.seek = 0;
++
++    uint8_t *computed_hash = NULL;
++    if (!hash_file(filepath, &check_opts, key, &computed_hash)) {
++        if (display_escaped) printf("\\");
++        printf("%s: FAILED (could not read file)\n", display_name);
++        free(filepath);
++        free(display_name);
++        return false;
++    }
++
++    // Compare hashes (constant time)
++    bool match = true;
++    for (size_t i = 0; i < BLAKE3_OUT_LEN; i++) {
++        if (computed_hash[i] != expected_hash[i]) {
++            match = false;
++        }
++    }
++
++    if (match) {
++        if (!opts->quiet) {
++            if (display_escaped) printf("\\");
++            printf("%s: OK\n", display_name);
++        }
++    } else {
++        if (display_escaped) printf("\\");
++        printf("%s: FAILED\n", display_name);
++    }
++
++    free(filepath);
++    free(display_name);
++    free(computed_hash);
++    return match;
++}
++
++// Check checksums from a file
++static uint64_t check_file(const char *checkfile, const struct options *opts, const uint8_t *key) {
++    FILE *fp;
++
++    if (strcmp(checkfile, "-") == 0) {
++        fp = stdin;
++    } else {
++        fp = fopen(checkfile, "r");
++        if (!fp) {
++            fprintf(stderr, "%s: %s: %s\n", NAME, checkfile, strerror(errno));
++            return 1;
++        }
++    }
++
++    uint64_t failed = 0;
++    char *line = NULL;
++    size_t line_cap = 0;
++    ssize_t line_len;
++
++    while ((line_len = getline(&line, &line_cap, fp)) >= 0) {
++        if (!check_one_line(line, opts, key)) {
++            failed++;
++        }
++    }
++
++    free(line);
++
++    if (fp != stdin) {
++        fclose(fp);
++    }
++
++    return failed;
++}
++
++int main(int argc, char **argv) {
++    struct options opts = {
++        .keyed = false,
++        .derive_key_context = NULL,
++        .length = BLAKE3_OUT_LEN,
++        .seek = 0,
++        .no_mmap = false,
++        .no_names = false,
++        .raw = false,
++        .tag = false,
++        .check = false,
++        .quiet = false,
++    };
++
++    // Long options
++    static struct option long_options[] = {
++        {"keyed", no_argument, NULL, 'k'},
++        {"derive-key", required_argument, NULL, 'd'},
++        {"length", required_argument, NULL, 'l'},
++        {"seek", required_argument, NULL, 's'},
++        {"no-mmap", no_argument, NULL, 'm'},
++        {"no-names", no_argument, NULL, 'n'},
++        {"raw", no_argument, NULL, 'r'},
++        {"tag", no_argument, NULL, 't'},
++        {"check", no_argument, NULL, 'c'},
++        {"quiet", no_argument, NULL, 'q'},
++        {"help", no_argument, NULL, 'h'},
++        {"version", no_argument, NULL, 'v'},
++        {NULL, 0, NULL, 0}
++    };
++
++    int opt;
++    while ((opt = getopt_long(argc, argv, "l:chv", long_options, NULL)) != -1) {
++        switch (opt) {
++        case 'k':
++            opts.keyed = true;
++            break;
++        case 'd':
++            opts.derive_key_context = optarg;
++            break;
++        case 'l': {
++            char *endptr;
++            unsigned long long val = strtoull(optarg, &endptr, 10);
++            if (*endptr != '\0' || errno == ERANGE) {
++                fprintf(stderr, "%s: invalid length: %s\n", NAME, optarg);
++                return 1;
++            }
++            opts.length = val;
++            break;
++        }
++        case 's': {
++            char *endptr;
++            unsigned long long val = strtoull(optarg, &endptr, 10);
++            if (*endptr != '\0' || errno == ERANGE) {
++                fprintf(stderr, "%s: invalid seek: %s\n", NAME, optarg);
++                return 1;
++            }
++            opts.seek = val;
++            break;
++        }
++        case 'm':
++            opts.no_mmap = true;
++            break;
++        case 'n':
++            opts.no_names = true;
++            break;
++        case 'r':
++            opts.raw = true;
++            opts.no_names = true;
++            break;
++        case 't':
++            opts.tag = true;
++            break;
++        case 'c':
++            opts.check = true;
++            break;
++        case 'q':
++            opts.quiet = true;
++            break;
++        case 'h':
++            usage(argv[0]);
++            return 0;
++        case 'v':
++            version();
++            return 0;
++        default:
++            usage(argv[0]);
++            return 1;
++        }
++    }
++
++    // Validation
++    if (opts.check && (opts.keyed || opts.derive_key_context || opts.raw ||
++                       opts.tag || opts.no_names || opts.length != BLAKE3_OUT_LEN)) {
++        fprintf(stderr, "%s: --check cannot be used with other options\n", NAME);
++        return 1;
++    }
++
++    if (opts.quiet && !opts.check) {
++        fprintf(stderr, "%s: --quiet requires --check\n", NAME);
++        return 1;
++    }
++
++    if (opts.keyed && opts.derive_key_context) {
++        fprintf(stderr, "%s: cannot use both --keyed and --derive-key\n", NAME);
++        return 1;
++    }
++
++    // Read key if in keyed mode
++    uint8_t key[BLAKE3_KEY_LEN];
++    if (opts.keyed) {
++        if (optind == argc) {
++            fprintf(stderr, "%s: --keyed requires file arguments (cannot read key and data from stdin)\n", NAME);
++            return 1;
++        }
++        if (!read_key_from_stdin(key)) {
++            return 1;
++        }
++    }
++
++    // Get file arguments
++    int num_files = argc - optind;
++    char **files;
++
++    if (num_files == 0) {
++        // No files specified, use stdin
++        static char *stdin_arg = "-";
++        files = &stdin_arg;
++        num_files = 1;
++    } else {
++        files = &argv[optind];
++    }
++
++    // Validate raw mode
++    if (opts.raw && num_files > 1) {
++        fprintf(stderr, "%s: only one file can be hashed with --raw\n", NAME);
++        return 1;
++    }
++
++    // Process files
++    uint64_t failed = 0;
++
++    if (opts.check) {
++        for (int i = 0; i < num_files; i++) {
++            failed += check_file(files[i], &opts, key);
++        }
++
++        if (failed > 0) {
++            fprintf(stderr, "%s: WARNING: %llu computed checksum%s did NOT match\n",
++                    NAME, (unsigned long long)failed, failed == 1 ? "" : "s");
++        }
++    } else {
++        for (int i = 0; i < num_files; i++) {
++            if (!hash_one_input(files[i], &opts, key)) {
++                failed++;
++            }
++        }
++    }
++
++    return failed > 0 ? 1 : 0;
++}
