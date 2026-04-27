@@ -1,0 +1,341 @@
+--- src/terminal.h	2026-04-26 21:16:21.226140146 +0000
++++ src/terminal.h	2026-04-26 21:16:37.729574798 +0000
+@@ -6,8 +6,10 @@
+ #include "attrs.h"
+ 
+ #include <functional>
++#include <vector>
+ 
+ #include <libtsm.h>
++#include <include/core/SkData.h>
+ 
+ namespace KeyboardModifier {
+   constexpr int kShift = TSM_SHIFT_MASK,
+@@ -33,12 +35,14 @@
+   using CopyCb = std::function<void(const string&)>;
+   using PasteCb = std::function<string()>;
+   using TitleCb = std::function<void(const string&)>;
++  using ImageCb = std::function<void(sk_sp<SkData>, int, int, int, int, bool)>;
+ 
+   void set_theme(const Theme& theme);
+   void set_draw_cb(DrawCb draw_cb);
+   void set_copy_cb(CopyCb copy_cb);
+   void set_paste_cb(PasteCb paste_cb);
+   void set_title_cb(TitleCb title_cb);
++  void set_image_cb(ImageCb image_cb);
+   void set_pty(Pty* pty);
+ 
+   Pos cursor();
+@@ -62,12 +66,16 @@
+   static void StaticWrite(tsm_vte *vte, const char *u8, size_t len, void *data);
+   static void StaticOsc(tsm_vte *vte, const char *u8, size_t len, void *data);
+ 
++  void HandleITerm2Image(const char *params, size_t params_len,
++                         const char *data, size_t data_len);
++
+   const Theme *m_theme{nullptr};
+ 
+   DrawCb m_draw_cb;
+   CopyCb m_copy_cb;
+   PasteCb m_paste_cb;
+   TitleCb m_title_cb;
++  ImageCb m_image_cb;
+ 
+   tsm_screen *m_screen;
+   tsm_vte *m_vte;
+--- src/terminal.cc	2026-04-26 21:16:21.231140278 +0000
++++ src/terminal.cc	2026-04-26 21:17:28.190903832 +0000
+@@ -2,8 +2,48 @@
+ 
+ #include <algorithm>
+ #include <unistd.h>
++#include <cstring>
+ 
+ #include <utf8.h>
++#include <include/core/SkData.h>
++
++// Base64 decoding table
++static const int8_t b64_table[256] = {
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
++  52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
++  -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
++  15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
++  -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
++  41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
++  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
++};
++
++static std::vector<uint8_t> base64_decode(const char *input, size_t len) {
++  std::vector<uint8_t> out;
++  out.reserve(len * 3 / 4);
++
++  int val = 0, bits = -8;
++  for (size_t i = 0; i < len; i++) {
++    int c = b64_table[(unsigned char)input[i]];
++    if (c < 0) continue;
++    val = (val << 6) | c;
++    bits += 6;
++    if (bits >= 0) {
++      out.push_back((val >> bits) & 0xFF);
++      bits -= 8;
++    }
++  }
++  return out;
++}
+ 
+ Terminal::Terminal() {
+   tsm_screen_new(&m_screen, nullptr, nullptr);
+@@ -29,6 +69,7 @@
+ void Terminal::set_copy_cb(CopyCb copy_cb) { m_copy_cb = copy_cb; }
+ void Terminal::set_paste_cb(PasteCb paste_cb) { m_paste_cb = paste_cb; }
+ void Terminal::set_title_cb(TitleCb title_cb) { m_title_cb = title_cb; }
++void Terminal::set_image_cb(ImageCb image_cb) { m_image_cb = image_cb; }
+ void Terminal::set_pty(Pty *pty) { m_pty = pty; }
+ 
+ Pos Terminal::cursor() {
+@@ -224,8 +265,80 @@
+ void Terminal::StaticOsc(tsm_vte *vte, const char *u8, size_t len, void *data) {
+   Terminal *term = static_cast<Terminal*>(data);
+ 
+-  if (u8[0] == '2' && u8[1] == ';') {
++  // OSC 2; - Set window title
++  if (len > 2 && u8[0] == '2' && u8[1] == ';') {
+     string text(u8 + 2, len - 2);
+     term->m_title_cb(text);
++    return;
++  }
++
++  // OSC 1337; - iTerm2 proprietary sequences
++  if (len > 5 && strncmp(u8, "1337;", 5) == 0) {
++    const char *payload = u8 + 5;
++    size_t payload_len = len - 5;
++
++    // Look for "File=" prefix for inline images
++    if (payload_len > 5 && strncmp(payload, "File=", 5) == 0) {
++      // Find the colon separating params from base64 data
++      const char *colon = static_cast<const char*>(memchr(payload, ':', payload_len));
++      if (colon) {
++        size_t params_len = colon - payload - 5;
++        const char *params = payload + 5;
++        const char *b64data = colon + 1;
++        size_t b64len = payload_len - (b64data - payload);
++
++        term->HandleITerm2Image(params, params_len, b64data, b64len);
++      }
++    }
+   }
+ }
++
++void Terminal::HandleITerm2Image(const char *params, size_t params_len,
++                                  const char *data, size_t data_len) {
++  if (!m_image_cb) return;
++
++  // Parse parameters: name=xxx;size=xxx;width=xxx;height=xxx;preserveAspectRatio=xxx;inline=1
++  int width = 0, height = 0;
++  bool preserveAspect = true;
++  bool is_inline = false;
++
++  string params_str(params, params_len);
++  size_t pos = 0;
++  while (pos < params_str.size()) {
++    size_t eq = params_str.find('=', pos);
++    size_t semi = params_str.find(';', pos);
++    if (semi == string::npos) semi = params_str.size();
++
++    if (eq != string::npos && eq < semi) {
++      string key = params_str.substr(pos, eq - pos);
++      string val = params_str.substr(eq + 1, semi - eq - 1);
++
++      if (key == "width") {
++        try { width = std::stoi(val); } catch (...) {}
++      } else if (key == "height") {
++        try { height = std::stoi(val); } catch (...) {}
++      } else if (key == "preserveAspectRatio") {
++        preserveAspect = (val != "0");
++      } else if (key == "inline") {
++        is_inline = (val == "1");
++      }
++    }
++    pos = semi + 1;
++  }
++
++  // Only handle inline images
++  if (!is_inline) return;
++
++  // Decode base64 data
++  std::vector<uint8_t> decoded = base64_decode(data, data_len);
++  if (decoded.empty()) return;
++
++  // Create SkData and invoke callback
++  sk_sp<SkData> skdata = SkData::MakeWithCopy(decoded.data(), decoded.size());
++
++  // Get current cursor position for image placement
++  int x = tsm_screen_get_cursor_x(m_screen);
++  int y = tsm_screen_get_cursor_y(m_screen);
++
++  m_image_cb(skdata, x, y, width, height, preserveAspect);
++}
+--- src/display.h	2026-04-26 21:16:21.236140409 +0000
++++ src/display.h	2026-04-26 21:17:41.648258273 +0000
+@@ -1,14 +1,18 @@
+ #pragma once
+ 
+-#include <SkTypeface.h>
+-#include <SkCanvas.h>
+-#include <SkPaint.h>
++#include <include/core/SkTypeface.h>
++#include <include/core/SkCanvas.h>
++#include <include/core/SkPaint.h>
++#include <include/core/SkImage.h>
++#include <include/core/SkData.h>
+ 
+ #include "base.h"
+ #include "terminal.h"
+ #include "text.h"
+ #include "marker_set.h"
+ 
++#include <vector>
++
+ class Display {
+ public:
+   Display(Terminal *term);
+@@ -20,6 +24,10 @@
+ 
+   Error Resize(int width, int height);
+   bool Draw(SkCanvas *canvas, bool lazy_updating);
++
++  // Add an inline image at the given cell position
++  void AddImage(sk_sp<SkData> data, int x, int y, int width, int height, bool preserveAspect);
++
+ private:
+   void TermDraw(const u32string& str, Pos pos, Attr attr, int width);
+   void UpdateWidth();
+@@ -38,4 +46,16 @@
+   AttrSet m_attrs;
+ 
+   bool m_has_updated{false};
++
++  // Stored images for rendering
++  struct DisplayImage {
++    sk_sp<SkImage> image;
++    int x, y;
++    int width, height;
++    bool preserveAspect;
++
++    DisplayImage(sk_sp<SkImage> img, int px, int py, int w, int h, bool aspect)
++      : image(img), x(px), y(py), width(w), height(h), preserveAspect(aspect) {}
++  };
++  std::vector<DisplayImage> m_images;
+ };
+--- src/display.cc	2026-04-26 21:16:21.239140488 +0000
++++ src/display.cc	2026-04-26 21:24:58.544750624 +0000
+@@ -1,6 +1,8 @@
+ #include "display.h"
+ 
+ #include <absl/container/inlined_vector.h>
++#include <include/codec/SkCodec.h>
++#include <include/core/SkBitmap.h>
+ 
+ // Clamps v to the range low (inclusive) to high (exclusive).
+ template <typename T>
+@@ -103,6 +105,24 @@
+     });
+   }
+ 
++  // Draw inline images
++  for (const auto &img : m_images) {
++    if (!img.image) continue;
++
++    SkScalar cellW = m_char_width;
++    SkScalar cellH = m_renderers[0].FindHeight();
++
++    // Calculate destination rect
++    SkScalar destX = cellW * img.x;
++    SkScalar destY = cellH * img.y + m_renderers[0].FindBaselineOffset();
++    SkScalar destW = img.width > 0 ? cellW * img.width : img.image->width();
++    SkScalar destH = img.height > 0 ? cellH * img.height : img.image->height();
++
++    SkRect destRect = SkRect::MakeXYWH(destX, destY, destW, destH);
++
++    canvas->drawImageRect(img.image, destRect, SkSamplingOptions(SkFilterMode::kLinear));
++  }
++
+   m_has_updated = false;
+   return significant_redraw;
+ }
+@@ -179,3 +199,28 @@
+     canvas->restore();
+   }
+ }
++
++void Display::AddImage(sk_sp<SkData> data, int x, int y, int width, int height, bool preserveAspect) {
++  // Decode image using SkCodec
++  std::unique_ptr<SkCodec> codec = SkCodec::MakeFromData(data);
++  if (!codec) {
++    return;
++  }
++
++  SkImageInfo info = codec->getInfo().makeColorType(kN32_SkColorType);
++
++  SkBitmap bitmap;
++  if (!bitmap.tryAllocPixels(info)) {
++    return;
++  }
++
++  SkCodec::Result result = codec->getPixels(info, bitmap.getPixels(), bitmap.rowBytes());
++  if (result != SkCodec::kSuccess) {
++    return;
++  }
++
++  sk_sp<SkImage> image = bitmap.asImage();
++
++  m_images.emplace_back(image, x, y, width, height, preserveAspect);
++  m_has_updated = true;
++}
+--- src/uterm.h	2026-04-26 21:16:21.244140620 +0000
++++ src/uterm.h	2026-04-26 21:18:28.652496295 +0000
+@@ -9,6 +9,8 @@
+ #include <thread>
+ #include <mutex>
+ 
++#include <include/core/SkData.h>
++
+ class AtomicFlag {
+ public:
+   bool get() { return m_flag.load(); }
+@@ -57,6 +59,7 @@
+   void HandleSelection(Selection state, double mx, double my);
+   void HandleScroll(ScrollDirection direction, uint distance);
+   void HandleTitle(const string &title);
++  void HandleImage(sk_sp<SkData> data, int x, int y, int width, int height, bool preserveAspect);
+ 
+   std::mutex m_current_reader_lock;
+   ReaderThread *m_current_reader{nullptr};
+--- src/uterm.cc	2026-04-26 21:16:21.260141042 +0000
++++ src/uterm.cc	2026-04-26 21:18:57.322250064 +0000
+@@ -88,6 +88,7 @@
+   m_term.set_copy_cb(std::bind(&Uterm::HandleCopy, this, _1));
+   m_term.set_paste_cb(std::bind(&Uterm::HandlePaste, this));
+   m_term.set_title_cb(std::bind(&Uterm::HandleTitle, this, _1));
++  m_term.set_image_cb(std::bind(&Uterm::HandleImage, this, _1, _2, _3, _4, _5, _6));
+ 
+   for (auto &font : m_config.fonts()) {
+     m_display.AddFont(font.name, font.size);
+@@ -190,3 +191,8 @@
+ void Uterm::HandleTitle(const string &title) {
+   m_window.SetTitle(title);
+ }
++
++void Uterm::HandleImage(sk_sp<SkData> data, int x, int y, int width, int height,
++                        bool preserveAspect) {
++  m_display.AddImage(data, x, y, width, height, preserveAspect);
++}
