@@ -13,7 +13,8 @@ proc yelp.add_dependencies {} {
             "${subport} offers in-app documentation via Yelp, which is not available on\
             your system. Some buttons or menu items related to Help may not work as expected."
     } else {
-        depends_run-append port:yelp
+        # Stop pulling in webkit2gtk for no good reason.
+        # depends_run-append port:yelp
     }
 }
 
