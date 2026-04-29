@@ -1,0 +1,1268 @@
+diff --git a/src/dispatch.c b/src/dispatch.c
+index a593f256..7a2f9577 100644
+--- a/src/dispatch.c
++++ b/src/dispatch.c
+@@ -398,17 +398,27 @@ static void generate_shaders(pl_dispatch dp,
+         ADD(pre, "precision highp int; \n");
+     }
+ 
+-    // textureLod() doesn't work on external/rect samplers, simply disable
+-    // LOD sampling in this case. We don't currently support mipmaps anyway.
+-    for (int i = 0; i < sh->descs.num; i++) {
+-        if (pass_params->descriptors[i].type != PL_DESC_SAMPLED_TEX)
+-            continue;
+-        pl_tex tex = sh->descs.elem[i].binding.object;
+-        if (tex->sampler_type != PL_SAMPLER_NORMAL) {
+-            ADD(pre, "#define textureLod(t, p, b) texture(t, p) \n"
+-                     "#define textureLodOffset(t, p, b, o)    \\\n"
+-                     "        textureOffset(t, p, o)            \n");
+-            break;
++    // GLSL < 130 compatibility: Use legacy texture functions
++    if (gpu->glsl.version < 130) {
++        ADD(pre, "// GLSL < 130 texture compatibility layer\n");
++        // Map modern texture() calls to legacy texture2D()
++        ADD(pre, "#define texture(t, p) texture2D(t, p)\n");
++        // For LOD sampling, use texture2DLod if available, otherwise just texture2D
++        ADD(pre, "#define textureLod(t, p, b) texture2D(t, p)\n");
++        ADD(pre, "#define textureLodOffset(t, p, b, o) texture2D(t, p)\n");
++    } else {
++        // textureLod() doesn't work on external/rect samplers, simply disable
++        // LOD sampling in this case. We don't currently support mipmaps anyway.
++        for (int i = 0; i < sh->descs.num; i++) {
++            if (pass_params->descriptors[i].type != PL_DESC_SAMPLED_TEX)
++                continue;
++            pl_tex tex = sh->descs.elem[i].binding.object;
++            if (tex->sampler_type != PL_SAMPLER_NORMAL) {
++                ADD(pre, "#define textureLod(t, p, b) texture(t, p) \n"
++                         "#define textureLodOffset(t, p, b, o)    \\\n"
++                         "        textureOffset(t, p, o)            \n");
++                break;
++            }
+         }
+     }
+ 
+@@ -620,6 +630,9 @@ static void generate_shaders(pl_dispatch dp,
+             if (has_loc) {
+                 ADD(vert_head, "layout(location=%d) in %s "$";\n",
+                     va->location, type, sh_ident_unpack(va->name));
++            } else if (gpu->glsl.version < 130) {
++                // GLSL < 130: use attribute instead of in for vertex inputs
++                ADD(vert_head, "attribute %s "$";\n", type, sh_ident_unpack(va->name));
+             } else {
+                 ADD(vert_head, "in %s "$";\n", type, sh_ident_unpack(va->name));
+             }
+@@ -639,6 +652,10 @@ static void generate_shaders(pl_dispatch dp,
+                         va->location, type, id);
+                     ADD(glsl, "layout(location=%d) in %s "$";\n",
+                         va->location, type, id);
++                } else if (gpu->glsl.version < 130) {
++                    // GLSL < 130: use varying instead of in/out
++                    ADD(vert_head, "varying %s "$";\n", type, id);
++                    ADD(glsl, "varying %s "$";\n", type, id);
+                 } else {
+                     ADD(vert_head, "out %s "$";\n", type, id);
+                     ADD(glsl, "in %s "$";\n", type, id);
+@@ -652,7 +669,10 @@ static void generate_shaders(pl_dispatch dp,
+         pl_hash_merge(&pass->signature, pl_str_builder_hash(vert_head));
+         *out_vert_builder = vert_head;
+ 
+-        if (has_loc) {
++        // GLSL < 130: use gl_FragColor instead of out_color
++        if (gpu->glsl.version < 130) {
++            // No output declaration needed, gl_FragColor is built-in
++        } else if (has_loc) {
+             ADD(glsl, "layout(location=0) out vec4 out_color;\n");
+         } else {
+             ADD(glsl, "out vec4 out_color;\n");
+@@ -676,7 +696,12 @@ static void generate_shaders(pl_dispatch dp,
+     switch (pass_params->type) {
+     case PL_PASS_RASTER:
+         pl_assert(sh->output == PL_SHADER_SIG_COLOR);
+-        ADD(glsl, "out_color = "$"();\n", sh->name);
++        // GLSL < 130: use gl_FragColor instead of out_color
++        if (gpu->glsl.version < 130) {
++            ADD(glsl, "gl_FragColor = "$"();\n", sh->name);
++        } else {
++            ADD(glsl, "out_color = "$"();\n", sh->name);
++        }
+         break;
+     case PL_PASS_COMPUTE:
+         ADD(glsl, $"();\n", sh->name);
+diff --git a/src/meson.build b/src/meson.build
+index e93e800f..0ce5d847 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -206,6 +206,14 @@ endif
+ defs = ''
+ pc_vars = []
+ 
++# Detect endianness (important for PowerPC big-endian support)
++if host_machine.endian() == 'big'
++  defs += '#define PL_HAVE_BIG_ENDIAN 1\n'
++  message('Detected big-endian system (e.g., PowerPC)')
++else
++  defs += '#undef PL_HAVE_BIG_ENDIAN\n'
++endif
++
+ foreach comp : components.keys()
+   found = components.get(comp)
+   varname = comp.underscorify().to_upper()
+diff --git a/src/opengl/context.c b/src/opengl/context.c
+index 8b38e652..1f126ff6 100644
+--- a/src/opengl/context.c
++++ b/src/opengl/context.c
+@@ -179,6 +179,39 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+         goto error;
+     }
+ 
++    // Alias GL_EXT_framebuffer_object functions to non-EXT names if ARB/core
++    // versions are not available. This is needed for GL 2.0 drivers that only
++    // provide the older EXT extension (e.g., NVIDIA on Mac OS X 10.6).
++#define ALIAS_FBO_EXT(name) \
++    if (!gl->name && gl->name##EXT) { \
++        gl->name = gl->name##EXT; \
++        PL_DEBUG(p, "Aliased " #name "EXT -> " #name); \
++    }
++    ALIAS_FBO_EXT(GenFramebuffers);
++    ALIAS_FBO_EXT(DeleteFramebuffers);
++    ALIAS_FBO_EXT(BindFramebuffer);
++    ALIAS_FBO_EXT(CheckFramebufferStatus);
++    ALIAS_FBO_EXT(FramebufferTexture1D);
++    ALIAS_FBO_EXT(FramebufferTexture2D);
++    ALIAS_FBO_EXT(FramebufferTexture3D);
++    ALIAS_FBO_EXT(FramebufferRenderbuffer);
++    ALIAS_FBO_EXT(GetFramebufferAttachmentParameteriv);
++    ALIAS_FBO_EXT(GenRenderbuffers);
++    ALIAS_FBO_EXT(DeleteRenderbuffers);
++    ALIAS_FBO_EXT(BindRenderbuffer);
++    ALIAS_FBO_EXT(RenderbufferStorage);
++    ALIAS_FBO_EXT(GetRenderbufferParameteriv);
++    ALIAS_FBO_EXT(IsFramebuffer);
++    ALIAS_FBO_EXT(IsRenderbuffer);
++#undef ALIAS_FBO_EXT
++
++    // Note: BlitFramebuffer is from GL_EXT_framebuffer_blit, not GL_EXT_framebuffer_object
++    // It may not be available on all GL 2.0 drivers
++    if (!gl->BlitFramebuffer && gl->BlitFramebufferEXT) {
++        gl->BlitFramebuffer = gl->BlitFramebufferEXT;
++        PL_DEBUG(p, "Aliased BlitFramebufferEXT -> BlitFramebuffer");
++    }
++
+     const char *version = (const char *) gl->GetString(GL_VERSION);
+     if (version) {
+         const char *ver = version;
+@@ -202,7 +235,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+     PL_INFO(p, "    GL_RENDERER: %s", (char *) gl->GetString(GL_RENDERER));
+ 
+     ext_arr_t exts = {0};
+-    if (pl_gl->major >= 3) {
++    if (pl_gl->major >= 3 && gl->GetStringi) {
+         gl->GetIntegerv(GL_NUM_EXTENSIONS, &exts.num);
+         PL_ARRAY_RESIZE(pl_gl, exts, exts.num);
+         for (int i = 0; i < exts.num; i++)
+@@ -217,7 +250,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+             PL_DEBUG(p, "        %s", exts.elem[i]);
+     }
+ 
+-    static const int gl_ver_req = 3;
++    static const int gl_ver_req = 2;
+     if (pl_gl->major < gl_ver_req) {
+         PL_FATAL(p, "OpenGL version too old (%d < %d), please use a newer "
+                  "OpenGL implementation or downgrade libplacebo!",
+diff --git a/src/opengl/formats.c b/src/opengl/formats.c
+index 94154448..7419b810 100644
+--- a/src/opengl/formats.c
++++ b/src/opengl/formats.c
+@@ -20,6 +20,14 @@
+ #include "formats.h"
+ #include "utils.h"
+ 
++// GL 2.0 legacy texture format constants (may not be in GLAD with gl:compatibility=2.0)
++#ifndef GL_LUMINANCE
++#define GL_LUMINANCE 0x1909
++#endif
++#ifndef GL_LUMINANCE_ALPHA
++#define GL_LUMINANCE_ALPHA 0x190A
++#endif
++
+ #ifdef PL_HAVE_UNIX
+ static bool supported_fourcc(struct pl_gl *p, EGLint fourcc)
+ {
+@@ -77,6 +85,12 @@ const struct gl_format formats_norm8[] = {
+     {GL_RGBA8,          RGBA,  U8,  FMT("rgba8",    8, UNORM, S|L|F|V)},
+ };
+ 
++// GL 2.0: Only r8/rg8 from ARB_texture_rg (rgb8/rgba8 already in legacy formats)
++const struct gl_format formats_norm8_rg[] = {
++    {GL_R8,             R,     U8,  FMT("r8",       8, UNORM, S|L|F|V)},
++    {GL_RG8,            RG,    U8,  FMT("rg8",      8, UNORM, S|L|F|V)},
++};
++
+ // Signed variants
+ /* TODO: these are broken in mesa
+ const struct gl_format formats_snorm8[] = {
+@@ -133,6 +147,15 @@ const struct gl_format formats_float32[] = {
+     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|F|V)},
+ };
+ 
++// 32-bit float formats for GL 2.0 without GL_ARB_texture_rg (only RGB/RGBA)
++// Note: NOT marked as renderable (F flag) because GL_ARB_texture_float does NOT
++// guarantee FBO support. GL_EXT_color_buffer_float/GL_ARB_color_buffer_float
++// would be needed for that, which old drivers typically don't have.
++const struct gl_format formats_float32_gl2[] = {
++    {GL_RGB32F,         RGB,   FLT, FMT("rgb32f",  32, FLOAT, S|L|V)},
++    {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|V)},
++};
++
+ // 16-bit floating point texture formats
+ const struct gl_format formats_float16[] = {
+     {GL_R16F,           R,     FLT,  FMT("r16f",    16, FLOAT, S|L|F)},
+@@ -205,12 +228,26 @@ const struct gl_format formats_uint[] = {
+     {GL_RGBA32I,        RGBAI, I32, FMT("rgba32i", 32, SINT)},
+ */
+ 
+-// GL2 legacy formats
++// GL2 legacy formats (use sized internal formats for FBO compatibility)
++// Note: GL_LUMINANCE and GL_LUMINANCE_ALPHA are NOT included because they are
++// unsized formats that cannot be used as FBO attachments and are not blittable.
++// libplacebo requires formats that are renderable and blittable for proper operation.
++// Use rgba8/rgb8 for all texture operations on GL 2.0.
+ const struct gl_format formats_legacy_gl2[] = {
+-    {GL_RGB8,           RGB,   U8,  FMT("rgb8",     8, UNORM, S|L|V)},
+-    {GL_RGBA8,          RGBA,  U8,  FMT("rgba8",    8, UNORM, S|L|V)},
+-    {GL_RGB16,          RGB,   U16, FMT("rgb16",   16, UNORM, S|L|V)},
+-    {GL_RGBA16,         RGBA,  U16, FMT("rgba16",  16, UNORM, S|L|V)},
++    {GL_RGB8,           RGB,               U8,                FMT("rgb8",     8, UNORM, S|L|F|V)},
++    {GL_RGBA8,          RGBA,              U8,                FMT("rgba8",    8, UNORM, S|L|F|V)},
++    {GL_RGB16,          RGB,               U16,               FMT("rgb16",   16, UNORM, S|L|F|V)},
++    {GL_RGBA16,         RGBA,              U16,               FMT("rgba16",  16, UNORM, S|L|F|V)},
++};
++
++// GL2 legacy single/dual component formats (sampleable only, NOT renderable)
++// These are needed for video plane uploads when GL_ARB_texture_rg is unavailable.
++// Note: GL_LUMINANCE swizzles to (L,L,L,1) and GL_LUMINANCE_ALPHA to (L,L,L,A)
++// in the shader, but libplacebo's component_mapping handles this correctly.
++const struct gl_format formats_luminance_gl2[] = {
++    // Note: NO 'F' flag - these cannot be FBO attachments
++    {GL_LUMINANCE,      GL_LUMINANCE,      GL_UNSIGNED_BYTE,  FMT("luminance",       8, UNORM, S|L|V)},
++    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_UNSIGNED_BYTE,  FMT("luminance_alpha", 8, UNORM, S|L|V)},
+ };
+ 
+ // GLES2 legacy formats
+@@ -238,6 +275,25 @@ const struct gl_format formats_basic_vertex[] = {
+     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, V)},
+ };
+ 
++// GL 2.0 vertex-only formats for 1/2 components (for systems without GL_ARB_texture_rg)
++// These use GL_LUMINANCE/GL_LUMINANCE_ALPHA as dummy internal/external formats
++// since they're only used for glVertexAttribPointer which only cares about
++// the type (GL_FLOAT) and num_components - not the texture format constants.
++// Note: Unique names (r32f_v, rg32f_v) to avoid conflicts with float texture formats.
++const struct gl_format formats_vertex_gl2_1_2comp[] = {
++    {GL_LUMINANCE,      GL_LUMINANCE,      GL_FLOAT, FMT("r32f_v",  32, FLOAT, V)},
++    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_FLOAT, FMT("rg32f_v", 32, FLOAT, V)},
++};
++
++// GL 2.0 vertex-only formats, all 4 components (for systems without GL_ARB_texture_rg
++// and without GL_ARB_texture_float)
++const struct gl_format formats_basic_vertex_gl2[] = {
++    {GL_LUMINANCE,      GL_LUMINANCE,      GL_FLOAT, FMT("r32f",    32, FLOAT, V)},
++    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_FLOAT, FMT("rg32f",   32, FLOAT, V)},
++    {GL_RGB,            GL_RGB,            GL_FLOAT, FMT("rgb32f",  32, FLOAT, V)},
++    {GL_RGBA,           GL_RGBA,           GL_FLOAT, FMT("rgba32f", 32, FLOAT, V)},
++};
++
+ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+ {
+     struct pl_gpu_t *gpu = (struct pl_gpu_t *) pgpu;
+@@ -252,10 +308,12 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+     switch (gl_fmt->fmt) {
+     case GL_RED:
+     case GL_RED_INTEGER:
++    case GL_LUMINANCE:
+         fmt->num_components = 1;
+         break;
+     case GL_RG:
+     case GL_RG_INTEGER:
++    case GL_LUMINANCE_ALPHA:
+         fmt->num_components = 2;
+         break;
+     case GL_RGB:
+@@ -372,6 +430,10 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+     if (fmt->caps & PL_FMT_CAP_SAMPLEABLE)
+         fmt->gatherable = p->gather_comps >= fmt->num_components;
+ 
++    // Mask renderable/blittable if no FBOs available (GL 2.0 compatibility)
++    if (!p->has_fbos)
++        fmt->caps &= ~(PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_BLITTABLE);
++
+     bool host_readable = false;
+     if (p->gl_ver && p->has_readback)
+         host_readable = true;
+@@ -444,8 +506,12 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+     }
+ #endif
+ 
++    PL_INFO(gpu, "GL version: %d, GLES version: %d, has_fbos: %d",
++            p->gl_ver, p->gles_ver, p->has_fbos);
++
+     if (p->gl_ver >= 30) {
+         // Desktop GL3+ has everything
++        PL_INFO(gpu, "Using GL 3.0+ format path");
+         DO_FORMATS(formats_norm8);
+         DO_FORMATS(formats_bgra8);
+         DO_FORMATS(formats_norm16);
+@@ -460,8 +526,10 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+     if (p->gl_ver >= 21) {
+         // If we have a reasonable set of extensions, we can enable most
+         // things. Otherwise, pick simple fallback formats
++        bool has_texture_rg = pl_opengl_has_ext(p->gl, "GL_ARB_texture_rg");
++        PL_INFO(gpu, "Using GL 2.1 format path, has_texture_rg=%d", has_texture_rg);
+         if (pl_opengl_has_ext(p->gl, "GL_ARB_texture_float") &&
+-            pl_opengl_has_ext(p->gl, "GL_ARB_texture_rg") &&
++            has_texture_rg &&
+             pl_opengl_has_ext(p->gl, "GL_ARB_framebuffer_object"))
+         {
+             DO_FORMATS(formats_norm8);
+@@ -475,9 +543,28 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+                 DO_FORMATS(formats_half16);
+             }
+         } else {
+-            // Fallback for GL2
++            // Fallback for GL 2.1 without full extension support
+             DO_FORMATS(formats_legacy_gl2);
+-            DO_FORMATS(formats_basic_vertex);
++            if (has_texture_rg) {
++                DO_FORMATS(formats_norm8_rg);
++            } else {
++                DO_FORMATS(formats_luminance_gl2);
++            }
++            if (pl_opengl_has_ext(p->gl, "GL_ARB_texture_float")) {
++                // Use GL2 float formats (no GL_R32F/GL_RG32F without texture_rg)
++                if (has_texture_rg) {
++                    DO_FORMATS(formats_float32);
++                } else {
++                    DO_FORMATS(formats_float32_gl2);
++                    DO_FORMATS(formats_vertex_gl2_1_2comp);
++                }
++            } else {
++                if (has_texture_rg) {
++                    DO_FORMATS(formats_basic_vertex);
++                } else {
++                    DO_FORMATS(formats_basic_vertex_gl2);
++                }
++            }
+         }
+         goto done;
+     }
+@@ -502,6 +589,42 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+         goto done;
+     }
+ 
++    if (p->gl_ver >= 20) {
++        // Desktop GL 2.0: Use legacy formats (GL_LUMINANCE, GL_RGB, GL_RGBA)
++        // with optional modern formats if GL_ARB_texture_rg available
++        bool has_texture_rg = pl_opengl_has_ext(p->gl, "GL_ARB_texture_rg");
++        PL_INFO(gpu, "Using GL 2.0 format path, has_texture_rg=%d", has_texture_rg);
++        DO_FORMATS(formats_legacy_gl2);
++        if (has_texture_rg) {
++            // Modern single/dual-component formats (r8/rg8 only, not rgb8/rgba8)
++            DO_FORMATS(formats_norm8_rg);
++        } else {
++            // Fallback to GL_LUMINANCE for 1/2-component textures (video planes)
++            // These are sampleable but NOT renderable
++            DO_FORMATS(formats_luminance_gl2);
++        }
++        if (pl_opengl_has_ext(p->gl, "GL_ARB_texture_float")) {
++            // Float texture formats - use full set only if texture_rg is available
++            // (GL_R32F/GL_RG32F require GL_RED/GL_RG which come from texture_rg)
++            if (has_texture_rg) {
++                DO_FORMATS(formats_float32);
++            } else {
++                // Only RGB/RGBA float textures
++                DO_FORMATS(formats_float32_gl2);
++                // Plus vertex-only 1/2 component formats for vertex attributes
++                DO_FORMATS(formats_vertex_gl2_1_2comp);
++            }
++        } else {
++            // No float textures - just vertex-only float formats
++            if (has_texture_rg) {
++                DO_FORMATS(formats_basic_vertex);
++            } else {
++                DO_FORMATS(formats_basic_vertex_gl2);
++            }
++        }
++        goto done;
++    }
++
+     if (p->gles_ver >= 20) {
+         // GLES 2.0 only has some legacy fallback formats, with support for
+         // float16 depending on GL_EXT_texture_norm16 being present
+@@ -521,5 +644,15 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+     goto done;
+ 
+ done:
++    // Debug: count renderable formats
++    {
++        int num_renderable = 0;
++        for (int i = 0; i < gpu->num_formats; i++) {
++            if (gpu->formats[i]->caps & PL_FMT_CAP_RENDERABLE)
++                num_renderable++;
++        }
++        PL_INFO(gpu, "Format setup complete: %d total formats, %d renderable",
++                gpu->num_formats, num_renderable);
++    }
+     return gl_check_err(gpu, "gl_setup_formats");
+ }
+diff --git a/src/opengl/gpu.c b/src/opengl/gpu.c
+index a515943f..c451deb9 100644
+--- a/src/opengl/gpu.c
++++ b/src/opengl/gpu.c
+@@ -30,6 +30,39 @@
+ #include <sysinfoapi.h>
+ #endif
+ 
++// Fallback definitions for OpenGL constants not available in GL 2.0
++// These will never be used at runtime due to extension checks, but are needed for compilation
++#ifndef GL_TEXTURE_RECTANGLE
++#define GL_TEXTURE_RECTANGLE GL_TEXTURE_RECTANGLE_ARB
++#endif
++#ifndef GL_MAX_PROGRAM_TEXTURE_GATHER_COMPONENTS_ARB
++#define GL_MAX_PROGRAM_TEXTURE_GATHER_COMPONENTS_ARB 0x8F9F
++#endif
++#ifndef GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET_ARB
++#define GL_MIN_PROGRAM_TEXTURE_GATHER_OFFSET_ARB 0x8E5E
++#endif
++#ifndef GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET_ARB
++#define GL_MAX_PROGRAM_TEXTURE_GATHER_OFFSET_ARB 0x8E5F
++#endif
++#ifndef GL_DYNAMIC_STORAGE_BIT
++#define GL_DYNAMIC_STORAGE_BIT 0x0100
++#endif
++#ifndef GL_MAP_PERSISTENT_BIT
++#define GL_MAP_PERSISTENT_BIT 0x0040
++#endif
++#ifndef GL_MAP_COHERENT_BIT
++#define GL_MAP_COHERENT_BIT 0x0080
++#endif
++#ifndef GL_CLIENT_STORAGE_BIT
++#define GL_CLIENT_STORAGE_BIT 0x0200
++#endif
++#ifndef GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT
++#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
++#endif
++#ifndef GL_TIME_ELAPSED
++#define GL_TIME_ELAPSED 0x88BF
++#endif
++
+ static const struct pl_gpu_fns pl_fns_gl;
+ 
+ static void gl_gpu_destroy(pl_gpu gpu)
+@@ -144,7 +177,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+         }
+     }
+ 
+-    static const int glsl_ver_req = 130;
++    static const int glsl_ver_req = 110;
+     if (glsl->version < glsl_ver_req) {
+         PL_FATAL(gpu, "GLSL version too old (%d < %d), please use a newer "
+                  "OpenGL implementation or downgrade libplacebo!",
+@@ -152,7 +185,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+         goto error;
+     }
+ 
+-    if (params->max_glsl_version && params->max_glsl_version >= glsl_ver_req) {
++    if (params->max_glsl_version && params->max_glsl_version >= 110) {
+         glsl->version = PL_MIN(glsl->version, params->max_glsl_version);
+         PL_INFO(gpu, "Restricting GLSL version to %d... new version is %d",
+                 params->max_glsl_version, glsl->version);
+@@ -246,6 +279,26 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+     p->has_invalidate_tex = gl_test_ext(gpu, "GL_ARB_invalidate_subdata", 43, 0);
+     p->has_queries = gl_test_ext(gpu, "GL_ARB_timer_query", 30, 0);
+     p->has_storage = gl_test_ext(gpu, "GL_ARB_shader_image_load_store", 42, 31);
++
++    // WORKAROUND: Unconditionally enable FBOs on GL 2.0+ (extension query is broken)
++    // All GL 2.0+ drivers support FBOs via GL_EXT_framebuffer_object or ARB version
++    if (p->gl_ver >= 20) {
++        p->has_fbos = true;
++        PL_INFO(gpu, "Forcing FBO support on GL 2.0+ (extension detection unreliable)");
++    } else if (p->gles_ver >= 20) {
++        p->has_fbos = true;
++    } else {
++        // Try standard detection for older GL versions
++        p->has_fbos = gl_test_ext(gpu, "GL_ARB_framebuffer_object", 30, 20) ||
++                      gl_test_ext(gpu, "GL_EXT_framebuffer_object", 20, 0);
++    }
++
++    // GL_READ_FRAMEBUFFER / GL_DRAW_FRAMEBUFFER require ARB_framebuffer_object or GL 3.0+
++    // GL_EXT_framebuffer_object only has GL_FRAMEBUFFER
++    p->has_separate_fbo_bindings = gl_test_ext(gpu, "GL_ARB_framebuffer_object", 30, 30);
++
++    p->has_stride = gl_test_ext(gpu, "GL_EXT_unpack_subimage", 11, 30);
++    p->has_unpack_image_height = p->gl_ver >= 12 || p->gles_ver >= 30;
+     p->has_readback = true;
+ 
+     if (p->has_readback && p->gles_ver) {
+@@ -277,9 +330,11 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+ 
+     // We simply don't know, so make up some values
+     limits->align_tex_xfer_offset = 32;
+-    limits->align_tex_xfer_pitch = 4;
++    limits->align_tex_xfer_pitch = 1;
+     limits->fragment_queues = 1;
+     limits->compute_queues = glsl->compute ? 1 : 0;
++    if (p->has_stride)
++        limits->align_tex_xfer_pitch = 4;
+ 
+     if (!gl_check_err(gpu, "pl_gpu_create_gl")) {
+         PL_WARN(gpu, "Encountered errors while detecting GPU capabilities... "
+diff --git a/src/opengl/gpu.h b/src/opengl/gpu.h
+index 3681f30b..c7380060 100644
+--- a/src/opengl/gpu.h
++++ b/src/opengl/gpu.h
+@@ -59,6 +59,10 @@ struct pl_gl {
+     bool has_readback;
+     bool has_egl_storage;
+     bool has_egl_import;
++    bool has_fbos;        // Framebuffer object support (EXT or ARB)
++    bool has_separate_fbo_bindings; // GL_ARB_framebuffer_object (has GL_READ/DRAW_FRAMEBUFFER)
++    bool has_stride;      // GL_EXT_unpack_subimage (GL_UNPACK_ROW_LENGTH support)
++    bool has_unpack_image_height; // GL 1.2+ or GLES 3.0+ (GL_UNPACK_IMAGE_HEIGHT)
+     int gather_comps;
+ };
+ 
+@@ -92,6 +96,21 @@ static inline void _release_current(pl_gpu gpu)
+ #define MAKE_CURRENT() _make_current(gpu)
+ #define RELEASE_CURRENT() _release_current(gpu)
+ 
++// Helper macros for FBO binding targets
++// GL_EXT_framebuffer_object only has GL_FRAMEBUFFER
++// GL_ARB_framebuffer_object / GL 3.0+ has GL_READ_FRAMEBUFFER and GL_DRAW_FRAMEBUFFER
++static inline GLenum gl_read_fb_target(pl_gpu gpu)
++{
++    struct pl_gl *p = PL_PRIV(gpu);
++    return p->has_separate_fbo_bindings ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
++}
++
++static inline GLenum gl_draw_fb_target(pl_gpu gpu)
++{
++    struct pl_gl *p = PL_PRIV(gpu);
++    return p->has_separate_fbo_bindings ? GL_DRAW_FRAMEBUFFER : GL_FRAMEBUFFER;
++}
++
+ struct pl_tex_gl {
+     GLenum target;
+     GLuint texture;
+diff --git a/src/opengl/gpu_pass.c b/src/opengl/gpu_pass.c
+index 96f15e7d..97127413 100644
+--- a/src/opengl/gpu_pass.c
++++ b/src/opengl/gpu_pass.c
+@@ -305,10 +305,16 @@ pl_pass gl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
+             break;
+         }
+         case PL_DESC_BUF_STORAGE: {
+-            GLuint idx = gl->GetProgramResourceIndex(pass_gl->program,
+-                                                     GL_SHADER_STORAGE_BLOCK,
+-                                                     desc->name);
+-            gl->ShaderStorageBlockBinding(pass_gl->program, idx, desc->binding);
++            // SSBOs require GL 4.3+ or GL_ARB_shader_storage_buffer_object
++            if (gpu->limits.max_ssbo_size > 0) {
++                GLuint idx = gl->GetProgramResourceIndex(pass_gl->program,
++                                                         GL_SHADER_STORAGE_BLOCK,
++                                                         desc->name);
++                gl->ShaderStorageBlockBinding(pass_gl->program, idx, desc->binding);
++            } else {
++                PL_ERR(gpu, "Pass uses SSBO descriptors but SSBOs are not supported!");
++                goto error;
++            }
+             break;
+         }
+         case PL_DESC_BUF_TEXEL_UNIFORM:
+@@ -479,6 +485,11 @@ static void update_desc(pl_gpu gpu, pl_pass pass, int index,
+         return;
+     }
+     case PL_DESC_BUF_STORAGE: {
++        // Should have been caught during pass creation
++        if (gpu->limits.max_ssbo_size == 0) {
++            PL_ERR(gpu, "SSBO descriptor used but SSBOs not supported!");
++            return;
++        }
+         pl_buf buf = db->object;
+         struct pl_buf_gl *buf_gl = PL_PRIV(buf);
+         gl->BindBufferRange(GL_SHADER_STORAGE_BUFFER, desc->binding, buf_gl->buffer,
+@@ -524,6 +535,11 @@ static void unbind_desc(pl_gpu gpu, pl_pass pass, int index,
+         gl->BindBufferBase(GL_UNIFORM_BUFFER, desc->binding, 0);
+         return;
+     case PL_DESC_BUF_STORAGE: {
++        // Should have been caught during pass creation
++        if (gpu->limits.max_ssbo_size == 0) {
++            PL_ERR(gpu, "SSBO descriptor used but SSBOs not supported!");
++            return;
++        }
+         pl_buf buf = db->object;
+         struct pl_buf_gl *buf_gl = PL_PRIV(buf);
+         gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, desc->binding, 0);
+@@ -568,10 +584,10 @@ void gl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+     switch (pass->params.type) {
+     case PL_PASS_RASTER: {
+         struct pl_tex_gl *target_gl = PL_PRIV(params->target);
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, target_gl->fbo);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), target_gl->fbo);
+         if (!pass->params.load_target && p->has_invalidate_fb) {
+             GLenum fb = target_gl->fbo ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
+-            gl->InvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &fb);
++            gl->InvalidateFramebuffer(gl_draw_fb_target(gpu), 1, &fb);
+         }
+ 
+         gl->Viewport(params->viewport.x0, params->viewport.y0,
+@@ -681,7 +697,7 @@ void gl_pass_run(pl_gpu gpu, const struct pl_pass_run_params *params)
+         gl->BindBuffer(GL_ARRAY_BUFFER, 0);
+         gl->Disable(GL_SCISSOR_TEST);
+         gl->Disable(GL_BLEND);
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), 0);
+         break;
+     }
+ 
+diff --git a/src/opengl/gpu_tex.c b/src/opengl/gpu_tex.c
+index ca488ee2..497b8c50 100644
+--- a/src/opengl/gpu_tex.c
++++ b/src/opengl/gpu_tex.c
+@@ -16,6 +16,11 @@
+  */
+ 
+ #include "gpu.h"
++
++// GL 2.0 compatibility: Map non-ARB constant to ARB version
++#ifndef GL_TEXTURE_RECTANGLE
++#define GL_TEXTURE_RECTANGLE GL_TEXTURE_RECTANGLE_ARB
++#endif
+ #include "formats.h"
+ #include "utils.h"
+ 
+@@ -408,8 +413,9 @@ pl_tex gl_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
+             goto error;
+         }
+ 
+-        const GLenum target = p->gles_ver && p->gles_ver < 30 ?
+-            GL_FRAMEBUFFER : GL_READ_FRAMEBUFFER;
++        // GL_READ_FRAMEBUFFER requires ARB_framebuffer_object or GL 3.0+
++        // GL_EXT_framebuffer_object only has GL_FRAMEBUFFER
++        const GLenum target = p->has_separate_fbo_bindings ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
+ 
+         gl->GenFramebuffers(1, &tex_gl->fbo);
+         gl->BindFramebuffer(target, tex_gl->fbo);
+@@ -486,14 +492,14 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
+         can_query = false; // can't query default framebuffer on GLES 2.0
+ 
+     if (can_query) {
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), fbo);
+ 
+         GLenum obj = p->gles_ver ? GL_BACK : GL_BACK_LEFT;
+         if (fbo != 0)
+             obj = GL_COLOR_ATTACHMENT0;
+ 
+         GLint type = 0;
+-        gl->GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, obj,
++        gl->GetFramebufferAttachmentParameteriv(gl_draw_fb_target(gpu), obj,
+                             GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
+         switch (type) {
+         case GL_FLOAT:                  fmt->type = PL_FMT_FLOAT; break;
+@@ -504,16 +510,16 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
+         default:                        fmt->type = PL_FMT_UNKNOWN; break;
+         }
+ 
+-        gl->GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, obj,
++        gl->GetFramebufferAttachmentParameteriv(gl_draw_fb_target(gpu), obj,
+                 GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE, &fmt->component_depth[0]);
+-        gl->GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, obj,
++        gl->GetFramebufferAttachmentParameteriv(gl_draw_fb_target(gpu), obj,
+                 GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE, &fmt->component_depth[1]);
+-        gl->GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, obj,
++        gl->GetFramebufferAttachmentParameteriv(gl_draw_fb_target(gpu), obj,
+                 GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE, &fmt->component_depth[2]);
+-        gl->GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, obj,
++        gl->GetFramebufferAttachmentParameteriv(gl_draw_fb_target(gpu), obj,
+                 GL_FRAMEBUFFER_ATTACHMENT_ALPHA_SIZE, &fmt->component_depth[3]);
+ 
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), 0);
+         gl_check_err(gpu, "gl_fb_query");
+ 
+         if (!fmt->component_depth[0]) {
+@@ -689,8 +695,9 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
+                    dims < 3;
+ 
+     if (can_fbo && !tex_gl->fbo) {
+-        const GLenum target = p->gles_ver && p->gles_ver < 30 ?
+-            GL_FRAMEBUFFER : GL_READ_FRAMEBUFFER;
++        // GL_READ_FRAMEBUFFER requires ARB_framebuffer_object or GL 3.0+
++        // GL_EXT_framebuffer_object only has GL_FRAMEBUFFER
++        const GLenum target = p->has_separate_fbo_bindings ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
+ 
+         gl->GenFramebuffers(1, &tex_gl->fbo);
+         gl->BindFramebuffer(target, tex_gl->fbo);
+@@ -788,9 +795,9 @@ void gl_tex_invalidate(pl_gpu gpu, pl_tex tex)
+ 
+     if ((tex_gl->wrapped_fb || tex_gl->fbo) && p->has_invalidate_fb) {
+         GLenum attachment = tex_gl->fbo ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, tex_gl->fbo);
+-        gl->InvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &attachment);
+-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), tex_gl->fbo);
++        gl->InvalidateFramebuffer(gl_draw_fb_target(gpu), 1, &attachment);
++        gl->BindFramebuffer(gl_draw_fb_target(gpu), 0);
+     }
+ 
+     gl_check_err(gpu, "gl_tex_invalidate");
+@@ -807,8 +814,8 @@ void gl_tex_clear_ex(pl_gpu gpu, pl_tex tex, const union pl_clear_color color)
+     struct pl_tex_gl *tex_gl = PL_PRIV(tex);
+     pl_assert(tex_gl->fbo || tex_gl->wrapped_fb);
+ 
+-    const GLenum target = p->gles_ver && p->gles_ver < 30 ?
+-        GL_FRAMEBUFFER : GL_DRAW_FRAMEBUFFER;
++    // Use helper function that respects FBO extension availability
++    const GLenum target = gl_draw_fb_target(gpu);
+ 
+     gl->BindFramebuffer(target, tex_gl->fbo);
+ 
+@@ -853,8 +860,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
+ 
+     pl_assert(src_gl->fbo || src_gl->wrapped_fb);
+     pl_assert(dst_gl->fbo || dst_gl->wrapped_fb);
+-    gl->BindFramebuffer(GL_READ_FRAMEBUFFER, src_gl->fbo);
+-    gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_gl->fbo);
++    gl->BindFramebuffer(gl_read_fb_target(gpu), src_gl->fbo);
++    gl->BindFramebuffer(gl_draw_fb_target(gpu), dst_gl->fbo);
+ 
+     static const GLint filters[PL_TEX_SAMPLE_MODE_COUNT] = {
+         [PL_TEX_SAMPLE_NEAREST] = GL_NEAREST,
+@@ -866,8 +873,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
+                         dst_rc.x0, dst_rc.y0, dst_rc.x1, dst_rc.y1,
+                         GL_COLOR_BUFFER_BIT, filters[params->sample_mode]);
+ 
+-    gl->BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+-    gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    gl->BindFramebuffer(gl_read_fb_target(gpu), 0);
++    gl->BindFramebuffer(gl_draw_fb_target(gpu), 0);
+     gl_check_err(gpu, "gl_tex_blit");
+     RELEASE_CURRENT();
+ }
+@@ -921,15 +928,22 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+         gl->PixelStorei(GL_UNPACK_ALIGNMENT, get_alignment(params->row_pitch));
+ 
+     int rows = pl_rect_h(params->rc);
+-    if (misaligned) {
+-        rows = 1;
+-    } else if (stride_w != pl_rect_w(params->rc)) {
+-        gl->PixelStorei(GL_UNPACK_ROW_LENGTH, stride_w);
++    if (stride_w != pl_rect_w(params->rc) || misaligned) {
++        if (p->has_stride && !misaligned) {
++            gl->PixelStorei(GL_UNPACK_ROW_LENGTH, stride_w);
++        } else {
++            rows = 1;
++        }
+     }
+ 
+     int imgs = pl_rect_d(params->rc);
+-    if (stride_h != pl_rect_h(params->rc) || rows < stride_h)
+-        gl->PixelStorei(GL_UNPACK_IMAGE_HEIGHT, stride_h);
++    if (stride_h != pl_rect_h(params->rc) || rows < stride_h) {
++        if (p->has_unpack_image_height) {
++            gl->PixelStorei(GL_UNPACK_IMAGE_HEIGHT, stride_h);
++        } else {
++            imgs = 1;
++        }
++    }
+ 
+     gl->BindTexture(tex_gl->target, tex_gl->texture);
+     gl_timer_begin(gpu, params->timer);
+@@ -964,8 +978,10 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+     gl_timer_end(gpu, params->timer);
+     gl->BindTexture(tex_gl->target, 0);
+     gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+-    gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+-    gl->PixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
++    if (p->has_stride)
++        gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    if (p->has_unpack_image_height)
++        gl->PixelStorei(GL_UNPACK_IMAGE_HEIGHT, 0);
+ 
+     if (buf) {
+         gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+@@ -1043,17 +1059,20 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+             gl->PixelStorei(GL_PACK_ALIGNMENT, get_alignment(params->row_pitch));
+ 
+         int rows = pl_rect_h(params->rc);
+-        if (misaligned) {
+-            rows = 1;
+-        } else if (stride_w != tex->params.w) {
+-            gl->PixelStorei(GL_PACK_ROW_LENGTH, stride_w);
++        if (stride_w != tex->params.w || misaligned) {
++            if (p->has_stride && !misaligned) {
++                gl->PixelStorei(GL_PACK_ROW_LENGTH, stride_w);
++            } else {
++                rows = 1;
++            }
+         }
+ 
+         // No 3D framebuffers
+         pl_assert(pl_rect_d(params->rc) == 1);
+ 
+-        const GLenum target = p->gles_ver && p->gles_ver < 30 ?
+-            GL_FRAMEBUFFER : GL_READ_FRAMEBUFFER;
++        // GL_READ_FRAMEBUFFER requires ARB_framebuffer_object or GL 3.0+
++        // GL_EXT_framebuffer_object only has GL_FRAMEBUFFER
++        const GLenum target = p->has_separate_fbo_bindings ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
+ 
+         gl->BindFramebuffer(target, tex_gl->fbo);
+         for (int y = params->rc.y0; y < params->rc.y1; y += rows) {
+@@ -1063,7 +1082,8 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+         }
+         gl->BindFramebuffer(target, 0);
+         gl->PixelStorei(GL_PACK_ALIGNMENT, 4);
+-        gl->PixelStorei(GL_PACK_ROW_LENGTH, 0);
++        if (p->has_stride)
++            gl->PixelStorei(GL_PACK_ROW_LENGTH, 0);
+     } else if (is_copy) {
+         // We're downloading the entire texture
+         gl->BindTexture(tex_gl->target, tex_gl->texture);
+diff --git a/src/opengl/include/glad/meson.build b/src/opengl/include/glad/meson.build
+index 05b3f023..bc5f5301 100644
+--- a/src/opengl/include/glad/meson.build
++++ b/src/opengl/include/glad/meson.build
+@@ -18,7 +18,7 @@ glad = custom_target('gl.h',
+   env: python_env,
+   command: [
+     python, '-m', 'glad', '--out-path=@OUTDIR@/../../',
+-    '--reproducible', '--merge', '--api=gl:core,gles2,egl',
++    '--reproducible', '--merge', '--api=gl:compatibility=2.0,gles2,egl',
+     '--extensions=' + ','.join(gl_extensions), 'c', '--header-only', '--mx'
+   ] + (opengl_link.allowed() ? ['--loader'] : [])
+ )
+diff --git a/src/opengl/meson.build b/src/opengl/meson.build
+index f753628c..a28ccb00 100644
+--- a/src/opengl/meson.build
++++ b/src/opengl/meson.build
+@@ -31,24 +31,37 @@ if opengl_build.allowed()
+ 
+   gl_extensions = [
+     'GL_AMD_pinned_memory',
++    # GL 4.4+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_buffer_storage',
+-    'GL_ARB_compute_shader',
+-    'GL_ARB_framebuffer_object',
+-    'GL_ARB_get_program_binary',
++    # GL 4.3+ extensions - needed for compilation even on GL 2.0
++    # (function pointers will be NULL if not available at runtime)
+     'GL_ARB_invalidate_subdata',
+-    'GL_ARB_pixel_buffer_object',
+     'GL_ARB_program_interface_query',
+-    'GL_ARB_shader_image_load_store',
+     'GL_ARB_shader_storage_buffer_object',
+-    'GL_ARB_sync',
+-    'GL_ARB_texture_float',
++    # Compute shaders not needed for GL 2.0
++    # 'GL_ARB_compute_shader',
++    # GL 4.2+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_shader_image_load_store',
++    # GL 4.1+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_get_program_binary',
++    # GL 4.0+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_texture_gather',
+-    'GL_ARB_texture_rg',
++    # GL 3.3+ extensions - needed for compilation even on GL 2.0
+     'GL_ARB_timer_query',
++    # GL 3.1+ extensions - needed for compilation even on GL 2.0
++    'GL_ARB_pixel_buffer_object',
+     'GL_ARB_uniform_buffer_object',
++    # GL 2.x compatible extensions
++    'GL_ARB_framebuffer_object',
++    'GL_ARB_sync',
++    'GL_ARB_texture_float',
++    'GL_ARB_texture_rectangle',
++    'GL_ARB_texture_rg',
+     'GL_ARB_vertex_array_object',
+     'GL_ARB_half_float_pixel',
+     'GL_EXT_EGL_image_storage',
++    'GL_EXT_framebuffer_object',  # GL 2.0+ FBO support (older than ARB version)
++    'GL_EXT_framebuffer_blit',    # BlitFramebuffer for GL 2.0 (older than ARB)
+     'GL_EXT_color_buffer_float',
+     'GL_EXT_texture3D',
+     'GL_EXT_texture_format_BGRA8888',
+diff --git a/src/renderer.c b/src/renderer.c
+index 576528b5..088373e1 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -419,16 +419,32 @@ static void find_fbo_format(struct pass_state *pass)
+         pass->fbofmt[4] = fmt;
+ 
+         // Probe the right variant for each number of channels, falling
+-        // back to the next biggest format
+-        for (int c = 1; c < 4; c++) {
++        // back to the next biggest format. Must iterate downward so that
++        // fbofmt[c+1] is already set when we compute the fallback.
++        // Note: For maximum compatibility (especially on old GL 2.0 drivers),
++        // we strongly prefer 4-component RGBA formats for FBOs since RGB
++        // formats often have poor FBO support.
++        for (int c = 3; c >= 1; c--) {
+             pass->fbofmt[c] = pl_find_fmt(rr->gpu, configs[i].type, c,
+                                         configs[i].depth, 0, fmt->caps);
+-            pass->fbofmt[c] = PL_DEF(pass->fbofmt[c], pass->fbofmt[c+1]);
++            // Prefer falling back to 4-component format directly for better
++            // FBO compatibility on older drivers
++            if (!pass->fbofmt[c])
++                pass->fbofmt[c] = pass->fbofmt[4];
++            if (!pass->fbofmt[c])
++                pass->fbofmt[c] = pass->fbofmt[c+1];
+         }
++        PL_INFO(rr, "Found FBO format: %s (type=%d, depth=%d), fbofmt[1]=%s, fbofmt[2]=%s, fbofmt[3]=%s, fbofmt[4]=%s",
++                fmt->name, configs[i].type, configs[i].depth,
++                pass->fbofmt[1] ? pass->fbofmt[1]->name : "(null)",
++                pass->fbofmt[2] ? pass->fbofmt[2]->name : "(null)",
++                pass->fbofmt[3] ? pass->fbofmt[3]->name : "(null)",
++                pass->fbofmt[4] ? pass->fbofmt[4]->name : "(null)");
+         return;
+     }
+ 
+-    PL_WARN(rr, "Found no renderable FBO format! Most features disabled");
++    PL_WARN(rr, "Found no renderable FBO format! Most features disabled. "
++            "Tried types: FLOAT@16, UNORM@16, SNORM@16, UNORM@8");
+     rr->errors |= PL_RENDER_ERR_FBO;
+ }
+ 
+@@ -450,9 +466,14 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
+     pl_renderer rr = pass->rr;
+     const int n = pass->info.stage;
+     comps = PL_DEF(comps, 4);
++    pl_fmt orig_fmt = fmt;
+     fmt = PL_DEF(fmt, pass->fbofmt[comps]);
+-    if (!fmt)
++    if (!fmt) {
++        PL_ERR(rr, "get_fbo: no format for comps=%d (orig_fmt=%p, fbofmt[1]=%p, fbofmt[2]=%p, fbofmt[3]=%p, fbofmt[4]=%p)",
++               comps, (void*)orig_fmt, (void*)pass->fbofmt[1], (void*)pass->fbofmt[2],
++               (void*)pass->fbofmt[3], (void*)pass->fbofmt[4]);
+         return NULL;
++    }
+ 
+     pl_assert(w && h);
+     struct pl_tex_params params = {
+@@ -1477,8 +1498,9 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
+     int min_depth = PL_MAX(a->repr.bits.sample_depth, b->repr.bits.sample_depth);
+ 
+     // Only return formats that support all relevant caps of both formats
+-    const enum pl_fmt_caps mask = PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR;
+-    enum pl_fmt_caps req_caps = (fmta->caps & mask) | (fmtb->caps & mask);
++    // RENDERABLE is required since the merged plane needs to be rendered to FBO
++    const enum pl_fmt_caps mask = PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_LINEAR | PL_FMT_CAP_RENDERABLE;
++    enum pl_fmt_caps req_caps = (fmta->caps & mask) | (fmtb->caps & mask) | PL_FMT_CAP_RENDERABLE;
+     enum pl_fmt_type req_type = fmta->type;
+ 
+     // If we have integer formats on input, convert now to FBO format.
+diff --git a/src/shaders.c b/src/shaders.c
+index 73e03ec8..1daef9c7 100644
+--- a/src/shaders.c
++++ b/src/shaders.c
+@@ -92,8 +92,8 @@ static void init_shader(pl_shader sh, const struct pl_shader_params *params)
+ 
+ pl_shader pl_shader_alloc(pl_log log, const struct pl_shader_params *params)
+ {
+-    static const int glsl_ver_req = 130;
+-    if (params && params->glsl.version && params->glsl.version < 130) {
++    static const int glsl_ver_req = 110;
++    if (params && params->glsl.version && params->glsl.version < 110) {
+         pl_err(log, "Requested GLSL version %d too low (required: %d)",
+                params->glsl.version, glsl_ver_req);
+         return NULL;
+@@ -208,7 +208,7 @@ struct pl_glsl_version sh_glsl(const pl_shader sh)
+     if (SH_GPU(sh))
+         return SH_GPU(sh)->glsl;
+ 
+-    return (struct pl_glsl_version) { .version = 130 };
++    return (struct pl_glsl_version) { .version = 110 };
+ }
+ 
+ bool sh_try_compute(pl_shader sh, int bw, int bh, bool flex, size_t mem)
+@@ -425,7 +425,12 @@ ident_t sh_const(pl_shader sh, struct pl_shader_const sc)
+         GLSLH("const int "$" = %d; \n", id, *(int *) sc.data);
+         return id;
+     case PL_VAR_UINT:
+-        GLSLH("const uint "$" = uint(%u); \n", id, *(unsigned int *) sc.data);
++        // GLSL < 130 doesn't have uint type, use int instead
++        if (sh_glsl(sh).version < 130) {
++            GLSLH("const int "$" = int(%u); \n", id, *(unsigned int *) sc.data);
++        } else {
++            GLSLH("const uint "$" = uint(%u); \n", id, *(unsigned int *) sc.data);
++        }
+         return id;
+     case PL_VAR_FLOAT:
+         GLSLH("const float "$" = float(%f); \n", id, *(float *) sc.data);
+@@ -959,26 +964,49 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
+     ident_t randfun = sh_fresh(sh, "rand"),
+             state = sh_fresh(sh, "state");
+ 
+-    // Based on pcg3d (http://jcgt.org/published/0009/03/02/)
+-    GLSLP("#define prng_t uvec3\n");
+-    GLSLH("vec3 "$"(inout uvec3 s) {                    \n"
+-          "    s = 1664525u * s + uvec3(1013904223u);   \n"
+-          "    s.x += s.y * s.z;                        \n"
+-          "    s.y += s.z * s.x;                        \n"
+-          "    s.z += s.x * s.y;                        \n"
+-          "    s ^= s >> 16u;                           \n"
+-          "    s.x += s.y * s.z;                        \n"
+-          "    s.y += s.z * s.x;                        \n"
+-          "    s.z += s.x * s.y;                        \n"
+-          "    return vec3(s) * 1.0/float(0xFFFFFFFFu); \n"
+-          "}                                            \n",
+-          randfun);
+-
+-    if (temporal) {
+-        GLSL("uvec3 "$" = uvec3(gl_FragCoord.xy, "$"); \n",
+-             state, SH_UINT_DYN(SH_PARAMS(sh).index));
++    const struct pl_glsl_version glsl = sh_glsl(sh);
++
++    if (glsl.version < 130) {
++        // GLSL < 130: Use float-based PRNG (no uvec3 support)
++        // Based on simple hash function using trigonometry
++        GLSLP("#define prng_t vec3\n");
++        GLSLH("vec3 "$"(inout vec3 s) {                             \n"
++              "    vec3 p = fract(s * vec3(0.1031, 0.1030, 0.0973)); \n"
++              "    p += dot(p, p.yzx + 33.33);                       \n"
++              "    s = fract((p.xxy + p.yzz) * p.zyx);               \n"
++              "    return fract(s * vec3(12.9898, 78.233, 37.719));  \n"
++              "}                                                     \n",
++              randfun);
++
++        if (temporal) {
++            GLSL("vec3 "$" = vec3(gl_FragCoord.xy, float("$")); \n",
++                 state, SH_UINT_DYN(SH_PARAMS(sh).index));
++        } else {
++            GLSL("vec3 "$" = vec3(gl_FragCoord.xy, 0.0); \n", state);
++        }
+     } else {
+-        GLSL("uvec3 "$" = uvec3(gl_FragCoord.xy, 0.0); \n", state);
++        // GLSL >= 130: Use uvec3-based PRNG (pcg3d)
++        // Based on pcg3d (http://jcgt.org/published/0009/03/02/)
++        GLSLP("#define prng_t uvec3\n");
++        GLSLH("vec3 "$"(inout uvec3 s) {                    \n"
++              "    s = 1664525u * s + uvec3(1013904223u);   \n"
++              "    s.x += s.y * s.z;                        \n"
++              "    s.y += s.z * s.x;                        \n"
++              "    s.z += s.x * s.y;                        \n"
++              "    s ^= s >> 16u;                           \n"
++              "    s.x += s.y * s.z;                        \n"
++              "    s.y += s.z * s.x;                        \n"
++              "    s.z += s.x * s.y;                        \n"
++              "    return vec3(s) * 1.0/float(0xFFFFFFFFu); \n"
++              "}                                            \n",
++              randfun);
++
++        if (temporal) {
++            GLSL("uvec3 "$" = uvec3(gl_FragCoord.xy, "$"); \n",
++                 state, SH_UINT_DYN(SH_PARAMS(sh).index));
++        } else {
++            GLSL("uvec3 "$" = uvec3(gl_FragCoord.xy, 0.0); \n", state);
++        }
+     }
+ 
+     if (p_state)
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 475af5ab..29b0d977 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -1866,6 +1866,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+         }
+ 
+         bool need_recovery = tone.input_max >= tone.output_max;
++        // GLSL < 130 doesn't support textureSize() needed by contrast recovery
++        if (sh_glsl(sh).version < 130 && need_recovery && params->contrast_recovery) {
++            PL_DEBUG(sh, "GLSL < 130: contrast recovery unavailable, skipping");
++            need_recovery = false;
++        }
+         if (need_recovery && params->contrast_recovery && args->feature_map) {
+             ident_t pos, pt;
+             ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+index 4ef08178..4af70c27 100644
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -1153,7 +1153,17 @@ static bool bind_pass_tex(pl_shader sh, pl_str name,
+     GLSLH("#define %.*s_raw "$" \n", PL_STR_FMT(name), id);
+     GLSLH("#define %.*s_pos "$" \n", PL_STR_FMT(name), pos);
+     GLSLH("#define %.*s_map "$"_map \n", PL_STR_FMT(name), pos);
+-    GLSLH("#define %.*s_size vec2(textureSize("$", 0)) \n", PL_STR_FMT(name), id);
++    // GLSL < 130 doesn't support textureSize(), use uniform instead
++    if (sh_glsl(sh).version < 130) {
++        float size[2] = { ptex->tex->params.w, ptex->tex->params.h };
++        GLSLH("#define %.*s_size "$" \n", PL_STR_FMT(name),
++              sh_var(sh, (struct pl_shader_var) {
++                  .var = pl_var_vec2("tex_size"),
++                  .data = size,
++        }));
++    } else {
++        GLSLH("#define %.*s_size vec2(textureSize("$", 0)) \n", PL_STR_FMT(name), id);
++    }
+     GLSLH("#define %.*s_pt "$" \n", PL_STR_FMT(name), pt);
+ 
+     float off[2] = { ptex->rect.x0, ptex->rect.y0 };
+diff --git a/src/shaders/deinterlacing.c b/src/shaders/deinterlacing.c
+index 27b285e2..3ee25fdd 100644
+--- a/src/shaders/deinterlacing.c
++++ b/src/shaders/deinterlacing.c
+@@ -27,6 +27,12 @@ void pl_shader_deinterlace(pl_shader sh, const struct pl_deinterlace_source *src
+ {
+     params = PL_DEF(params, &pl_deinterlace_default_params);
+ 
++    // GLSL < 130 doesn't support textureSize() needed by deinterlacing
++    if (sh_glsl(sh).version < 130) {
++        PL_WARN(sh, "GLSL < 130: deinterlacing unavailable");
++        return;
++    }
++
+     const struct pl_tex_params *texparams = &src->cur.top->params;
+     if (!sh_require(sh, PL_SHADER_SIG_NONE, texparams->w, texparams->h))
+         return;
+diff --git a/src/shaders/dithering.c b/src/shaders/dithering.c
+index 4485d110..df6ca580 100644
+--- a/src/shaders/dithering.c
++++ b/src/shaders/dithering.c
+@@ -165,11 +165,23 @@ void pl_shader_dither(pl_shader sh, int new_depth,
+     goto done;
+ 
+ fallback:
+-    method = PL_DITHER_ORDERED_FIXED;
++    // GLSL < 130 doesn't support uvec2/uint types needed for ORDERED_FIXED
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: Using white noise dither instead of ordered fixed");
++        method = PL_DITHER_WHITE_NOISE;
++    } else {
++        method = PL_DITHER_ORDERED_FIXED;
++    }
+     // fall through
+ 
+ done: ;
+ 
++    // GLSL < 130 check: If still using ORDERED_FIXED, switch to white noise
++    if (method == PL_DITHER_ORDERED_FIXED && sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: Forcing white noise dither (ordered fixed unsupported)");
++        method = PL_DITHER_WHITE_NOISE;
++    }
++
+     int size = 0;
+     if (lut) {
+         size = lut_size;
+diff --git a/src/shaders/lut.c b/src/shaders/lut.c
+index b0124fcc..6ba5684f 100644
+--- a/src/shaders/lut.c
++++ b/src/shaders/lut.c
+@@ -435,7 +435,10 @@ next_dim: ; // `continue` out of the inner loop
+         }
+     }
+ 
+-    bool can_uniform = gpu && gpu->limits.max_variable_comps >= size * params->comps;
++    // Reserve some headroom for other uniforms (matrices, textures coords, etc)
++    // This is especially important for GL 2.0 where max_variable_comps may be small
++    const size_t uniform_headroom = 256;
++    bool can_uniform = gpu && gpu->limits.max_variable_comps >= size * params->comps + uniform_headroom;
+     bool can_literal = sh_glsl(sh).version > 110; // needed for literal arrays
+     can_literal &= size <= SH_LUT_MAX_LITERAL_HARD && !params->dynamic;
+ 
+diff --git a/src/shaders/sampling.c b/src/shaders/sampling.c
+index 55e966d4..edcb1dfa 100644
+--- a/src/shaders/sampling.c
++++ b/src/shaders/sampling.c
+@@ -317,6 +317,12 @@ bool pl_shader_sample_bilinear(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src)
+ {
++    // GLSL < 130 doesn't support textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: bicubic sampling unavailable, using fallback");
++        return false;
++    }
++
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -365,6 +371,12 @@ bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src)
+ {
++    // GLSL < 130 doesn't support textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: hermite sampling unavailable, using fallback");
++        return false;
++    }
++
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -391,6 +403,12 @@ bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src)
+ {
++    // GLSL < 130 doesn't support textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: gaussian sampling unavailable, using fallback");
++        return false;
++    }
++
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -436,6 +454,12 @@ bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src)
+ bool pl_shader_sample_oversample(pl_shader sh, const struct pl_sample_src *src,
+                                  float threshold)
+ {
++    // GLSL < 130 doesn't support textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: oversample unavailable, using fallback");
++        return false;
++    }
++
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -593,6 +617,12 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+         return false;
+     }
+ 
++    // GLSL < 130 doesn't support textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: polar sampling unavailable, using fallback");
++        return false;
++    }
++
+     uint8_t cmask;
+     float rx, ry, scalef;
+     ident_t src_tex, pos, pt, scale;
+@@ -956,6 +986,12 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+         return false;
+     }
+ 
++    // GLSL < 130 doesn't support uint types and textureSize() needed by this shader
++    if (sh_glsl(sh).version < 130) {
++        PL_DEBUG(sh, "GLSL < 130: ortho sampling unavailable, using fallback");
++        return false;
++    }
++
+     pl_gpu gpu = SH_GPU(sh);
+     pl_assert(gpu);
+ 
+@@ -1112,6 +1148,15 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
+     if (!sh_require(sh, PL_SHADER_SIG_NONE, out_w, out_h))
+         return;
+ 
++    // GLSL < 130: Disable bicubic mode (needs textureSize()), fall back to bilinear
++    struct pl_distort_params compat_params;
++    if (sh_glsl(sh).version < 130 && params->bicubic) {
++        PL_DEBUG(sh, "GLSL < 130: distort bicubic unavailable, using bilinear");
++        compat_params = *params;
++        compat_params.bicubic = false;
++        params = &compat_params;
++    }
++
+     const int src_w = src_tex->params.w, src_h = src_tex->params.h;
+     float rx = 1.0f, ry = 1.0f;
+     if (src_w > src_h) {
