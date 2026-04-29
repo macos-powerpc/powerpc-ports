@@ -1,0 +1,808 @@
+From d4b419347b785461a8da6440ed62923398794a10 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 3 Mar 2026 12:41:31 +0000
+Subject: [PATCH] video/out: add Cocoa OpenGL backend for macOS 10.6
+
+Add a simplified Cocoa implementation based on mpv v0.28.0 for legacy
+macOS systems (10.6 Snow Leopard).
+
+Changes:
+- Add cocoa_common.h/m for Cocoa window management and event handling
+- Add context_cocoa_legacy.m as OpenGL context provider
+- Use CGL (Core Graphics Layer) with Legacy profile for GL 2.0/2.1
+- Remove modern features not available in 10.6:
+  * Touch Bar support (requires 10.12.2+)
+  * Retina/HiDPI APIs (requires 10.7+)
+  * CVDisplayLink for vsync (simplified)
+  * Native fullscreen transitions (uses simple style mask change)
+- Integrate into meson.build when gl-cocoa feature is enabled
+- Register ra_ctx_cocoa_legacy in GPU context list
+
+The simplified implementation maintains core functionality:
+- Window creation, positioning, and fullscreen
+- OpenGL context creation and buffer swapping
+- Basic event handling and cursor management
+- Power management (screensaver prevention)
+- Compatible with macOS 10.6 APIs
+
+Implementation is ~507 lines (vs 1125 in v0.28.0), removing features
+that require newer macOS versions or are unnecessary for basic playback.
+---
+ meson.build                             |   2 +
+ video/out/cocoa_common.h                |  40 ++
+ video/out/cocoa_common.m                | 507 ++++++++++++++++++++++++
+ video/out/gpu/context.c                 |   4 +
+ video/out/opengl/context_cocoa_legacy.m | 165 ++++++++
+ 5 files changed, 718 insertions(+)
+ create mode 100644 video/out/cocoa_common.h
+ create mode 100644 video/out/cocoa_common.m
+ create mode 100644 video/out/opengl/context_cocoa_legacy.m
+
+diff --git a/meson.build b/meson.build
+index 5ffe559768..9304fa223a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1151,6 +1151,8 @@ features += {'gl-cocoa': gl_cocoa.allowed()}
+ if features['gl-cocoa']
+     dependencies += GL
+     features += {'gl': true}
++    sources += files('video/out/cocoa_common.m',
++                     'video/out/opengl/context_cocoa_legacy.m')
+ endif
+ 
+ gl_win32 = get_option('gl-win32').require(
+diff --git a/video/out/cocoa_common.h b/video/out/cocoa_common.h
+new file mode 100644
+index 0000000000..076136dabe
+--- /dev/null
++++ b/video/out/cocoa_common.h
+@@ -0,0 +1,40 @@
++/*
++ * Cocoa OpenGL Backend
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef MPLAYER_COCOA_COMMON_H
++#define MPLAYER_COCOA_COMMON_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <OpenGL/OpenGL.h>
++
++struct vo;
++struct vo_cocoa_state;
++
++void vo_cocoa_init(struct vo *vo);
++void vo_cocoa_uninit(struct vo *vo);
++
++int vo_cocoa_config_window(struct vo *vo);
++
++int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg);
++
++void vo_cocoa_swap_buffers(struct vo *vo);
++void vo_cocoa_set_opengl_ctx(struct vo *vo, CGLContextObj ctx);
++
++#endif /* MPLAYER_COCOA_COMMON_H */
+diff --git a/video/out/cocoa_common.m b/video/out/cocoa_common.m
+new file mode 100644
+index 0000000000..4bae851738
+--- /dev/null
++++ b/video/out/cocoa_common.m
+@@ -0,0 +1,507 @@
++/*
++ * Cocoa OpenGL Backend (macOS 10.6 Compatible)
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Simplified version for macOS 10.6 Snow Leopard compatibility.
++ * Removed: Touch Bar, Retina display support, modern Cocoa APIs.
++ */
++
++#import <Cocoa/Cocoa.h>
++#import <IOKit/pwr_mgt/IOPMLib.h>
++#import <IOKit/IOKitLib.h>
++#include <pthread.h>
++
++#import "cocoa_common.h"
++
++#include "config.h"
++#include "options/options.h"
++#include "video/out/vo.h"
++#include "common/msg.h"
++#include "input/input.h"
++#include "osdep/threads.h"
++#include "osdep/timer.h"
++
++// Forward declarations
++static void vo_cocoa_fullscreen(struct vo *vo);
++static void vo_cocoa_update_screen_info(struct vo *vo);
++
++// Simple NSView subclass for OpenGL rendering
++@interface MpvGLView : NSView
++@end
++
++@implementation MpvGLView
++- (BOOL)isOpaque { return YES; }
++- (BOOL)acceptsFirstResponder { return YES; }
++@end
++
++// Simple window class
++@interface MpvWindow : NSWindow
++{
++    struct vo *_vo;
++}
++- (void)setVideoOutput:(struct vo *)vo;
++@end
++
++@implementation MpvWindow
++
++- (void)setVideoOutput:(struct vo *)vo
++{
++    _vo = vo;
++}
++
++- (BOOL)canBecomeKeyWindow { return YES; }
++- (BOOL)canBecomeMainWindow { return YES; }
++
++@end
++
++struct vo_cocoa_state {
++    // Window and view
++    NSWindow *window;
++    NSView *view;
++
++    // OpenGL context
++    CGLContextObj cgl_ctx;
++    NSOpenGLContext *nsgl_ctx;
++
++    // Screen info
++    NSScreen *current_screen;
++    CGDirectDisplayID display_id;
++
++    // Window state
++    bool embedded;
++    bool fullscreen;
++    NSRect unfs_window;
++    NSRect unfs_content;
++    NSInteger window_level;
++
++    // Cursor visibility
++    bool cursor_visible;
++    bool cursor_visibility_wanted;
++
++    // Power management
++    IOPMAssertionID power_mgmt_assertion;
++
++    // Synchronization
++    pthread_mutex_t lock;
++    pthread_cond_t wakeup;
++
++    // Pending events
++    int pending_events;
++
++    // VO size
++    int vo_dwidth;
++    int vo_dheight;
++
++    // Ready flag
++    bool vo_ready;
++
++    // Window title
++    char *window_title;
++
++    // Log
++    struct mp_log *log;
++};
++
++static void flag_events(struct vo *vo, int events)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++    pthread_mutex_lock(&s->lock);
++    s->pending_events |= events;
++    pthread_mutex_unlock(&s->lock);
++    if (events)
++        vo_wakeup(vo);
++}
++
++static void enable_power_management(struct vo_cocoa_state *s)
++{
++    if (!s->power_mgmt_assertion) return;
++    IOPMAssertionRelease(s->power_mgmt_assertion);
++    s->power_mgmt_assertion = kIOPMNullAssertionID;
++}
++
++static void disable_power_management(struct vo_cocoa_state *s)
++{
++    if (s->power_mgmt_assertion) return;
++    IOPMAssertionCreateWithName(
++            kIOPMAssertionTypePreventUserIdleDisplaySleep,
++            kIOPMAssertionLevelOn,
++            CFSTR("io.mpv.video_playing_back"),
++            &s->power_mgmt_assertion);
++}
++
++static void run_on_main_thread(struct vo *vo, void(^block)(void))
++{
++    dispatch_sync(dispatch_get_main_queue(), block);
++}
++
++static NSScreen *get_screen_by_id(struct vo *vo, int screen_id)
++{
++    NSArray *screens = [NSScreen screens];
++    int n_of_displays = [screens count];
++
++    if (screen_id >= n_of_displays || screen_id < 0) {
++        return nil;
++    }
++
++    return [screens objectAtIndex:screen_id];
++}
++
++static void vo_cocoa_update_screen_info(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++    struct mp_vo_opts *opts = vo->opts;
++
++    if (s->embedded)
++        return;
++
++    if (s->current_screen && s->window) {
++        s->current_screen = [s->window screen];
++    } else if (!s->current_screen) {
++        s->current_screen = get_screen_by_id(vo, opts->screen_id);
++        if (!s->current_screen)
++            s->current_screen = [NSScreen mainScreen];
++    }
++
++    NSDictionary *sinfo = [s->current_screen deviceDescription];
++    s->display_id = [[sinfo objectForKey:@"NSScreenNumber"] longValue];
++}
++
++static void vo_cocoa_update_cursor_visibility(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    if (s->embedded)
++        return;
++
++    if (s->cursor_visibility_wanted && !s->cursor_visible) {
++        [NSCursor unhide];
++        s->cursor_visible = true;
++    } else if (!s->cursor_visibility_wanted && s->cursor_visible) {
++        [NSCursor hide];
++        s->cursor_visible = false;
++    }
++}
++
++static void vo_set_level(struct vo *vo, int ontop)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    if (ontop) {
++        s->window_level = NSFloatingWindowLevel;
++    } else {
++        s->window_level = NSNormalWindowLevel;
++    }
++
++    [s->window setLevel:s->window_level];
++}
++
++static MpvWindow *create_window(NSRect rect, NSScreen *s, bool border)
++{
++    int window_mask = 0;
++    if (border) {
++        window_mask = NSTitledWindowMask | NSClosableWindowMask |
++                      NSMiniaturizableWindowMask | NSResizableWindowMask;
++    } else {
++        window_mask = NSBorderlessWindowMask | NSResizableWindowMask;
++    }
++
++    MpvWindow *w = [[MpvWindow alloc] initWithContentRect:rect
++                                                styleMask:window_mask
++                                                  backing:NSBackingStoreBuffered
++                                                    defer:NO
++                                                   screen:s];
++    return w;
++}
++
++static void create_ui(struct vo *vo, NSRect *win_rect)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++    struct mp_vo_opts *opts = vo->opts;
++
++    NSView *parent;
++    if (s->embedded) {
++        parent = (NSView *)(intptr_t)opts->WinID;
++    } else {
++        s->window = create_window(*win_rect, s->current_screen, opts->border);
++        [(MpvWindow *)s->window setVideoOutput:vo];
++        [s->window setDelegate:(id)s->window];
++        parent = [s->window contentView];
++    }
++
++    s->view = [[MpvGLView alloc] initWithFrame:[parent bounds]];
++    [parent addSubview:s->view];
++
++    [s->nsgl_ctx setView:s->view];
++
++    if (!s->embedded) {
++        [s->window makeMainWindow];
++        [s->window makeKeyAndOrderFront:nil];
++        [NSApp activateIgnoringOtherApps:YES];
++    }
++}
++
++static void cocoa_set_window_title(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    if (s->embedded || !s->window_title)
++        return;
++
++    NSString *nstitle = [NSString stringWithUTF8String:s->window_title];
++    if (nstitle) {
++        [s->window setTitle:nstitle];
++    }
++}
++
++void vo_cocoa_init(struct vo *vo)
++{
++    struct vo_cocoa_state *s = talloc_zero(NULL, struct vo_cocoa_state);
++    *s = (struct vo_cocoa_state){
++        .power_mgmt_assertion = kIOPMNullAssertionID,
++        .log = mp_log_new(s, vo->log, "cocoa"),
++        .embedded = vo->opts->WinID >= 0,
++        .cursor_visible = true,
++        .cursor_visibility_wanted = true,
++        .fullscreen = false,
++    };
++
++    pthread_mutex_init(&s->lock, NULL);
++    pthread_cond_init(&s->wakeup, NULL);
++
++    vo->cocoa = s;
++
++    vo_cocoa_update_screen_info(vo);
++
++    if (!s->embedded) {
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++    }
++}
++
++void vo_cocoa_uninit(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    if (!s)
++        return;
++
++    run_on_main_thread(vo, ^{
++        if (s->window) {
++            vo_cocoa_update_cursor_visibility(vo);
++            [s->window setDelegate:nil];
++            [s->window close];
++        }
++
++        enable_power_management(s);
++
++        [s->nsgl_ctx release];
++        CGLReleaseContext(s->cgl_ctx);
++
++        [s->view removeFromSuperview];
++        [s->view release];
++    });
++
++    pthread_cond_destroy(&s->wakeup);
++    pthread_mutex_destroy(&s->lock);
++
++    talloc_free(s);
++    vo->cocoa = NULL;
++}
++
++void vo_cocoa_set_opengl_ctx(struct vo *vo, CGLContextObj ctx)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++    run_on_main_thread(vo, ^{
++        s->cgl_ctx = CGLRetainContext(ctx);
++        s->nsgl_ctx = [[NSOpenGLContext alloc] initWithCGLContextObj:s->cgl_ctx];
++    });
++}
++
++int vo_cocoa_config_window(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++    struct mp_vo_opts *opts = vo->opts;
++
++    run_on_main_thread(vo, ^{
++        NSRect screen_frame = [s->current_screen frame];
++
++        // Calculate window size
++        int width = vo->dwidth;
++        int height = vo->dheight;
++
++        // Center the window on screen
++        int x = (screen_frame.size.width - width) / 2;
++        int y = (screen_frame.size.height - height) / 2;
++
++        NSRect win_rect = NSMakeRect(x, y, width, height);
++
++        if (!s->view) {
++            create_ui(vo, &win_rect);
++        }
++
++        s->unfs_window = win_rect;
++        s->unfs_content = NSMakeRect(0, 0, width, height);
++
++        if (!s->embedded && s->window) {
++            cocoa_set_window_title(vo);
++            vo_set_level(vo, opts->ontop);
++
++            if (opts->fullscreen && !s->fullscreen) {
++                vo_cocoa_fullscreen(vo);
++            }
++        }
++
++        s->vo_ready = true;
++        s->vo_dwidth = width;
++        s->vo_dheight = height;
++
++        [s->nsgl_ctx update];
++    });
++
++    return 0;
++}
++
++static void vo_cocoa_fullscreen(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    if (s->embedded)
++        return;
++
++    NSScreen *screen = s->current_screen;
++    NSRect screen_frame = [screen frame];
++
++    if (!s->fullscreen) {
++        // Enter fullscreen
++        s->unfs_window = [s->window frame];
++        s->unfs_content = [s->view frame];
++
++        [s->window setStyleMask:NSBorderlessWindowMask];
++        [s->window setFrame:screen_frame display:YES];
++        [s->window setLevel:NSMainMenuWindowLevel + 1];
++
++        s->fullscreen = true;
++    } else {
++        // Exit fullscreen
++        [s->window setStyleMask:NSTitledWindowMask | NSClosableWindowMask |
++                                NSMiniaturizableWindowMask | NSResizableWindowMask];
++        [s->window setFrame:s->unfs_window display:YES];
++        [s->window setLevel:s->window_level];
++
++        s->fullscreen = false;
++    }
++
++    flag_events(vo, VO_EVENT_RESIZE);
++}
++
++void vo_cocoa_swap_buffers(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    // Simple synchronous swap
++    [s->nsgl_ctx flushBuffer];
++}
++
++static int vo_cocoa_check_events(struct vo *vo)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    pthread_mutex_lock(&s->lock);
++    int events = s->pending_events;
++    s->pending_events = 0;
++
++    if (events & VO_EVENT_RESIZE) {
++        vo->dwidth = s->vo_dwidth;
++        vo->dheight = s->vo_dheight;
++    }
++    pthread_mutex_unlock(&s->lock);
++
++    return events;
++}
++
++static int vo_cocoa_control_on_main_thread(struct vo *vo, int request, void *arg)
++{
++    struct vo_cocoa_state *s = vo->cocoa;
++
++    switch (request) {
++    case VOCTRL_FULLSCREEN:
++        vo_cocoa_fullscreen(vo);
++        return VO_TRUE;
++    case VOCTRL_GET_FULLSCREEN:
++        *(int *)arg = s->fullscreen;
++        return VO_TRUE;
++    case VOCTRL_ONTOP:
++        vo_set_level(vo, vo->opts->ontop);
++        return VO_TRUE;
++    case VOCTRL_BORDER:
++        // Border changes not supported in this simplified version
++        return VO_NOTIMPL;
++    case VOCTRL_GET_UNFS_WINDOW_SIZE: {
++        int *sz = arg;
++        NSRect rect = s->fullscreen ? s->unfs_content : [s->view frame];
++        sz[0] = rect.size.width;
++        sz[1] = rect.size.height;
++        return VO_TRUE;
++    }
++    case VOCTRL_SET_UNFS_WINDOW_SIZE: {
++        int *sz = arg;
++        NSRect r = NSMakeRect(0, 0, sz[0], sz[1]);
++        if (!s->fullscreen && s->window) {
++            [s->window setContentSize:r.size];
++            s->vo_dwidth = sz[0];
++            s->vo_dheight = sz[1];
++            flag_events(vo, VO_EVENT_RESIZE);
++        }
++        return VO_TRUE;
++    }
++    case VOCTRL_SET_CURSOR_VISIBILITY:
++        s->cursor_visibility_wanted = *(bool *)arg;
++        vo_cocoa_update_cursor_visibility(vo);
++        return VO_TRUE;
++    case VOCTRL_UPDATE_WINDOW_TITLE:
++        talloc_free(s->window_title);
++        s->window_title = talloc_strdup(s, (char *)arg);
++        cocoa_set_window_title(vo);
++        return VO_TRUE;
++    case VOCTRL_RESTORE_SCREENSAVER:
++        enable_power_management(s);
++        return VO_TRUE;
++    case VOCTRL_KILL_SCREENSAVER:
++        disable_power_management(s);
++        return VO_TRUE;
++    case VOCTRL_GET_DISPLAY_FPS:
++        // Return a default 60Hz for simplicity
++        *(double *)arg = 60.0;
++        return VO_TRUE;
++    }
++
++    return VO_NOTIMPL;
++}
++
++int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg)
++{
++    if (request == VOCTRL_CHECK_EVENTS) {
++        *events |= vo_cocoa_check_events(vo);
++        return VO_TRUE;
++    }
++
++    __block int r = VO_NOTIMPL;
++    run_on_main_thread(vo, ^{
++        r = vo_cocoa_control_on_main_thread(vo, request, arg);
++    });
++
++    return r;
++}
+diff --git a/video/out/gpu/context.c b/video/out/gpu/context.c
+index 60c0641a70..4c08ad72ba 100644
+--- a/video/out/gpu/context.c
++++ b/video/out/gpu/context.c
+@@ -42,6 +42,7 @@ extern const struct ra_ctx_fns ra_ctx_wgl;
+ extern const struct ra_ctx_fns ra_ctx_angle;
+ extern const struct ra_ctx_fns ra_ctx_dxgl;
+ extern const struct ra_ctx_fns ra_ctx_android;
++extern const struct ra_ctx_fns ra_ctx_cocoa_legacy;
+ 
+ /* Vulkan */
+ extern const struct ra_ctx_fns ra_ctx_vulkan_wayland;
+@@ -102,6 +103,9 @@ static const struct ra_ctx_fns *const contexts[] = {
+ #if HAVE_EGL_ANDROID
+     &ra_ctx_android,
+ #endif
++#if HAVE_GL_COCOA
++    &ra_ctx_cocoa_legacy,
++#endif
+ #if HAVE_EGL_ANGLE_WIN32
+     &ra_ctx_angle,
+ #endif
+diff --git a/video/out/opengl/context_cocoa_legacy.m b/video/out/opengl/context_cocoa_legacy.m
+new file mode 100644
+index 0000000000..6383001615
+--- /dev/null
++++ b/video/out/opengl/context_cocoa_legacy.m
+@@ -0,0 +1,165 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <OpenGL/OpenGL.h>
++#include <dlfcn.h>
++#include "video/out/cocoa_common.h"
++#include "context.h"
++
++struct priv {
++    GL gl;
++    CGLPixelFormatObj pix;
++    CGLContextObj ctx;
++};
++
++static int set_swap_interval(int enabled)
++{
++    CGLContextObj ctx = CGLGetCurrentContext();
++    CGLError err = CGLSetParameter(ctx, kCGLCPSwapInterval, &enabled);
++    return (err == kCGLNoError) ? 0 : -1;
++}
++
++static void *cocoa_glgetaddr(const char *s)
++{
++    void *ret = NULL;
++    void *handle = dlopen(
++        "/System/Library/Frameworks/OpenGL.framework/OpenGL",
++        RTLD_LAZY | RTLD_LOCAL);
++    if (!handle)
++        return NULL;
++    ret = dlsym(handle, s);
++    dlclose(handle);
++    return ret;
++}
++
++static bool create_gl_context(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    GL *gl = &p->gl;
++
++    // For macOS 10.6, use Legacy profile to get OpenGL 2.0/2.1
++    CGLPixelFormatAttribute attrs[] = {
++        kCGLPFAOpenGLProfile,
++        (CGLPixelFormatAttribute) kCGLOGLPVersion_Legacy,
++        kCGLPFAAccelerated,
++        kCGLPFADoubleBuffer,
++        kCGLPFAColorSize, 24,
++        kCGLPFAAlphaSize, 8,
++        kCGLPFADepthSize, 16,
++        0
++    };
++
++    GLint npix;
++    CGLError err = CGLChoosePixelFormat(attrs, &p->pix, &npix);
++    if (err != kCGLNoError) {
++        MP_ERR(ctx->vo, "error creating CGL pixel format: %s (%d)\n",
++               CGLErrorString(err), err);
++        return false;
++    }
++
++    err = CGLCreateContext(p->pix, 0, &p->ctx);
++    if (err != kCGLNoError) {
++        MP_FATAL(ctx->vo, "error creating CGL context: %s (%d)\n",
++                 CGLErrorString(err), err);
++        CGLReleasePixelFormat(p->pix);
++        return false;
++    }
++
++    vo_cocoa_set_opengl_ctx(ctx->vo, p->ctx);
++    CGLSetCurrentContext(p->ctx);
++
++    if (ctx->opts.want_alpha)
++        CGLSetParameter(p->ctx, kCGLCPSurfaceOpacity, &(GLint){0});
++
++    mpgl_load_functions(gl, (void *)cocoa_glgetaddr, NULL, ctx->vo->log);
++    gl->SwapInterval = set_swap_interval;
++
++    CGLReleasePixelFormat(p->pix);
++
++    return true;
++}
++
++static void cocoa_uninit(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    ra_gl_ctx_uninit(ctx);
++    if (p->ctx)
++        CGLReleaseContext(p->ctx);
++    vo_cocoa_uninit(ctx->vo);
++}
++
++static void cocoa_swap_buffers(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    GL *gl = &p->gl;
++    vo_cocoa_swap_buffers(ctx->vo);
++    gl->Flush();
++}
++
++static bool cocoa_init(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
++    GL *gl = &p->gl;
++
++    vo_cocoa_init(ctx->vo);
++
++    if (!create_gl_context(ctx))
++        goto fail;
++
++    struct ra_ctx_params params = {
++        .swap_buffers = cocoa_swap_buffers,
++    };
++
++    if (!ra_gl_ctx_init(ctx, gl, params))
++        goto fail;
++
++    return true;
++
++fail:
++    cocoa_uninit(ctx);
++    return false;
++}
++
++static void resize(struct ra_ctx *ctx)
++{
++    ra_gl_ctx_resize(ctx->swapchain, ctx->vo->dwidth, ctx->vo->dheight, 0);
++}
++
++static bool cocoa_reconfig(struct ra_ctx *ctx)
++{
++    vo_cocoa_config_window(ctx->vo);
++    resize(ctx);
++    return true;
++}
++
++static int cocoa_control(struct ra_ctx *ctx, int *events, int request,
++                         void *arg)
++{
++    int ret = vo_cocoa_control(ctx->vo, events, request, arg);
++    if (*events & VO_EVENT_RESIZE)
++        resize(ctx);
++    return ret;
++}
++
++const struct ra_ctx_fns ra_ctx_cocoa_legacy = {
++    .type           = "opengl",
++    .name           = "cocoa",
++    .init           = cocoa_init,
++    .reconfig       = cocoa_reconfig,
++    .control        = cocoa_control,
++    .uninit         = cocoa_uninit,
++};
+-- 
+2.43.0
+
