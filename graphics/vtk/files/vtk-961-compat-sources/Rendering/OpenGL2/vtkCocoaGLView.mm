@@ -584,7 +584,9 @@ static const char* MacKeyCodeToKeySymTable[128] = {
   NSURL* fileURL;
   while ((fileURL = [urlEnumerator nextObject]) != nil)
   {
-    const char* filePath = [fileURL fileSystemRepresentation];
+    // Use -path and UTF8String instead of -fileSystemRepresentation for 10.5/10.6 SDK compatibility
+    // (-fileSystemRepresentation was added in 10.9)
+    const char* filePath = [[fileURL path] UTF8String];
     filePaths->InsertNextValue(filePath);
   }
 
@@ -656,13 +658,18 @@ static const char* MacKeyCodeToKeySymTable[128] = {
 }
 
 //----------------------------------------------------------------------------
-// Overridden (from NSView).
+// Overridden (from NSView). Available in 10.7+.
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
 - (void)viewDidChangeBackingProperties
 {
-  [super viewDidChangeBackingProperties];
+  if ([NSView instancesRespondToSelector:@selector(viewDidChangeBackingProperties)])
+  {
+    [super viewDidChangeBackingProperties];
+  }
 
   NSWindow* window = [self window];
   [self modifyDPIForBackingScaleFactorOfWindow:window];
 }
+#endif
 
 @end
