@@ -1698,6 +1698,13 @@ void vtkOpenGLRenderWindow::StereoMidpoint()
 //------------------------------------------------------------------------------
 void vtkOpenGLRenderWindow::Frame()
 {
+  // On legacy OpenGL 2.x without FBO support, just return - rendering went
+  // directly to the default framebuffer
+  if (glBindFramebuffer == nullptr)
+  {
+    return;
+  }
+
   if (this->SwapBuffers)
   {
     this->GetState()->PushFramebufferBindings();
