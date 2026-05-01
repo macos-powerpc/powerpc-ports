@@ -234,6 +234,81 @@ static inline CGFloat vtkCocoaGetBackingScaleFactor(NSWindow* window)
   return 1.0;
 }
 
+// Convert rect from backing coordinates on NSWindow (10.7+)
+// Falls back to identity transform on pre-10.7 systems
+static inline NSRect vtkCocoaWindowConvertRectFromBacking(NSWindow* window, NSRect rect)
+{
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+  if ([window respondsToSelector:@selector(convertRectFromBacking:)])
+  {
+    return [window convertRectFromBacking:rect];
+  }
+#else
+  SEL sel = @selector(convertRectFromBacking:);
+  if ([window respondsToSelector:sel])
+  {
+    typedef NSRect (*MsgSendRectRect)(id, SEL, NSRect);
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64__)
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend;
+#else
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend_stret;
+#endif
+    return msgSend(window, sel, rect);
+  }
+#endif
+  return rect;
+}
+
+// Convert rect to backing coordinates on NSWindow (10.7+)
+// Falls back to identity transform on pre-10.7 systems
+static inline NSRect vtkCocoaWindowConvertRectToBacking(NSWindow* window, NSRect rect)
+{
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+  if ([window respondsToSelector:@selector(convertRectToBacking:)])
+  {
+    return [window convertRectToBacking:rect];
+  }
+#else
+  SEL sel = @selector(convertRectToBacking:);
+  if ([window respondsToSelector:sel])
+  {
+    typedef NSRect (*MsgSendRectRect)(id, SEL, NSRect);
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64__)
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend;
+#else
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend_stret;
+#endif
+    return msgSend(window, sel, rect);
+  }
+#endif
+  return rect;
+}
+
+// Convert rect from backing coordinates on NSScreen (10.7+)
+// Falls back to identity transform on pre-10.7 systems
+static inline NSRect vtkCocoaScreenConvertRectFromBacking(NSScreen* screen, NSRect rect)
+{
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+  if ([screen respondsToSelector:@selector(convertRectFromBacking:)])
+  {
+    return [screen convertRectFromBacking:rect];
+  }
+#else
+  SEL sel = @selector(convertRectFromBacking:);
+  if ([screen respondsToSelector:sel])
+  {
+    typedef NSRect (*MsgSendRectRect)(id, SEL, NSRect);
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64__)
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend;
+#else
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend_stret;
+#endif
+    return msgSend(screen, sel, rect);
+  }
+#endif
+  return rect;
+}
+
 #endif // __OBJC__
 
 // Create handy #defines that indicate the Objective-C memory management model.
