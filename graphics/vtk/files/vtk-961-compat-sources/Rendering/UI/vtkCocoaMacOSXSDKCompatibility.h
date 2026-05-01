@@ -101,45 +101,95 @@
 // These provide runtime checks for the backing coordinate methods
 #ifdef __OBJC__
 #import <Cocoa/Cocoa.h>
+#import <objc/message.h>
+
+// On SDKs < 10.7, the backing coordinate methods don't exist in headers,
+// so we must use objc_msgSend to call them dynamically at runtime.
+// We define typed function pointer casts to maintain type safety.
 
 // Convert point from view coordinates to backing (pixel) coordinates
 // Falls back to identity transform on pre-10.7 systems
 static inline NSPoint vtkCocoaConvertPointToBacking(NSView* view, NSPoint point)
 {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
   if ([view respondsToSelector:@selector(convertPointToBacking:)])
   {
     return [view convertPointToBacking:point];
   }
+#else
+  SEL sel = @selector(convertPointToBacking:);
+  if ([view respondsToSelector:sel])
+  {
+    typedef NSPoint (*MsgSendPointPoint)(id, SEL, NSPoint);
+    MsgSendPointPoint msgSend = (MsgSendPointPoint)objc_msgSend;
+    return msgSend(view, sel, point);
+  }
+#endif
   return point;
 }
 
 // Convert rect from view coordinates to backing (pixel) coordinates
-static inline NSRect vtkCocoaConvertRectToBacking(NSView* view, NSRect rect)
+static inline NSRect vtkCocoaConvertRectToBacking(id viewOrScreen, NSRect rect)
 {
-  if ([view respondsToSelector:@selector(convertRectToBacking:)])
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+  if ([viewOrScreen respondsToSelector:@selector(convertRectToBacking:)])
   {
-    return [view convertRectToBacking:rect];
+    return [viewOrScreen convertRectToBacking:rect];
   }
+#else
+  SEL sel = @selector(convertRectToBacking:);
+  if ([viewOrScreen respondsToSelector:sel])
+  {
+    typedef NSRect (*MsgSendRectRect)(id, SEL, NSRect);
+    // For structs larger than register size, some ABIs use objc_msgSend_stret
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64__)
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend;
+#else
+    MsgSendRectRect msgSend = (MsgSendRectRect)objc_msgSend_stret;
+#endif
+    return msgSend(viewOrScreen, sel, rect);
+  }
+#endif
   return rect;
 }
 
 // Convert size from backing (pixel) coordinates to view coordinates
 static inline NSSize vtkCocoaConvertSizeFromBacking(NSView* view, NSSize size)
 {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
   if ([view respondsToSelector:@selector(convertSizeFromBacking:)])
   {
     return [view convertSizeFromBacking:size];
   }
+#else
+  SEL sel = @selector(convertSizeFromBacking:);
+  if ([view respondsToSelector:sel])
+  {
+    typedef NSSize (*MsgSendSizeSize)(id, SEL, NSSize);
+    MsgSendSizeSize msgSend = (MsgSendSizeSize)objc_msgSend;
+    return msgSend(view, sel, size);
+  }
+#endif
   return size;
 }
 
 // Convert point from backing (pixel) coordinates to view coordinates
 static inline NSPoint vtkCocoaConvertPointFromBacking(NSView* view, NSPoint point)
 {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
   if ([view respondsToSelector:@selector(convertPointFromBacking:)])
   {
     return [view convertPointFromBacking:point];
   }
+#else
+  SEL sel = @selector(convertPointFromBacking:);
+  if ([view respondsToSelector:sel])
+  {
+    typedef NSPoint (*MsgSendPointPoint)(id, SEL, NSPoint);
+    MsgSendPointPoint msgSend = (MsgSendPointPoint)objc_msgSend;
+    return msgSend(view, sel, point);
+  }
+#endif
   return point;
 }
 
@@ -147,20 +197,40 @@ static inline NSPoint vtkCocoaConvertPointFromBacking(NSView* view, NSPoint poin
 // Does nothing on pre-10.7 systems
 static inline void vtkCocoaSetWantsBestResolutionOpenGLSurface(NSView* view, BOOL wantsBest)
 {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
   if ([view respondsToSelector:@selector(setWantsBestResolutionOpenGLSurface:)])
   {
     [view setWantsBestResolutionOpenGLSurface:wantsBest];
   }
+#else
+  SEL sel = @selector(setWantsBestResolutionOpenGLSurface:);
+  if ([view respondsToSelector:sel])
+  {
+    typedef void (*MsgSendVoidBool)(id, SEL, BOOL);
+    MsgSendVoidBool msgSend = (MsgSendVoidBool)objc_msgSend;
+    msgSend(view, sel, wantsBest);
+  }
+#endif
 }
 
 // Get backing scale factor from window (10.7+)
 // Returns 1.0 on pre-10.7 systems
 static inline CGFloat vtkCocoaGetBackingScaleFactor(NSWindow* window)
 {
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
   if ([window respondsToSelector:@selector(backingScaleFactor)])
   {
     return [window backingScaleFactor];
   }
+#else
+  SEL sel = @selector(backingScaleFactor);
+  if ([window respondsToSelector:sel])
+  {
+    typedef CGFloat (*MsgSendCGFloat)(id, SEL);
+    MsgSendCGFloat msgSend = (MsgSendCGFloat)objc_msgSend;
+    return msgSend(window, sel);
+  }
+#endif
   return 1.0;
 }
 
