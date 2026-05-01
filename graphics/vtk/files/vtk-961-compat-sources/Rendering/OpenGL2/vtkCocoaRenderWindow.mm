@@ -401,12 +401,26 @@ const char* vtkCocoaRenderWindow::ReportCapabilities()
        << "\nOpenGL version string:  " << glVersion << endl;
 
   strm << "OpenGL extensions:  " << endl;
-  GLint n, i;
-  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-  for (i = 0; i < n; i++)
+  // glGetStringi and GL_NUM_EXTENSIONS are OpenGL 3.0+
+  // For OpenGL 2.x, use the old glGetString(GL_EXTENSIONS) method
+  if (glGetStringi != nullptr)
   {
-    const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, i);
-    strm << "  " << ext << endl;
+    GLint n, i;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (i = 0; i < n; i++)
+    {
+      const char* ext = (const char*)glGetStringi(GL_EXTENSIONS, i);
+      strm << "  " << ext << endl;
+    }
+  }
+  else
+  {
+    // Legacy OpenGL 2.x path
+    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
+    if (extensions)
+    {
+      strm << "  " << extensions << endl;
+    }
   }
 
   // Obtain the OpenGL context in order to keep track of the current screen.
@@ -450,8 +464,14 @@ const char* vtkCocoaRenderWindow::ReportCapabilities()
   [pixelFormat getValues:&pfd forAttribute:NSOpenGLPFAAccelerated forVirtualScreen:currentScreen];
   strm << "  hardware acceleration:  " << (pfd == 0 ? "No" : "Yes") << endl;
 
-  [pixelFormat getValues:&pfd forAttribute:NSOpenGLPFAOpenGLProfile forVirtualScreen:currentScreen];
-  strm << "  profile version:  0x" << std::hex << pfd << endl;
+  // NSOpenGLPFAOpenGLProfile is only available on 10.7+
+#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+  if ([pixelFormat respondsToSelector:@selector(getValues:forAttribute:forVirtualScreen:)])
+  {
+    [pixelFormat getValues:&pfd forAttribute:NSOpenGLPFAOpenGLProfile forVirtualScreen:currentScreen];
+    strm << "  profile version:  0x" << std::hex << pfd << endl;
+  }
+#endif
 
   delete[] this->Capabilities;
 
