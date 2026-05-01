@@ -918,12 +918,18 @@ void vtkCocoaRenderWindow::CreateGLContext()
 {
   // If the deployment target is at least 10.10, prefer the 'OpenGL 4.1 Core
   // Implementation', otherwise we'll fall back to the 'OpenGL 3.2 Core
-  // Implementation' (available since 10.7).
+  // Implementation' (available since 10.7), or legacy OpenGL for pre-10.7.
   NSOpenGLPixelFormatAttribute profileVersion;
+  bool useProfile = true;  // Whether to include NSOpenGLPFAOpenGLProfile
 #if MAC_OS_X_VERSION_MIN_REQUIRED >= 101000
   profileVersion = NSOpenGLProfileVersion4_1Core;
-#else
+#elif MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
   profileVersion = NSOpenGLProfileVersion3_2Core;
+#else
+  // For 10.5/10.6, start with legacy profile (no NSOpenGLPFAOpenGLProfile)
+  // and only try core profiles at runtime if the system supports them.
+  profileVersion = NSOpenGLProfileVersionLegacy;
+  useProfile = false;  // Don't request a profile on legacy systems initially
 #endif
 
   // Prefer hardware acceleration
@@ -936,8 +942,12 @@ void vtkCocoaRenderWindow::CreateGLContext()
     int i = 0;
     NSOpenGLPixelFormatAttribute attribs[20];
 
-    attribs[i++] = NSOpenGLPFAOpenGLProfile;
-    attribs[i++] = profileVersion;
+    // Only include OpenGL profile on 10.7+ systems
+    if (useProfile)
+    {
+      attribs[i++] = NSOpenGLPFAOpenGLProfile;
+      attribs[i++] = profileVersion;
+    }
 
     attribs[i++] = NSOpenGLPFADepthSize;
     attribs[i++] = (NSOpenGLPixelFormatAttribute)32;
@@ -966,10 +976,15 @@ void vtkCocoaRenderWindow::CreateGLContext()
 
     if (pixelFormat == nil)
     {
-      if (profileVersion != NSOpenGLProfileVersion3_2Core)
+      if (useProfile && profileVersion != NSOpenGLProfileVersion3_2Core)
       {
         // Try falling back to the 3.2 Core Profile
         profileVersion = NSOpenGLProfileVersion3_2Core;
+      }
+      else if (useProfile && profileVersion == NSOpenGLProfileVersion3_2Core)
+      {
+        // Try falling back to legacy OpenGL (no profile specification)
+        useProfile = false;
       }
       else if (hardware == NSOpenGLPFAAccelerated)
       {
