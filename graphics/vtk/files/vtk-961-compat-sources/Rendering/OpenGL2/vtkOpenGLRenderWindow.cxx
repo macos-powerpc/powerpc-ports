@@ -1558,7 +1558,11 @@ int vtkOpenGLRenderWindow::ReadPixels(
 //------------------------------------------------------------------------------
 void vtkOpenGLRenderWindow::End()
 {
-  this->GetState()->PopFramebufferBindings();
+  // Only pop framebuffer bindings if FBOs are available (matches Start())
+  if (glBindFramebuffer != nullptr)
+  {
+    this->GetState()->PopFramebufferBindings();
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -2042,12 +2046,17 @@ void vtkOpenGLRenderWindow::Start()
   // creates or resizes the framebuffer
   this->Size[0] = (this->Size[0] > 0 ? this->Size[0] : 300);
   this->Size[1] = (this->Size[1] > 0 ? this->Size[1] : 300);
-  this->CreateFramebuffers(this->Size[0], this->Size[1]);
 
-  // push and bind
-  this->GetState()->PushFramebufferBindings();
-  this->RenderFramebuffer->Bind();
-  this->RenderFramebuffer->ActivateDrawBuffer(0);
+  // Only use framebuffers if FBO functions are available (OpenGL 3.0+)
+  if (glBindFramebuffer != nullptr)
+  {
+    this->CreateFramebuffers(this->Size[0], this->Size[1]);
+
+    // push and bind
+    this->GetState()->PushFramebufferBindings();
+    this->RenderFramebuffer->Bind();
+    this->RenderFramebuffer->ActivateDrawBuffer(0);
+  }
 }
 
 //------------------------------------------------------------------------------
@@ -2855,6 +2864,14 @@ int vtkOpenGLRenderWindow::CreateFramebuffers(int width, int height)
 {
   assert("pre: positive_width" && width > 0);
   assert("pre: positive_height" && height > 0);
+
+  // Skip framebuffer creation if FBO functions are not available (OpenGL < 3.0)
+  // This allows basic rendering on legacy OpenGL 2.x systems, though many
+  // advanced features will not work.
+  if (glBindFramebuffer == nullptr || glGenFramebuffers == nullptr)
+  {
+    return 0;
+  }
 
 #if defined(__APPLE__)
   // make sure requested multisamples is OK with platform
