@@ -23,7 +23,7 @@ if {${os.arch} eq "powerpc"} {
     PortGroup                   mrustc 1.0
 
     # Rustc version used by mrustc port:
-    set rustc_target_ver        1.54
+    set rustc_target_ver        1.90
 
     default universal_variant   no
 
