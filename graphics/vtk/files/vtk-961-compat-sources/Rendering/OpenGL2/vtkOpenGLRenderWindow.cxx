@@ -1149,6 +1149,23 @@ int vtkOpenGLRenderWindow::GetColorBufferSizes(int* rgba)
   if (this->Initialized)
   {
     this->MakeCurrent();
+
+    // For OpenGL 2.x (legacy), use the old GL_RED_BITS etc. queries
+    // glGetFramebufferAttachmentParameteriv is OpenGL 3.0+ and may not be available
+    if (glGetFramebufferAttachmentParameteriv == nullptr)
+    {
+      // Legacy OpenGL 2.x path using deprecated but functional queries
+      glGetIntegerv(GL_RED_BITS, &size);
+      rgba[0] = static_cast<int>(size);
+      glGetIntegerv(GL_GREEN_BITS, &size);
+      rgba[1] = static_cast<int>(size);
+      glGetIntegerv(GL_BLUE_BITS, &size);
+      rgba[2] = static_cast<int>(size);
+      glGetIntegerv(GL_ALPHA_BITS, &size);
+      rgba[3] = static_cast<int>(size);
+      return rgba[0] + rgba[1] + rgba[2] + rgba[3];
+    }
+
     GLint attachment = GL_BACK_LEFT;
 #ifdef GL_DRAW_BUFFER
     glGetIntegerv(GL_DRAW_BUFFER, &attachment);
