@@ -206,8 +206,10 @@ extern char CocoWindowActiveKey;
 @interface CocoView : NSView <NSWindowDelegate, NSTextInputClient>
 @end
 
-// Use NSWindow directly instead of subclassing to avoid GCC ObjC runtime issues
-typedef NSWindow CocoWindow;
+// CocoWindow subclass - required for canBecomeKeyWindow/canBecomeMainWindow
+// Uses associated objects instead of ivars to avoid GCC ObjC runtime issues
+@interface CocoWindow : NSWindow
+@end
 
 // Helper functions to get/set associated ctrl pointer
 inline Upp::Ctrl* CocoViewGetCtrl(CocoView *view) {

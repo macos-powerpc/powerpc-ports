@@ -4,8 +4,32 @@
 
 #define LLOG(x)
 
-// CocoWindow is now typedef'd to NSWindow - no subclass needed
-// canBecomeKeyWindow and canBecomeMainWindow use default NSWindow behavior
+// CocoWindow implementation - uses associated objects instead of ivars
+// This is required for canBecomeKeyWindow/canBecomeMainWindow which control
+// whether windows (especially modal dialogs) can receive keyboard focus
+
+@implementation CocoWindow
+
+- (void)becomeKeyWindow {
+	[super becomeKeyWindow];
+}
+
+- (BOOL)canBecomeKeyWindow {
+	Upp::GuiLock __;
+	Upp::Ctrl *ctrl = CocoWindowGetCtrl(self);
+	bool active = CocoWindowGetActive(self);
+	return active && ctrl && ctrl->IsEnabled();
+}
+
+- (BOOL)canBecomeMainWindow {
+	Upp::GuiLock __;
+	Upp::Ctrl *ctrl = CocoWindowGetCtrl(self);
+	bool active = CocoWindowGetActive(self);
+	LLOG("canBecomeMainWindow " << Upp::Name(ctrl) << ", owner " << Upp::Name(ctrl->GetOwner()));
+	return active && ctrl && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
+}
+
+@end
 
 namespace Upp {
 
