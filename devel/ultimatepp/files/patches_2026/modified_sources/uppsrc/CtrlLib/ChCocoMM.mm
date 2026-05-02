@@ -2,6 +2,10 @@
 
 #ifdef PLATFORM_COCOA
 
+// Disable old-style Carbon assertion macros (check, verify, require, etc.)
+// to avoid conflicts with identifiers in U++ code (e.g., IMAGE_ID(check))
+// See: https://github.com/opencv/opencv/issues/6047
+#define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
 #include <Carbon/Carbon.h>
 
 #endif

@@ -5,6 +5,13 @@
 
 #if defined(PLATFORM_COCOA) && !defined(VIRTUALGUI)
 
+// Disable old-style Carbon assertion macros (check, verify, require, etc.)
+// to avoid conflicts with identifiers in U++ code (e.g., IMAGE_ID(check))
+// See: https://github.com/opencv/opencv/issues/6047
+#ifndef __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES
+#define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
+#endif
+
 #define Point NS_Point
 #define Rect  NS_Rect
 #define Size  NS_Size
