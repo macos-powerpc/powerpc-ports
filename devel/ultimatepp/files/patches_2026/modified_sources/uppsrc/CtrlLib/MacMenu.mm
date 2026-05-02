@@ -115,8 +115,8 @@ struct CocoMenuBar : public Bar {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.cb = cb;
-			m.nsitem.target = sharedMenuDelegate;
-			m.nsitem.action = @selector(cocoMenuAction:);
+			[m.nsitem setTarget:sharedMenuDelegate];
+			[m.nsitem setAction:@selector(cocoMenuAction:)];
 		}
 		return m;
 	}
@@ -126,8 +126,9 @@ struct CocoMenuBar : public Bar {
 		if(!just_check) {
 			m.submenu.Create();
 			*m.submenu->proc = proc_;
-			m.nsitem.action = @selector(cocoMenuAction:);
-			m.nsitem.submenu = m.submenu->cocomenu;
+			// Note: submenu items don't need action/target - the submenu itself handles opening
+			// The action selector is for the submenu's delegate, not the menu item
+			[m.nsitem setSubmenu:m.submenu->cocomenu];
 		}
 		return m;
 	}
@@ -227,9 +228,9 @@ CocoMenuBar::Item& CocoMenuBar::Item::Text(const char *text)
 			h.Cat(*text++);
 	}
 	NSString *s = [NSString stringWithUTF8String:~h];
-	nsitem.title = s;
+	[nsitem setTitle:s];
 	if(submenu)
-		submenu->cocomenu.title = s;
+		[submenu->cocomenu setTitle:s];
 	return *this;
 }
 
@@ -252,11 +253,11 @@ CocoMenuBar::Item& CocoMenuBar::Item::Key(dword key)
 	auto *v = FindTuple(code, __countof(code), key & ~(K_CTRL|K_SHIFT|K_ALT|K_OPTION));
 	if(v) {
 		unichar chr = v->b;
-		nsitem.keyEquivalent = [NSString stringWithCharacters:&chr length:1];
-		nsitem.keyEquivalentModifierMask = (key & K_CTRL ? NSEventModifierFlagCommand : 0) |
-		                                   (key & K_SHIFT ? NSEventModifierFlagShift : 0) |
-		                                   (key & K_ALT ? NSEventModifierFlagControl : 0) |
-		                                   (key & K_OPTION ? NSEventModifierFlagOption : 0);
+		[nsitem setKeyEquivalent:[NSString stringWithCharacters:&chr length:1]];
+		[nsitem setKeyEquivalentModifierMask:(key & K_CTRL ? NSEventModifierFlagCommand : 0) |
+		                                     (key & K_SHIFT ? NSEventModifierFlagShift : 0) |
+		                                     (key & K_ALT ? NSEventModifierFlagControl : 0) |
+		                                     (key & K_OPTION ? NSEventModifierFlagOption : 0)];
 	}
 	return *this;
 }
@@ -265,7 +266,7 @@ CocoMenuBar::Item& CocoMenuBar::Item::Image(const class Image& img)
 {
 	if(FailCheck())
 		return *this;
-	nsitem.image = GetNSImage(img);
+	[nsitem setImage:GetNSImage(img)];
 	return *this;
 }
 
@@ -273,7 +274,7 @@ CocoMenuBar::Item& CocoMenuBar::Item::Check(bool check)
 {
 	if(FailCheck())
 		return *this;
-	nsitem.state = check ? NSControlStateValueOn : NSControlStateValueOff;
+	[nsitem setState:(check ? NSControlStateValueOn : NSControlStateValueOff)];
 	return *this;
 }
 
@@ -289,7 +290,7 @@ CocoMenuBar::Item& CocoMenuBar::Item::Enable(bool enable)
 	if(FailCheck(enabled == enable))
 		return *this;
 	enabled = enable;
-	nsitem.enabled = enable;
+	[nsitem setEnabled:enable];
 	return *this;
 }
 
