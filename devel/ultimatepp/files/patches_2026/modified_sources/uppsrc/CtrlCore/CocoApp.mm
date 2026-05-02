@@ -318,8 +318,8 @@ void Ctrl::GetWorkArea(Array<Rect>& rc)
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		CGRect frame = [screen visibleFrame];
-		rc.Add(MakeScreenRect(screen, frame));
+		NSRect frame = [screen visibleFrame];
+		rc.Add(MakeScreenRect(screen, NSRectToCGRect(frame)));
 	}
 }
 
@@ -344,8 +344,8 @@ Rect Ctrl::GetVirtualScreenArea()
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		CGRect frame = [screen frame];
-		Rect sr = MakeScreenRect(screen, frame);
+		NSRect frame = [screen frame];
+		Rect sr = MakeScreenRect(screen, NSRectToCGRect(frame));
 		if(first)
 			r = sr;
 		else
@@ -368,8 +368,8 @@ Rect Ctrl::GetScreenArea(Point pt)
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		CGRect frame = [screen frame];
-		Rect rc = MakeScreenRect(screen, frame);
+		NSRect frame = [screen frame];
+		Rect rc = MakeScreenRect(screen, NSRectToCGRect(frame));
 		if(rc.Contains(pt))
 			return rc;
 	}
@@ -381,8 +381,8 @@ Rect Ctrl::GetPrimaryScreenArea()
 	NSArray *screens = [NSScreen screens];
 	if([screens count] > 0) {
 		NSScreen *screen = [screens objectAtIndex:0];
-		CGRect frame = [screen frame];
-		return MakeScreenRect(screen, frame);
+		NSRect frame = [screen frame];
+		return MakeScreenRect(screen, NSRectToCGRect(frame));
 	}
 	return Rect(0, 0, 1024, 768);
 }
@@ -417,7 +417,7 @@ void MMCtrl::SyncRect(CocoView *view)
 	NSScreen *screen = [win screen];
 	NSRect winFrame = [win frame];
 	NSRect contentRect = [win contentRectForFrameRect:winFrame];
-	view->ctrl->SetWndRect(MakeScreenRect(screen, contentRect));
+	view->ctrl->SetWndRect(MakeScreenRect(screen, NSRectToCGRect(contentRect)));
 }
 
 TopFrameDraw::TopFrameDraw(Ctrl *ctrl, const Rect& r)
@@ -427,7 +427,11 @@ TopFrameDraw::TopFrameDraw(Ctrl *ctrl, const Rect& r)
 	ASSERT(ctrl->GetTop()->coco);
 	Rect tr = ctrl->GetScreenRect();
 	NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithWindow:ctrl->GetTop()->coco->window];
+#ifdef MAC_OS_X_VERSION_10_10
 	Init([gc CGContext], NULL);
+#else
+	Init((CGContextRef)[gc graphicsPort], NULL);
+#endif
 
 	CGContextTranslateCTM(cgHandle, 0, tr.GetHeight());
 	CGContextScaleCTM(cgHandle, 1, -1);
