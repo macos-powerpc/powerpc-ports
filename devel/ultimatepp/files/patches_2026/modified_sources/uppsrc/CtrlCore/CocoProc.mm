@@ -101,7 +101,8 @@ struct MMImp {
 	
 	static bool MouseEvent(CocoView *view, NSEvent *e, int event, double zd = 0)
 	{
-		if(!view->ctrl)
+		Ctrl *ctrl = CocoViewGetCtrl(view);
+		if(!ctrl)
 			return false;
 		Flags(e);
 		sCurrentMouseEvent__ = e;
@@ -123,7 +124,7 @@ struct MMImp {
 			}
 		}
 		NSPoint np = [view convertPoint:[e locationInWindow] fromView:nil];
-		Rect r = view->ctrl->GetRect();
+		Rect r = ctrl->GetRect();
 		Upp::Point p(DPI(np.x), DPI(np.y));
 		coco_mouse_pos = p + r.TopLeft();
 
@@ -158,21 +159,22 @@ struct MMImp {
 			}
 		}
 		else
-		if(view->ctrl->IsEnabled() && (view->ctrl->HasWndCapture() || r.Contains(coco_mouse_pos))) {
-	        if((event & Ctrl::ACTION) == Ctrl::DOWN && !view->ctrl->HasFocusDeep() && view->ctrl->IsWantFocus())
-	            view->ctrl->SetFocus();
-			view->ctrl->DispatchMouse(event, p, 120 * sgn(zd));
+		if(ctrl->IsEnabled() && (ctrl->HasWndCapture() || r.Contains(coco_mouse_pos))) {
+	        if((event & Ctrl::ACTION) == Ctrl::DOWN && !ctrl->HasFocusDeep() && ctrl->IsWantFocus())
+	            ctrl->SetFocus();
+			ctrl->DispatchMouse(event, p, 120 * sgn(zd));
 		}
-		
+
 		sCurrentMouseEvent__ = NULL;
 		return false;
 	}
 
 	static bool MouseDownEvent(CocoView *view, NSEvent *e, int button)
 	{
-		if(!view->ctrl)
+		Ctrl *ctrl = CocoViewGetCtrl(view);
+		if(!ctrl)
 			return false;
-		Upp::Ctrl::lastActive = view->ctrl;
+		Upp::Ctrl::lastActive = ctrl;
 		if(Ctrl::ignoremouseup) {
 			Ctrl::KillRepeat();
 			Ctrl::ignoreclick = false;
@@ -352,21 +354,14 @@ struct MMImp {
 
 @implementation CocoView
 
-- (id)initWithFrame:(NSRect)frameRect {
-	self = [super initWithFrame:frameRect];
-	if(self) {
-		ctrl = NULL;
-	}
-	return self;
-}
-
 -(BOOL)isFlipped {
 	return YES;
 }
 
 -(void)drawRect:(NSRect)r {
 	Upp::GuiLock __;
-	if(ctrl) {
+	Upp::Ctrl *c = CocoViewGetCtrl(self);
+	if(c) {
 #ifdef MAC_OS_X_VERSION_10_10
 		CGContextRef cg = [[NSGraphicsContext currentContext] CGContext];
 #else
@@ -376,7 +371,7 @@ struct MMImp {
 		Upp::SystemDraw w(cg, self);
 		// Convert NSRect to CGRect for MakeRect
 		CGRect cgr = CGRectMake(r.origin.x, r.origin.y, r.size.width, r.size.height);
-		Upp::MMImp::Paint(ctrl, w, MakeRect(cgr, Upp::DPI(1)));
+		Upp::MMImp::Paint(c, w, MakeRect(cgr, Upp::DPI(1)));
 	}
 }
 
@@ -391,7 +386,7 @@ struct MMImp {
 	Upp::GuiLock __;
 	int m = decode([e buttonNumber], 3, Upp::K_MOUSE_BACKWARD, 4, Upp::K_MOUSE_FORWARD, 0);
 	if(m)
-		Upp::MMImp::DispatchKey(ctrl, m);
+		Upp::MMImp::DispatchKey(CocoViewGetCtrl(self), m);
 	else
 		[super otherMouseDown:e];
 }
@@ -442,19 +437,19 @@ struct MMImp {
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
     [self interpretKeyEvents: [NSArray arrayWithObject: e]];
-	if(!Upp::MMImp::KeyEvent(ctrl, e, 0))
+	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
 		[super keyDown:e];
 }
 
 - (void)keyUp:(NSEvent *)e {
 	Upp::GuiLock __;
-	if(!Upp::MMImp::KeyEvent(ctrl, e, Upp::K_KEYUP))
+	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, Upp::K_KEYUP))
 			[super keyUp:e];
 }
 
 - (void)flagsChanged:(NSEvent *)e {
 	Upp::GuiLock __;
-	if(!Upp::MMImp::KeyFlags(ctrl, e))
+	if(!Upp::MMImp::KeyFlags(CocoViewGetCtrl(self), e))
 		[super flagsChanged:e];
 }
 
@@ -467,8 +462,9 @@ struct MMImp {
 // Use 'id' type for sender to match NSWindowDelegate protocol (pre-10.7)
 - (BOOL)windowShouldClose:(id)sender {
 	Upp::GuiLock __;
-	if(ctrl->IsEnabled())
-		Upp::MMImp::DoClose(ctrl);
+	Upp::Ctrl *c = CocoViewGetCtrl(self);
+	if(c && c->IsEnabled())
+		Upp::MMImp::DoClose(c);
 	return NO;
 }
 
@@ -484,12 +480,12 @@ struct MMImp {
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
 	Upp::GuiLock __;
-	Upp::MMImp::BecomeKey(ctrl);
+	Upp::MMImp::BecomeKey(CocoViewGetCtrl(self));
 }
 
 - (void)windowDidResignKey:(NSNotification *)notification {
 	Upp::GuiLock __;
-	Upp::MMImp::ResignKey(ctrl);
+	Upp::MMImp::ResignKey(CocoViewGetCtrl(self));
 }
 
 - (BOOL)acceptsFirstResponder {
@@ -498,37 +494,38 @@ struct MMImp {
 
 - (BOOL)canBecomeKeyView {
 	Upp::GuiLock __;
-	return ctrl->IsEnabled();
+	Upp::Ctrl *c = CocoViewGetCtrl(self);
+	return c && c->IsEnabled();
 }
 
 - (NSDragOperation)draggingEntered:(id <NSDraggingInfo>)sender
 {
 	Upp::GuiLock __;
-	return Upp::MMImp::DnD(ctrl, sender);
+	return Upp::MMImp::DnD(CocoViewGetCtrl(self), sender);
 }
 
 - (NSDragOperation)draggingUpdated:(id <NSDraggingInfo>)sender
 {
 	Upp::GuiLock __;
-	return Upp::MMImp::DnD(ctrl, sender);
+	return Upp::MMImp::DnD(CocoViewGetCtrl(self), sender);
 }
 
 - (void)draggingEnded:(id <NSDraggingInfo>)sender
 {
 	Upp::GuiLock __;
-	Upp::MMImp::DnDLeave(ctrl);
+	Upp::MMImp::DnDLeave(CocoViewGetCtrl(self));
 }
 
 - (void)draggingExited:(id <NSDraggingInfo>)sender
 {
 	Upp::GuiLock __;
-	Upp::MMImp::DnDLeave(ctrl);
+	Upp::MMImp::DnDLeave(CocoViewGetCtrl(self));
 }
 
 - (BOOL)performDragOperation:(id <NSDraggingInfo>)sender
 {
 	Upp::GuiLock __;
-	return Upp::MMImp::DnD(ctrl, sender, true) != NSDragOperationNone;
+	return Upp::MMImp::DnD(CocoViewGetCtrl(self), sender, true) != NSDragOperationNone;
 }
 
 - (void)updateTrackingAreas
@@ -540,7 +537,9 @@ struct MMImp {
 		[self removeTrackingArea:t];
 	}
 
-	Upp::Size sz = ctrl->GetScreenRect().GetSize();
+	Upp::Ctrl *c = CocoViewGetCtrl(self);
+	if(!c) return;
+	Upp::Size sz = c->GetScreenRect().GetSize();
 	NSTrackingArea *ta = [[NSTrackingArea alloc]
 		initWithRect:NSMakeRect(0, 0, sz.cx, sz.cy)
 	         options:NSTrackingMouseEnteredAndExited|NSTrackingActiveAlways|
@@ -561,7 +560,7 @@ struct MMImp {
     NSString* pInsert = [aString isMemberOfClass: [NSAttributedString class]] ? [aString string] : aString;
 
 	if(pInsert)
-		Upp::MMImp::PreeditText(ctrl, Upp::ToWString(pInsert));
+		Upp::MMImp::PreeditText(CocoViewGetCtrl(self), Upp::ToWString(pInsert));
 }
 
 - (NSRange)markedRange
@@ -577,7 +576,7 @@ struct MMImp {
 - (NSRect)firstRectForCharacterRange:(NSRange)aRange actualRange:(NSRangePointer)actualRange
 {
 	Upp::GuiLock __;
-	return Upp::MMImp::PreeditRect(ctrl);
+	return Upp::MMImp::PreeditRect(CocoViewGetCtrl(self));
 }
 
 - (void)setMarkedText:(id)aString selectedRange:(NSRange)selRange replacementRange:(NSRange)replacementRange
@@ -586,7 +585,7 @@ struct MMImp {
     if(![aString isKindOfClass:[NSAttributedString class]] )
         aString = [[[NSAttributedString alloc] initWithString:aString] autorelease];
 
-	Upp::MMImp::ShowPreedit(ctrl, Upp::ToWString([aString string]));
+	Upp::MMImp::ShowPreedit(CocoViewGetCtrl(self), Upp::ToWString([aString string]));
 }
 
 - (BOOL)hasMarkedText
@@ -617,6 +616,12 @@ struct MMImp {
 {
 	(void)thePoint;
 	return 0;
+}
+
+- (void)doCommandBySelector:(SEL)aSelector
+{
+	// Required by NSTextInputClient protocol
+	// Do nothing - U++ handles key events directly
 }
 
 @end

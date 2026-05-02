@@ -193,25 +193,40 @@ NSRect DesktopRect(const Upp::Rect& r);
 
 }
 
+// Use objc_setAssociatedObject/objc_getAssociatedObject to store data
+// This avoids GCC ObjC runtime issues with ivars
+#import <objc/runtime.h>
+
+// Keys for associated objects - must be unique addresses
+static char CocoViewCtrlKey;
+static char CocoWindowCtrlKey;
+static char CocoWindowActiveKey;
+
 @interface CocoView : NSView <NSWindowDelegate, NSTextInputClient>
-{
-	@public
-	Upp::Ctrl *ctrl;  // Raw pointer - GCC ObjC runtime doesn't properly construct C++ objects in ivars
-}
-- (id)initWithFrame:(NSRect)frameRect;
 @end
 
-@interface CocoWindow : NSWindow
-{
-	@public
-	Upp::Ctrl *ctrl;  // Raw pointer - GCC ObjC runtime doesn't properly construct C++ objects in ivars
-	bool active;
+// Use NSWindow directly instead of subclassing to avoid GCC ObjC runtime issues
+typedef NSWindow CocoWindow;
+
+// Helper functions to get/set associated ctrl pointer
+static inline Upp::Ctrl* CocoViewGetCtrl(CocoView *view) {
+	return (Upp::Ctrl*)objc_getAssociatedObject(view, &CocoViewCtrlKey);
 }
-- (id)initWithContentRect:(NSRect)contentRect
-                styleMask:(NSUInteger)style
-                  backing:(NSBackingStoreType)backingStoreType
-                    defer:(BOOL)flag;
-@end
+static inline void CocoViewSetCtrl(CocoView *view, Upp::Ctrl *c) {
+	objc_setAssociatedObject(view, &CocoViewCtrlKey, (id)c, OBJC_ASSOCIATION_ASSIGN);
+}
+static inline Upp::Ctrl* CocoWindowGetCtrl(CocoWindow *win) {
+	return (Upp::Ctrl*)objc_getAssociatedObject(win, &CocoWindowCtrlKey);
+}
+static inline void CocoWindowSetCtrl(CocoWindow *win, Upp::Ctrl *c) {
+	objc_setAssociatedObject(win, &CocoWindowCtrlKey, (id)c, OBJC_ASSOCIATION_ASSIGN);
+}
+static inline bool CocoWindowGetActive(CocoWindow *win) {
+	return objc_getAssociatedObject(win, &CocoWindowActiveKey) != nil;
+}
+static inline void CocoWindowSetActive(CocoWindow *win, bool a) {
+	objc_setAssociatedObject(win, &CocoWindowActiveKey, a ? (id)1 : nil, OBJC_ASSOCIATION_ASSIGN);
+}
 
 struct Upp::MMCtrl {
 	static void SyncRect(CocoView *view);

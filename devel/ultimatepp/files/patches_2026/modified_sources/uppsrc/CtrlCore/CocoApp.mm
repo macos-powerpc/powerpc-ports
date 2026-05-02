@@ -417,7 +417,7 @@ void MMCtrl::SyncRect(CocoView *view)
 	NSScreen *screen = [win screen];
 	NSRect winFrame = [win frame];
 	NSRect contentRect = [win contentRectForFrameRect:winFrame];
-	view->ctrl->SetWndRect(MakeScreenRect(screen, NSRectToCGRect(contentRect)));
+	CocoViewGetCtrl(view)->SetWndRect(MakeScreenRect(screen, NSRectToCGRect(contentRect)));
 }
 
 TopFrameDraw::TopFrameDraw(Ctrl *ctrl, const Rect& r)

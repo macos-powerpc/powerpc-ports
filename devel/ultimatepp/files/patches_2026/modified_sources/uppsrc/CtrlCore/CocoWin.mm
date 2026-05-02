@@ -4,45 +4,8 @@
 
 #define LLOG(x)
 
-@implementation CocoWindow
-
-- (id)initWithContentRect:(NSRect)contentRect
-                styleMask:(NSUInteger)style
-                  backing:(NSBackingStoreType)backingStoreType
-                    defer:(BOOL)flag
-{
-	self = [super initWithContentRect:contentRect styleMask:style backing:backingStoreType defer:flag];
-	if(self) {
-		ctrl = NULL;
-		active = false;
-	}
-	return self;
-}
-
-- (void)becomeKeyWindow {
-	[super becomeKeyWindow];
-}
-
-- (BOOL)canBecomeKeyWindow {
-	Upp::GuiLock __;
-    return active && ctrl && ctrl->IsEnabled();
-}
-
-- (BOOL)canBecomeMainWindow {
-	Upp::GuiLock __;
-	LLOG("canBecomeMainWindow " << Upp::Name(ctrl) << ", owner " << Upp::Name(ctrl->GetOwner()));
-	return active && ctrl && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
-}
-
-- (NSMenu *)applicationDockMenu:(NSApplication *)sender {
-	Upp::GuiLock __;
-	NSMenu *menu = [[[NSMenu alloc] initWithTitle:@"DocTile Menu"] autorelease];
-	NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:@"Hello" action:@selector(hello) keyEquivalent:@"k"] autorelease];
-	[menu addItem:item];
-	return menu;
-}
-
-@end
+// CocoWindow is now typedef'd to NSWindow - no subclass needed
+// canBecomeKeyWindow and canBecomeMainWindow use default NSWindow behavior
 
 namespace Upp {
 
@@ -140,14 +103,14 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
 	if(owner && owner->top && owner->GetTop()->coco)
 		[owner->GetTop()->coco->window addChildWindow:window ordered:NSWindowAbove];
 
-	window->ctrl = this;
-	window->active = active;
+	CocoWindowSetCtrl(window, this);
+	CocoWindowSetActive(window, active);
 	window.backgroundColor = [NSColor clearColor];
 
 	isopen = true;
-		
+
 	CocoView *view = [[[CocoView alloc] initWithFrame:frame] autorelease];
-	view->ctrl = this;
+	CocoViewSetCtrl(view, this);
 	GetTop()->coco->view = view;
 	[window setContentView:view];
 	[window setDelegate:view];
@@ -414,7 +377,7 @@ void TopWindow::Overlap(bool effect)
 
 bool Ctrl::IsCocoActive() const
 {
-	return top && GetTop()->coco && GetTop()->coco->window && GetTop()->coco->window->active;
+	return top && GetTop()->coco && GetTop()->coco->window && CocoWindowGetActive(GetTop()->coco->window);
 }
 
 }
