@@ -4,32 +4,66 @@
 
 #define LLOG(x)
 
-// CocoWindow implementation - uses associated objects instead of ivars
-// This is required for canBecomeKeyWindow/canBecomeMainWindow which control
-// whether windows (especially modal dialogs) can receive keyboard focus
+// Method swizzling for NSWindow to override canBecomeKeyWindow/canBecomeMainWindow
+// This avoids subclassing NSWindow which causes crashes with GCC's ObjC runtime
 
-@implementation CocoWindow
+static IMP sOriginalCanBecomeKeyWindow = NULL;
+static IMP sOriginalCanBecomeMainWindow = NULL;
 
-- (void)becomeKeyWindow {
-	[super becomeKeyWindow];
+// Replacement for canBecomeKeyWindow - checks if our Ctrl is enabled
+static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
+{
+	Upp::Ctrl *ctrl = CocoWindowGetCtrl((CocoWindow*)self);
+	bool active = CocoWindowGetActive((CocoWindow*)self);
+	// If this is our window, use our logic
+	if(ctrl) {
+		Upp::GuiLock __;
+		return active && ctrl->IsEnabled();
+	}
+	// Otherwise call original
+	if(sOriginalCanBecomeKeyWindow)
+		return ((BOOL(*)(id, SEL))sOriginalCanBecomeKeyWindow)(self, _cmd);
+	return YES; // NSWindow default
 }
 
-- (BOOL)canBecomeKeyWindow {
-	Upp::GuiLock __;
-	Upp::Ctrl *ctrl = CocoWindowGetCtrl(self);
-	bool active = CocoWindowGetActive(self);
-	return active && ctrl && ctrl->IsEnabled();
+// Replacement for canBecomeMainWindow - checks if TopWindow without owner
+static BOOL Swizzled_canBecomeMainWindow(id self, SEL _cmd)
+{
+	Upp::Ctrl *ctrl = CocoWindowGetCtrl((CocoWindow*)self);
+	bool active = CocoWindowGetActive((CocoWindow*)self);
+	// If this is our window, use our logic
+	if(ctrl) {
+		Upp::GuiLock __;
+		return active && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
+	}
+	// Otherwise call original
+	if(sOriginalCanBecomeMainWindow)
+		return ((BOOL(*)(id, SEL))sOriginalCanBecomeMainWindow)(self, _cmd);
+	return YES; // NSWindow default
 }
 
-- (BOOL)canBecomeMainWindow {
-	Upp::GuiLock __;
-	Upp::Ctrl *ctrl = CocoWindowGetCtrl(self);
-	bool active = CocoWindowGetActive(self);
-	LLOG("canBecomeMainWindow " << Upp::Name(ctrl) << ", owner " << Upp::Name(ctrl->GetOwner()));
-	return active && ctrl && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
-}
+static void SwizzleNSWindowMethods()
+{
+	static bool swizzled = false;
+	if(swizzled) return;
+	swizzled = true;
 
-@end
+	Class windowClass = [NSWindow class];
+
+	// Swizzle canBecomeKeyWindow
+	Method origKey = class_getInstanceMethod(windowClass, @selector(canBecomeKeyWindow));
+	if(origKey) {
+		sOriginalCanBecomeKeyWindow = method_getImplementation(origKey);
+		method_setImplementation(origKey, (IMP)Swizzled_canBecomeKeyWindow);
+	}
+
+	// Swizzle canBecomeMainWindow
+	Method origMain = class_getInstanceMethod(windowClass, @selector(canBecomeMainWindow));
+	if(origMain) {
+		sOriginalCanBecomeMainWindow = method_getImplementation(origMain);
+		method_setImplementation(origMain, (IMP)Swizzled_canBecomeMainWindow);
+	}
+}
 
 namespace Upp {
 
@@ -112,6 +146,9 @@ void Ctrl::DoCancelPreedit()
 void Ctrl::Create(Ctrl *owner, dword style, bool active)
 {
 	cancel_preedit = DoCancelPreedit; // We really need this just once, but whatever..
+
+	// Swizzle NSWindow methods for canBecomeKeyWindow/canBecomeMainWindow (GCC compatibility)
+	SwizzleNSWindowMethods();
 	
 	if(owner)
 		owner = owner->GetTopCtrl();
