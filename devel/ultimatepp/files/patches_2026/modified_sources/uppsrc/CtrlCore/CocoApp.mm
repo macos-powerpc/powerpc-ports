@@ -4,6 +4,9 @@
 
 #ifdef GUI_COCOA
 
+// For CGEventTap (GCC block workaround)
+#include <ApplicationServices/ApplicationServices.h>
+
 @interface AppDelegate : NSObject<NSApplicationDelegate>
 {
 }
@@ -69,6 +72,52 @@ void SyncPopupFocus(NSWindow *win)
 	}
 }
 
+#ifndef __clang__
+// CGEventTap callback for GCC (replaces block-based NSEvent monitors)
+// This provides global and local mouse event monitoring without using blocks
+static CFMachPortRef sEventTap = NULL;
+static CFRunLoopSourceRef sEventTapSource = NULL;
+
+static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
+{
+	if(type == kCGEventLeftMouseDown) {
+		// Get the window under the mouse for local events
+		// For global events (outside our app), win will be NULL
+		CGPoint location = CGEventGetLocation(event);
+		// Check if the event is in our application
+		ProcessSerialNumber psn;
+		GetCurrentProcess(&psn);
+		ProcessSerialNumber frontPsn;
+		GetFrontProcess(&frontPsn);
+		Boolean sameProcess = false;
+		SameProcess(&psn, &frontPsn, &sameProcess);
+
+		SyncPopupFocus(sameProcess ? [NSApp keyWindow] : NULL);
+	}
+	// Return event unchanged to allow normal processing
+	return event;
+}
+
+static void SetupEventTap()
+{
+	// Create event tap for left mouse down events
+	CGEventMask eventMask = CGEventMaskBit(kCGEventLeftMouseDown);
+	sEventTap = CGEventTapCreate(kCGSessionEventTap,
+	                              kCGHeadInsertEventTap,
+	                              kCGEventTapOptionListenOnly,  // Don't modify events
+	                              eventMask,
+	                              EventTapCallback,
+	                              NULL);
+	if(sEventTap) {
+		sEventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, sEventTap, 0);
+		if(sEventTapSource) {
+			CFRunLoopAddSource(CFRunLoopGetMain(), sEventTapSource, kCFRunLoopCommonModes);
+			CGEventTapEnable(sEventTap, true);
+		}
+	}
+}
+#endif
+
 extern const char *sClipFmtsRTF;
 
 id menubar;
@@ -123,12 +172,11 @@ void CocoInit(int argc, const char **argv, const char **envptr)
 
 	GUI_DblClickTime_Write(1000 * [NSEvent doubleClickInterval]);
 
-#ifdef MAC_OS_X_VERSION_10_6
-	// Event monitors with blocks - available in 10.6+ but GCC doesn't support blocks
-	// Skip event monitors for GCC compatibility - popup focus sync disabled
 #ifndef __clang__
-	// GCC: skip block-based event monitors
+	// GCC: use CGEventTap instead of block-based NSEvent monitors
+	SetupEventTap();
 #else
+	// Clang: use block-based event monitors
 	[NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown)
 	  handler:^(NSEvent *e) {
 	      SyncPopupFocus(NULL);
@@ -138,7 +186,6 @@ void CocoInit(int argc, const char **argv, const char **envptr)
 	      SyncPopupFocus([e window]);
 	      return e;
     }];
-#endif
 #endif
     
     sClipFmtsRTF = "rtf";

@@ -20,8 +20,11 @@ static Upp::Ptr<Upp::Ctrl> coco_capture;
 Upp::Ptr<Upp::Ctrl> Upp::Ctrl::lastActive;
 
 namespace Upp {
-	
+
 extern id menubar;
+
+// Declared in CocoApp.mm - syncs popup focus on mouse events
+void SyncPopupFocus(NSWindow *win);
 
 bool  GetShift() { return coco_flags & NSEventModifierFlagShift; }
 bool  GetCtrl() { return coco_flags & NSEventModifierFlagCommand; }
@@ -179,6 +182,8 @@ struct MMImp {
 		Ctrl *ctrl = CocoViewGetCtrl(view);
 		if(!ctrl)
 			return false;
+		// Sync popup focus on mouse down (replaces block-based event monitor for GCC)
+		SyncPopupFocus([e window]);
 		Upp::Ctrl::lastActive = ctrl;
 		if(Ctrl::ignoremouseup) {
 			Ctrl::KillRepeat();

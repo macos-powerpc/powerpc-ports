@@ -17,6 +17,7 @@ struct CocoMenuBar;
 // Associated object keys for menu data - defined in this file
 static char CocoMenuPtrKey;
 static char CocoMenuProcKey;
+static char CocoMenuItemBarKey;  // For storing CocoMenuBar* on NSMenuItem
 
 // Use NSMenu directly (typedef) to avoid GCC ObjC runtime issues with subclassing
 typedef NSMenu CocoMenu;
@@ -33,6 +34,12 @@ static inline Upp::Event<Upp::Bar&>* CocoMenuGetProc(NSMenu *menu) {
 }
 static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 	objc_setAssociatedObject(menu, &CocoMenuProcKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
+}
+static inline Upp::CocoMenuBar* CocoMenuItemGetBar(NSMenuItem *item) {
+	return (Upp::CocoMenuBar*)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+}
+static inline void CocoMenuItemSetBar(NSMenuItem *item, Upp::CocoMenuBar *p) {
+	objc_setAssociatedObject(item, &CocoMenuItemBarKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
 }
 
 // Separate delegate object to handle menu events - avoids subclassing NSMenu
@@ -117,6 +124,7 @@ struct CocoMenuBar : public Bar {
 			m.cb = cb;
 			[m.nsitem setTarget:sharedMenuDelegate];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
+			CocoMenuItemSetBar(m.nsitem, this);  // Store bar pointer on item for action lookup
 		}
 		return m;
 	}
@@ -324,10 +332,10 @@ void CocoMenuBar::New() {
 @implementation CocoMenuDelegate
 
 -(void)cocoMenuAction:(id)sender {
-	// Find which menu contains this item
+	// Get the CocoMenuBar directly from the menu item (not from parent menu)
+	// This works even after menuDidClose removes items from menu
 	NSMenuItem *item = (NSMenuItem *)sender;
-	NSMenu *menu = [item menu];
-	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+	Upp::CocoMenuBar *ptr = CocoMenuItemGetBar(item);
 	if(ptr)
 		ptr->MenuAction(sender);
 }
