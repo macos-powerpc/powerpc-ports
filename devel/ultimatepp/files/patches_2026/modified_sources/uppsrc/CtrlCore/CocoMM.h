@@ -196,16 +196,21 @@ NSRect DesktopRect(const Upp::Rect& r);
 @interface CocoView : NSView <NSWindowDelegate, NSTextInputClient>
 {
 	@public
-	Upp::Ptr<Upp::Ctrl> ctrl;
+	Upp::Ctrl *ctrl;  // Raw pointer - GCC ObjC runtime doesn't properly construct C++ objects in ivars
 }
+- (id)initWithFrame:(NSRect)frameRect;
 @end
 
 @interface CocoWindow : NSWindow
 {
 	@public
-	Upp::Ptr<Upp::Ctrl> ctrl;
+	Upp::Ctrl *ctrl;  // Raw pointer - GCC ObjC runtime doesn't properly construct C++ objects in ivars
 	bool active;
 }
+- (id)initWithContentRect:(NSRect)contentRect
+                styleMask:(NSUInteger)style
+                  backing:(NSBackingStoreType)backingStoreType
+                    defer:(BOOL)flag;
 @end
 
 struct Upp::MMCtrl {

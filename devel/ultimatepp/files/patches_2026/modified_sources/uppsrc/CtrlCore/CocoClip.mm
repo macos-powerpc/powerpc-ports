@@ -43,21 +43,39 @@ NSPasteboard *Pasteboard(bool dnd = false)
 
 @interface CocoClipboardOwner : NSObject {
 	@public
-	Upp::VectorMap<Upp::String, Upp::ClipData> data;
-	Upp::Ptr<Upp::Ctrl> source;
+	// Use pointers to avoid GCC ObjC runtime issues with C++ object construction
+	Upp::VectorMap<Upp::String, Upp::ClipData> *data;
+	Upp::Ctrl *source;  // Raw pointer - GCC ObjC runtime doesn't properly construct C++ objects
 	bool dnd;
 }
+- (id)init;
+- (void)dealloc;
 @end
 
 @implementation CocoClipboardOwner
 
+- (id)init {
+	self = [super init];
+	if(self) {
+		data = new Upp::VectorMap<Upp::String, Upp::ClipData>();
+		source = NULL;
+		dnd = false;
+	}
+	return self;
+}
+
+- (void)dealloc {
+	delete data;
+	[super dealloc];
+}
+
 // Helper method to render clipboard data - replaces lambda (GCC ICE workaround)
 -(Upp::String)renderFormat:(const Upp::String&)fmt
 {
-	int q = data.Find(fmt);
+	int q = data->Find(fmt);
 	if(q < 0)
 		return Upp::Null;
-	return data[q].Render();
+	return (*data)[q].Render();
 }
 
 -(void)pasteboard:(NSPasteboard *)sender provideDataForType:(NSString *)type
@@ -132,7 +150,7 @@ void ClearClipboard(bool dnd)
 {
 	GuiLock __;
 	[Pasteboard(dnd) clearContents];
-	ClipboardOwner()->data.Clear();
+	ClipboardOwner()->data->Clear();
 }
 
 void ClearClipboard()
@@ -152,14 +170,14 @@ void AppendClipboard(bool dnd, const char *format, const Value& value, String (*
 {
 	GuiLock __;
 
-	auto& data = ClipboardOwner(dnd)->data;
+	auto& dataMap = *ClipboardOwner(dnd)->data;
 
 	for(String fmt : Split(format, ';'))
-		data.GetAdd(fmt) = ClipData(value, render);
+		dataMap.GetAdd(fmt) = ClipData(value, render);
 
 	AutoreleasePool ___;
 
-	[Pasteboard(dnd) declareTypes:[PasteboardTypes(data.GetKeys()) allObjects]
+	[Pasteboard(dnd) declareTypes:[PasteboardTypes(dataMap.GetKeys()) allObjects]
 	                        owner:ClipboardOwner(dnd)];
 }
 

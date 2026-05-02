@@ -6,6 +6,19 @@
 
 @implementation CocoWindow
 
+- (id)initWithContentRect:(NSRect)contentRect
+                styleMask:(NSUInteger)style
+                  backing:(NSBackingStoreType)backingStoreType
+                    defer:(BOOL)flag
+{
+	self = [super initWithContentRect:contentRect styleMask:style backing:backingStoreType defer:flag];
+	if(self) {
+		ctrl = NULL;
+		active = false;
+	}
+	return self;
+}
+
 - (void)becomeKeyWindow {
 	[super becomeKeyWindow];
 }
@@ -18,7 +31,7 @@
 - (BOOL)canBecomeMainWindow {
 	Upp::GuiLock __;
 	LLOG("canBecomeMainWindow " << Upp::Name(ctrl) << ", owner " << Upp::Name(ctrl->GetOwner()));
-	return active && ctrl && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(~ctrl) && !ctrl->GetOwner();
+	return active && ctrl && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
 }
 
 - (NSMenu *)applicationDockMenu:(NSApplication *)sender {

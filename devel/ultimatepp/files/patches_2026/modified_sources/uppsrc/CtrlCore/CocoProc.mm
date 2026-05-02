@@ -352,6 +352,14 @@ struct MMImp {
 
 @implementation CocoView
 
+- (id)initWithFrame:(NSRect)frameRect {
+	self = [super initWithFrame:frameRect];
+	if(self) {
+		ctrl = NULL;
+	}
+	return self;
+}
+
 -(BOOL)isFlipped {
 	return YES;
 }
