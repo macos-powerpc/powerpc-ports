@@ -7,6 +7,11 @@
 
 #ifndef flagNOMM // Removes ObjectiveC and AppKit dependence in Draw (but disables Fonts)
 
+// Disable old-style Carbon assertion macros (check, verify, require, etc.)
+#ifndef __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES
+#define __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES 0
+#endif
+
 #define Point NS_Point
 #define Rect  NS_Rect
 #define Size  NS_Size
@@ -14,6 +19,12 @@
 #undef  Point
 #undef  Rect
 #undef  Size
+
+// macOS 10.6 SDK compatibility - kCTFontOrientationHorizontal added in 10.8
+// kCTFontDefaultOrientation (value 0) is equivalent for horizontal text
+#ifndef kCTFontOrientationHorizontal
+#define kCTFontOrientationHorizontal kCTFontDefaultOrientation
+#endif
 
 namespace Upp {
 
