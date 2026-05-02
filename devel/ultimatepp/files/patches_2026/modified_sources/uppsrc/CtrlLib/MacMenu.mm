@@ -14,23 +14,39 @@ struct CocoMenuBar;
 
 };
 
-@interface CocoMenu : NSMenu<NSMenuDelegate>
-{
-@public
-	// Use pointers to avoid GCC ObjC runtime issues with C++ object construction
-	Upp::CocoMenuBar *ptr;  // Raw pointer instead of Ptr<>
-	Upp::Event<Upp::Bar&> *proc;  // Pointer to heap-allocated Event
+// Associated object keys for menu data - defined in this file
+static char CocoMenuPtrKey;
+static char CocoMenuProcKey;
+
+// Use NSMenu directly (typedef) to avoid GCC ObjC runtime issues with subclassing
+typedef NSMenu CocoMenu;
+
+// Helper functions to get/set associated menu data
+static inline Upp::CocoMenuBar* CocoMenuGetPtr(NSMenu *menu) {
+	return (Upp::CocoMenuBar*)objc_getAssociatedObject(menu, &CocoMenuPtrKey);
 }
--(void)cocoMenuAction:(id)sender;
-- (id)init;
-- (id)initWithTitle:(NSString *)aTitle;
-- (void)dealloc;
+static inline void CocoMenuSetPtr(NSMenu *menu, Upp::CocoMenuBar *p) {
+	objc_setAssociatedObject(menu, &CocoMenuPtrKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
+}
+static inline Upp::Event<Upp::Bar&>* CocoMenuGetProc(NSMenu *menu) {
+	return (Upp::Event<Upp::Bar&>*)objc_getAssociatedObject(menu, &CocoMenuProcKey);
+}
+static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
+	objc_setAssociatedObject(menu, &CocoMenuProcKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
+}
+
+// Separate delegate object to handle menu events - avoids subclassing NSMenu
+@interface CocoMenuDelegate : NSObject<NSMenuDelegate>
 @end
+
+// Global delegate instance - shared by all menus
+static CocoMenuDelegate *sharedMenuDelegate = nil;
 
 namespace Upp {
 
 struct CocoMenuBar : public Bar {
 	CocoMenu *cocomenu;
+	Event<Bar&> *proc;  // Heap-allocated to avoid C++ object in ObjC associated storage
 	int       lock = 0;
 	bool      dockmenu = false;
 	int       cy = 0; // estimate of height to place the menu correctly
@@ -62,20 +78,20 @@ struct CocoMenuBar : public Bar {
 
 		~Item() { if(nsitem) [nsitem release]; }
 	};
-	
+
 	Array<Item> item;
-	
+
 	void StartCheck() {
 		just_check = true;
 		check_i = 0;
 		is_same = true;
 	}
-	
+
 	bool CheckedIsSame() {
 		just_check = false;
 		return is_same;
 	}
-	
+
 	Item& AddItem() {
 		if(just_check) {
 			if(is_same && check_i < item.GetCount())
@@ -99,17 +115,17 @@ struct CocoMenuBar : public Bar {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.cb = cb;
-			m.nsitem.target = cocomenu;
+			m.nsitem.target = sharedMenuDelegate;
 			m.nsitem.action = @selector(cocoMenuAction:);
 		}
 		return m;
 	}
-	
-	virtual Item&  AddSubMenu(Event<Bar&> proc) {
+
+	virtual Item&  AddSubMenu(Event<Bar&> proc_) {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.submenu.Create();
-			*m.submenu->cocomenu->proc = proc;
+			*m.submenu->proc = proc_;
 			m.nsitem.action = @selector(cocoMenuAction:);
 			m.nsitem.submenu = m.submenu->cocomenu;
 		}
@@ -121,39 +137,37 @@ struct CocoMenuBar : public Bar {
 
 	virtual bool   IsEmpty() const;
 	virtual void   Separator();
-	
+
 	void MenuAction(id item);
-	
+
 	void Set(Event<Bar&> bar);
-	
+
 	void ClearItems() {
 		cy = 0;
 		just_check = false;
 		is_same = false;
 		item.Clear();
 	}
-	
+
 	void Clear() {
 		ClearItems();
 		if(cocomenu) {
+			CocoMenuSetPtr(cocomenu, NULL);
+			CocoMenuSetProc(cocomenu, NULL);
 			[cocomenu release];
 			cocomenu = NULL;
 		}
 	}
-	void New() {
-		Clear();
-		cocomenu = [CocoMenu new];
-		cocomenu.autoenablesItems = NO;
-		cocomenu->ptr = this;
-		cocomenu.delegate = cocomenu;
-	}
-	
+	void New();
+
 	CocoMenuBar() {
 		cocomenu = NULL;
+		proc = new Event<Bar&>();
 		New();
 	}
 	~CocoMenuBar() {
 		Clear();
+		delete proc;
 	}
 };
 
@@ -292,62 +306,50 @@ bool CocoMenuBar::IsEmpty() const
 	return item.GetCount() == 0;
 }
 
+// Implementation of New() - must be after CocoMenuDelegate is declared but before it's used
+void CocoMenuBar::New() {
+	Clear();
+	if(!sharedMenuDelegate)
+		sharedMenuDelegate = [[CocoMenuDelegate alloc] init];
+	cocomenu = [[NSMenu alloc] init];
+	[cocomenu setAutoenablesItems:NO];
+	CocoMenuSetPtr(cocomenu, this);
+	CocoMenuSetProc(cocomenu, proc);
+	[cocomenu setDelegate:sharedMenuDelegate];
 }
 
-@implementation CocoMenu
-
-- (id)init {
-	self = [super init];
-	if(self) {
-		ptr = NULL;
-		proc = new Upp::Event<Upp::Bar&>();
-	}
-	return self;
 }
 
-- (id)initWithTitle:(NSString *)aTitle {
-	self = [super initWithTitle:aTitle];
-	if(self) {
-		ptr = NULL;
-		proc = new Upp::Event<Upp::Bar&>();
-	}
-	return self;
-}
-
-- (void)dealloc {
-	delete proc;
-	[super dealloc];
-}
+@implementation CocoMenuDelegate
 
 -(void)cocoMenuAction:(id)sender {
+	// Find which menu contains this item
+	NSMenuItem *item = (NSMenuItem *)sender;
+	NSMenu *menu = [item menu];
+	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
 	if(ptr)
 		ptr->MenuAction(sender);
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-	CocoMenu *m = (CocoMenu *)menu;
-	if(m && m->ptr && m->ptr->dockmenu)
+	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+	Upp::Event<Upp::Bar&> *proc = CocoMenuGetProc(menu);
+	if(ptr && ptr->dockmenu)
 		return;
-	if(m && m->ptr && m->proc && *m->proc) {
-		m->ptr->ClearItems();
-		[m removeAllItems];
-		(*m->proc)(*m->ptr);
+	if(ptr && proc && *proc) {
+		ptr->ClearItems();
+		[menu removeAllItems];
+		(*proc)(*ptr);
 	}
 }
 
 - (void)menuDidClose:(NSMenu *)menu {
-	CocoMenu *m = (CocoMenu *)menu;
-	if(m && m->ptr && m->ptr->dockmenu)
+	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+	if(ptr && ptr->dockmenu)
 		return;
 	// DO NOT CALL ClearItems here - menu is closed before MenuAction, we need items to find
 	// correct callback
-	[m removeAllItems];
-}
-
--(void)submenuAction:(id)sender {
-	if(ptr && proc)
-		(*proc)(*ptr);
-	[super submenuAction:sender];
+	[menu removeAllItems];
 }
 
 @end
@@ -449,10 +451,13 @@ NSMenu *Cocoa_DockMenu() {
 		static Upp::CocoMenuBar bar;
 		bar.dockmenu = true;
 		bar.Clear();
-		bar.cocomenu = [[[CocoMenu alloc] initWithTitle:@"DocTile Menu"] autorelease];
-		bar.cocomenu.autoenablesItems = NO;
-		bar.cocomenu->ptr = &bar;
-		bar.cocomenu.delegate = bar.cocomenu;
+		bar.cocomenu = [[[NSMenu alloc] initWithTitle:@"DocTile Menu"] autorelease];
+		[bar.cocomenu setAutoenablesItems:NO];
+		CocoMenuSetPtr(bar.cocomenu, &bar);
+		CocoMenuSetProc(bar.cocomenu, bar.proc);
+		if(!sharedMenuDelegate)
+			sharedMenuDelegate = [[CocoMenuDelegate alloc] init];
+		[bar.cocomenu setDelegate:sharedMenuDelegate];
 		w->WhenDockMenu(bar);
 		CocoMenu *m = bar.cocomenu;
 		bar.cocomenu = NULL;
