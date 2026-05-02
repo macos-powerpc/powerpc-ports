@@ -281,6 +281,14 @@ String StoreAsJson(const T& var, bool pretty = false)
 template <class T>
 bool LoadFromJson(T& var, const char *json)
 {
+#if defined(__OBJC__) && defined(__GNUC__) && !defined(__clang__)
+	// Workaround for GCC ICE in objc_eh_runtime_type when compiling Objective-C++
+	Value jv = ParseJSON(json);
+	if(jv.IsError())
+		return false;
+	LoadFromJsonValue(var, jv);
+	return true;
+#else
 	try {
 		Value jv = ParseJSON(json);
 		if(jv.IsError())
@@ -294,6 +302,7 @@ bool LoadFromJson(T& var, const char *json)
 		return false;
 	}
 	return true;
+#endif
 }
 
 String sJsonFile(const char *file);
