@@ -205,9 +205,13 @@ CommonFontInfo GetFontInfoSys(Font font)
 		fi.ttf = true;
 
 		CFRef<CTFontDescriptorRef> fd = CTFontCopyFontDescriptor(ctfont);
-	    CFRef<CFURLRef> url = (CFURLRef)CTFontDescriptorCopyAttribute(fd, kCTFontURLAttribute);
-		CFRef<CFStringRef> path = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
-		String p = ToString(path);
+	    CFURLRef url = (CFURLRef)CTFontDescriptorCopyAttribute(fd, kCTFontURLAttribute);
+		String p;
+		if(url) {
+			CFRef<CFStringRef> pathStr = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle);
+			p = ToString(pathStr);
+			CFRelease(url);
+		}
 
 		if(p.GetCount() < 250)
 			strcpy(fi.path, ~p);

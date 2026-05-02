@@ -6,17 +6,25 @@
 
 namespace Upp {
 
+// Callback for CGDataProviderCreateWithData - releases the Image data
+static void ReleaseImageData(void *info, const void *data, size_t size)
+{
+	delete (Image *)info;
+}
+
 CGImageRef createCGImage(const Image& img)
 {
 	if(IsNull(img))
 		return NULL;
 	Image *km = new Image(img); // to keep data alive
 	CGDataProvider *dataProvider = CGDataProviderCreateWithData(km, ~img, img.GetLength() * sizeof(RGBA),
-	                               [](void *info, const void *data, size_t size) { delete (Image *)info; });
+	                               ReleaseImageData);
 	static CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB(); // TODO: This is probably wrong...
 	Upp::Size isz = img.GetSize();
+	// On big-endian (PowerPC), we need to specify byte order explicitly
+	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
     CGImageRef cg_img = CGImageCreate(isz.cx, isz.cy, 8, 32, isz.cx * sizeof(RGBA),
-                                      colorSpace, kCGImageAlphaPremultipliedFirst,
+                                      colorSpace, bitmapInfo,
                                       dataProvider, 0, false, kCGRenderingIntentDefault);
 	CGDataProviderRelease(dataProvider);
 	return cg_img;
@@ -325,9 +333,19 @@ void ImageDraw::Init(int cx, int cy)
 
 	static CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
 
+	// On big-endian (PowerPC), we need to specify byte order explicitly
+	// kCGBitmapByteOrder32Host resolves to the correct order for the platform
+	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060 && !defined(__ppc__)
+	// CGBitmapContextCreateWithData available in 10.6+, but may have issues on PPC
 	SystemDraw::Init(CGBitmapContextCreateWithData(~ib, cx, cy, 8, cx * sizeof(RGBA),
-	                                               colorSpace, kCGImageAlphaPremultipliedFirst,
+	                                               colorSpace, bitmapInfo,
 	                                               NULL, NULL), NULL);
+#else
+	// Fallback for 10.5 and PowerPC 10.6: use CGBitmapContextCreate
+	SystemDraw::Init(CGBitmapContextCreate(~ib, cx, cy, 8, cx * sizeof(RGBA),
+	                                       colorSpace, bitmapInfo), NULL);
+#endif
 	CGContextTranslateCTM(cgHandle, 0, cy);
 	if(IsUHDMode()) {
 		CGContextScaleCTM(cgHandle, 2, -2);
