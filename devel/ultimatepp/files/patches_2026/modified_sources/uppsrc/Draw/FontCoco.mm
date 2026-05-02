@@ -265,7 +265,9 @@ Vector<FaceInfo> GetAllFacesSys()
 		fi.info = Font::SCALEABLE;
 		if(traits & kCTFontMonoSpaceTrait)
 			fi.info |= Font::FIXEDPITCH;
-		switch((CTFontSymbolicTraits)(traits & kCTFontClassMaskTrait)) {
+		// Cast to int32 to avoid narrowing conversion error with kCTFontScriptsClass
+		// (which has high bit set and is defined as signed int)
+		switch((int32)(traits & kCTFontClassMaskTrait)) {
 		case kCTFontOldStyleSerifsClass:
 		case kCTFontTransitionalSerifsClass:
 		case kCTFontModernSerifsClass:
