@@ -139,7 +139,9 @@ struct MMImp {
 				coco_capture->DispatchMouse(event, coco_mouse_pos - coco_capture->GetScreenRect().TopLeft(), 120 * sgn(zd));
 			else {
 				Vector<Ctrl *> t = Ctrl::GetTopCtrls(); // Find window that contains the mouse, from the top
-				for(NSNumber *num in [NSWindow windowNumbersWithOptions:0]) { // All app windows
+				NSArray *windowNumbers = [NSWindow windowNumbersWithOptions:0]; // All app windows
+				for(NSUInteger i = 0; i < [windowNumbers count]; i++) {
+					NSNumber *num = [windowNumbers objectAtIndex:i];
 					NSWindow *win = [NSApp windowWithWindowNumber:[num integerValue]];
 					if(win) {
 					    int q = FindMatch(t, [&](Ctrl *t) { return t->GetNSWindow() == win; });
@@ -524,8 +526,11 @@ struct MMImp {
 - (void)updateTrackingAreas
 {
 	Upp::GuiLock __;
-	for(NSTrackingArea *t in [self trackingAreas])
+	NSArray *areas = [self trackingAreas];
+	for(NSUInteger i = 0; i < [areas count]; i++) {
+		NSTrackingArea *t = [areas objectAtIndex:i];
 		[self removeTrackingArea:t];
+	}
 
 	Upp::Size sz = ctrl->GetScreenRect().GetSize();
 	NSTrackingArea *ta = [[NSTrackingArea alloc]
