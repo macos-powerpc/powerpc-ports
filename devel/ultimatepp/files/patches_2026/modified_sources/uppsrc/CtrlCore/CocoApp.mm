@@ -151,13 +151,13 @@ void CocoInit(int argc, const char **argv, const char **envptr)
 int Ctrl::GetKbdDelay()
 {
 	Upp::GuiLock __;
-	return int(1000 * NSEvent.keyRepeatDelay);
+	return int(1000 * [NSEvent keyRepeatDelay]);
 }
 
 int Ctrl::GetKbdSpeed()
 {
 	Upp::GuiLock __;
-	return int(1000 * NSEvent.keyRepeatInterval);
+	return int(1000 * [NSEvent keyRepeatInterval]);
 }
 
 static NSEvent *current_event;
@@ -318,7 +318,8 @@ void Ctrl::GetWorkArea(Array<Rect>& rc)
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		rc.Add(MakeScreenRect(screen, [screen visibleFrame]));
+		CGRect frame = [screen visibleFrame];
+		rc.Add(MakeScreenRect(screen, frame));
 	}
 }
 
@@ -343,7 +344,8 @@ Rect Ctrl::GetVirtualScreenArea()
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		Rect sr = MakeScreenRect(screen, [screen frame]);
+		CGRect frame = [screen frame];
+		Rect sr = MakeScreenRect(screen, frame);
 		if(first)
 			r = sr;
 		else
@@ -366,7 +368,8 @@ Rect Ctrl::GetScreenArea(Point pt)
 	NSArray *screens = [NSScreen screens];
 	for(NSUInteger i = 0; i < [screens count]; i++) {
 		NSScreen *screen = [screens objectAtIndex:i];
-		Rect rc = MakeScreenRect(screen, [screen frame]);
+		CGRect frame = [screen frame];
+		Rect rc = MakeScreenRect(screen, frame);
 		if(rc.Contains(pt))
 			return rc;
 	}
@@ -378,7 +381,8 @@ Rect Ctrl::GetPrimaryScreenArea()
 	NSArray *screens = [NSScreen screens];
 	if([screens count] > 0) {
 		NSScreen *screen = [screens objectAtIndex:0];
-		return MakeScreenRect(screen, [screen frame]);
+		CGRect frame = [screen frame];
+		return MakeScreenRect(screen, frame);
 	}
 	return Rect(0, 0, 1024, 768);
 }
@@ -410,7 +414,10 @@ void Ctrl::GuiPlatformGetTopRect(Rect& r) const
 void MMCtrl::SyncRect(CocoView *view)
 {
 	NSWindow *win = [view window];
-	view->ctrl->SetWndRect(MakeScreenRect([win screen], [win contentRectForFrameRect: [win frame]]));
+	NSScreen *screen = [win screen];
+	NSRect winFrame = [win frame];
+	NSRect contentRect = [win contentRectForFrameRect:winFrame];
+	view->ctrl->SetWndRect(MakeScreenRect(screen, contentRect));
 }
 
 TopFrameDraw::TopFrameDraw(Ctrl *ctrl, const Rect& r)
@@ -449,7 +456,7 @@ String GetSpecialDirectory(int i)
 	
 	if(auto *h = FindTuple(map, __countof(map), i)) {
 		NSArray * paths = NSSearchPathForDirectoriesInDomains(h->b, NSUserDomainMask, YES);
-		if(paths.count)
+		if([paths count])
 			return ToString([paths objectAtIndex:0]);
 	}
 	

@@ -50,18 +50,22 @@ NSPasteboard *Pasteboard(bool dnd = false)
 @end
 
 @implementation CocoClipboardOwner
+
+// Helper method to render clipboard data - replaces lambda (GCC ICE workaround)
+-(Upp::String)renderFormat:(const Upp::String&)fmt
+{
+	int q = data.Find(fmt);
+	if(q < 0)
+		return Upp::Null;
+	return data[q].Render();
+}
+
 -(void)pasteboard:(NSPasteboard *)sender provideDataForType:(NSString *)type
 {
 	RLOG(Upp::ToString(type));
-	
+
 	Upp::GuiLock __;
-	auto render = [&](const Upp::String& fmt) -> Upp::String {
-		int q = data.Find(fmt);
-		if(q < 0)
-			return Upp::Null;
-		return data[q].Render();
-	};
-	
+
 	NSPasteboard *pasteboard = Upp::Pasteboard(dnd);
 	if(Upp::IsStandardPasteboardType(type)) {
 		RLOG("Standard type - clearning contents!");
@@ -69,7 +73,7 @@ NSPasteboard *Pasteboard(bool dnd = false)
 	}
 
 	if([type isEqual:NSPasteboardTypeString]) {
-		Upp::String raw = render("text");
+		Upp::String raw = [self renderFormat:"text"];
 		if(raw.GetCount() == 0 && source)
 			raw = source->GetDropData("text");
 	    [pasteboard setString:[NSString stringWithUTF8String:raw]
@@ -77,7 +81,7 @@ NSPasteboard *Pasteboard(bool dnd = false)
 		return;
 	}
 	else if([type isEqual:NSPasteboardTypeFileURL]) {
-		Upp::String raw = render("files");
+		Upp::String raw = [self renderFormat:"files"];
 		Upp::Value v = ParseJSON(raw);
 		if(!IsValueArray(v))
 			return;
@@ -96,7 +100,7 @@ NSPasteboard *Pasteboard(bool dnd = false)
 	bool is_rtf = [type isEqual:NSPasteboardTypeRTF];
 	Upp::String fmt = is_png ? "png" : is_rtf ? "rtf" : Upp::ToString(type);
 	
-	Upp::String raw = render(fmt);
+	Upp::String raw = [self renderFormat:fmt];
 	if(raw.GetCount() == 0 && source)
 		raw = source->GetDropData(fmt);
 	[pasteboard setData:[NSData dataWithBytes:~raw length:raw.GetCount()] forType:type];
