@@ -226,8 +226,8 @@ struct MMImp {
 		Flags(e);
 		if(!ctrl->IsEnabled())
 			return false;
-		Upp::dword k = e.keyCode;
-		WString x = ToWString((CFStringRef)(e.charactersIgnoringModifiers));
+		Upp::dword k = [e keyCode];
+		WString x = ToWString((CFStringRef)([e charactersIgnoringModifiers]));
 		if(x.GetCount() == 1)
 			switch(ToUpper(x[0])) {
 			#define KEY(c) case #c[0]: k = kVK_ANSI_##c; break;
@@ -248,15 +248,15 @@ struct MMImp {
 		if(GetOption())
 			k |= K_OPTION;
 		
-		if(e.keyCode == kVK_Help) // TODO: This is Insert key, but all this is dubious
+		if([e keyCode] == kVK_Help) // TODO: This is Insert key, but all this is dubious
 			ctrl->DispatchKey(k & ~K_KEYUP, 1);
 
 		ctrl->DispatchKey(k, 1);
 		if(!up && !(k & (K_CTRL|K_ALT))) {
-			WString x = ToWString((CFStringRef)(e.characters));
-			if(e.keyCode == kVK_ANSI_KeypadEnter && *x != 13)
+			WString x = ToWString((CFStringRef)([e characters]));
+			if([e keyCode] == kVK_ANSI_KeypadEnter && *x != 13)
 				ctrl->DispatchKey(13, 1);
-			if(e.keyCode == kVK_Space && !(k & K_SHIFT))
+			if([e keyCode] == kVK_Space && !(k & K_SHIFT))
 				ctrl->DispatchKey(' ', 1);
 		}
 		return true;

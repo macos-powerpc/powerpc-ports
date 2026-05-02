@@ -166,7 +166,7 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
 
 	CocoWindowSetCtrl(window, this);
 	CocoWindowSetActive(window, active);
-	window.backgroundColor = [NSColor clearColor];
+	[window setBackgroundColor:[NSColor clearColor]];
 
 	isopen = true;
 
