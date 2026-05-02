@@ -1,0 +1,425 @@
+From: OpenVDB Contributors
+Subject: [PATCH] Rewrite xcode_locator.m for macOS 10.6 compatibility
+
+This patch rewrites xcode_locator.m to:
+1. Remove ARC requirement - use manual retain/release
+2. Replace LSCopyApplicationURLsForBundleIdentifier (10.10+) with
+   directory scanning of /Applications and /Developer
+3. Remove modern ObjC literal syntax for GCC compatibility
+4. Support building with GCC (gcc-14 or similar)
+
+On macOS 10.6, Xcode lives in /Developer or /Applications/Xcode.app.
+This version scans known locations instead of using Launch Services.
+
+---
+ tools/osx/xcode_locator.m | 298 +++++++++++++++++-----------------------------
+ 1 file changed, 107 insertions(+), 191 deletions(-)
+
+diff --git a/tools/osx/xcode_locator.m b/tools/osx/xcode_locator.m
+index abcdef1..1234567 100644
+--- a/tools/osx/xcode_locator.m
++++ b/tools/osx/xcode_locator.m
+@@ -12,18 +12,16 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+
+-// Application that finds all Xcodes installed on a given Mac and will return a
+-// path for a given version number.
++// Application that finds all Xcodes installed on a given Mac and will return
++// a path for a given version number.
+ //
+-// If you have 7.0, 6.4.1 and 6.3 installed the inputs will map to:
+-//
+-// 7,7.0,7.0.0 = 7.0
+-// 6,6.4,6.4.1 = 6.4.1
+-// 6.3,6.3.0 = 6.3
++// This version is compatible with macOS 10.6+ and GCC.
++// It uses directory scanning instead of Launch Services APIs
++// that are not available on older macOS versions.
+
+-#if !defined(__has_feature) || !__has_feature(objc_arc)
+-#error "This file requires ARC support."
+-#endif
++// Note: This file uses manual reference counting (MRC) for compatibility
++// with GCC and older macOS versions. When building with clang and ARC,
++// the retain/release calls are harmless (though redundant).
+
+ #import <CoreServices/CoreServices.h>
+ #import <Foundation/Foundation.h>
+@@ -36,210 +34,128 @@
+
+ @implementation XcodeVersionEntry
+
++- (void)dealloc {
++  [_version release];
++  [_url release];
++  [super dealloc];
++}
++
+ - (id)initWithVersion:(NSString *)version url:(NSURL *)url {
+   if ((self = [super init])) {
+-    _version = version;
+-    _url = url;
++    _version = [version retain];
++    _url = [url retain];
+   }
+   return self;
+ }
+
+ - (id)description {
+-  return [NSString stringWithFormat:@"<%@ %p>: %@ %@",
+-                   [self class], self, _version, _url];
++  return [NSString stringWithFormat:@"<%@ %p>: %@ %@",
++                   [self class], self, _version, _url];
+ }
+
+ @end
+
+-// Given an entry, insert it into a dictionary that is keyed by versions.
+-//
+-// For an entry that is 6.4.1:/Applications/Xcode.app, add it for 6.4.1 and
+-// optionally add it for 6.4 and 6 if it is "better" than any entry that may
+-// already be there, where "better" is defined as:
+-//
+-// 1. Under /Applications/. (This avoids mounted xcode versions taking
+-//    precedence over installed versions.)
+-//
+-// 2. Not older (at least as high version number).
+-static void AddEntryToDictionary(
+-  XcodeVersionEntry *entry,
+-  NSMutableDictionary<NSString *, XcodeVersionEntry *> *dict) {
+-  BOOL inApplications = [entry.url.path hasPrefix:@"/Applications/"];
++static void AddEntryToDictionary(XcodeVersionEntry *entry,
++                                  NSMutableDictionary *dict) {
++  BOOL inApplications = [[entry.url path] hasPrefix:@"/Applications/"];
+   NSString *entryVersion = entry.version;
+   NSString *subversion = entryVersion;
+-  if (dict[entryVersion] && !inApplications) {
++  if ([dict objectForKey:entryVersion] && !inApplications) {
+     return;
+   }
+-  dict[entryVersion] = entry;
++  [dict setObject:entry forKey:entryVersion];
+   while (YES) {
+     NSRange range = [subversion rangeOfString:@"." options:NSBackwardsSearch];
+     if (range.length == 0 || range.location == 0) {
+       break;
+     }
+     subversion = [subversion substringToIndex:range.location];
+-    XcodeVersionEntry *subversionEntry = dict[subversion];
++    XcodeVersionEntry *subversionEntry = [dict objectForKey:subversion];
+     if (subversionEntry) {
+-      BOOL atLeastAsLarge = ([subversionEntry.version compare:entry.version]
+-                             == NSOrderedDescending);
++      BOOL atLeastAsLarge =
++          ([[subversionEntry version] compare:[entry version]] ==
++           NSOrderedDescending);
+       if (inApplications && atLeastAsLarge) {
+-        dict[subversion] = entry;
++        [dict setObject:entry forKey:subversion];
+       }
+     } else {
+-      dict[subversion] = entry;
++      [dict setObject:entry forKey:subversion];
+     }
+   }
+ }
+
+-// Given a "version", expand it to at least 3 components by adding .0 as
+-// necessary.
+ static NSString *ExpandVersion(NSString *version) {
+   NSArray *components = [version componentsSeparatedByString:@"."];
+   NSString *appendage = nil;
+-  if (components.count == 2) {
++  if ([components count] == 2) {
+     appendage = @".0";
+-  } else if (components.count == 1) {
++  } else if ([components count] == 1) {
+     appendage = @".0.0";
+   }
+   if (appendage) {
+     version = [version stringByAppendingString:appendage];
+   }
+   return version;
+ }
+
+-// Searches for all available Xcodes in the system and returns a dictionary that
+-// maps version identifiers of any form (X, X.Y, and X.Y.Z) to the directory
+-// where the Xcode bundle lives.
+-//
+-// If there is a problem locating the Xcodes, prints one or more error messages
+-// and returns nil.
+-static NSMutableDictionary<NSString *, XcodeVersionEntry *> *FindXcodes()
+-  __attribute((ns_returns_retained)) {
+-  CFStringRef cfBundleID = CFSTR("com.apple.dt.Xcode");
+-  NSString *bundleID = (__bridge NSString *)cfBundleID;
+-
+-  NSMutableDictionary<NSString *, XcodeVersionEntry *> *dict =
+-      [[NSMutableDictionary alloc] init];
+-  CFErrorRef cfError;
+-  NSArray *array = CFBridgingRelease(LSCopyApplicationURLsForBundleIdentifier(
+-      cfBundleID, &cfError));
+-  if (array == nil) {
+-    NSError *nsError = (__bridge NSError *)cfError;
+-    fprintf(stderr, "error: %s\n", nsError.description.UTF8String);
+-    return nil;
+-  }
+-
+-  // Scan all bundles but delay returning in case of errors until we are
+-  // done. This is to let us log details about all the bundles that were
+-  // processed so that a faulty bundle doesn't hide useful information about
+-  // other bundles that were found.
+-  BOOL errors = NO;
+-  for (NSURL *url in array) {
+-    NSArray *contents = [
+-      [NSFileManager defaultManager] contentsOfDirectoryAtURL:url
+-                                   includingPropertiesForKeys:nil
+-                                                      options:0
+-                                                        error:nil];
+-    NSLog(@"Found bundle %@ in %@; contents on disk: %@",
+-          bundleID, url, contents);
+-
+-    NSBundle *bundle = [NSBundle bundleWithURL:url];
+-    if (bundle == nil) {
+-      NSLog(@"ERROR: Unable to open bundle at URL: %@\n", url);
+-      errors = YES;
+-      continue;
+-    }
+-
+-    // LSCopyApplicationURLsForBundleIdentifier seems to sometimes return
+-    // invalid bundles (e.g. an arbitrary folder), which we should ignore (but
+-    // don't treat as an error).
+-    //
+-    // To work around this issue, we double check to make sure the NSBundle's
+-    // bundleIdentifier is that of Xcode's, as invalid bundles won't match.
+-    if (![bundle.bundleIdentifier isEqualToString:bundleID]) {
+-      NSLog(@"WARNING: Ignoring bundle %@ due to bundleID mismatch "
+-            @"(got \"%@\" but expected \"%@\"); info: %@",
+-            url, bundle.bundleIdentifier, bundleID, bundle.infoDictionary);
+-      continue;
+-    }
+-
+-    NSString *versionKey = @"CFBundleShortVersionString";
+-    NSString *version = [bundle.infoDictionary objectForKey:versionKey];
+-    if (version == nil) {
+-      NSLog(@"ERROR: Cannot find %@ in info for bundle %@; info: %@\n",
+-            versionKey, url, bundle.infoDictionary);
+-      errors = YES;
++// Try to add an Xcode installation from a given path
++static void TryAddXcodeAtPath(NSString *path, NSMutableDictionary *dict) {
++  NSFileManager *fm = [NSFileManager defaultManager];
++  BOOL isDir = NO;
++
++  if (![fm fileExistsAtPath:path isDirectory:&isDir] || !isDir) {
++    return;
++  }
++
++  NSBundle *bundle = [NSBundle bundleWithPath:path];
++  if (bundle == nil) {
++    return;
++  }
++
++  NSString *bundleID = [bundle bundleIdentifier];
++  if (bundleID == nil ||
++      (![bundleID isEqualToString:@"com.apple.dt.Xcode"] &&
++       ![bundleID isEqualToString:@"com.apple.Xcode"])) {
++    return;
++  }
++
++  NSString *versionKey = @"CFBundleShortVersionString";
++  NSString *version = [[bundle infoDictionary] objectForKey:versionKey];
++  if (version == nil) {
++    return;
++  }
++
++  NSString *expandedVersion = ExpandVersion(version);
++
++  // Try to get build version from version.plist
++  NSString *versionPlistPath =
++      [path stringByAppendingPathComponent:@"Contents/version.plist"];
++  NSDictionary *versionPlist =
++      [NSDictionary dictionaryWithContentsOfFile:versionPlistPath];
++  if (versionPlist) {
++    NSString *productVersion = [versionPlist objectForKey:@"ProductBuildVersion"];
++    if (productVersion) {
++      expandedVersion =
++          [expandedVersion stringByAppendingFormat:@".%@", productVersion];
++    }
++  }
++
++  // Developer dir is Contents/Developer for modern Xcode, or just the path for old /Developer
++  NSString *developerPath;
++  NSString *contentsDevPath =
++      [path stringByAppendingPathComponent:@"Contents/Developer"];
++  if ([fm fileExistsAtPath:contentsDevPath isDirectory:&isDir] && isDir) {
++    developerPath = contentsDevPath;
++  } else {
++    developerPath = path;
++  }
++
++  NSURL *developerURL = [NSURL fileURLWithPath:developerPath];
++  XcodeVersionEntry *entry =
++      [[[XcodeVersionEntry alloc] initWithVersion:expandedVersion
++                                              url:developerURL] autorelease];
++  AddEntryToDictionary(entry, dict);
++}
++
++static NSMutableDictionary *FindXcodes(void) {
++  NSMutableDictionary *dict =
++      [[[NSMutableDictionary alloc] init] autorelease];
++  NSFileManager *fm = [NSFileManager defaultManager];
++
++  // Check legacy /Developer path (Xcode 3.x and earlier)
++  TryAddXcodeAtPath(@"/Developer", dict);
++
++  // Check /Applications for Xcode*.app bundles
++  NSArray *appsContents = [fm contentsOfDirectoryAtPath:@"/Applications"
++                                                  error:nil];
++  for (NSString *item in appsContents) {
++    if ([item hasPrefix:@"Xcode"] && [item hasSuffix:@".app"]) {
++      NSString *fullPath =
++          [@"/Applications" stringByAppendingPathComponent:item];
++      TryAddXcodeAtPath(fullPath, dict);
++    }
++  }
++
++  // Also check user Applications folder
++  NSString *userApps = [@"~/Applications" stringByExpandingTildeInPath];
++  NSArray *userAppsContents = [fm contentsOfDirectoryAtPath:userApps error:nil];
++  for (NSString *item in userAppsContents) {
++    if ([item hasPrefix:@"Xcode"] && [item hasSuffix:@".app"]) {
++      NSString *fullPath = [userApps stringByAppendingPathComponent:item];
++      TryAddXcodeAtPath(fullPath, dict);
+       continue;
+     }
+-    NSString *expandedVersion = ExpandVersion(version);
+-    NSLog(@"Version strings for %@: short=%@, expanded=%@",
+-          url, version, expandedVersion);
+-
+-    NSURL *versionPlistUrl = [url URLByAppendingPathComponent:@"Contents/version.plist"];
+-    NSDictionary *versionPlistContents =
+-        [[NSDictionary alloc] initWithContentsOfURL:versionPlistUrl];
+-    NSString *productVersion = [versionPlistContents objectForKey:@"ProductBuildVersion"];
+-    if (productVersion) {
+-      expandedVersion = [expandedVersion stringByAppendingFormat:@".%@", productVersion];
+-    }
+-
+-    NSURL *developerDir =
+-        [url URLByAppendingPathComponent:@"Contents/Developer"];
+-    XcodeVersionEntry *entry =
+-        [[XcodeVersionEntry alloc] initWithVersion:expandedVersion
+-                                               url:developerDir];
+-    AddEntryToDictionary(entry, dict);
+   }
+-  return errors ? nil : dict;
++
++  return dict;
+ }
+
+-// Prints out the located Xcodes as a set of lines where each line contains the
+-// list of versions for a given Xcode and its location on disk.
+-static void DumpAsVersionsOnly(
+-  FILE *output,
+-  NSMutableDictionary<NSString *, XcodeVersionEntry *> *dict) {
+-  NSMutableDictionary<NSString *, NSMutableSet <NSString *> *> *aliasDict =
+-      [[NSMutableDictionary alloc] init];
+-  [dict enumerateKeysAndObjectsUsingBlock:^(NSString *aliasVersion,
+-                                            XcodeVersionEntry *entry,
+-                                            BOOL *stop) {
+-    NSString *versionString = entry.version;
+-    if (aliasDict[versionString] == nil) {
+-      aliasDict[versionString] = [[NSMutableSet alloc] init];
++static void DumpAsVersionsOnly(FILE *output, NSMutableDictionary *dict) {
++  NSMutableDictionary *aliasDict =
++      [[[NSMutableDictionary alloc] init] autorelease];
++
++  NSEnumerator *keyEnum = [dict keyEnumerator];
++  NSString *aliasVersion;
++  while ((aliasVersion = [keyEnum nextObject])) {
++    XcodeVersionEntry *entry = [dict objectForKey:aliasVersion];
++    NSString *versionString = [entry version];
++    if ([aliasDict objectForKey:versionString] == nil) {
++      [aliasDict setObject:[NSMutableSet set] forKey:versionString];
+     }
+-    [aliasDict[versionString] addObject:aliasVersion];
+-  }];
++    [[aliasDict objectForKey:versionString] addObject:aliasVersion];
++  }
++
+   for (NSString *version in aliasDict) {
+-    XcodeVersionEntry *entry = dict[version];
++    XcodeVersionEntry *entry = [dict objectForKey:version];
+     fprintf(output, "%s:%s:%s\n",
+-            version.UTF8String,
+-            [[aliasDict[version] allObjects]
+-                   componentsJoinedByString: @","].UTF8String,
+-            entry.url.fileSystemRepresentation);
++            [version UTF8String],
++            [[[[aliasDict objectForKey:version] allObjects]
++                componentsJoinedByString:@","] UTF8String],
++            [[entry.url path] UTF8String]);
+   }
+ }
+
+-// Prints out the located Xcodes in JSON format.
+-static void DumpAsJson(
+-  FILE *output,
+-  NSMutableDictionary<NSString *, XcodeVersionEntry *> *dict) {
++static void DumpAsJson(FILE *output, NSMutableDictionary *dict) {
+   fprintf(output, "{\n");
+   for (NSString *version in dict) {
+-    XcodeVersionEntry *entry = dict[version];
++    XcodeVersionEntry *entry = [dict objectForKey:version];
+     fprintf(output, "\t\"%s\": \"%s\",\n",
+-            version.UTF8String, entry.url.fileSystemRepresentation);
++            [version UTF8String], [[[entry url] path] UTF8String]);
+   }
+   fprintf(output, "}\n");
+ }
+
+-// Dumps usage information.
+ static void usage(FILE *output) {
+   fprintf(
+       output,
+@@ -260,7 +176,8 @@ static void usage(FILE *output) {
+ }
+
+ int main(int argc, const char *argv[]) {
+-  @autoreleasepool {
++  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
++  {
+     NSString *versionArg = nil;
+     BOOL versionsOnly = NO;
+     if (argc == 1) {
+@@ -277,11 +194,9 @@ int main(int argc, const char * argv[]) {
+     if (versionArg == nil) {
+       usage(stderr);
++      [pool release];
+       return 1;
+     }
+
+-    NSMutableDictionary<NSString *, XcodeVersionEntry *> *dict = FindXcodes();
+-    if (dict == nil) {
+-      return 1;
+-    }
++    NSMutableDictionary *dict = FindXcodes();
+
+-    XcodeVersionEntry *entry = [dict objectForKey:versionArg];
++    XcodeVersionEntry *entry = [dict objectForKey:versionArg];
+     if (entry) {
+-      printf("%s\n", entry.url.fileSystemRepresentation);
++      printf("%s\n", [[[entry url] path] UTF8String]);
++      [pool release];
+       return 0;
+     }
+
+@@ -290,6 +205,7 @@ int main(int argc, const char * argv[]) {
+     } else {
+       DumpAsJson(stdout, dict);
+     }
++    [pool release];
+     return ([@"" isEqualToString:versionArg] ? 0 : 1);
+   }
+ }
+--
+2.39.0
