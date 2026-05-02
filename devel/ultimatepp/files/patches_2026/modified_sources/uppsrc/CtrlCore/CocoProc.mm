@@ -2,6 +2,11 @@
 
 #ifdef GUI_COCOA
 
+// Define associated object keys - declared extern in CocoMM.h
+char CocoViewCtrlKey;
+char CocoWindowCtrlKey;
+char CocoWindowActiveKey;
+
 NSEvent *sCurrentMouseEvent__; // needed for drag operation
 
 #define LLOG(x) // DLOG(x)

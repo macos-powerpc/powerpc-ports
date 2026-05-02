@@ -197,10 +197,11 @@ NSRect DesktopRect(const Upp::Rect& r);
 // This avoids GCC ObjC runtime issues with ivars
 #import <objc/runtime.h>
 
-// Keys for associated objects - must be unique addresses
-static char CocoViewCtrlKey;
-static char CocoWindowCtrlKey;
-static char CocoWindowActiveKey;
+// Keys for associated objects - declared extern, defined in CocoProc.mm
+// Must be unique addresses across all translation units
+extern char CocoViewCtrlKey;
+extern char CocoWindowCtrlKey;
+extern char CocoWindowActiveKey;
 
 @interface CocoView : NSView <NSWindowDelegate, NSTextInputClient>
 @end
@@ -209,22 +210,22 @@ static char CocoWindowActiveKey;
 typedef NSWindow CocoWindow;
 
 // Helper functions to get/set associated ctrl pointer
-static inline Upp::Ctrl* CocoViewGetCtrl(CocoView *view) {
+inline Upp::Ctrl* CocoViewGetCtrl(CocoView *view) {
 	return (Upp::Ctrl*)objc_getAssociatedObject(view, &CocoViewCtrlKey);
 }
-static inline void CocoViewSetCtrl(CocoView *view, Upp::Ctrl *c) {
+inline void CocoViewSetCtrl(CocoView *view, Upp::Ctrl *c) {
 	objc_setAssociatedObject(view, &CocoViewCtrlKey, (id)c, OBJC_ASSOCIATION_ASSIGN);
 }
-static inline Upp::Ctrl* CocoWindowGetCtrl(CocoWindow *win) {
+inline Upp::Ctrl* CocoWindowGetCtrl(CocoWindow *win) {
 	return (Upp::Ctrl*)objc_getAssociatedObject(win, &CocoWindowCtrlKey);
 }
-static inline void CocoWindowSetCtrl(CocoWindow *win, Upp::Ctrl *c) {
+inline void CocoWindowSetCtrl(CocoWindow *win, Upp::Ctrl *c) {
 	objc_setAssociatedObject(win, &CocoWindowCtrlKey, (id)c, OBJC_ASSOCIATION_ASSIGN);
 }
-static inline bool CocoWindowGetActive(CocoWindow *win) {
+inline bool CocoWindowGetActive(CocoWindow *win) {
 	return objc_getAssociatedObject(win, &CocoWindowActiveKey) != nil;
 }
-static inline void CocoWindowSetActive(CocoWindow *win, bool a) {
+inline void CocoWindowSetActive(CocoWindow *win, bool a) {
 	objc_setAssociatedObject(win, &CocoWindowActiveKey, a ? (id)1 : nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
