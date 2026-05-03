@@ -121,10 +121,12 @@ struct CocoMenuBar : public Bar {
 			m.cb = cb;
 			// Store bar pointer on the menu item for lookup in the action
 			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
-			// Set target to AppDelegate explicitly - responder chain doesn't work on macOS 10.6
+			// Set target to AppDelegate explicitly
+			// Use sel_registerName to ensure selector is registered with GCC ObjC runtime
+			SEL action = sel_registerName("cocoMenuAction:");
 			[m.nsitem setTarget:[NSApp delegate]];
-			[m.nsitem setAction:@selector(cocoMenuAction:)];
-			NSLog(@"AddItem: nsitem=%p target=%p bar=%p", m.nsitem, [NSApp delegate], this);
+			[m.nsitem setAction:action];
+			NSLog(@"AddItem: nsitem=%p target=%p action=%p bar=%p", m.nsitem, [NSApp delegate], action, this);
 		}
 		return m;
 	}
