@@ -46,6 +46,13 @@ void CocoMenuBarAction(void *bar, id sender);
 	return YES;
 }
 
+// Explicitly declare we respond to cocoMenuAction: for GCC ObjC runtime
+-(BOOL)respondsToSelector:(SEL)aSelector {
+	if(aSelector == @selector(cocoMenuAction:))
+		return YES;
+	return [super respondsToSelector:aSelector];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
 	Upp::GuiLock __;
