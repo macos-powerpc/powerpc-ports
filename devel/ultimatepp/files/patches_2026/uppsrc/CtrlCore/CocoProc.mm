@@ -276,9 +276,7 @@ struct MMImp {
 		Upp::Ctrl::lastActive = ctrl;
 		ctrl->ActivateWnd();
 		auto tw = dynamic_cast<TopWindow *>(ctrl);
-		NSLog(@"BecomeKey: ctrl=%p tw=%p placefocus=%d", ctrl, tw, tw ? (int)tw->placefocus : -1);
 		if(tw && tw->placefocus) {
-			NSLog(@"BecomeKey: calling PlaceFocus");
 			tw->PlaceFocus();
 			tw->placefocus = false;
 		}
@@ -351,10 +349,8 @@ struct MMImp {
 	
 	static void PreeditText(Ctrl *ctrl, const WString& s)
 	{
-		NSLog(@"PreeditText: ctrl=%p s.len=%d", ctrl, (int)s.GetCount());
 		if(ctrl)
 			for(Upp::wchar ch : s) {
-				NSLog(@"PreeditText: ch=%d (0x%x)", (int)ch, (int)ch);
 				if(ch >= 32 && ch != 127 && ch != ' ')
 					ctrl->DispatchKey(ch, 1);
 			}
@@ -396,15 +392,6 @@ void CocoMenuBarAction(void *bar, id sender);
 
 - (void)mouseDown:(NSEvent *)e {
 	Upp::GuiLock __;
-	Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
-	NSLog(@"mouseDown: view=%p ctrl=%p window=%p isKeyWindow=%d firstResponder=%p",
-	      self, ctrl, [self window],
-	      (int)[[self window] isKeyWindow], [[self window] firstResponder]);
-	if(ctrl) {
-		Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
-		NSLog(@"mouseDown: ctrl.IsEnabled=%d IsOpen=%d focusCtrl=%p",
-		      (int)ctrl->IsEnabled(), (int)ctrl->IsOpen(), focus);
-	}
 	coco_mouse_left = true;
 	if(!Upp::MMImp::MouseDownEvent(self, e, Upp::Ctrl::LEFT))
 		[super mouseDown:e];
@@ -421,8 +408,6 @@ void CocoMenuBarAction(void *bar, id sender);
 
 - (void)mouseUp:(NSEvent *)e {
 	Upp::GuiLock __;
-	NSLog(@"mouseUp: view=%p ctrl=%p window=%p isKeyWindow=%d",
-	      self, CocoViewGetCtrl(self), [self window], (int)[[self window] isKeyWindow]);
 	coco_mouse_left = false;
 	if(!Upp::MMImp::MouseEvent(self, e, Upp::Ctrl::LEFTUP))
 		[super mouseUp:e];
@@ -466,10 +451,7 @@ void CocoMenuBarAction(void *bar, id sender);
 
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
-	Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
 	NSString *chars = [e characters];
-	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d focusCtrl=%p chars=%@",
-	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus, chars);
 
 	// On macOS 10.6, interpretKeyEvents may not call insertText for simple characters
 	// So we handle character input directly here for printable characters
@@ -478,7 +460,6 @@ void CocoMenuBarAction(void *bar, id sender);
 		// Check if it's a printable character (not a control character)
 		// and no command key is pressed
 		if(ch >= 32 && ch != 127 && !([e modifierFlags] & NSEventModifierFlagCommand)) {
-			NSLog(@"keyDown: direct character input ch=%d (0x%x)", (int)ch, (int)ch);
 			Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
 			if(ctrl) {
 				// Dispatch the character directly using MMImp helper (DispatchKey is private)
@@ -534,7 +515,6 @@ void CocoMenuBarAction(void *bar, id sender);
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
 	Upp::GuiLock __;
-	NSLog(@"windowDidBecomeKey: view=%p ctrl=%p", self, CocoViewGetCtrl(self));
 	Upp::MMImp::BecomeKey(CocoViewGetCtrl(self));
 }
 
@@ -544,7 +524,6 @@ void CocoMenuBarAction(void *bar, id sender);
 }
 
 - (BOOL)acceptsFirstResponder {
-	NSLog(@"acceptsFirstResponder: view=%p returning YES", self);
 	return YES;
 }
 
@@ -614,7 +593,6 @@ void CocoMenuBarAction(void *bar, id sender);
     (void) replacementRange;
 
     NSString* pInsert = [aString isMemberOfClass: [NSAttributedString class]] ? [aString string] : aString;
-	NSLog(@"insertText: view=%p pInsert=%@ ctrl=%p", self, pInsert, CocoViewGetCtrl(self));
 
 	if(pInsert)
 		Upp::MMImp::PreeditText(CocoViewGetCtrl(self), Upp::ToWString(pInsert));
@@ -679,7 +657,6 @@ void CocoMenuBarAction(void *bar, id sender);
 {
 	// Required by NSTextInputClient protocol
 	// Do nothing - U++ handles key events directly
-	NSLog(@"doCommandBySelector: %@", NSStringFromSelector(aSelector));
 }
 
 // Menu action handler - called when menu items with nil target are clicked
@@ -687,16 +664,12 @@ void CocoMenuBarAction(void *bar, id sender);
 - (void)cocoMenuAction:(id)sender
 {
 	Upp::GuiLock __;
-	NSLog(@"CocoView cocoMenuAction: sender=%p", sender);
 	NSMenuItem *item = (NSMenuItem *)sender;
 	// Get the bar pointer from the menu item's associated object
 	void *barPtr = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"CocoView cocoMenuAction: item=%p barPtr=%p", item, barPtr);
 	if(barPtr) {
 		// Forward to the Upp menu action handler (defined in MacMenu.mm)
 		Upp::CocoMenuBarAction(barPtr, sender);
-	} else {
-		NSLog(@"CocoView cocoMenuAction: bar is NULL!");
 	}
 }
 

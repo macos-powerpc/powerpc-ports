@@ -31,14 +31,10 @@ void CocoMenuBarAction(void *bar, id sender);
 
 -(void)cocoMenuAction:(id)sender {
 	Upp::GuiLock __;
-	NSLog(@"AppDelegate cocoMenuAction: sender=%p", sender);
 	NSMenuItem *item = (NSMenuItem *)sender;
 	void *bar = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"AppDelegate cocoMenuAction: item=%p bar=%p", item, bar);
 	if(bar)
 		Upp::CocoMenuBarAction(bar, sender);
-	else
-		NSLog(@"AppDelegate cocoMenuAction: bar is NULL!");
 }
 
 -(BOOL)validateMenuItem:(NSMenuItem *)menuItem {

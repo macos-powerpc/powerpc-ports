@@ -39,7 +39,7 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 // NOTE: CocoMenuItemBarKey is declared extern in CocoMM.h and defined in CocoProc.mm
 // so that CocoApp.mm can use the same key for lookups
 
-// Track last selected menu item for workaround
+// Track last selected menu item for GCC ObjC runtime workaround
 static NSMenuItem *lastSelectedMenuItem = nil;
 static BOOL menuItemWasClicked = NO;
 
@@ -134,7 +134,6 @@ struct CocoMenuBar : public Bar {
 			ASSERT(sharedMenuDelegate != nil);
 			[m.nsitem setTarget:sharedMenuDelegate];
 			[m.nsitem setAction:@selector(menuItemAction:)];
-			NSLog(@"AddItem: nsitem=%p target=%p action=menuItemAction: bar=%p", m.nsitem, sharedMenuDelegate, this);
 		}
 		return m;
 	}
@@ -352,18 +351,15 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 @implementation CocoMenuDelegate
 
 - (void)menuItemAction:(id)sender {
-	NSLog(@"CocoMenuDelegate menuItemAction: sender=%p", sender);
 	Upp::GuiLock __;
 	NSMenuItem *item = (NSMenuItem *)sender;
 	void *barPtr = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"CocoMenuDelegate menuItemAction: barPtr=%p", barPtr);
 	if(barPtr) {
 		Upp::CocoMenuBarAction(barPtr, sender);
 	}
 }
 
 - (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item {
-	NSLog(@"willHighlightItem: menu=%p item=%p title=%@", menu, item, item ? [item title] : @"(nil)");
 	// Track highlighted item - if it's a real item (not nil, not separator, not submenu parent)
 	if(item && ![item isSeparatorItem] && ![item hasSubmenu]) {
 		lastSelectedMenuItem = item;
@@ -371,7 +367,6 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
-	NSLog(@"menuWillOpen: menu=%p", menu);
 	lastSelectedMenuItem = nil;
 	menuItemWasClicked = NO;
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
@@ -386,16 +381,13 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 }
 
 - (void)menuDidClose:(NSMenu *)menu {
-	NSLog(@"menuDidClose: menu=%p lastSelected=%p", menu, lastSelectedMenuItem);
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
 	if(ptr && ptr->dockmenu)
 		return;
 
 	// GCC ObjC runtime workaround: action/target dispatch doesn't work,
 	// so we manually invoke the action for the highlighted item when menu closes
-	// Check if there was a highlighted item and if mouse was released over it
 	if(lastSelectedMenuItem && [lastSelectedMenuItem isEnabled]) {
-		NSLog(@"menuDidClose: executing action for item=%p title=%@", lastSelectedMenuItem, [lastSelectedMenuItem title]);
 		void *barPtr = objc_getAssociatedObject(lastSelectedMenuItem, &CocoMenuItemBarKey);
 		if(barPtr) {
 			Upp::GuiLock __;
