@@ -22,10 +22,11 @@ static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
 		// Check if it's a TopWindow (dialog) - these should always be able to become key if enabled
 		// PopUp windows (menus, tooltips) have active=false and should not become key
 		bool active = CocoWindowGetActive((CocoWindow*)self);
-		bool isTopWindow = dynamic_cast<Upp::TopWindow*>(ctrl) != NULL;
+		Upp::TopWindow *tw = dynamic_cast<Upp::TopWindow*>(ctrl);
+		bool isTopWindow = (tw != NULL);
 		BOOL result = (active || isTopWindow) && ctrl->IsEnabled();
-		NSLog(@"canBecomeKeyWindow: active=%d isTopWindow=%d enabled=%d result=%d",
-		      (int)active, (int)isTopWindow, (int)ctrl->IsEnabled(), (int)result);
+		NSLog(@"canBecomeKeyWindow: ctrl=%p active=%d tw=%p isTopWindow=%d enabled=%d result=%d",
+		      ctrl, (int)active, tw, (int)isTopWindow, (int)ctrl->IsEnabled(), (int)result);
 		return result;
 	}
 	// Otherwise call original
@@ -215,6 +216,9 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
 void Ctrl::WndDestroy()
 {
 	LLOG("WndDestroy " << Name());
+	NSLog(@"WndDestroy: ctrl=%p window=%p isTopWindow=%d",
+	      this, top ? GetTop()->coco->window : nil,
+	      dynamic_cast<TopWindow*>(this) != NULL);
 	if(!top)
 		return;
 	bool focus = HasFocusDeep();
