@@ -330,7 +330,10 @@ void CocoMenuBar::New() {
 
 // Function called by AppDelegate when menu item is clicked
 // This is exposed so CocoApp.mm can call it
-void CocoMenuBarAction(CocoMenuBar *bar, id sender) {
+// Called from CocoView::cocoMenuAction and AppDelegate::cocoMenuAction
+// Uses void* to allow extern declaration without struct definition
+void CocoMenuBarAction(void *barPtr, id sender) {
+	CocoMenuBar *bar = (CocoMenuBar *)barPtr;
 	if(bar)
 		bar->MenuAction(sender);
 }

@@ -679,6 +679,25 @@ struct MMImp {
 	NSLog(@"doCommandBySelector: %@", NSStringFromSelector(aSelector));
 }
 
+// Menu action handler - called when menu items with nil target are clicked
+// This is in the responder chain as the first responder (key window's content view)
+- (void)cocoMenuAction:(id)sender
+{
+	Upp::GuiLock __;
+	NSLog(@"CocoView cocoMenuAction: sender=%p", sender);
+	NSMenuItem *item = (NSMenuItem *)sender;
+	// Get the bar pointer from the menu item's associated object
+	void *barPtr = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"CocoView cocoMenuAction: item=%p barPtr=%p", item, barPtr);
+	if(barPtr) {
+		// Forward to the Upp menu action handler
+		extern void CocoMenuBarAction(void *bar, id sender);
+		CocoMenuBarAction(barPtr, sender);
+	} else {
+		NSLog(@"CocoView cocoMenuAction: bar is NULL!");
+	}
+}
+
 @end
 
 #endif

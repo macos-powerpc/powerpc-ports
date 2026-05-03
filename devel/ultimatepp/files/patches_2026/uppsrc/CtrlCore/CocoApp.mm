@@ -19,8 +19,7 @@
 // Forward declarations for menu handling
 namespace Upp {
 NSMenu *Cocoa_DockMenu();
-struct CocoMenuBar;
-void CocoMenuBarAction(CocoMenuBar *bar, id sender);
+void CocoMenuBarAction(void *bar, id sender);
 };
 
 @implementation AppDelegate
@@ -34,7 +33,7 @@ void CocoMenuBarAction(CocoMenuBar *bar, id sender);
 	Upp::GuiLock __;
 	NSLog(@"AppDelegate cocoMenuAction: sender=%p", sender);
 	NSMenuItem *item = (NSMenuItem *)sender;
-	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	void *bar = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
 	NSLog(@"AppDelegate cocoMenuAction: item=%p bar=%p", item, bar);
 	if(bar)
 		Upp::CocoMenuBarAction(bar, sender);
