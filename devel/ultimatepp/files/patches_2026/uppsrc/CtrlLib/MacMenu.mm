@@ -39,10 +39,15 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 // NOTE: CocoMenuItemBarKey is declared extern in CocoMM.h and defined in CocoProc.mm
 // so that CocoApp.mm can use the same key for lookups
 
+// Track last selected menu item for workaround
+static NSMenuItem *lastSelectedMenuItem = nil;
+static BOOL menuItemWasClicked = NO;
+
 // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
 // Also handles menu item actions since GCC ObjC runtime doesn't dispatch action/target properly
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
 - (void)menuItemAction:(id)sender;
+- (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item;
 @end
 
 // Global delegate instance - shared by all menus
@@ -357,7 +362,18 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 	}
 }
 
+- (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item {
+	NSLog(@"willHighlightItem: menu=%p item=%p title=%@", menu, item, item ? [item title] : @"(nil)");
+	// Track highlighted item - if it's a real item (not nil, not separator, not submenu parent)
+	if(item && ![item isSeparatorItem] && ![item hasSubmenu]) {
+		lastSelectedMenuItem = item;
+	}
+}
+
 - (void)menuWillOpen:(NSMenu *)menu {
+	NSLog(@"menuWillOpen: menu=%p", menu);
+	lastSelectedMenuItem = nil;
+	menuItemWasClicked = NO;
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
 	Upp::Event<Upp::Bar&> *proc = CocoMenuGetProc(menu);
 	if(ptr && ptr->dockmenu)
@@ -370,11 +386,24 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 }
 
 - (void)menuDidClose:(NSMenu *)menu {
+	NSLog(@"menuDidClose: menu=%p lastSelected=%p", menu, lastSelectedMenuItem);
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
 	if(ptr && ptr->dockmenu)
 		return;
-	// DO NOT CALL ClearItems here - menu is closed before MenuAction, we need items to find
-	// correct callback
+
+	// GCC ObjC runtime workaround: action/target dispatch doesn't work,
+	// so we manually invoke the action for the highlighted item when menu closes
+	// Check if there was a highlighted item and if mouse was released over it
+	if(lastSelectedMenuItem && [lastSelectedMenuItem isEnabled]) {
+		NSLog(@"menuDidClose: executing action for item=%p title=%@", lastSelectedMenuItem, [lastSelectedMenuItem title]);
+		void *barPtr = objc_getAssociatedObject(lastSelectedMenuItem, &CocoMenuItemBarKey);
+		if(barPtr) {
+			Upp::GuiLock __;
+			Upp::CocoMenuBarAction(barPtr, lastSelectedMenuItem);
+		}
+		lastSelectedMenuItem = nil;
+	}
+
 	[menu removeAllItems];
 }
 
