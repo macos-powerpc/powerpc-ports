@@ -227,11 +227,23 @@ void Ctrl::WndDestroy()
 	auto* coco = GetTop()->coco;
 	auto* window = coco->window;
 
-	NSLog(@"WndDestroy: before close, window=%p isVisible=%d retainCount=%lu",
-	      window, (int)[window isVisible], (unsigned long)[window retainCount]);
-	[window setCollectionBehavior:NSWindowCollectionBehaviorTransient];
-	[window orderOut:nil];  // Force window to hide immediately
+	NSLog(@"WndDestroy: before close, window=%p isVisible=%d retainCount=%lu parentWindow=%p",
+	      window, (int)[window isVisible], (unsigned long)[window retainCount], [window parentWindow]);
+
+	// Remove from parent window's child list first
+	NSWindow *parent = [window parentWindow];
+	if(parent) {
+		NSLog(@"WndDestroy: removing from parent window %p", parent);
+		[parent removeChildWindow:window];
+	}
+
+	// Clear the delegate to prevent callbacks during close
+	[window setDelegate:nil];
+
+	// Order out and close
+	[window orderOut:nil];
 	[window close];
+
 	NSLog(@"WndDestroy: after close, isVisible=%d", (int)[window isVisible]);
 
 	delete coco;

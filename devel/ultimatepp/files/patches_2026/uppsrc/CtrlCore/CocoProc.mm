@@ -463,11 +463,30 @@ struct MMImp {
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
 	Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
+	NSString *chars = [e characters];
 	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d focusCtrl=%p chars=%@",
-	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus, [e characters]);
-	NSLog(@"keyDown: before interpretKeyEvents");
-    [self interpretKeyEvents: [NSArray arrayWithObject: e]];
-	NSLog(@"keyDown: after interpretKeyEvents");
+	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus, chars);
+
+	// On macOS 10.6, interpretKeyEvents may not call insertText for simple characters
+	// So we handle character input directly here for printable characters
+	if(chars && [chars length] > 0) {
+		unichar ch = [chars characterAtIndex:0];
+		// Check if it's a printable character (not a control character)
+		// and no command key is pressed
+		if(ch >= 32 && ch != 127 && !([e modifierFlags] & NSEventModifierFlagCommand)) {
+			NSLog(@"keyDown: direct character input ch=%d (0x%x)", (int)ch, (int)ch);
+			Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
+			if(ctrl) {
+				// Dispatch the character directly
+				ctrl->DispatchKey(ch, 1);
+			}
+		}
+	}
+
+	// Still call interpretKeyEvents for IME support
+	[self interpretKeyEvents: [NSArray arrayWithObject: e]];
+
+	// And KeyEvent for special keys (arrows, function keys, etc.)
 	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
 		[super keyDown:e];
 }
