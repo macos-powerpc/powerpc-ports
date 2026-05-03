@@ -60,8 +60,12 @@ static void SwizzleNSMenuMethods()
 
 	// Add cocoMenuAction: method to NSMenu class
 	// This makes any NSMenu instance able to receive this action
-	class_addMethod(menuClass, actionSel, (IMP)Swizzled_cocoMenuAction, "v@:@");
-	NSLog(@"SwizzleNSMenuMethods: added cocoMenuAction: to NSMenu");
+	BOOL added = class_addMethod(menuClass, actionSel, (IMP)Swizzled_cocoMenuAction, "v@:@");
+	NSLog(@"SwizzleNSMenuMethods: class_addMethod returned %d", (int)added);
+
+	// Verify the method was added
+	Method m = class_getInstanceMethod(menuClass, actionSel);
+	NSLog(@"SwizzleNSMenuMethods: method lookup returned %p", m);
 }
 
 namespace Upp {
@@ -141,6 +145,9 @@ struct CocoMenuBar : public Bar {
 			// This matches the original behavior where CocoMenu subclass had this method
 			[m.nsitem setTarget:cocomenu];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
+			NSLog(@"AddItem: nsitem=%p target=%p action=%s respondsToSelector=%d",
+			      m.nsitem, cocomenu, sel_getName(@selector(cocoMenuAction:)),
+			      (int)[cocomenu respondsToSelector:@selector(cocoMenuAction:)]);
 		}
 		return m;
 	}
