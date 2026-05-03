@@ -366,6 +366,9 @@ struct MMImp {
 	}
 };
 
+// Forward declaration for menu action handler (defined in MacMenu.mm)
+void CocoMenuBarAction(void *bar, id sender);
+
 };
 
 @implementation CocoView
@@ -690,9 +693,8 @@ struct MMImp {
 	void *barPtr = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
 	NSLog(@"CocoView cocoMenuAction: item=%p barPtr=%p", item, barPtr);
 	if(barPtr) {
-		// Forward to the Upp menu action handler
-		extern void CocoMenuBarAction(void *bar, id sender);
-		CocoMenuBarAction(barPtr, sender);
+		// Forward to the Upp menu action handler (defined in MacMenu.mm)
+		Upp::CocoMenuBarAction(barPtr, sender);
 	} else {
 		NSLog(@"CocoView cocoMenuAction: bar is NULL!");
 	}
