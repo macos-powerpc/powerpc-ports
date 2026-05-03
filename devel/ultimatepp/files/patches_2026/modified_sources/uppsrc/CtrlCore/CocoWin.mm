@@ -18,9 +18,12 @@ static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
 	// If this is our window, use our logic
 	if(ctrl) {
 		Upp::GuiLock __;
-		return active && ctrl->IsEnabled();
+		BOOL result = active && ctrl->IsEnabled();
+		RLOG("Swizzled_canBecomeKeyWindow: ctrl=" << Upp::Name(ctrl) << " active=" << active << " enabled=" << ctrl->IsEnabled() << " -> " << result);
+		return result;
 	}
 	// Otherwise call original
+	RLOG("Swizzled_canBecomeKeyWindow: no ctrl, calling original");
 	if(sOriginalCanBecomeKeyWindow)
 		return ((BOOL(*)(id, SEL))sOriginalCanBecomeKeyWindow)(self, _cmd);
 	return YES; // NSWindow default
@@ -48,6 +51,7 @@ static void SwizzleNSWindowMethods()
 	if(swizzled) return;
 	swizzled = true;
 
+	RLOG("SwizzleNSWindowMethods: swizzling NSWindow methods");
 	Class windowClass = [NSWindow class];
 
 	// Swizzle canBecomeKeyWindow
@@ -55,6 +59,9 @@ static void SwizzleNSWindowMethods()
 	if(origKey) {
 		sOriginalCanBecomeKeyWindow = method_getImplementation(origKey);
 		method_setImplementation(origKey, (IMP)Swizzled_canBecomeKeyWindow);
+		RLOG("SwizzleNSWindowMethods: canBecomeKeyWindow swizzled");
+	} else {
+		RLOG("SwizzleNSWindowMethods: canBecomeKeyWindow NOT FOUND");
 	}
 
 	// Swizzle canBecomeMainWindow
@@ -62,6 +69,9 @@ static void SwizzleNSWindowMethods()
 	if(origMain) {
 		sOriginalCanBecomeMainWindow = method_getImplementation(origMain);
 		method_setImplementation(origMain, (IMP)Swizzled_canBecomeMainWindow);
+		RLOG("SwizzleNSWindowMethods: canBecomeMainWindow swizzled");
+	} else {
+		RLOG("SwizzleNSWindowMethods: canBecomeMainWindow NOT FOUND");
 	}
 }
 
