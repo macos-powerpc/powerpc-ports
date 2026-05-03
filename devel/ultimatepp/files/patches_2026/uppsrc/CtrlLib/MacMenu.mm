@@ -36,8 +36,8 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 }
 
 // Associated object key for storing CocoMenuBar* on each NSMenuItem
-// NOTE: Must match the key in CocoApp.mm for AppDelegate menu action handler
-static char CocoMenuItemBarKey;
+// NOTE: CocoMenuItemBarKey is declared extern in CocoMM.h and defined in CocoProc.mm
+// so that CocoApp.mm can use the same key for lookups
 
 // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
@@ -121,11 +121,11 @@ struct CocoMenuBar : public Bar {
 			m.cb = cb;
 			// Store bar pointer on the menu item for lookup in the action
 			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
-			// Set target to the application delegate - it's always in the responder chain
-			// and has cocoMenuAction: method to dispatch to the correct CocoMenuBar
-			[m.nsitem setTarget:[NSApp delegate]];
+			// Set target to nil - action goes through responder chain to AppDelegate
+			// AppDelegate has cocoMenuAction: method to dispatch to the correct CocoMenuBar
+			[m.nsitem setTarget:nil];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
-			NSLog(@"AddItem: nsitem=%p target=%p (app delegate) bar=%p", m.nsitem, [NSApp delegate], this);
+			NSLog(@"AddItem: nsitem=%p target=nil (responder chain) bar=%p", m.nsitem, this);
 		}
 		return m;
 	}

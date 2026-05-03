@@ -240,8 +240,19 @@ void Ctrl::WndDestroy()
 	// Clear the delegate to prevent callbacks during close
 	[window setDelegate:nil];
 
+	// Clear the content view's ctrl reference to prevent further callbacks
+	CocoViewSetCtrl(coco->view, NULL);
+
+	// On macOS 10.6, we need to ensure the window is truly hidden
+	// setContentView:nil helps force release of the view
+	[window setContentView:nil];
+
 	// Order out and close
 	[window orderOut:nil];
+
+	// Force display update to ensure window disappears immediately
+	[window display];
+
 	[window close];
 
 	NSLog(@"WndDestroy: after close, isVisible=%d", (int)[window isVisible]);

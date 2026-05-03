@@ -202,6 +202,7 @@ NSRect DesktopRect(const Upp::Rect& r);
 extern char CocoViewCtrlKey;
 extern char CocoWindowCtrlKey;
 extern char CocoWindowActiveKey;
+extern char CocoMenuItemBarKey;
 
 @interface CocoView : NSView <NSWindowDelegate, NSTextInputClient>
 @end

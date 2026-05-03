@@ -6,6 +6,7 @@
 char CocoViewCtrlKey;
 char CocoWindowCtrlKey;
 char CocoWindowActiveKey;
+char CocoMenuItemBarKey;
 
 NSEvent *sCurrentMouseEvent__; // needed for drag operation
 

@@ -7,8 +7,7 @@
 // For CGEventTap (GCC block workaround)
 #include <ApplicationServices/ApplicationServices.h>
 
-// Associated object key for menu item bar pointer - same as in MacMenu.mm
-static char CocoMenuItemBarKey;
+// CocoMenuItemBarKey is declared extern in CocoMM.h and defined in CocoProc.mm
 
 @interface AppDelegate : NSObject<NSApplicationDelegate>
 {
