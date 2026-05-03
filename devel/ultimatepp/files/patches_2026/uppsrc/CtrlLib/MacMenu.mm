@@ -35,17 +35,34 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 	objc_setAssociatedObject(menu, &CocoMenuProcKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
 }
 
-// Delegate object to handle NSMenuDelegate methods AND menu actions
-// Using a single object for both delegate and action target ensures proper dispatch
-@interface CocoMenuDelegate : NSObject<NSMenuDelegate>
+// Associated object key for storing CocoMenuBar* on each NSMenuItem
+static char CocoMenuItemBarKey;
+
+// Category on NSMenu to add cocoMenuAction: method
+// Categories work with GCC ObjC runtime (unlike subclassing with C++ ivars)
+@interface NSMenu (CocoMenuAction)
 -(void)cocoMenuAction:(id)sender;
+@end
+
+@implementation NSMenu (CocoMenuAction)
+-(void)cocoMenuAction:(id)sender {
+	NSLog(@"NSMenu cocoMenuAction: self=%p sender=%p", self, sender);
+	NSMenuItem *item = (NSMenuItem *)sender;
+	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"NSMenu cocoMenuAction: item=%p bar=%p", item, bar);
+	if(bar)
+		bar->MenuAction(sender);
+	else
+		NSLog(@"NSMenu cocoMenuAction: bar is NULL!");
+}
+@end
+
+// Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
+@interface CocoMenuDelegate : NSObject<NSMenuDelegate>
 @end
 
 // Global delegate instance - shared by all menus
 static CocoMenuDelegate *sharedMenuDelegate = nil;
-
-// Associated object key for storing CocoMenuBar* on each NSMenuItem
-static char CocoMenuItemBarKey;
 
 namespace Upp {
 
@@ -120,12 +137,12 @@ struct CocoMenuBar : public Bar {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.cb = cb;
-			// Set target to the shared delegate which implements cocoMenuAction:
-			// Store the CocoMenuBar pointer on the menu item for lookup in the action
-			[m.nsitem setTarget:sharedMenuDelegate];
-			[m.nsitem setAction:@selector(cocoMenuAction:)];
+			// Store bar pointer on the menu item for lookup in the action
 			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
-			NSLog(@"AddItem: nsitem=%p target=%p bar=%p", m.nsitem, sharedMenuDelegate, this);
+			// Set target to the menu itself - we'll add cocoMenuAction: via category
+			[m.nsitem setTarget:cocomenu];
+			[m.nsitem setAction:@selector(cocoMenuAction:)];
+			NSLog(@"AddItem: nsitem=%p target=%p (menu) bar=%p", m.nsitem, cocomenu, this);
 		}
 		return m;
 	}
@@ -331,17 +348,6 @@ void CocoMenuBar::New() {
 }
 
 @implementation CocoMenuDelegate
-
--(void)cocoMenuAction:(id)sender {
-	NSLog(@"cocoMenuAction: sender=%p", sender);
-	NSMenuItem *item = (NSMenuItem *)sender;
-	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"cocoMenuAction: item=%p bar=%p", item, bar);
-	if(bar)
-		bar->MenuAction(sender);
-	else
-		NSLog(@"cocoMenuAction: bar is NULL!");
-}
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
