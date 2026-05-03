@@ -40,7 +40,9 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 // so that CocoApp.mm can use the same key for lookups
 
 // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
+// Also handles menu item actions since GCC ObjC runtime doesn't dispatch action/target properly
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
+- (void)menuItemAction:(id)sender;
 @end
 
 // Global delegate instance - shared by all menus
@@ -121,12 +123,13 @@ struct CocoMenuBar : public Bar {
 			m.cb = cb;
 			// Store bar pointer on the menu item for lookup in the action
 			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
-			// Set target to AppDelegate explicitly
-			// Use sel_registerName to ensure selector is registered with GCC ObjC runtime
-			SEL action = sel_registerName("cocoMenuAction:");
-			[m.nsitem setTarget:[NSApp delegate]];
-			[m.nsitem setAction:action];
-			NSLog(@"AddItem: nsitem=%p target=%p action=%p bar=%p", m.nsitem, [NSApp delegate], action, this);
+			// Use sharedMenuDelegate as target - it's an ObjC object created in this file
+			// so the selector should be properly registered with GCC ObjC runtime
+			// Note: sharedMenuDelegate is guaranteed to exist because New() creates it
+			ASSERT(sharedMenuDelegate != nil);
+			[m.nsitem setTarget:sharedMenuDelegate];
+			[m.nsitem setAction:@selector(menuItemAction:)];
+			NSLog(@"AddItem: nsitem=%p target=%p action=menuItemAction: bar=%p", m.nsitem, sharedMenuDelegate, this);
 		}
 		return m;
 	}
@@ -342,6 +345,17 @@ void CocoMenuBarAction(void *barPtr, id sender) {
 }
 
 @implementation CocoMenuDelegate
+
+- (void)menuItemAction:(id)sender {
+	NSLog(@"CocoMenuDelegate menuItemAction: sender=%p", sender);
+	Upp::GuiLock __;
+	NSMenuItem *item = (NSMenuItem *)sender;
+	void *barPtr = objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"CocoMenuDelegate menuItemAction: barPtr=%p", barPtr);
+	if(barPtr) {
+		Upp::CocoMenuBarAction(barPtr, sender);
+	}
+}
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
