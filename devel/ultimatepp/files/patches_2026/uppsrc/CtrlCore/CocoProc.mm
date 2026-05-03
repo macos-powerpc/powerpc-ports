@@ -350,10 +350,13 @@ struct MMImp {
 	
 	static void PreeditText(Ctrl *ctrl, const WString& s)
 	{
+		NSLog(@"PreeditText: ctrl=%p s.len=%d", ctrl, (int)s.GetCount());
 		if(ctrl)
-			for(Upp::wchar ch : s)
+			for(Upp::wchar ch : s) {
+				NSLog(@"PreeditText: ch=%d (0x%x)", (int)ch, (int)ch);
 				if(ch >= 32 && ch != 127 && ch != ' ')
 					ctrl->DispatchKey(ch, 1);
+			}
 	}
 	
 	static void CancelPreedit()
@@ -389,9 +392,15 @@ struct MMImp {
 
 - (void)mouseDown:(NSEvent *)e {
 	Upp::GuiLock __;
+	Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
 	NSLog(@"mouseDown: view=%p ctrl=%p window=%p isKeyWindow=%d firstResponder=%p",
-	      self, CocoViewGetCtrl(self), [self window],
+	      self, ctrl, [self window],
 	      (int)[[self window] isKeyWindow], [[self window] firstResponder]);
+	if(ctrl) {
+		Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
+		NSLog(@"mouseDown: ctrl.IsEnabled=%d IsOpen=%d focusCtrl=%p",
+		      (int)ctrl->IsEnabled(), (int)ctrl->IsOpen(), focus);
+	}
 	coco_mouse_left = true;
 	if(!Upp::MMImp::MouseDownEvent(self, e, Upp::Ctrl::LEFT))
 		[super mouseDown:e];
@@ -453,7 +462,9 @@ struct MMImp {
 
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
-	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d", self, CocoViewGetCtrl(self), (int)[e keyCode]);
+	Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
+	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d focusCtrl=%p",
+	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus);
     [self interpretKeyEvents: [NSArray arrayWithObject: e]];
 	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
 		[super keyDown:e];
@@ -578,6 +589,7 @@ struct MMImp {
     (void) replacementRange;
 
     NSString* pInsert = [aString isMemberOfClass: [NSAttributedString class]] ? [aString string] : aString;
+	NSLog(@"insertText: view=%p pInsert=%@ ctrl=%p", self, pInsert, CocoViewGetCtrl(self));
 
 	if(pInsert)
 		Upp::MMImp::PreeditText(CocoViewGetCtrl(self), Upp::ToWString(pInsert));

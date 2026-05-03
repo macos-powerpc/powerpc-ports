@@ -227,8 +227,12 @@ void Ctrl::WndDestroy()
 	auto* coco = GetTop()->coco;
 	auto* window = coco->window;
 
+	NSLog(@"WndDestroy: before close, window=%p isVisible=%d retainCount=%lu",
+	      window, (int)[window isVisible], (unsigned long)[window retainCount]);
 	[window setCollectionBehavior:NSWindowCollectionBehaviorTransient];
+	[window orderOut:nil];  // Force window to hide immediately
 	[window close];
+	NSLog(@"WndDestroy: after close, isVisible=%d", (int)[window isVisible]);
 
 	delete coco;
 	DeleteTop();

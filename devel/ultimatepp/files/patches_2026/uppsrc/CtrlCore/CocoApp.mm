@@ -7,13 +7,21 @@
 // For CGEventTap (GCC block workaround)
 #include <ApplicationServices/ApplicationServices.h>
 
+// Associated object key for menu item bar pointer - same as in MacMenu.mm
+static char CocoMenuItemBarKey;
+
 @interface AppDelegate : NSObject<NSApplicationDelegate>
 {
 }
+// Menu action handler - receives actions from menu items
+-(void)cocoMenuAction:(id)sender;
 @end
 
+// Forward declarations for menu handling
 namespace Upp {
 NSMenu *Cocoa_DockMenu();
+struct CocoMenuBar;
+void CocoMenuBarAction(CocoMenuBar *bar, id sender);
 };
 
 @implementation AppDelegate
@@ -21,6 +29,23 @@ NSMenu *Cocoa_DockMenu();
 {
 	Upp::GuiLock __;
 	return Upp::Cocoa_DockMenu();
+}
+
+-(void)cocoMenuAction:(id)sender {
+	Upp::GuiLock __;
+	NSLog(@"AppDelegate cocoMenuAction: sender=%p", sender);
+	NSMenuItem *item = (NSMenuItem *)sender;
+	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"AppDelegate cocoMenuAction: item=%p bar=%p", item, bar);
+	if(bar)
+		Upp::CocoMenuBarAction(bar, sender);
+	else
+		NSLog(@"AppDelegate cocoMenuAction: bar is NULL!");
+}
+
+-(BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+	// Enable all menu items that have us as target
+	return YES;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification

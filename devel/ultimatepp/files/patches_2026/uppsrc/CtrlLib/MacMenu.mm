@@ -36,13 +36,8 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 }
 
 // Associated object key for storing CocoMenuBar* on each NSMenuItem
+// NOTE: Must match the key in CocoApp.mm for AppDelegate menu action handler
 static char CocoMenuItemBarKey;
-
-// Category on NSMenu to add cocoMenuAction: method - declaration only
-// Implementation is after CocoMenuBar struct definition
-@interface NSMenu (CocoMenuAction)
--(void)cocoMenuAction:(id)sender;
-@end
 
 // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
@@ -126,10 +121,11 @@ struct CocoMenuBar : public Bar {
 			m.cb = cb;
 			// Store bar pointer on the menu item for lookup in the action
 			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
-			// Set target to the menu itself - we'll add cocoMenuAction: via category
-			[m.nsitem setTarget:cocomenu];
+			// Set target to the application delegate - it's always in the responder chain
+			// and has cocoMenuAction: method to dispatch to the correct CocoMenuBar
+			[m.nsitem setTarget:[NSApp delegate]];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
-			NSLog(@"AddItem: nsitem=%p target=%p (menu) bar=%p", m.nsitem, cocomenu, this);
+			NSLog(@"AddItem: nsitem=%p target=%p (app delegate) bar=%p", m.nsitem, [NSApp delegate], this);
 		}
 		return m;
 	}
@@ -334,19 +330,12 @@ void CocoMenuBar::New() {
 
 }
 
-// Category implementation - must be after CocoMenuBar is fully defined
-@implementation NSMenu (CocoMenuAction)
--(void)cocoMenuAction:(id)sender {
-	NSLog(@"NSMenu cocoMenuAction: self=%p sender=%p", self, sender);
-	NSMenuItem *item = (NSMenuItem *)sender;
-	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"NSMenu cocoMenuAction: item=%p bar=%p", item, bar);
+// Function called by AppDelegate when menu item is clicked
+// This is exposed so CocoApp.mm can call it
+void CocoMenuBarAction(CocoMenuBar *bar, id sender) {
 	if(bar)
 		bar->MenuAction(sender);
-	else
-		NSLog(@"NSMenu cocoMenuAction: bar is NULL!");
 }
-@end
 
 @implementation CocoMenuDelegate
 
