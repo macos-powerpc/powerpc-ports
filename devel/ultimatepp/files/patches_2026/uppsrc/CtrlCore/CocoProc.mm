@@ -463,9 +463,11 @@ struct MMImp {
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
 	Upp::Ctrl *focus = Upp::Ctrl::GetFocusCtrl();
-	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d focusCtrl=%p",
-	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus);
+	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d focusCtrl=%p chars=%@",
+	      self, CocoViewGetCtrl(self), (int)[e keyCode], focus, [e characters]);
+	NSLog(@"keyDown: before interpretKeyEvents");
     [self interpretKeyEvents: [NSArray arrayWithObject: e]];
+	NSLog(@"keyDown: after interpretKeyEvents");
 	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
 		[super keyDown:e];
 }
@@ -654,6 +656,7 @@ struct MMImp {
 {
 	// Required by NSTextInputClient protocol
 	// Do nothing - U++ handles key events directly
+	NSLog(@"doCommandBySelector: %@", NSStringFromSelector(aSelector));
 }
 
 @end
