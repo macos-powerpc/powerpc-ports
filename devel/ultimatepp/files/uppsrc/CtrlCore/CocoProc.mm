@@ -406,6 +406,8 @@ struct MMImp {
 
 - (void)mouseUp:(NSEvent *)e {
 	Upp::GuiLock __;
+	NSLog(@"mouseUp: view=%p ctrl=%p window=%p isKeyWindow=%d",
+	      self, CocoViewGetCtrl(self), [self window], (int)[[self window] isKeyWindow]);
 	coco_mouse_left = false;
 	if(!Upp::MMImp::MouseEvent(self, e, Upp::Ctrl::LEFTUP))
 		[super mouseUp:e];

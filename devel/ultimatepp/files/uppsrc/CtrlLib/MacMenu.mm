@@ -336,8 +336,11 @@ void CocoMenuBar::New() {
 	// This works even after menuDidClose removes items from menu
 	NSMenuItem *item = (NSMenuItem *)sender;
 	Upp::CocoMenuBar *ptr = CocoMenuItemGetBar(item);
+	NSLog(@"cocoMenuAction: sender=%p item=%p ptr=%p", sender, item, ptr);
 	if(ptr)
 		ptr->MenuAction(sender);
+	else
+		NSLog(@"cocoMenuAction: ptr is NULL, action not executed!");
 }
 
 - (void)menuWillOpen:(NSMenu *)menu {
