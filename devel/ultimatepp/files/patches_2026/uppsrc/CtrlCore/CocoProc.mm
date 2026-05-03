@@ -477,7 +477,7 @@ struct MMImp {
 			NSLog(@"keyDown: direct character input ch=%d (0x%x)", (int)ch, (int)ch);
 			Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
 			if(ctrl) {
-				// Dispatch the character directly
+				// Dispatch the character directly using MMImp helper (DispatchKey is private)
 				Upp::MMImp::DispatchKey(ctrl, ch);
 			}
 		}
