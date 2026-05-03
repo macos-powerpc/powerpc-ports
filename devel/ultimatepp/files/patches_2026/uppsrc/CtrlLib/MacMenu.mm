@@ -17,7 +17,6 @@ struct CocoMenuBar;
 // Associated object keys for menu data - defined in this file
 static char CocoMenuPtrKey;
 static char CocoMenuProcKey;
-static char CocoMenuItemBarKey;  // For storing CocoMenuBar* on NSMenuItem
 
 // Use NSMenu directly (typedef) to avoid GCC ObjC runtime issues with subclassing
 typedef NSMenu CocoMenu;
@@ -35,19 +34,35 @@ static inline Upp::Event<Upp::Bar&>* CocoMenuGetProc(NSMenu *menu) {
 static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 	objc_setAssociatedObject(menu, &CocoMenuProcKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
 }
-static inline Upp::CocoMenuBar* CocoMenuItemGetBar(NSMenuItem *item) {
-	return (Upp::CocoMenuBar*)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-}
-static inline void CocoMenuItemSetBar(NSMenuItem *item, Upp::CocoMenuBar *p) {
-	objc_setAssociatedObject(item, &CocoMenuItemBarKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
-}
 
-// Separate delegate object to handle menu events - avoids subclassing NSMenu
+// Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
 @end
 
 // Global delegate instance - shared by all menus
 static CocoMenuDelegate *sharedMenuDelegate = nil;
+
+// Forward declaration of the swizzled action method
+static void Swizzled_cocoMenuAction(id self, SEL _cmd, id sender);
+
+// Flag to track if we've swizzled NSMenu
+static bool sMenuSwizzled = false;
+
+// Swizzle NSMenu to add cocoMenuAction: method dynamically
+// This allows menu items to have target = menu itself, matching original behavior
+static void SwizzleNSMenuMethods()
+{
+	if(sMenuSwizzled) return;
+	sMenuSwizzled = true;
+
+	Class menuClass = [NSMenu class];
+	SEL actionSel = @selector(cocoMenuAction:);
+
+	// Add cocoMenuAction: method to NSMenu class
+	// This makes any NSMenu instance able to receive this action
+	class_addMethod(menuClass, actionSel, (IMP)Swizzled_cocoMenuAction, "v@:@");
+	NSLog(@"SwizzleNSMenuMethods: added cocoMenuAction: to NSMenu");
+}
 
 namespace Upp {
 
@@ -122,12 +137,10 @@ struct CocoMenuBar : public Bar {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.cb = cb;
-			[m.nsitem setTarget:sharedMenuDelegate];
+			// Set target to the menu itself - cocoMenuAction: is added via swizzling
+			// This matches the original behavior where CocoMenu subclass had this method
+			[m.nsitem setTarget:cocomenu];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
-			CocoMenuItemSetBar(m.nsitem, this);  // Store bar pointer on item for action lookup
-			NSLog(@"AddItem: nsitem=%p target=%p action=%s bar=%p",
-			      m.nsitem, sharedMenuDelegate,
-			      sel_getName(@selector(cocoMenuAction:)), this);
 		}
 		return m;
 	}
@@ -321,6 +334,8 @@ bool CocoMenuBar::IsEmpty() const
 // Implementation of New() - must be after CocoMenuDelegate is declared but before it's used
 void CocoMenuBar::New() {
 	Clear();
+	// Swizzle NSMenu to add cocoMenuAction: method (done once)
+	SwizzleNSMenuMethods();
 	if(!sharedMenuDelegate)
 		sharedMenuDelegate = [[CocoMenuDelegate alloc] init];
 	cocomenu = [[NSMenu alloc] init];
@@ -332,27 +347,20 @@ void CocoMenuBar::New() {
 
 }
 
-@implementation CocoMenuDelegate
-
-// Check if delegate responds to selector (for debugging)
-- (BOOL)respondsToSelector:(SEL)aSelector {
-	BOOL responds = [super respondsToSelector:aSelector];
-	if(aSelector == @selector(cocoMenuAction:))
-		NSLog(@"respondsToSelector:cocoMenuAction: = %d", (int)responds);
-	return responds;
-}
-
--(void)cocoMenuAction:(id)sender {
-	// Get the CocoMenuBar directly from the menu item (not from parent menu)
-	// This works even after menuDidClose removes items from menu
-	NSMenuItem *item = (NSMenuItem *)sender;
-	Upp::CocoMenuBar *ptr = CocoMenuItemGetBar(item);
-	NSLog(@"cocoMenuAction: sender=%p item=%p ptr=%p", sender, item, ptr);
+// Implementation of swizzled cocoMenuAction: for NSMenu
+// This is called when a menu item with target=menu is clicked
+static void Swizzled_cocoMenuAction(id self, SEL _cmd, id sender)
+{
+	NSMenu *menu = (NSMenu *)self;
+	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+	NSLog(@"cocoMenuAction: menu=%p sender=%p ptr=%p", menu, sender, ptr);
 	if(ptr)
 		ptr->MenuAction(sender);
 	else
 		NSLog(@"cocoMenuAction: ptr is NULL, action not executed!");
 }
+
+@implementation CocoMenuDelegate
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
@@ -373,12 +381,6 @@ void CocoMenuBar::New() {
 	// DO NOT CALL ClearItems here - menu is closed before MenuAction, we need items to find
 	// correct callback
 	[menu removeAllItems];
-}
-
-// Menu item validation - required for items to be enabled
-- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
-	NSLog(@"validateMenuItem: item=%p title=%@", menuItem, [menuItem title]);
-	return YES;
 }
 
 @end
