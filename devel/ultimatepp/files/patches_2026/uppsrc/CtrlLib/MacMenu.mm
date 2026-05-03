@@ -35,38 +35,17 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 	objc_setAssociatedObject(menu, &CocoMenuProcKey, (id)p, OBJC_ASSOCIATION_ASSIGN);
 }
 
-// Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
+// Delegate object to handle NSMenuDelegate methods AND menu actions
+// Using a single object for both delegate and action target ensures proper dispatch
 @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
+-(void)cocoMenuAction:(id)sender;
 @end
 
 // Global delegate instance - shared by all menus
 static CocoMenuDelegate *sharedMenuDelegate = nil;
 
-// Forward declaration of the swizzled action method
-static void Swizzled_cocoMenuAction(id self, SEL _cmd, id sender);
-
-// Flag to track if we've swizzled NSMenu
-static bool sMenuSwizzled = false;
-
-// Swizzle NSMenu to add cocoMenuAction: method dynamically
-// This allows menu items to have target = menu itself, matching original behavior
-static void SwizzleNSMenuMethods()
-{
-	if(sMenuSwizzled) return;
-	sMenuSwizzled = true;
-
-	Class menuClass = [NSMenu class];
-	SEL actionSel = @selector(cocoMenuAction:);
-
-	// Add cocoMenuAction: method to NSMenu class
-	// This makes any NSMenu instance able to receive this action
-	BOOL added = class_addMethod(menuClass, actionSel, (IMP)Swizzled_cocoMenuAction, "v@:@");
-	NSLog(@"SwizzleNSMenuMethods: class_addMethod returned %d", (int)added);
-
-	// Verify the method was added
-	Method m = class_getInstanceMethod(menuClass, actionSel);
-	NSLog(@"SwizzleNSMenuMethods: method lookup returned %p", m);
-}
+// Associated object key for storing CocoMenuBar* on each NSMenuItem
+static char CocoMenuItemBarKey;
 
 namespace Upp {
 
@@ -141,13 +120,12 @@ struct CocoMenuBar : public Bar {
 		Item& m = AddItem();
 		if(!just_check) {
 			m.cb = cb;
-			// Set target to the menu itself - cocoMenuAction: is added via swizzling
-			// This matches the original behavior where CocoMenu subclass had this method
-			[m.nsitem setTarget:cocomenu];
+			// Set target to the shared delegate which implements cocoMenuAction:
+			// Store the CocoMenuBar pointer on the menu item for lookup in the action
+			[m.nsitem setTarget:sharedMenuDelegate];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
-			NSLog(@"AddItem: nsitem=%p target=%p action=%s respondsToSelector=%d",
-			      m.nsitem, cocomenu, sel_getName(@selector(cocoMenuAction:)),
-			      (int)[cocomenu respondsToSelector:@selector(cocoMenuAction:)]);
+			objc_setAssociatedObject(m.nsitem, &CocoMenuItemBarKey, (id)this, OBJC_ASSOCIATION_ASSIGN);
+			NSLog(@"AddItem: nsitem=%p target=%p bar=%p", m.nsitem, sharedMenuDelegate, this);
 		}
 		return m;
 	}
@@ -341,8 +319,6 @@ bool CocoMenuBar::IsEmpty() const
 // Implementation of New() - must be after CocoMenuDelegate is declared but before it's used
 void CocoMenuBar::New() {
 	Clear();
-	// Swizzle NSMenu to add cocoMenuAction: method (done once)
-	SwizzleNSMenuMethods();
 	if(!sharedMenuDelegate)
 		sharedMenuDelegate = [[CocoMenuDelegate alloc] init];
 	cocomenu = [[NSMenu alloc] init];
@@ -354,20 +330,18 @@ void CocoMenuBar::New() {
 
 }
 
-// Implementation of swizzled cocoMenuAction: for NSMenu
-// This is called when a menu item with target=menu is clicked
-static void Swizzled_cocoMenuAction(id self, SEL _cmd, id sender)
-{
-	NSMenu *menu = (NSMenu *)self;
-	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
-	NSLog(@"cocoMenuAction: menu=%p sender=%p ptr=%p", menu, sender, ptr);
-	if(ptr)
-		ptr->MenuAction(sender);
-	else
-		NSLog(@"cocoMenuAction: ptr is NULL, action not executed!");
-}
-
 @implementation CocoMenuDelegate
+
+-(void)cocoMenuAction:(id)sender {
+	NSLog(@"cocoMenuAction: sender=%p", sender);
+	NSMenuItem *item = (NSMenuItem *)sender;
+	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"cocoMenuAction: item=%p bar=%p", item, bar);
+	if(bar)
+		bar->MenuAction(sender);
+	else
+		NSLog(@"cocoMenuAction: bar is NULL!");
+}
 
 - (void)menuWillOpen:(NSMenu *)menu {
 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
