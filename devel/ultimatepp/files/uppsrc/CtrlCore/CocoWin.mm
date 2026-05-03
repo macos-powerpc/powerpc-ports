@@ -11,15 +11,21 @@ static IMP sOriginalCanBecomeKeyWindow = NULL;
 static IMP sOriginalCanBecomeMainWindow = NULL;
 
 // Replacement for canBecomeKeyWindow - checks if our Ctrl is enabled
+// Note: The 'active' flag is only used for popup menus/tooltips that should never become key
+// Dialogs (TopWindow) should always be able to become key if enabled
 static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
 {
 	Upp::Ctrl *ctrl = CocoWindowGetCtrl((CocoWindow*)self);
-	bool active = CocoWindowGetActive((CocoWindow*)self);
 	// If this is our window, use our logic
 	if(ctrl) {
 		Upp::GuiLock __;
-		BOOL result = active && ctrl->IsEnabled();
-		NSLog(@"canBecomeKeyWindow: active=%d enabled=%d result=%d", (int)active, (int)ctrl->IsEnabled(), (int)result);
+		// Check if it's a TopWindow (dialog) - these should always be able to become key if enabled
+		// PopUp windows (menus, tooltips) have active=false and should not become key
+		bool active = CocoWindowGetActive((CocoWindow*)self);
+		bool isTopWindow = dynamic_cast<Upp::TopWindow*>(ctrl) != NULL;
+		BOOL result = (active || isTopWindow) && ctrl->IsEnabled();
+		NSLog(@"canBecomeKeyWindow: active=%d isTopWindow=%d enabled=%d result=%d",
+		      (int)active, (int)isTopWindow, (int)ctrl->IsEnabled(), (int)result);
 		return result;
 	}
 	// Otherwise call original
@@ -33,11 +39,13 @@ static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
 static BOOL Swizzled_canBecomeMainWindow(id self, SEL _cmd)
 {
 	Upp::Ctrl *ctrl = CocoWindowGetCtrl((CocoWindow*)self);
-	bool active = CocoWindowGetActive((CocoWindow*)self);
 	// If this is our window, use our logic
 	if(ctrl) {
 		Upp::GuiLock __;
-		return active && ctrl->IsEnabled() && dynamic_cast<Upp::TopWindow *>(ctrl) && !ctrl->GetOwner();
+		// Main window must be a TopWindow, enabled, and without owner
+		// The 'active' flag is not relevant for main window status
+		Upp::TopWindow *tw = dynamic_cast<Upp::TopWindow *>(ctrl);
+		return tw && ctrl->IsEnabled() && !ctrl->GetOwner();
 	}
 	// Otherwise call original
 	if(sOriginalCanBecomeMainWindow)
