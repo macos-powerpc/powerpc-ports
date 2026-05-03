@@ -186,8 +186,11 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
 	[window setContentView:view];
 	[window setDelegate:view];
 	[window setAcceptsMouseMovedEvents:YES];
-	[window makeFirstResponder:view];
+	BOOL frResult = [window makeFirstResponder:view];
+	NSLog(@"Create: window=%p view=%p makeFirstResponder=%d", window, view, (int)frResult);
 	[window makeKeyAndOrderFront:window];
+	NSLog(@"Create: after makeKeyAndOrderFront, isKeyWindow=%d firstResponder=%p",
+	      (int)[window isKeyWindow], [window firstResponder]);
 	
 	ONCELOCK {
 		[NSApp activateIgnoringOtherApps:YES];

@@ -387,6 +387,9 @@ struct MMImp {
 
 - (void)mouseDown:(NSEvent *)e {
 	Upp::GuiLock __;
+	NSLog(@"mouseDown: view=%p ctrl=%p window=%p isKeyWindow=%d firstResponder=%p",
+	      self, CocoViewGetCtrl(self), [self window],
+	      (int)[[self window] isKeyWindow], [[self window] firstResponder]);
 	coco_mouse_left = true;
 	if(!Upp::MMImp::MouseDownEvent(self, e, Upp::Ctrl::LEFT))
 		[super mouseDown:e];
@@ -446,6 +449,7 @@ struct MMImp {
 
 - (void)keyDown:(NSEvent *)e {
 	Upp::GuiLock __;
+	NSLog(@"keyDown: view=%p ctrl=%p keyCode=%d", self, CocoViewGetCtrl(self), (int)[e keyCode]);
     [self interpretKeyEvents: [NSArray arrayWithObject: e]];
 	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
 		[super keyDown:e];
@@ -490,6 +494,7 @@ struct MMImp {
 
 - (void)windowDidBecomeKey:(NSNotification *)notification {
 	Upp::GuiLock __;
+	NSLog(@"windowDidBecomeKey: view=%p ctrl=%p", self, CocoViewGetCtrl(self));
 	Upp::MMImp::BecomeKey(CocoViewGetCtrl(self));
 }
 
@@ -499,6 +504,7 @@ struct MMImp {
 }
 
 - (BOOL)acceptsFirstResponder {
+	NSLog(@"acceptsFirstResponder: view=%p returning YES", self);
 	return YES;
 }
 
