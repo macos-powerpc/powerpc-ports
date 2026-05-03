@@ -478,7 +478,7 @@ struct MMImp {
 			Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
 			if(ctrl) {
 				// Dispatch the character directly
-				ctrl->DispatchKey(ch, 1);
+				Upp::MMImp::DispatchKey(ctrl, ch);
 			}
 		}
 	}
