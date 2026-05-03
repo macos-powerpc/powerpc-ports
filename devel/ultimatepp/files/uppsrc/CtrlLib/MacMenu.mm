@@ -334,6 +334,14 @@ void CocoMenuBar::New() {
 
 @implementation CocoMenuDelegate
 
+// Check if delegate responds to selector (for debugging)
+- (BOOL)respondsToSelector:(SEL)aSelector {
+	BOOL responds = [super respondsToSelector:aSelector];
+	if(aSelector == @selector(cocoMenuAction:))
+		NSLog(@"respondsToSelector:cocoMenuAction: = %d", (int)responds);
+	return responds;
+}
+
 -(void)cocoMenuAction:(id)sender {
 	// Get the CocoMenuBar directly from the menu item (not from parent menu)
 	// This works even after menuDidClose removes items from menu
@@ -365,6 +373,12 @@ void CocoMenuBar::New() {
 	// DO NOT CALL ClearItems here - menu is closed before MenuAction, we need items to find
 	// correct callback
 	[menu removeAllItems];
+}
+
+// Menu item validation - required for items to be enabled
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+	NSLog(@"validateMenuItem: item=%p title=%@", menuItem, [menuItem title]);
+	return YES;
 }
 
 @end
