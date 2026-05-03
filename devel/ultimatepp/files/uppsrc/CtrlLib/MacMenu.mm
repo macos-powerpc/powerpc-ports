@@ -125,6 +125,9 @@ struct CocoMenuBar : public Bar {
 			[m.nsitem setTarget:sharedMenuDelegate];
 			[m.nsitem setAction:@selector(cocoMenuAction:)];
 			CocoMenuItemSetBar(m.nsitem, this);  // Store bar pointer on item for action lookup
+			NSLog(@"AddItem: nsitem=%p target=%p action=%s bar=%p",
+			      m.nsitem, sharedMenuDelegate,
+			      sel_getName(@selector(cocoMenuAction:)), this);
 		}
 		return m;
 	}

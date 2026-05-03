@@ -275,7 +275,9 @@ struct MMImp {
 		Upp::Ctrl::lastActive = ctrl;
 		ctrl->ActivateWnd();
 		auto tw = dynamic_cast<TopWindow *>(ctrl);
+		NSLog(@"BecomeKey: ctrl=%p tw=%p placefocus=%d", ctrl, tw, tw ? (int)tw->placefocus : -1);
 		if(tw && tw->placefocus) {
+			NSLog(@"BecomeKey: calling PlaceFocus");
 			tw->PlaceFocus();
 			tw->placefocus = false;
 		}
