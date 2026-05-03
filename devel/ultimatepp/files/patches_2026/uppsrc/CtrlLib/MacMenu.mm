@@ -38,23 +38,10 @@ static inline void CocoMenuSetProc(NSMenu *menu, Upp::Event<Upp::Bar&> *p) {
 // Associated object key for storing CocoMenuBar* on each NSMenuItem
 static char CocoMenuItemBarKey;
 
-// Category on NSMenu to add cocoMenuAction: method
-// Categories work with GCC ObjC runtime (unlike subclassing with C++ ivars)
+// Category on NSMenu to add cocoMenuAction: method - declaration only
+// Implementation is after CocoMenuBar struct definition
 @interface NSMenu (CocoMenuAction)
 -(void)cocoMenuAction:(id)sender;
-@end
-
-@implementation NSMenu (CocoMenuAction)
--(void)cocoMenuAction:(id)sender {
-	NSLog(@"NSMenu cocoMenuAction: self=%p sender=%p", self, sender);
-	NSMenuItem *item = (NSMenuItem *)sender;
-	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
-	NSLog(@"NSMenu cocoMenuAction: item=%p bar=%p", item, bar);
-	if(bar)
-		bar->MenuAction(sender);
-	else
-		NSLog(@"NSMenu cocoMenuAction: bar is NULL!");
-}
 @end
 
 // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
@@ -346,6 +333,20 @@ void CocoMenuBar::New() {
 }
 
 }
+
+// Category implementation - must be after CocoMenuBar is fully defined
+@implementation NSMenu (CocoMenuAction)
+-(void)cocoMenuAction:(id)sender {
+	NSLog(@"NSMenu cocoMenuAction: self=%p sender=%p", self, sender);
+	NSMenuItem *item = (NSMenuItem *)sender;
+	Upp::CocoMenuBar *bar = (Upp::CocoMenuBar *)objc_getAssociatedObject(item, &CocoMenuItemBarKey);
+	NSLog(@"NSMenu cocoMenuAction: item=%p bar=%p", item, bar);
+	if(bar)
+		bar->MenuAction(sender);
+	else
+		NSLog(@"NSMenu cocoMenuAction: bar is NULL!");
+}
+@end
 
 @implementation CocoMenuDelegate
 
