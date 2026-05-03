@@ -328,13 +328,13 @@ void CocoMenuBar::New() {
 	[cocomenu setDelegate:sharedMenuDelegate];
 }
 
-}
-
 // Function called by AppDelegate when menu item is clicked
 // This is exposed so CocoApp.mm can call it
 void CocoMenuBarAction(CocoMenuBar *bar, id sender) {
 	if(bar)
 		bar->MenuAction(sender);
+}
+
 }
 
 @implementation CocoMenuDelegate
