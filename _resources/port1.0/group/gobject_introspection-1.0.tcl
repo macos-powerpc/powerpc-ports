@@ -42,7 +42,8 @@ proc gobject_introspection_pg::gobject_introspection_setup {} {
             configure.args-append   --disable-introspection
         }
     } else {
-        depends_lib-append          path:lib/pkgconfig/gobject-introspection-1.0.pc:gobject-introspection
+        depends_build-append        path:lib/pkgconfig/gobject-introspection-1.0.pc:gobject-introspection
+
         if {![string match *meson* [option configure.cmd]]} {
             platform darwin 8 {
                 global prefix_frozen
