@@ -315,7 +315,6 @@ proc kde4.add_app_wrapper {wrappername {bundlename ""} {bundleexec ""}} {
 }
 
 proc kde4::configure_build {} {
-
     global prefix applications_dir subport os.platform
     global qt_cmake_defines qt_cmake_module_dir
     global cmake_share_module_dir
@@ -329,7 +328,7 @@ proc kde4::configure_build {} {
     # Automoc added as build dependency here as most, if not all kde
     # programs currently need it. The automoc port, which includes this
     # PortGroup overrides depends_build, removing "port:automoc" to
-    # prevent a cyclic dependency
+    # prevent a cyclic dependency.
     if {${subport} ne "automoc"} {
         ui_debug "kde4-1.1 PG : depends_build-append    port:automoc"
         depends_build-delete \
@@ -339,25 +338,27 @@ proc kde4::configure_build {} {
     }
 
     # Phonon added as library dependency here as most, if not all KDE
-    # programs current need it.  The phonon port, which includes this
-    # PortGroup overrides depends_lib, removing "port:phonon" to prevent a
-    # cyclic dependency
+    # programs current need it. The phonon port, which includes this
+    # PortGroup overrides depends_lib, removing "port:phonon" to prevent
+    # a cyclic dependency.
     depends_lib-delete      port:phonon
     depends_lib-append      port:phonon
 
-    # augment the CMake module lookup path, if necessary depending on
+    # Augment the CMake module lookup path, if necessary depending on
     # where Qt4 is installed.
     if {${qt_cmake_module_dir} ne ${cmake_share_module_dir}} {
         set cmake_module_path ${kde4.cmake_module_dir}\;${cmake_share_module_dir}\;${qt_cmake_module_dir}
     } else {
-        # prepend our own (new) install location for cmake modules:
+        # Prepend our own (new) install location for cmake modules:
         set cmake_module_path ${kde4.cmake_module_dir}\;${cmake_share_module_dir}
     }
-    configure.args-delete -DCMAKE_MODULE_PATH=${cmake_share_module_dir}
-    configure.args-append -DCMAKE_MODULE_PATH="${cmake_module_path}" \
-                          -DCMAKE_PREFIX_PATH="${cmake_module_path}"
+    set cmake_module_path   [join [list ${cmake_module_path} {*}[option cmake.module_path]] \;]
+    set cmake_prefix_path   [join [list ${cmake_module_path} {*}[option cmake.prefix_path]] \;]
+    configure.args-delete   -DCMAKE_MODULE_PATH=${cmake_share_module_dir}
+    configure.args-append   -DCMAKE_MODULE_PATH="${cmake_module_path}" \
+                            -DCMAKE_PREFIX_PATH="${cmake_prefix_path}"
 
-    # standard configure args; virtually all KDE ports use CMake and Qt4.
+    # Standard configure args; virtually all KDE ports use CMake and Qt4.
     configure.args-append   -DBUILD_doc=OFF \
                             -DBUILD_docs=OFF \
                             -DBUILD_SHARED_LIBS=ON \
@@ -365,7 +366,7 @@ proc kde4::configure_build {} {
                             -DKDE_DISTRIBUTION_TEXT=\"MacPorts\/Mac OS X\" \
                             ${qt_cmake_defines}
 
-    # explicitly define certain headers and libraries, to avoid
+    # Explicitly define certain headers and libraries, to avoid
     # conflicts with those installed into system paths by the user.
     set shext [expr {${os.platform} eq "darwin" ? "dylib" : "so"}]
     configure.args-append   -DDOCBOOKXSL_DIR=${prefix}/share/xsl/docbook-xsl-nons \
