@@ -205,7 +205,7 @@ proc kde4.restore_from_legacy_prefix {} {
 #                         -DLIBINTL_INCLUDE_DIR=${prefix}/include \
 #                         -DLIBINTL_LIBRARY=${prefix}/lib/libintl.dylib \
 #                         -DLIBXML2_INCLUDE_DIR=${prefix}/include/libxml2 \
-#                         -DLIBXML2_LIBRARIES=${prefix}/lib/libxml2.dylib \
+#                         -DLIBXML2_LIBRARY=${prefix}/lib/libxml2.dylib \
 #                         -DLIBXML2_XMLLINT_EXECUTABLE=${prefix}/bin/xmllint \
 #                         -DLIBXSLT_INCLUDE_DIR=${prefix}/include \
 #                         -DLIBXSLT_LIBRARIES=${prefix}/lib/libxslt.dylib \
@@ -389,7 +389,7 @@ proc kde4::configure_build {} {
                             -DLIBINTL_INCLUDE_DIR=${prefix}/include \
                             -DLIBINTL_LIBRARY=${prefix}/lib/libintl.${shext} \
                             -DLIBXML2_INCLUDE_DIR=${prefix}/include/libxml2 \
-                            -DLIBXML2_LIBRARIES=${prefix}/lib/libxml2.${shext} \
+                            -DLIBXML2_LIBRARY=${prefix}/lib/libxml2.${shext} \
                             -DLIBXML2_XMLLINT_EXECUTABLE=${prefix}/bin/xmllint \
                             -DLIBXSLT_INCLUDE_DIR=${prefix}/include \
                             -DLIBXSLT_LIBRARIES=${prefix}/lib/libxslt.${shext} \
