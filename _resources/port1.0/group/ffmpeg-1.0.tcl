@@ -50,6 +50,7 @@ proc ffmpeg::version_proc {option action args} {
     ffmpeg::configure_build
 }
 
+global ffmpeg._version
 set ffmpeg._version ""
 port::register_callback ffmpeg::configure_build
 option_proc ffmpeg.version ffmpeg::version_proc
