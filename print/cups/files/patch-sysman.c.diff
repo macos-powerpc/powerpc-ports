@@ -1,0 +1,208 @@
+--- scheduler/sysman.c	2026-04-28 01:13:21.000000000 +0800
++++ scheduler/sysman.c	2026-06-09 00:23:46.000000000 +0800
+@@ -17,6 +17,14 @@
+ #include "cupsd.h"
+ #ifdef __APPLE__
+ #  include <IOKit/pwr_mgt/IOPMLib.h>
++
++#  ifndef kIOPMAssertNetworkClientActive
++#    define kIOPMAssertNetworkClientActive CFSTR("NoIdleSleepAssertion")
++#  endif
++
++#  ifndef kIOPSNotifyPowerSource
++#    define kIOPSNotifyPowerSource "com.apple.system.powersources"
++#  endif
+ #endif /* __APPLE__ */
+ 
+ 
+@@ -202,6 +210,7 @@
+ #  include <IOKit/ps/IOPowerSources.h>
+ #  include <IOKit/pwr_mgt/IOPMLib.h>
+ #  include <SystemConfiguration/SystemConfiguration.h>
++#  include <dispatch/dispatch.h>
+ #  include <pthread.h>
+ 
+ 
+@@ -266,7 +274,8 @@
+ static cupsd_sysevent_t	LastSysEvent;	/* Last system event (for delayed sleep) */
+ static int		NameChanged = 0;/* Did we get a 'name changed' event during sleep? */
+ static int		PSToken = 0;	/* Power source notifications */
+-
++static int               PSNotifyFD       = -1;   /* Power source notify pipe fd */
++static dispatch_source_t PSDispatchSource = NULL; /* Power source dispatch source */
+ 
+ /*
+  * Local functions...
+@@ -282,9 +291,103 @@
+ static void	sysEventTimerNotifier(CFRunLoopTimerRef timer, void *context);
+ static void	sysUpdate(void);
+ static void	sysUpdateNames(void);
++static int	sysGetACPower(void);
++static void	sysEventPowerSourceHandler(void *ctx);
++
++/*
++ * 'sysGetACPower()' - Return 1 if running on AC power, 0 on battery.
++ *
++ * Uses IOPSCopyPowerSourcesInfo() which is available since OS X 10.0,
++ * so this works on all macOS versions without needing
++ * IOPSGetTimeRemainingEstimate() (macOS 10.7+).
++ */
++
++static int
++sysGetACPower(void)
++{
++  CFTypeRef       blob;                 /* Power sources blob */
++  CFArrayRef      list;                 /* Power source list */
++  CFIndex         i, count;             /* Loop variables */
++  int             ac = 1;               /* Result: assume AC if unknown */
++
++
++  blob = IOPSCopyPowerSourcesInfo();
++  if (!blob)
++    return 1;
++
++  list = IOPSCopyPowerSourcesList(blob);
++  if (!list)
++  {
++    CFRelease(blob);
++    return 1;
++  }
++
++  count = CFArrayGetCount(list);
++  if (count == 0)
++  {
++   /*
++    * No battery sources at all — AC-only hardware (desktop, etc.)
++    */
++
++    CFRelease(list);
++    CFRelease(blob);
++    return 1;
++  }
++
++  ac = 0;
++  for (i = 0; i < count; i ++)
++  {
++    CFDictionaryRef src   = IOPSGetPowerSourceDescription(blob,
++                                CFArrayGetValueAtIndex(list, i));
++    CFStringRef     state;
++
++    if (!src)
++      continue;
++
++    state = CFDictionaryGetValue(src, CFSTR("Power Source State"));
++    if (state &&
++        CFStringCompare(state, CFSTR("AC Power"), 0) == kCFCompareEqualTo)
++    {
++      ac = 1;
++      break;
++    }
++  }
++
++  CFRelease(list);
++  CFRelease(blob);
++  return ac;
++}
+ 
+ 
+ /*
++ * 'sysEventPowerSourceHandler()' - Dispatch source handler for power source
++ *                                   change notifications.
++ *
++ * Called on the main GCD queue when kIOPSNotifyPowerSource fires.
++ * Replaces the notify_register_dispatch block which required Apple Blocks.
++ * The context pointer carries the notify pipe fd so we can drain it.
++ */
++
++static void
++sysEventPowerSourceHandler(void *ctx)
++{
++  int   fd = (int)(intptr_t)ctx;
++  int   token;
++
++
++ /*
++  * Each notification delivers one int-sized token value to the pipe;
++  * drain it so the fd does not fill up.
++  */
++
++  read(fd, &token, sizeof(token));
++
++  ACPower = sysGetACPower();
++  cupsdLogMessage(CUPSD_LOG_DEBUG2,
++                  "Power source changed, ACPower now %d.", ACPower);
++}
++
++/*
+  * 'cupsdAllowSleep()' - Tell the OS it is now OK to sleep.
+  */
+ 
+@@ -340,10 +443,33 @@
+   * Monitor for power source changes via dispatch queue...
+   */
+ 
+-  cupsdLogMessage(CUPSD_LOG_DEBUG2, "cupsdStartSystemMonitor: IOPSGetTimeRemainingEstimate=%f", IOPSGetTimeRemainingEstimate());
+-  ACPower = IOPSGetTimeRemainingEstimate() == kIOPSTimeRemainingUnlimited;
+-  notify_register_dispatch(kIOPSNotifyPowerSource, &PSToken, dispatch_get_main_queue(), ^(int t) { (void)t;
+-      ACPower = IOPSGetTimeRemainingEstimate() == kIOPSTimeRemainingUnlimited; });
++ /*
++  * Initialise the AC power state, then monitor for future changes via a
++  * GCD dispatch source. notify_register_file_descriptor (10.0+) delivers
++  * each notification as a 4-byte token written to a pipe; we watch that
++  * pipe with dispatch_source_create/dispatch_source_set_event_handler_f
++  * (10.6+, C function-pointer variant — no Blocks required).
++  */
++
++  ACPower = sysGetACPower();
++  cupsdLogMessage(CUPSD_LOG_DEBUG2,
++                  "cupsdStartSystemMonitor: ACPower=%d", ACPower);
++
++  if (notify_register_file_descriptor(kIOPSNotifyPowerSource,
++                                       &PSNotifyFD, 0, &PSToken)
++          == NOTIFY_STATUS_OK && PSNotifyFD >= 0)
++  {
++    PSDispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
++                           (uintptr_t)PSNotifyFD, 0,
++                           dispatch_get_main_queue());
++    if (PSDispatchSource)
++    {
++      dispatch_set_context(PSDispatchSource, (void *)(intptr_t)PSNotifyFD);
++      dispatch_source_set_event_handler_f(PSDispatchSource,
++                                           sysEventPowerSourceHandler);
++      dispatch_resume(PSDispatchSource);
++    }
++  }
+ }
+ 
+ 
+@@ -390,11 +516,30 @@
+     cupsdClosePipe(SysEventPipes);
+   }
+ 
++ /*
++  * Cancel and release the power source dispatch source first, then
++  * cancel the notify token, then close the pipe fd.
++  * Order matters: cancel the source before closing the fd it watches.
++  */
++
++  if (PSDispatchSource)
++  {
++    dispatch_source_cancel(PSDispatchSource);
++    dispatch_release(PSDispatchSource);
++    PSDispatchSource = NULL;
++  }
++
+   if (PSToken != 0)
+   {
+     notify_cancel(PSToken);
+     PSToken = 0;
+   }
++
++  if (PSNotifyFD >= 0)
++  {
++    close(PSNotifyFD);
++    PSNotifyFD = -1;
++  }
+ }
+ 
+ 
