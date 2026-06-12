@@ -1,0 +1,177 @@
+--- llarp/vpn/apple.hpp
++++ llarp/vpn/apple.hpp	2026-06-12 20:30:21.000000000 +0800
+@@ -12,9 +12,11 @@
+ #include <sys/socket.h>
+ #include <sys/param.h>
+ #include <sys/uio.h>
++#include <sys/sysctl.h>
+ 
+ #include <arpa/inet.h>
+ #include <net/if.h>
++#include <net/if_dl.h>
+ #include <net/if_var.h>
+ #include <net/if_types.h>
+ #include <net/route.h>
+@@ -165,27 +167,153 @@
+ 
+   class AppleRouteManager : public IRouteManager
+   {
+-    void AddRoute(net::ipaddr_t, net::ipaddr_t) override{};
++    static void
++    Exec(std::string cmd)
++    {
++      system(cmd.c_str());
++    }
+ 
+-    void DelRoute(net::ipaddr_t, net::ipaddr_t) override{};
++    static std::string
++    AddrToString(const net::ipaddr_t& addr)
++    {
++      return std::visit(
++          [](auto&& a) -> std::string {
++            char buf[64] = {};
++            if constexpr (std::is_same_v<std::decay_t<decltype(a)>, net::ipv4addr_t>)
++              inet_ntop(AF_INET, &a.n, buf, sizeof(buf));
++            else
++              inet_ntop(AF_INET6, &a.n, buf, sizeof(buf));
++            return buf;
++          },
++          addr);
++    }
+ 
+     void
+-    AddDefaultRouteViaInterface(NetworkInterface&) override{};
++    AddRoute(net::ipaddr_t ip, net::ipaddr_t gateway) override
++    {
++      Exec("/sbin/route add -host " + AddrToString(ip) + " " + AddrToString(gateway));
++    }
+ 
+     void
+-    DelDefaultRouteViaInterface(NetworkInterface&) override{};
++    DelRoute(net::ipaddr_t ip, net::ipaddr_t gateway) override
++    {
++      Exec("/sbin/route delete -host " + AddrToString(ip) + " " + AddrToString(gateway));
++    }
+ 
+     void
+-    AddRouteViaInterface(NetworkInterface&, IPRange) override{};
++    AddDefaultRouteViaInterface(NetworkInterface& vpn) override
++    {
++      const auto& ifname = vpn.Info().ifname;
++      // Split-default technique: two /1 routes are more specific than the /0 default,
++      // so they override it without deleting it (mirrors what Linux does with RTM_NEWROUTE).
++      Exec("/sbin/route add 0/1 -interface " + ifname);
++      Exec("/sbin/route add 128/1 -interface " + ifname);
++      Exec("/sbin/route add -inet6 ::/1 -interface " + ifname);
++      Exec("/sbin/route add -inet6 8000::/1 -interface " + ifname);
++    }
++
++    void
++    DelDefaultRouteViaInterface(NetworkInterface& vpn) override
++    {
++      // No -interface needed on delete; there is only one route to each destination.
++      (void)vpn;
++      Exec("/sbin/route delete 0/1");
++      Exec("/sbin/route delete 128/1");
++      Exec("/sbin/route delete -inet6 ::/1");
++      Exec("/sbin/route delete -inet6 8000::/1");
++    }
+ 
+     void
+-    DelRouteViaInterface(NetworkInterface&, IPRange) override{};
++    AddRouteViaInterface(NetworkInterface& vpn, IPRange range) override
++    {
++      Exec("/sbin/route add -net " + range.ToString() + " -interface " + vpn.Info().ifname);
++    }
++
++    void
++    DelRouteViaInterface(NetworkInterface& vpn, IPRange range) override
++    {
++      Exec("/sbin/route delete -net " + range.ToString() + " -interface " + vpn.Info().ifname);
++    }
+ 
+     std::vector<net::ipaddr_t>
+-    GetGatewaysNotOnInterface(NetworkInterface&) override
++    GetGatewaysNotOnInterface(NetworkInterface& vpn) override
+     {
+-      return std::vector<net::ipaddr_t>{};
+-    };
++      const auto& ifname = vpn.Info().ifname;
++      std::vector<net::ipaddr_t> gateways;
++
++      // Ask the kernel for all IPv4 routes that have a gateway (RTF_GATEWAY).
++      // This is the macOS equivalent of reading /proc/net/route on Linux.
++      int mib[] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_GATEWAY};
++      size_t needed = 0;
++      if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) < 0 || needed == 0)
++        return gateways;
++
++      std::vector<char> buf(needed);
++      if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) < 0)
++        return gateways;
++
++      char* p = buf.data();
++      char* end = p + needed;
++      while (p < end)
++      {
++        auto* rtm = reinterpret_cast<rt_msghdr*>(p);
++        if (rtm->rtm_msglen == 0)
++          break;
++
++        // Skip routes that belong to our VPN interface.
++        char iface[IF_NAMESIZE + 1] = {};
++        if_indextoname(rtm->rtm_index, iface);
++        if (ifname == iface)
++        {
++          p += rtm->rtm_msglen;
++          continue;
++        }
++
++        // Walk the variable-length sockaddr array that follows the header.
++        const sockaddr* sa[RTAX_MAX] = {};
++        char* ap = reinterpret_cast<char*>(rtm + 1);
++        for (int i = 0; i < RTAX_MAX; ++i)
++        {
++          if (rtm->rtm_addrs & (1 << i))
++          {
++            sa[i] = reinterpret_cast<const sockaddr*>(ap);
++            ap += roundup(sa[i]->sa_len, sizeof(uint32_t));
++          }
++        }
++
++        // We only want the default route (destination 0.0.0.0), matching what
++        // the Linux implementation does when it looks for an all-zero destination
++        // in /proc/net/route.
++        if (sa[RTAX_DST] && sa[RTAX_DST]->sa_family == AF_INET)
++        {
++          const auto* dst = reinterpret_cast<const sockaddr_in*>(sa[RTAX_DST]);
++          if (dst->sin_addr.s_addr == INADDR_ANY && sa[RTAX_GATEWAY]
++              && sa[RTAX_GATEWAY]->sa_family == AF_INET)
++          {
++            const auto* gw = reinterpret_cast<const sockaddr_in*>(sa[RTAX_GATEWAY]);
++            // ipv4addr_t stores network-byte-order, same as sin_addr.s_addr.
++            gateways.emplace_back(net::ipv4addr_t{gw->sin_addr.s_addr});
++          }
++        }
++
++        p += rtm->rtm_msglen;
++      }
++      return gateways;
++    }
++
++    void
++    AddBlackhole() override
++    {
++      Exec("/sbin/route add -blackhole 0/1");
++      Exec("/sbin/route add -blackhole 128/1");
++    }
++
++    void
++    DelBlackhole() override
++    {
++      Exec("/sbin/route delete -blackhole 0/1");
++      Exec("/sbin/route delete -blackhole 128/1");
++    }
+   };
+ 
+   class ApplePlatform : public Platform
