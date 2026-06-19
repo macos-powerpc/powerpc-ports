@@ -81,7 +81,7 @@ options compilers.add_gcc_rpath_support
 default compilers.add_gcc_rpath_support yes
 
 # Set a default gcc version
-set compilers.gcc_default gcc14
+set compilers.gcc_default gcc16
 
 set compilers.list {cc cxx cpp objc fc f77 f90}
 
@@ -92,7 +92,7 @@ if { ${os.arch} eq "arm" || ${os.platform} ne "darwin" } {
     if { [vercmp ${xcodeversion} < 16.0] && [vercmp ${xcodecltversion} < 16.0] } {
         lappend gcc_versions 10 11 12 13
     }
-    lappend gcc_versions 14 devel
+    lappend gcc_versions 16 14 devel
 } else {
     set gcc_versions [list]
     if { ${os.major} < 15 } {
@@ -104,14 +104,14 @@ if { ${os.arch} eq "arm" || ${os.platform} ne "darwin" } {
     if { [vercmp ${xcodeversion} < 16.0] && [vercmp ${xcodecltversion} < 16.0] } {
         lappend gcc_versions 10 11 12 13
     }
-    lappend gcc_versions 14 devel
+    lappend gcc_versions 16 14 devel
     if { ${os.arch} eq "powerpc" } {
         lappend gcc_versions powerpc
     }
 }
 # GCC version providing the primary runtime
 # Note settings here *must* match those in the lang/libgcc port.
-set gcc_main_version 14
+set gcc_main_version 16
 
 ui_debug "GCC versions for Darwin ${os.major} ${os.arch} - ${gcc_versions}"
 foreach ver ${gcc_versions} {

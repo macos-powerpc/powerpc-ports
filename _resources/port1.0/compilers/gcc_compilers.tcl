@@ -4,7 +4,7 @@
 # https://trac.macports.org/ticket/61636
 
 # GCC 14 on all systems
-lappend compilers macports-gcc-14
+lappend compilers macports-gcc-16 macports-gcc-14
 
 # GCC 11 to GCC 13 on OSX10.6+
 if {${os.major} >= 10 || [option os.platform] ne "darwin"} {
