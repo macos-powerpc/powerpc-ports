@@ -94,7 +94,9 @@ default categories          "R science"
 # For w/e reason universal is presently disabled for R in Macports.
 default universal_variant   no
 
-compiler.cxx_standard       2014
+compiler.openmp_version     4.5
+# We do not want old C++ ABI set.
+# compiler.cxx_standard       2014
 
 # Avoid Apple clangs:
 compiler.blacklist-append   {clang}
@@ -108,12 +110,12 @@ compiler.blacklist-append   {macports-clang-2[0-9]}
 # This setting should also be kept in sync with the one in the R port.
 # Updates should be coordinated with the R maintainers.
 # https://trac.macports.org/ticket/70799
-compiler.blacklist-append   {macports-gcc-1[5-9]}
+compiler.blacklist-append   {macports-gcc-1[7-9]}
 
 # NOTE: upon the update to gcc15, please update the blacklist accordingly,
 # like it is done for clangs. We would prefer using the same version of gcc and gfortran.
 # https://trac.macports.org/ticket/70799
-default_variants-append     +gcc14
+default_variants-append     +gcc16
 
 # R bakes in the compiler, so if it is built with ccache,
 # then it will require ccache to build R packages.
@@ -158,7 +160,7 @@ proc R.add_dependencies {} {
 
 global prefix frameworks_dir
 # Please update R version here:
-set Rversion        4.5.3
+set Rversion        4.6.0
 set branch          [join [lrange [split ${Rversion} .] 0 1] .]
 set packages        ${frameworks_dir}/R.framework/Versions/${branch}/Resources/library
 set suffix          .tar.gz
