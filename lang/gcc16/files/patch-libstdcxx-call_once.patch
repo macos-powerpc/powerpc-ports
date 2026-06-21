@@ -1,0 +1,196 @@
+From 1aabd474c7f58e069e49b6096056937389ba7b51 Mon Sep 17 00:00:00 2001
+From: Iain Sandoe <iain@sandoe.co.uk>
+Date: Wed, 9 Aug 2023 12:13:54 +0100
+Subject: [PATCH] libstdc++: Possible reimplementation of std::call_once.
+
+This reimplements std::call_once using a stack-based approach which
+does not depend on pthread_once for its action.
+
+Signed-off-by: Iain Sandoe <iain@sandoe.co.uk>
+
+libstdc++-v3/ChangeLog:
+
+	* config/abi/pre/gnu.ver: Export once_flag::__do_call_once.
+	* include/std/mutex: Reimplement std::call_once for threaded cases.
+	* src/c++11/mutex.cc (once_flag::__do_call_once): New.
+---
+ libstdc++-v3/config/abi/pre/gnu.ver           |  2 +
+ .../config/os/bsd/darwin/os_defines.h         |  4 ++
+ libstdc++-v3/include/std/mutex                | 51 +++++++++++++++-
+ libstdc++-v3/src/c++11/mutex.cc               | 61 ++++++++++++++++++-
+ 4 files changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/libstdc++-v3/config/abi/pre/gnu.ver b/libstdc++-v3/config/abi/pre/gnu.ver
+index bd4da6418295..849dce5c1f20 100644
+--- libstdc++-v3/config/abi/pre/gnu.ver
++++ libstdc++-v3/config/abi/pre/gnu.ver
+@@ -1323,6 +1323,8 @@ GLIBCXX_3.4.11 {
+     _ZNKSt10lock_error4whatEv;
+ 
+     _ZSt11__once_call;
++    _ZNSt6__ocv29once_flag14__do_call_onceEPFvPvES1_;
++    # old implementation
+     _ZSt15__once_callable;
+     _ZSt14__once_functor;
+     _ZSt23__get_once_functor_lockv;
+diff --git a/libstdc++-v3/config/os/bsd/darwin/os_defines.h b/libstdc++-v3/config/os/bsd/darwin/os_defines.h
+index b6a5b76de211..151ee6cd1692 100644
+--- libstdc++-v3/config/os/bsd/darwin/os_defines.h
++++ libstdc++-v3/config/os/bsd/darwin/os_defines.h
+@@ -57,4 +57,8 @@
+ // read(2) can return EINVAL for n >= INT_MAX.
+ #define _GLIBCXX_MAX_READ_SIZE (__INT_MAX__ - 1)
+ 
++// Use the V2 ABI for once_call, the pthreads version does not work for
++// OS versions less than 10.11 (darwin15).
++#define _GLIBCXX_ONCE_CALL_ABI2 1
++
+ #endif
+diff --git a/libstdc++-v3/include/std/mutex b/libstdc++-v3/include/std/mutex
+index fb5b5073834a..94cf6f355c46 100644
+--- libstdc++-v3/include/std/mutex
++++ libstdc++-v3/include/std/mutex
+@@ -791,6 +791,55 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ #endif // __cpp_lib_scoped_lock
+ 
+ #ifdef _GLIBCXX_HAS_GTHREADS
++#ifdef _GLIBCXX_ONCE_CALL_ABI2
++  // The revised ABI does not use TLS
++  /// Flag type used by std::call_once
++  inline namespace __ocv2 __attribute__((__abi_tag__ ("ocv2"))) {
++  struct once_flag
++  {
++    /// Constructor
++    constexpr once_flag() = default;
++
++    /// Deleted copy constructor
++    once_flag(const once_flag&) = delete;
++    /// Deleted assignment operator
++    once_flag& operator=(const once_flag&) = delete;
++
++  private:
++    // call state: 0 = init, 1 = someone is trying, 2 = done.
++    unsigned int _M_state_ = 0;
++    __gthread_mutex_t _M_mutx_ = __GTHREAD_MUTEX_INIT;
++    __gthread_cond_t _M_condv_ = __GTHREAD_COND_INIT;
++
++    void __do_call_once(void (*)(void*), void*);
++
++    template<typename _Callable, typename... _Args>
++      friend void
++      call_once(once_flag& __once, _Callable&& __f, _Args&&... __args);
++  };
++
++  /// Invoke a callable and synchronize with other calls using the same flag
++  template<typename _Callable, typename... _Args>
++  void
++  call_once (once_flag& __flag, _Callable&& __f, _Args&&... __args)
++  {
++    if (__flag._M_state_ == 2)
++      return;
++
++    // Closure type that runs the original function with the supplied args.
++    auto __callable = [&] {
++	  std::__invoke(std::forward<_Callable>(__f),
++			std::forward<_Args>(__args)...);
++    };
++    // Trampoline to call the actual fn; we will pass in the closure address.
++    void (*__oc_tramp)(void*)
++      = [] (void *ca) { (*static_cast<decltype(__callable)*>(ca))(); };
++    // Attempt to do it and synchronize with any other threads that are also
++    // trying.
++    __flag.__do_call_once (__oc_tramp, std::__addressof(__callable));
++}
++} // namespace ocv2
++#else // ! _GLIBCXX_ONCE_CALL_ABI2
+   /// Flag type used by std::call_once
+   struct once_flag
+   {
+@@ -923,7 +972,7 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+       if (int __e = __gthread_once(&__once._M_once, &__once_proxy))
+ 	__throw_system_error(__e);
+     }
+-
++#endif // _GLIBCXX_ONCE_CALL_ABI2
+ #else // _GLIBCXX_HAS_GTHREADS
+ 
+   /// Flag type used by std::call_once
+diff --git a/libstdc++-v3/src/c++11/mutex.cc b/libstdc++-v3/src/c++11/mutex.cc
+index 8f04494620be..01c8b4f737cb 100644
+--- libstdc++-v3/src/c++11/mutex.cc
++++ libstdc++-v3/src/c++11/mutex.cc
+@@ -30,6 +30,66 @@ namespace std _GLIBCXX_VISIBILITY(default)
+ {
+ _GLIBCXX_BEGIN_NAMESPACE_VERSION
+ 
++#ifdef _GLIBCXX_ONCE_CALL_ABI2
++inline namespace __ocv2 __attribute__((__abi_tag__ ("ocv2"))) {
++// Version 2 ABI without global state, is callable recursively.
++// This calls the trampoline lambda, passing the address of the closure
++// repesenting the original function and its arguments.
++void
++once_flag::__do_call_once (void (*func)(void*), void *arg)
++{
++  __gthread_mutex_lock(&_M_mutx_);
++  while (_M_state_ == 1)
++    __gthread_cond_wait(&_M_condv_, &_M_mutx_);
++
++  // mutex locked, the most likely outcome is that the once-call completed
++  // on some other thread, so we are done.
++  if (_M_state_ == 2)
++    {
++      __gthread_mutex_unlock(&_M_mutx_);
++      return;
++    }
++
++  // mutex locked; if we get here, we expect the state to be 0, this would
++  // correspond to an exception throw by the previous thread that tried to
++  // do the once_call.
++  __glibcxx_assert (_M_state_ == 0);
++
++  try
++    {
++      // mutex locked.
++      _M_state_ = 1;
++      __gthread_mutex_unlock (&_M_mutx_);
++      func (arg);
++      // We got here without an exception, so the call is done.
++      // If the underlying implementation is pthreads, then it is possible
++      // to trigger a sequence of events where wake-ups are lost - unless the
++      // mutex associated with the condition var is locked around the relevant
++      // broadcast (or signal).
++      __gthread_mutex_lock(&_M_mutx_);
++      _M_state_ = 2;
++      __gthread_cond_broadcast (&_M_condv_);
++      __gthread_mutex_unlock (&_M_mutx_);
++    }
++  catch (...)
++    {
++      // mutex unlocked.
++      // func raised an exception, let someone else try ...
++      // See above.
++      __gthread_mutex_lock(&_M_mutx_);
++      _M_state_ = 0;
++      __gthread_cond_broadcast (&_M_condv_);
++      __gthread_mutex_unlock (&_M_mutx_);
++      // ... and pass the exeception to our caller.
++      throw;
++    }
++}
++} // namespace ocv2
++#endif // _GLIBCXX_ONCE_CALL_ABI2
++
++// Unless we have a versioned library, provide the symbols for the previous
++// once call impl.
++
+ #ifdef _GLIBCXX_HAVE_TLS
+   __thread void* __once_callable;
+   __thread void (*__once_call)();
+@@ -115,7 +175,6 @@ namespace
+     callable();
+   }
+ #endif // ! TLS
+-
+ _GLIBCXX_END_NAMESPACE_VERSION
+ } // namespace std
+ 
