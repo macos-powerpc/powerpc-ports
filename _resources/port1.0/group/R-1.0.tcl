@@ -100,19 +100,19 @@ compiler.openmp_version     4.5
 
 # Avoid Apple clangs:
 compiler.blacklist-append   {clang}
-# Blacklist macports-clang-20+. See discussion: https://trac.macports.org/ticket/67144
+# Blacklist macports-clang-23+. See discussion: https://trac.macports.org/ticket/67144
 # for rationale. The decision when to migrate to a new compiler
 # is then in the hands of the R maintainers and will not change
 # from the current defaults when these get bumped centrally.
 # NOTE: Keep this setting in sync with the one in the R port.
-compiler.blacklist-append   {macports-clang-2[0-9]}
-# Similarly, for gcc select the gcc14 variant of the compilers PG.
+compiler.blacklist-append   {macports-clang-2[3-9]}
+# Similarly, for gcc select the gcc16 variant of the compilers PG.
 # This setting should also be kept in sync with the one in the R port.
 # Updates should be coordinated with the R maintainers.
 # https://trac.macports.org/ticket/70799
 compiler.blacklist-append   {macports-gcc-1[7-9]}
 
-# NOTE: upon the update to gcc15, please update the blacklist accordingly,
+# NOTE: upon the update to gcc17, please update the blacklist accordingly,
 # like it is done for clangs. We would prefer using the same version of gcc and gfortran.
 # https://trac.macports.org/ticket/70799
 default_variants-append     +gcc16
