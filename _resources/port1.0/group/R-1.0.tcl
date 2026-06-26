@@ -95,8 +95,7 @@ default categories          "R science"
 default universal_variant   no
 
 compiler.openmp_version     4.5
-# We do not want old C++ ABI set.
-# compiler.cxx_standard       2014
+compiler.cxx_standard       2014
 
 # Avoid Apple clangs:
 compiler.blacklist-append   {clang}
@@ -191,17 +190,17 @@ if {${os.platform} eq "darwin" && ${configure.cxx_stdlib} ne "libc++"} {
     # Normally should not be needed at configure stage,
     # however R still builds some stuff there occasionally.
     configure.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     configure.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     build.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     build.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     destroot.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     destroot.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
     # With supported_archs set to noarch, Macports wants Clang on 10.6, even when build is for PPC.
     # Fix this nonsense, until Clang is fixed.
     compiler.blacklist-append *clang*
@@ -210,7 +209,7 @@ if {${os.platform} eq "darwin" && ${configure.cxx_stdlib} ne "libc++"} {
 # Notice that while we install tests to make them available to the user,
 # in a case of testthat running test_check("${R.package}") from within R session will not work.
 # It has been left broken by upstream for years, see: https://github.com/r-lib/testthat/issues/205
-build.post_args     --library=${builddir} --install-tests
+build.post_args     --library=${builddir} --install-tests --no-clean-on-error
 build.target
 
 destroot {
