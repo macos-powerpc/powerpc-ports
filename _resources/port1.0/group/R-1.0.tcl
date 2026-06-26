@@ -190,17 +190,17 @@ if {${os.platform} eq "darwin" && ${configure.cxx_stdlib} ne "libc++"} {
     # Normally should not be needed at configure stage,
     # however R still builds some stuff there occasionally.
     configure.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     configure.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     build.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     build.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     destroot.env-append \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     destroot.cmd-prepend \
-                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:${prefix}/lib:\$DYLD_LIBRARY_PATH
+                    DYLD_LIBRARY_PATH=${prefix}/lib/libgcc:\$DYLD_LIBRARY_PATH
     # With supported_archs set to noarch, Macports wants Clang on 10.6, even when build is for PPC.
     # Fix this nonsense, until Clang is fixed.
     compiler.blacklist-append *clang*
