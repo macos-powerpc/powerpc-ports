@@ -1,0 +1,1368 @@
+From e7fb58595f6b44efb608c70ce5749d5135591f12 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <vital.had@gmail.com>
+Date: Wed, 8 Jul 2026 21:41:59 +0800
+Subject: [PATCH] macOS support
+
+---
+ CMakeLists.txt    |  20 ++++-
+ compat/sbuf.h     | 109 ++++++++++++++++++++++++
+ transports/mach.c |  18 ++--
+ transports/unix.c | 146 +++++++++++++++++++++++++-------
+ xpc/base.h        |  50 ++++++++++-
+ xpc/connection.h  |   3 -
+ xpc/xpc.h         |  39 ++++++---
+ xpc_array.c       |   6 +-
+ xpc_connection.c  | 207 +++++++++++++++++++++++++++++++++++++---------
+ xpc_dictionary.c  |  25 +++---
+ xpc_internal.h    |  14 ++++
+ xpc_misc.c        |  80 +++++++++++++-----
+ xpc_type.c        |  59 +++++++------
+ 13 files changed, 622 insertions(+), 154 deletions(-)
+ create mode 100644 compat/sbuf.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index faa256d..0a3b059 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -79,6 +79,22 @@ endif()
+ 
+ include_directories(/usr/local/include)
+ set(CMAKE_INCLUDE_CURRENT_DIR ON)
+-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fblocks -Wall -Wextra")
++
++# Apple Blocks are optional. On toolchains that support them (e.g. clang), the
++# block-based applier/handler APIs are enabled; on toolchains without Blocks
++# (e.g. GCC for powerpc-apple-darwin / macOS 10.6) the library falls back to C
++# function pointers. Enable -fblocks only when the compiler accepts it.
++include(CheckCCompilerFlag)
++check_c_compiler_flag("-fblocks" HAVE_FBLOCKS)
++if(HAVE_FBLOCKS)
++    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fblocks")
++endif()
++
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra")
+ add_library(xpc SHARED ${SOURCES})
+-add_subdirectory(examples)
++
++# The bundled examples use Apple Blocks in their event handlers, so they can
++# only be built on a Blocks-capable toolchain.
++if(HAVE_FBLOCKS)
++    add_subdirectory(examples)
++endif()
+diff --git a/compat/sbuf.h b/compat/sbuf.h
+new file mode 100644
+index 0000000..aeaf97d
+--- /dev/null
++++ b/compat/sbuf.h
+@@ -0,0 +1,109 @@
++/*
++ * Minimal drop-in replacement for FreeBSD's <sys/sbuf.h> safe string buffer
++ * API, for platforms that do not ship one (e.g. macOS). Only the subset used by
++ * libxpc is implemented: sbuf_new_auto(), sbuf_printf(), sbuf_finish(),
++ * sbuf_data() and sbuf_delete().
++ *
++ * The buffer grows automatically and always keeps its contents NUL-terminated.
++ */
++
++#ifndef _LIBXPC_COMPAT_SBUF_H
++#define _LIBXPC_COMPAT_SBUF_H
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++struct sbuf {
++	char *	s_buf;
++	size_t	s_size;	/* allocated capacity, including room for NUL */
++	size_t	s_len;	/* current length, excluding NUL */
++};
++
++static __inline struct sbuf *
++sbuf_new_auto(void)
++{
++	struct sbuf *s;
++
++	s = (struct sbuf *)malloc(sizeof(*s));
++	if (s == NULL)
++		return (NULL);
++
++	s->s_size = 128;
++	s->s_buf = (char *)malloc(s->s_size);
++	if (s->s_buf == NULL) {
++		free(s);
++		return (NULL);
++	}
++
++	s->s_buf[0] = '\0';
++	s->s_len = 0;
++	return (s);
++}
++
++static __inline int
++sbuf_printf(struct sbuf *s, const char *fmt, ...)
++{
++	va_list ap;
++	int needed;
++	size_t avail;
++
++	if (s == NULL)
++		return (-1);
++
++	for (;;) {
++		avail = s->s_size - s->s_len;
++		va_start(ap, fmt);
++		needed = vsnprintf(s->s_buf + s->s_len, avail, fmt, ap);
++		va_end(ap);
++
++		if (needed < 0)
++			return (-1);
++
++		if ((size_t)needed < avail) {
++			s->s_len += (size_t)needed;
++			return (0);
++		}
++
++		/* Grow to fit and retry. */
++		while (s->s_size - s->s_len <= (size_t)needed)
++			s->s_size *= 2;
++
++		{
++			char *nbuf = (char *)realloc(s->s_buf, s->s_size);
++			if (nbuf == NULL)
++				return (-1);
++			s->s_buf = nbuf;
++		}
++	}
++}
++
++static __inline int
++sbuf_finish(struct sbuf *s)
++{
++
++	if (s == NULL)
++		return (-1);
++	s->s_buf[s->s_len] = '\0';
++	return (0);
++}
++
++static __inline char *
++sbuf_data(struct sbuf *s)
++{
++
++	return (s != NULL ? s->s_buf : NULL);
++}
++
++static __inline void
++sbuf_delete(struct sbuf *s)
++{
++
++	if (s == NULL)
++		return;
++	free(s->s_buf);
++	free(s);
++}
++
++#endif /* _LIBXPC_COMPAT_SBUF_H */
+diff --git a/transports/mach.c b/transports/mach.c
+index 2203327..1c3fa67 100644
+--- a/transports/mach.c
++++ b/transports/mach.c
+@@ -34,8 +34,10 @@
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include <stdbool.h>
+-#include <xpc/xpc.h>
++#include <launch.h>
++#include <servers/bootstrap.h>
+ 
++#include "xpc/xpc.h"
+ #include "../xpc_internal.h"
+ 
+ #define MAX_RECV 8192
+@@ -110,6 +112,13 @@ mach_port_compare(xpc_port_t p1, xpc_port_t p2)
+ 	return (mach_port_t)p1 == (mach_port_t)p2;
+ }
+ 
++static void
++mach_client_cancel_handler(void *context)
++{
++
++	xpc_connection_destroy_peer(context);
++}
++
+ static dispatch_source_t
+ mach_create_client_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ {
+@@ -121,9 +130,7 @@ mach_create_client_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ 
+ 	dispatch_set_context(ret, context);
+ 	dispatch_source_set_event_handler_f(ret, xpc_connection_recv_message);
+-	dispatch_source_set_cancel_handler(ret, ^{
+-	    xpc_connection_destroy_peer(dispatch_get_context(ret));
+-	});
++	dispatch_source_set_cancel_handler_f(ret, mach_client_cancel_handler);
+ 
+ 	return (ret);
+ }
+@@ -132,7 +139,6 @@ static dispatch_source_t
+ mach_create_server_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ {
+ 	mach_port_t mp = (mach_port_t)port;
+-	void *client_ctx;
+ 	dispatch_source_t ret;
+ 
+ 	ret = dispatch_source_create(DISPATCH_SOURCE_TYPE_MACH_RECV,
+@@ -162,7 +168,7 @@ mach_send(xpc_port_t local, xpc_port_t remote, void *buf, size_t len,
+ 
+ 	debugf("local=%d remote=%d", src, dst);
+ 
+-	msg_size = _ALIGN(len + sizeof(struct xpc_message));
++	msg_size = ALIGN(len + sizeof(struct xpc_message));
+ 	message->header.msgh_size = msg_size;
+ 	message->header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+ 	    MACH_MSG_TYPE_MAKE_SEND);
+diff --git a/transports/unix.c b/transports/unix.c
+index 2316602..439ec5c 100644
+--- a/transports/unix.c
++++ b/transports/unix.c
+@@ -147,6 +147,47 @@ unix_port_compare(xpc_port_t p1, xpc_port_t p2)
+ 	return (int)p1 == (int)p2;
+ }
+ 
++/*
++ * State captured for a server (listening) source. Blocks are not available in
++ * this build, so the values a block would have closed over are carried in a
++ * heap-allocated struct that becomes the source's dispatch context and is read
++ * back by the function-pointer handlers via dispatch_get_context().
++ */
++struct unix_server_ctx {
++	int			fd;
++	void *			context;
++	dispatch_queue_t	tq;
++};
++
++static void
++unix_client_cancel_handler(void *context)
++{
++	struct xpc_connection *conn = context;
++	int fd;
++
++	if (conn == NULL)
++		return;
++
++	fd = (int)conn->xc_local_port;
++	shutdown(fd, SHUT_RDWR);
++	close(fd);
++	xpc_connection_destroy_peer(conn);
++}
++
++static void
++unix_server_event_handler(void *context)
++{
++	struct unix_server_ctx *sc = context;
++	int sock;
++	xpc_port_t client_port;
++	dispatch_source_t client_source;
++
++	sock = accept(sc->fd, NULL, NULL);
++	client_port = (xpc_port_t)(long)sock;
++	client_source = unix_create_client_source(client_port, NULL, sc->tq);
++	xpc_connection_new_peer(sc->context, client_port, -1, client_source);
++}
++
+ static dispatch_source_t
+ unix_create_client_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ {
+@@ -158,11 +199,7 @@ unix_create_client_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ 
+ 	dispatch_set_context(ret, context);
+ 	dispatch_source_set_event_handler_f(ret, xpc_connection_recv_message);
+-	dispatch_source_set_cancel_handler(ret, ^{
+-	    shutdown(fd, SHUT_RDWR);
+-	    close(fd);
+-	    xpc_connection_destroy_peer(dispatch_get_context(ret));
+-	});
++	dispatch_source_set_cancel_handler_f(ret, unix_client_cancel_handler);
+ 
+ 	return (ret);
+ }
+@@ -171,21 +208,19 @@ static dispatch_source_t
+ unix_create_server_source(xpc_port_t port, void *context, dispatch_queue_t tq)
+ {
+ 	int fd = (int)port;
+-	void *client_ctx;
++	struct unix_server_ctx *sc;
+ 	dispatch_source_t ret;
+ 
+ 	ret = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
+ 	    (uintptr_t)fd, 0, tq);
+-	dispatch_source_set_event_handler(ret, ^{
+-	    	int sock;
+-	    	xpc_port_t client_port;
+-	    	dispatch_source_t client_source;
+ 
+-	    	sock = accept(fd, NULL, NULL);
+-	    	client_port = (xpc_port_t)(long)sock;
+-	    	client_source = unix_create_client_source(client_port, NULL, tq);
+-	    	xpc_connection_new_peer(context, client_port, -1, client_source);
+-	});
++	sc = malloc(sizeof(*sc));
++	sc->fd = fd;
++	sc->context = context;
++	sc->tq = tq;
++
++	dispatch_set_context(ret, sc);
++	dispatch_source_set_event_handler_f(ret, unix_server_event_handler);
+ 
+ 	return (ret);
+ }
+@@ -207,6 +242,22 @@ unix_send(xpc_port_t local, xpc_port_t remote __unused, void *buf, size_t len,
+ 	memset(&msg, 0, sizeof(struct msghdr));
+ 	msg.msg_iov = &iov;
+ 	msg.msg_iovlen = 1;
++	msg.msg_control = NULL;
++	msg.msg_controllen = 0;
++	cmsg = NULL;
++
++	for (i = 0; i < (int)nres; i++) {
++		if (res[i].xr_type == XPC_RESOURCE_FD)
++			nfds++;
++	}
++
++#if !defined(__APPLE__)
++	/*
++	 * On FreeBSD the sender attaches an SCM_CREDS control block that the
++	 * kernel fills in with its credentials. macOS has no equivalent; there
++	 * the receiver reads peer credentials with getpeereid()/LOCAL_PEERPID,
++	 * so nothing is attached to the message on the send side.
++	 */
+ 	msg.msg_controllen = CMSG_SPACE(sizeof(struct cmsgcred));
+ 	msg.msg_control = malloc(msg.msg_controllen);
+ 
+@@ -214,33 +265,32 @@ unix_send(xpc_port_t local, xpc_port_t remote __unused, void *buf, size_t len,
+ 	cmsg->cmsg_type = SCM_CREDS;
+ 	cmsg->cmsg_level = SOL_SOCKET;
+ 	cmsg->cmsg_len = CMSG_LEN(sizeof(struct cmsgcred));
++#endif
+ 
+-	for (i = 0; i < nres; i++) {
+-		if (res[i].xr_type == XPC_RESOURCE_FD)
+-			nfds++;
+-	}
+-
+-	if (nres > 0) {
++	if (nfds > 0) {
+ 		int *fds;
+ 
+-		msg.msg_controllen = CMSG_SPACE(sizeof(struct cmsgcred)) +
+-		    CMSG_SPACE(nfds * sizeof(int));
++		msg.msg_controllen += CMSG_SPACE(nfds * sizeof(int));
+ 		msg.msg_control = realloc(msg.msg_control, msg.msg_controllen);
+-		cmsg = CMSG_NXTHDR(&msg, cmsg);
++		cmsg = (cmsg == NULL) ? CMSG_FIRSTHDR(&msg)
++		    : CMSG_NXTHDR(&msg, cmsg);
+ 		cmsg->cmsg_type = SCM_RIGHTS;
+ 		cmsg->cmsg_level = SOL_SOCKET;
+-		cmsg->cmsg_len = CMSG_LEN(nres * sizeof(int));
++		cmsg->cmsg_len = CMSG_LEN(nfds * sizeof(int));
+ 		fds = (int *)CMSG_DATA(cmsg);
+ 
+-		for (i = 0; i < nres; i++) {
++		for (i = 0; i < (int)nres; i++) {
+ 			if (res[i].xr_type == XPC_RESOURCE_FD)
+ 				*fds++ = res[i].xr_fd;
+ 		}
+ 	}
+ 
+-	if (sendmsg(fd, &msg, 0) < 0)
++	if (sendmsg(fd, &msg, 0) < 0) {
++		free(msg.msg_control);
+ 		return (-1);
++	}
+ 
++	free(msg.msg_control);
+ 	return (0);
+ }
+ 
+@@ -251,11 +301,13 @@ unix_recv(xpc_port_t local, xpc_port_t *remote, void *buf, size_t len,
+ 	int fd = (int)local;
+ 	struct msghdr msg;
+ 	struct cmsghdr *cmsg;
+-	struct cmsgcred *recv_creds = NULL;
+ 	struct iovec iov = { .iov_base = buf, .iov_len = len };
+ 	int *recv_fds = NULL;
+ 	size_t recv_fds_count = 0;
+ 	ssize_t recvd;
++#if !defined(__APPLE__)
++	struct cmsgcred *recv_creds = NULL;
++#endif
+ 
+ 	msg.msg_name = NULL;
+ 	msg.msg_namelen = 0;
+@@ -273,17 +325,47 @@ unix_recv(xpc_port_t local, xpc_port_t *remote, void *buf, size_t len,
+ 
+ 	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+ 	     cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++#if !defined(__APPLE__)
+ 		if (cmsg->cmsg_type == SCM_CREDS) {
+ 			recv_creds = (struct cmsgcred *)CMSG_DATA(cmsg);
+ 			continue;
+ 		}
++#endif
+ 
+ 		if (cmsg->cmsg_type == SCM_RIGHTS) {
+ 			recv_fds = (int *)CMSG_DATA(cmsg);
+-			recv_fds_count = CMSG_SPACE(cmsg);
++			recv_fds_count = (cmsg->cmsg_len - CMSG_LEN(0)) /
++			    sizeof(int);
+ 		}
+ 	}
+ 
++#if defined(__APPLE__)
++	/*
++	 * macOS does not deliver peer credentials as SCM_CREDS ancillary data.
++	 * Query them directly from the connected socket instead.
++	 */
++	{
++		uid_t euid = (uid_t)-1;
++		gid_t egid = (gid_t)-1;
++
++		if (getpeereid(fd, &euid, &egid) == 0) {
++			creds->xc_remote_euid = euid;
++			creds->xc_remote_guid = egid;
++		}
++#if defined(LOCAL_PEERPID)
++		{
++			pid_t pid = 0;
++			socklen_t plen = sizeof(pid);
++
++			if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid,
++			    &plen) == 0)
++				creds->xc_remote_pid = pid;
++		}
++#endif
++		debugf("remote pid=%d, uid=%d, gid=%d", creds->xc_remote_pid,
++		    creds->xc_remote_euid, creds->xc_remote_guid);
++	}
++#else
+ 	if (recv_creds != NULL) {
+ 		creds->xc_remote_pid = recv_creds->cmcred_pid;
+ 		creds->xc_remote_euid = recv_creds->cmcred_euid;
+@@ -292,15 +374,17 @@ unix_recv(xpc_port_t local, xpc_port_t *remote, void *buf, size_t len,
+ 		    recv_creds->cmcred_uid, recv_creds->cmcred_gid);
+ 
+ 	}
++#endif
+ 
+-	if (recv_fds != NULL) {
+-		int i;
++	if (recv_fds != NULL && recv_fds_count > 0) {
++		size_t i;
+ 		*res = malloc(sizeof(struct xpc_resource) * recv_fds_count);
+ 
+ 		for (i = 0; i < recv_fds_count; i++) {
+ 			(*res)[i].xr_type = XPC_RESOURCE_FD;
+ 			(*res)[i].xr_fd = recv_fds[i];
+ 		}
++		*nres = recv_fds_count;
+ 	}
+ 
+ 	*remote = NULL;
+diff --git a/xpc/base.h b/xpc/base.h
+index 50c662e..0d241a3 100644
+--- a/xpc/base.h
++++ b/xpc/base.h
+@@ -15,6 +15,14 @@ __BEGIN_DECLS
+ #define __has_attribute(x) 0
+ #endif // !defined(__has_attribute)
+ 
++#if !defined(__has_extension)
++#define __has_extension(x) 0
++#endif // !defined(__has_extension)
++
++#if !defined(__has_feature)
++#define __has_feature(x) 0
++#endif // !defined(__has_feature)
++
+ #if __has_include(<xpc/availability.h>)
+ #include <xpc/availability.h>
+ #else // __has_include(<xpc/availability.h>)
+@@ -24,6 +32,21 @@ __BEGIN_DECLS
+ #define __XPC_IOS_SIMULATOR_AVAILABLE_STARTING(version)
+ #endif // __has_include(<xpc/availability.h>)
+ 
++/*
++ * This is a reimplementation of libxpc, not Apple's. On real macOS the SDK's
++ * <Availability.h> defines __OSX_AVAILABLE_STARTING() to version-check macros
++ * that expand to __attribute__((availability(...))) or, on toolchains that do
++ * not understand that attribute (e.g. GCC for powerpc-apple-darwin targeting
++ * 10.6), to stray tokens that break every declaration they annotate. We never
++ * want those semantics here, so force the availability annotations to no-ops.
++ */
++#undef __OSX_AVAILABLE_STARTING
++#define __OSX_AVAILABLE_STARTING(_osx, _ios)
++#undef __OSX_AVAILABLE_BUT_DEPRECATED
++#define __OSX_AVAILABLE_BUT_DEPRECATED(...)
++#undef __XPC_IOS_SIMULATOR_AVAILABLE_STARTING
++#define __XPC_IOS_SIMULATOR_AVAILABLE_STARTING(version)
++
+ #if XPC_SERVICE_MAIN_IN_LIBXPC
+ #define XPC_HOSTING_OLD_MAIN 1
+ #else // XPC_SERVICE_MAIN_IN_LIBXPC
+@@ -160,8 +183,31 @@ __BEGIN_DECLS
+ #define XPC_DEPRECATED
+ /*! @parseOnly */
+ #define XPC_UNAVAILABLE(m)
+-#endif // __GNUC__ 
++#endif // __GNUC__
++
++/*
++ * dispatch_block_t is normally provided by <dispatch/dispatch.h>, but the old
++ * libdispatch shipped with macOS 10.6 does not typedef it. Provide a fallback
++ * so the connection barrier APIs can be declared.
++ *
++ * When building without Blocks support (this port targets toolchains that lack
++ * Apple Blocks), a "block" is represented as a plain C function pointer taking
++ * no arguments; the barrier implementation invokes it via dispatch_*_f(). This
++ * keeps the public API name stable across block-capable and block-free builds.
++ *
++ * Guarded with XPC_HAVE_DISPATCH_BLOCK_T so a libdispatch that already provides
++ * the typedef does not clash; define that macro before including this header if
++ * your dispatch headers declare dispatch_block_t themselves.
++ */
++#if !defined(XPC_HAVE_DISPATCH_BLOCK_T)
++#define XPC_HAVE_DISPATCH_BLOCK_T 1
++#if __BLOCKS__
++typedef void (^dispatch_block_t)(void);
++#else // __BLOCKS__
++typedef void (*dispatch_block_t)(void);
++#endif // __BLOCKS__
++#endif // !defined(XPC_HAVE_DISPATCH_BLOCK_T)
+ 
+ __END_DECLS
+ 
+-#endif // __XPC_BASE_H__ 
++#endif // __XPC_BASE_H__
+diff --git a/xpc/connection.h b/xpc/connection.h
+index 6e7f8ef..87fb4d1 100644
+--- a/xpc/connection.h
++++ b/xpc/connection.h
+@@ -7,9 +7,6 @@
+ #include <xpc/base.h>
+ #endif // __XPC_INDIRECT__ 
+ 
+-#ifndef __BLOCKS__
+-#error "XPC connections require Blocks support."
+-#endif // __BLOCKS__
+ 
+ __BEGIN_DECLS
+ 
+diff --git a/xpc/xpc.h b/xpc/xpc.h
+index cb8cbbe..dda80cc 100644
+--- a/xpc/xpc.h
++++ b/xpc/xpc.h
+@@ -3,9 +3,11 @@
+ #ifndef __XPC_H__
+ #define __XPC_H__
+ 
+-#ifndef __FreeBSD__
++#if !defined(__FreeBSD__) && defined(__has_include)
++#if __has_include(<os/object.h>)
+ #include <os/object.h>
+ #endif
++#endif
+ #include <dispatch/dispatch.h>
+ 
+ #include <sys/mman.h>
+@@ -22,14 +24,17 @@
+ 
+ __BEGIN_DECLS
+ 
+-#ifndef __OSX_AVAILABLE_STARTING
+-#define __OSX_AVAILABLE_STARTING(x, y)
+-#endif // __OSX_AVAILABLE_STARTING
+-
+ #ifndef __XPC_INDIRECT__
+ #define __XPC_INDIRECT__
+ #endif // __XPC_INDIRECT__
+ 
++/*
++ * __OSX_AVAILABLE_STARTING() is deliberately not defined here. On real macOS
++ * <Availability.h> (pulled in transitively by <xpc/base.h> below) defines it to
++ * version-check machinery, and <xpc/base.h> then neutralizes it to a no-op so
++ * that toolchains which mishandle those annotations (e.g. GCC targeting an old
++ * powerpc-apple-darwin SDK) can still parse these declarations.
++ */
+ #include <xpc/base.h>
+ 
+ #define XPC_API_VERSION 20121012
+@@ -95,6 +100,8 @@ typedef void * xpc_object_t;
+  */
+ #if __BLOCKS__
+ typedef void (^xpc_handler_t)(xpc_object_t object);
++#else
++typedef void (*xpc_handler_t)(xpc_object_t object);
+ #endif // __BLOCKS__ 
+ 
+ /*!
+@@ -324,8 +331,14 @@ const char *const _xpc_event_key_name;
+ #ifndef __XPC_BUILDING_XPC__
+ #include <xpc/endpoint.h>
+ #include <xpc/debug.h>
+-#if __BLOCKS__
++/*
++ * The connection API does not require Blocks: xpc_handler_t degrades to a C
++ * function pointer and the send-barrier uses dispatch_block_t (also a function
++ * pointer without Blocks). Only the activity API depends on Blocks, so it stays
++ * gated. This lets the library build on toolchains without Apple Blocks.
++ */
+ #include <xpc/connection.h>
++#if __BLOCKS__
+ #include <xpc/activity.h>
+ #endif // __BLOCKS__
+ #undef __XPC_INDIRECT__
+@@ -1116,7 +1129,10 @@ xpc_shmem_map(xpc_object_t xshmem, void **region);
+  */
+ #ifdef __BLOCKS__
+ typedef bool (^xpc_array_applier_t)(size_t index, xpc_object_t value);
+-#endif // __BLOCKS__ 
++#else // __BLOCKS__
++/* Blocks are unavailable in this build; fall back to a C function pointer. */
++typedef bool (*xpc_array_applier_t)(size_t index, xpc_object_t value);
++#endif // __BLOCKS__
+ 
+ /*!
+  * @function xpc_array_create
+@@ -1253,12 +1269,10 @@ xpc_array_get_value(xpc_object_t xarray, size_t index);
+  * You should not modify an array's contents during iteration. The array indexes
+  * are iterated in order.
+  */
+-#ifdef __BLOCKS__
+ __OSX_AVAILABLE_STARTING(__MAC_10_7, __IPHONE_5_0)
+ XPC_EXPORT XPC_NONNULL_ALL
+ bool
+ xpc_array_apply(xpc_object_t xarray, xpc_array_applier_t applier);
+-#endif // __BLOCKS__ 
+ 
+ #pragma mark Array Primitive Setters
+ /*!
+@@ -1782,7 +1796,10 @@ xpc_array_create_connection(xpc_object_t xarray, size_t index);
+  */
+ #ifdef __BLOCKS__
+ typedef bool (^xpc_dictionary_applier_t)(const char *key, xpc_object_t value);
+-#endif // __BLOCKS__ 
++#else // __BLOCKS__
++/* Blocks are unavailable in this build; fall back to a C function pointer. */
++typedef bool (*xpc_dictionary_applier_t)(const char *key, xpc_object_t value);
++#endif // __BLOCKS__
+ 
+ /*!
+  * @function xpc_dictionary_create
+@@ -1936,12 +1953,10 @@ xpc_dictionary_get_count(xpc_object_t xdict);
+  * You should not modify a dictionary's contents during iteration. There is no
+  * guaranteed order of iteration over dictionaries.
+  */
+-#ifdef __BLOCKS__
+ __OSX_AVAILABLE_STARTING(__MAC_10_7, __IPHONE_5_0)
+ XPC_EXPORT XPC_NONNULL_ALL
+ bool
+ xpc_dictionary_apply(xpc_object_t xdict, xpc_dictionary_applier_t applier);
+-#endif // __BLOCKS__ 
+ 
+ /*!
+  * @function xpc_dictionary_get_remote_connection
+diff --git a/xpc_array.c b/xpc_array.c
+index 38b6edd..4c60ade 100644
+--- a/xpc_array.c
++++ b/xpc_array.c
+@@ -55,8 +55,10 @@ xpc_array_set_value(xpc_object_t xarray, size_t index, xpc_object_t value)
+ 	arr = &xo->xo_array;
+ 	i = 0;
+ 
+-	if (index == XPC_ARRAY_APPEND)
+-		return xpc_array_append_value(xarray, value);
++	if (index == XPC_ARRAY_APPEND) {
++		xpc_array_append_value(xarray, value);
++		return;
++	}
+ 
+ 	if (index >= (size_t)xo->xo_size)
+ 		return;
+diff --git a/xpc_connection.c b/xpc_connection.c
+index a55bf7a..9bd35ab 100644
+--- a/xpc_connection.c
++++ b/xpc_connection.c
+@@ -26,15 +26,65 @@
+  */
+ 
+ #include <errno.h>
+-#include <xpc/xpc.h>
+-#include <machine/atomic.h>
+-#include <Block.h>
++#include <stdatomic.h>
++
++#ifdef __APPLE__
++#include <bsm/libbsm.h>
++#endif
++
++#include "xpc/xpc.h"
+ #include "xpc_internal.h"
+ 
+-#define XPC_CONNECTION_NEXT_ID(conn) (atomic_fetchadd_long(&conn->xc_last_id, 1))
++#define XPC_CONNECTION_NEXT_ID(conn) atomic_fetch_add(&conn->xc_last_id, 1)
+ 
+ static void xpc_send(xpc_connection_t xconn, xpc_object_t message, uint64_t id);
+ 
++struct xpc_send_context {
++	xpc_connection_t xconn;
++	xpc_object_t message;
++	uint64_t id;
++};
++
++struct xpc_handler_context {
++	xpc_connection_t xconn;
++	xpc_handler_t handler;
++};
++
++struct xpc_reply_context {
++	xpc_object_t result;
++	dispatch_semaphore_t sem;
++};
++
++struct xpc_new_peer_context {
++	struct xpc_connection *conn;
++	struct xpc_connection *peer;
++	xpc_object_t result;
++	uint64_t id;
++};
++
++struct xpc_destroy_peer_context {
++	struct xpc_connection *conn;
++	struct xpc_connection *parent;
++};
++
++struct xpc_callback_context {
++	struct xpc_connection *conn;
++	struct xpc_pending_call *call;
++	xpc_object_t result;
++};
++
++struct xpc_dispatch_context {
++	struct xpc_connection *conn;
++	xpc_object_t result;
++};
++
++static void xpc_send_message_f(void *context);
++static void xpc_new_peer_handler_f(void *context);
++static void xpc_mach_new_peer_handler_f(void *context);
++static void xpc_destroy_peer_handler_f(void *context);
++static void xpc_callback_handler_f(void *context);
++static void xpc_dispatch_handler_f(void *context);
++
+ xpc_connection_t
+ xpc_connection_create(const char *name, dispatch_queue_t targetq)
+ {
+@@ -130,7 +180,7 @@ xpc_connection_set_event_handler(xpc_connection_t xconn,
+ 
+ 	debugf("connection=%p", xconn);
+ 	conn = (struct xpc_connection *)xconn;
+-	conn->xc_handler = (xpc_handler_t)Block_copy(handler);
++	conn->xc_handler = handler;
+ }
+ 
+ void
+@@ -167,11 +217,20 @@ xpc_connection_resume(xpc_connection_t xconn)
+ 	dispatch_resume(conn->xc_recv_queue);
+ }
+ 
++static void
++xpc_send_message_f(void *context)
++{
++	struct xpc_send_context *ctx = context;
++	xpc_send(ctx->xconn, ctx->message, ctx->id);
++	free(ctx);
++}
++
+ void
+ xpc_connection_send_message(xpc_connection_t xconn,
+     xpc_object_t message)
+ {
+ 	struct xpc_connection *conn;
++	struct xpc_send_context *ctx;
+ 	uint64_t id;
+ 
+ 	conn = (struct xpc_connection *)xconn;
+@@ -180,9 +239,11 @@ xpc_connection_send_message(xpc_connection_t xconn,
+ 	if (id == 0)
+ 		id = XPC_CONNECTION_NEXT_ID(conn);
+ 
+-	dispatch_async(conn->xc_send_queue, ^{
+-		xpc_send(xconn, message, id);
+-	});
++	ctx = malloc(sizeof(*ctx));
++	ctx->xconn = xconn;
++	ctx->message = message;
++	ctx->id = id;
++	dispatch_async_f(conn->xc_send_queue, ctx, xpc_send_message_f);
+ }
+ 
+ void
+@@ -191,6 +252,7 @@ xpc_connection_send_message_with_reply(xpc_connection_t xconn,
+ {
+ 	struct xpc_connection *conn;
+ 	struct xpc_pending_call *call;
++	struct xpc_send_context *ctx;
+ 
+ 	conn = (struct xpc_connection *)xconn;
+ 	call = malloc(sizeof(struct xpc_pending_call));
+@@ -199,27 +261,40 @@ xpc_connection_send_message_with_reply(xpc_connection_t xconn,
+ 	call->xp_queue = targetq;
+ 	TAILQ_INSERT_TAIL(&conn->xc_pending, call, xp_link);
+ 
+-	dispatch_async(conn->xc_send_queue, ^{
+-		xpc_send(xconn, message, call->xp_id);
+-	});
++	ctx = malloc(sizeof(*ctx));
++	ctx->xconn = xconn;
++	ctx->message = message;
++	ctx->id = call->xp_id;
++	dispatch_async_f(conn->xc_send_queue, ctx, xpc_send_message_f);
++}
++
++static struct xpc_reply_context *sync_reply_context = NULL;
+ 
++static void
++xpc_sync_reply_handler(xpc_object_t o)
++{
++	if (sync_reply_context) {
++		sync_reply_context->result = o;
++		dispatch_semaphore_signal(sync_reply_context->sem);
++	}
+ }
+ 
+ xpc_object_t
+ xpc_connection_send_message_with_reply_sync(xpc_connection_t conn,
+     xpc_object_t message)
+ {
+-	__block xpc_object_t result;
+-	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
++	struct xpc_reply_context ctx;
++	ctx.result = NULL;
++	ctx.sem = dispatch_semaphore_create(0);
+ 
++	sync_reply_context = &ctx;
+ 	xpc_connection_send_message_with_reply(conn, message, NULL,
+-	    ^(xpc_object_t o) {
+-		result = o;
+-		dispatch_semaphore_signal(sem);
+-	});
++	    xpc_sync_reply_handler);
+ 
+-	dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+-	return (result);
++	dispatch_semaphore_wait(ctx.sem, DISPATCH_TIME_FOREVER);
++	dispatch_release(ctx.sem);
++	sync_reply_context = NULL;
++	return (ctx.result);
+ }
+ 
+ void
+@@ -228,7 +303,8 @@ xpc_connection_send_barrier(xpc_connection_t xconn, dispatch_block_t barrier)
+ 	struct xpc_connection *conn;
+ 
+ 	conn = (struct xpc_connection *)xconn;
+-	dispatch_sync(conn->xc_send_queue, barrier);
++	dispatch_sync_f(conn->xc_send_queue, (void *)barrier,
++	    (dispatch_function_t)barrier);
+ }
+ 
+ void
+@@ -401,28 +477,48 @@ xpc_connection_new_peer(void *context, xpc_port_t local, xpc_port_t remote, disp
+ 	TAILQ_INSERT_TAIL(&conn->xc_peers, peer, xc_link);
+ 
+ 	if (src) {
++		struct xpc_new_peer_context *ctx;
+ 		dispatch_set_context(src, peer);
+ 		dispatch_resume(src);
+-		dispatch_async(conn->xc_target_queue, ^{
+-		    conn->xc_handler(peer);
+-		});
++		ctx = malloc(sizeof(*ctx));
++		ctx->conn = conn;
++		ctx->peer = peer;
++		dispatch_async_f(conn->xc_target_queue, ctx, xpc_new_peer_handler_f);
+ 	}
+ 
+ 	return (peer);
+ }
+ 
++static void
++xpc_new_peer_handler_f(void *context)
++{
++	struct xpc_new_peer_context *ctx = context;
++	ctx->conn->xc_handler((xpc_connection_t)ctx->peer);
++	free(ctx);
++}
++
++static void
++xpc_destroy_peer_handler_f(void *context)
++{
++	struct xpc_destroy_peer_context *ctx = context;
++	ctx->conn->xc_handler((xpc_object_t)XPC_ERROR_CONNECTION_INVALID);
++	free(ctx);
++}
++
+ void
+ xpc_connection_destroy_peer(void *context)
+ {
+ 	struct xpc_connection *conn, *parent;
++	struct xpc_destroy_peer_context *ctx;
+ 
+ 	conn = context;
+ 	parent = conn->xc_parent;
+ 
+ 	if (conn->xc_parent != NULL) {
+-		dispatch_async(parent->xc_target_queue, ^{
+-		    conn->xc_handler((xpc_object_t)XPC_ERROR_CONNECTION_INVALID);
+-		});
++		ctx = malloc(sizeof(*ctx));
++		ctx->conn = conn;
++		ctx->parent = parent;
++		dispatch_async_f(parent->xc_target_queue, ctx, xpc_destroy_peer_handler_f);
+ 
+ 		TAILQ_REMOVE(&parent->xc_peers, conn, xc_link);
+ 	}
+@@ -430,6 +526,25 @@ xpc_connection_destroy_peer(void *context)
+ 	dispatch_release(conn->xc_recv_source);
+ }
+ 
++static void
++xpc_callback_handler_f(void *context)
++{
++	struct xpc_callback_context *ctx = context;
++	ctx->call->xp_handler(ctx->result);
++	TAILQ_REMOVE(&ctx->conn->xc_pending, ctx->call, xp_link);
++	free(ctx->call);
++	free(ctx);
++}
++
++static void
++xpc_dispatch_handler_f(void *context)
++{
++	struct xpc_dispatch_context *ctx = context;
++	debugf("calling handler=%p", ctx->conn->xc_handler);
++	ctx->conn->xc_handler(ctx->result);
++	free(ctx);
++}
++
+ static void
+ xpc_connection_dispatch_callback(struct xpc_connection *conn,
+     xpc_object_t result, uint64_t id)
+@@ -438,22 +553,22 @@ xpc_connection_dispatch_callback(struct xpc_connection *conn,
+ 
+ 	TAILQ_FOREACH(call, &conn->xc_pending, xp_link) {
+ 		if (call->xp_id == id) {
+-			dispatch_async(conn->xc_target_queue, ^{
+-			    call->xp_handler(result);
+-			    TAILQ_REMOVE(&conn->xc_pending, call,
+-				xp_link);
+-			    free(call);
+-			});
++			struct xpc_callback_context *ctx = malloc(sizeof(*ctx));
++			ctx->conn = conn;
++			ctx->call = call;
++			ctx->result = result;
++			dispatch_async_f(conn->xc_target_queue, ctx, xpc_callback_handler_f);
+ 			return;
+ 		}
+ 	}
+ 
+ 	if (conn->xc_handler) {
++		struct xpc_dispatch_context *ctx;
+ 		debugf("yes");
+-		dispatch_async(conn->xc_target_queue, ^{
+-		    debugf("calling handler=%p", conn->xc_handler);
+-		    conn->xc_handler(result);
+-		});
++		ctx = malloc(sizeof(*ctx));
++		ctx->conn = conn;
++		ctx->result = result;
++		dispatch_async_f(conn->xc_target_queue, ctx, xpc_dispatch_handler_f);
+ 	}
+ }
+ 
+@@ -513,14 +628,26 @@ xpc_connection_recv_mach_message(void *context)
+ 
+ 	peer = xpc_connection_get_peer(context, remote);
+ 	if (!peer) {
++		struct xpc_new_peer_context *ctx;
+ 		debugf("new peer on port %s",
+ 		    transport->xt_port_to_string(remote));
+ 		peer = xpc_connection_new_peer(context, conn->xc_local_port, remote, NULL);
+ 
+-		dispatch_async(conn->xc_target_queue, ^{
+-		    conn->xc_handler(peer);
+-		    xpc_connection_dispatch_callback(peer, result, id);
+-		});
++		ctx = malloc(sizeof(*ctx));
++		ctx->conn = conn;
++		ctx->peer = peer;
++		ctx->result = result;
++		ctx->id = id;
++		dispatch_async_f(conn->xc_target_queue, ctx, xpc_mach_new_peer_handler_f);
+ 	} else
+ 		xpc_connection_dispatch_callback(peer, result, id);
++}
++
++static void
++xpc_mach_new_peer_handler_f(void *context)
++{
++	struct xpc_new_peer_context *ctx = context;
++	ctx->conn->xc_handler((xpc_connection_t)ctx->peer);
++	xpc_connection_dispatch_callback(ctx->peer, ctx->result, ctx->id);
++	free(ctx);
+ }
+\ No newline at end of file
+diff --git a/xpc_dictionary.c b/xpc_dictionary.c
+index fa8e570..a59bc57 100644
+--- a/xpc_dictionary.c
++++ b/xpc_dictionary.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <sys/types.h>
++
+ #include "xpc/xpc.h"
+ #include "xpc_internal.h"
+ #include "mpack.h"
+@@ -115,24 +116,26 @@ xpc2mpack(mpack_writer_t *writer, xpc_object_t obj)
+ 	struct xpc_object *xotmp = obj;
+ 
+ 	switch (xotmp->xo_xpc_type) {
+-	case _XPC_TYPE_DICTIONARY:
++	case _XPC_TYPE_DICTIONARY: {
++		struct xpc_dict_pair *pair;
+ 		mpack_start_map(writer, xpc_dictionary_get_count(obj));
+-		xpc_dictionary_apply(obj, ^(const char *k, xpc_object_t v) {
+-		    mpack_write_cstr(writer, k);
+-		    xpc2mpack(writer, v);
+-		    return ((bool)true);
+-		});
++		TAILQ_FOREACH(pair, &xotmp->xo_dict, xo_link) {
++			mpack_write_cstr(writer, pair->key);
++			xpc2mpack(writer, pair->value);
++		}
+ 		mpack_finish_map(writer);
+ 		break;
++	}
+ 
+-	case _XPC_TYPE_ARRAY:
++	case _XPC_TYPE_ARRAY: {
++		struct xpc_object *item;
+ 		mpack_start_array(writer, xpc_array_get_count(obj));
+-		xpc_array_apply(obj, ^(size_t index __unused, xpc_object_t v) {
+-		    xpc2mpack(writer, v);
+-		    return ((bool)true);
+-		});
++		TAILQ_FOREACH(item, &xotmp->xo_array, xo_link) {
++			xpc2mpack(writer, item);
++		}
+ 		mpack_finish_map(writer);
+ 		break;
++	}
+ 
+ 	case _XPC_TYPE_NULL:
+ 		mpack_write_nil(writer);
+diff --git a/xpc_internal.h b/xpc_internal.h
+index c0828d3..fcc782a 100644
+--- a/xpc_internal.h
++++ b/xpc_internal.h
+@@ -33,6 +33,20 @@
+ #include <dispatch/dispatch.h>
+ #include "mpack.h"
+ 
++/*
++ * __private_extern__ is an Apple/clang keyword used to give a symbol hidden
++ * visibility. GCC (including the powerpc-apple-darwin toolchain used for macOS
++ * 10.6) does not recognize it as a keyword, so fall back to the visibility
++ * attribute, or nothing on compilers that lack it.
++ */
++#ifndef __private_extern__
++#if defined(__GNUC__)
++#define __private_extern__ __attribute__((visibility("hidden")))
++#else
++#define __private_extern__ extern
++#endif
++#endif
++
+ #ifdef XPC_DEBUG
+ #define debugf(...) 				\
+     do { 					\
+diff --git a/xpc_misc.c b/xpc_misc.c
+index 4ebc354..03d572e 100644
+--- a/xpc_misc.c
++++ b/xpc_misc.c
+@@ -26,22 +26,43 @@
+  */
+ 
+ #include <sys/types.h>
++#include <sys/cdefs.h>
+ #include <sys/errno.h>
++#if defined(__FreeBSD__)
+ #include <sys/sbuf.h>
+-#include <machine/atomic.h>
++#include <sys/uuid.h>
++#elif defined(__APPLE__)
++#include "compat/sbuf.h" /* macOS has sys/sbuf.h, but it lacks needed stuff. */
++#elif defined(__has_include)
++#if __has_include(<sys/sbuf.h>)
++#include <sys/sbuf.h>
++#else
++#include "compat/sbuf.h"
++#endif
++#else
++#include "compat/sbuf.h"
++#endif
+ #include <assert.h>
+-#include <syslog.h>
+ #include <pthread.h>
++#include <stdatomic.h>
++#include <syslog.h>
++
+ #include "xpc/xpc.h"
+ #include "xpc_internal.h"
+ 
++#ifndef __DECONST
++#define __DECONST(type, var) ((type)(uintptr_t)(const void *)(var))
++#endif
++
+ #define RECV_BUFFER_SIZE	65536
+ 
+ static void xpc_copy_description_level(xpc_object_t obj, struct sbuf *sbuf,
+     int level);
+ 
+ extern struct xpc_transport unix_transport __attribute__((weak));
++#ifdef MACH
+ extern struct xpc_transport mach_transport __attribute__((weak));
++#endif
+ static struct xpc_transport *selected_transport = NULL;
+ 
+ struct xpc_transport *
+@@ -54,7 +75,11 @@ xpc_get_transport()
+ 				selected_transport = &unix_transport;
+ 
+ 			if (!strcmp(env, "mach"))
++#ifdef MACH
+ 				selected_transport = &mach_transport;
++#else
++				selected_transport = &unix_transport;
++#endif
+ 		} else {
+ #ifdef MACH
+ 			selected_transport = &mach_transport;
+@@ -160,7 +185,7 @@ xpc_retain(xpc_object_t obj)
+ 	struct xpc_object *xo;
+ 
+ 	xo = obj;
+-	atomic_add_int(&xo->xo_refcnt, 1);
++	__atomic_add_fetch(&xo->xo_refcnt, 1, __ATOMIC_RELAXED);
+ 	return (obj);
+ }
+ 
+@@ -170,7 +195,7 @@ xpc_release(xpc_object_t obj)
+ 	struct xpc_object *xo;
+ 
+ 	xo = obj;
+-	if (atomic_fetchadd_int(&xo->xo_refcnt, -1) > 1)
++	if (__atomic_fetch_sub(&xo->xo_refcnt, 1, __ATOMIC_ACQ_REL) > 1)
+ 		return;
+ 
+ 	xpc_object_destroy(xo);
+@@ -213,9 +238,6 @@ static void
+ xpc_copy_description_level(xpc_object_t obj, struct sbuf *sbuf, int level)
+ {
+ 	struct xpc_object *xo = obj;
+-	struct uuid *id;
+-	char *uuid_str;
+-	uint32_t uuid_status;
+ 
+ 	if (obj == NULL) {
+ 		sbuf_printf(sbuf, "<null value>\n");
+@@ -225,23 +247,27 @@ xpc_copy_description_level(xpc_object_t obj, struct sbuf *sbuf, int level)
+ 	sbuf_printf(sbuf, "(%s) ", _xpc_get_type_name(obj));
+ 
+ 	switch (xo->xo_xpc_type) {
+-	case _XPC_TYPE_DICTIONARY:
++	case _XPC_TYPE_DICTIONARY: {
++		struct xpc_dict_pair *pair;
+ 		sbuf_printf(sbuf, "\n");
+-		xpc_dictionary_apply(xo, ^(const char *k, xpc_object_t v) {
+-			sbuf_printf(sbuf, "%*s\"%s\": ", level * 4, " ", k);
+-			xpc_copy_description_level(v, sbuf, level + 1);
+-			return ((bool)true);
+-		});
++		TAILQ_FOREACH(pair, &xo->xo_dict, xo_link) {
++			sbuf_printf(sbuf, "%*s\"%s\": ", level * 4, " ", pair->key);
++			xpc_copy_description_level(pair->value, sbuf, level + 1);
++		}
+ 		break;
++	}
+ 
+-	case _XPC_TYPE_ARRAY:
++	case _XPC_TYPE_ARRAY: {
++		struct xpc_object *item;
++		size_t idx = 0;
+ 		sbuf_printf(sbuf, "\n");
+-		xpc_array_apply(xo, ^(size_t idx, xpc_object_t v) {
++		TAILQ_FOREACH(item, &xo->xo_array, xo_link) {
+ 			sbuf_printf(sbuf, "%*s%ld: ", level * 4, " ", idx);
+-			xpc_copy_description_level(v, sbuf, level + 1);
+-			return ((bool)true);
+-		});
++			xpc_copy_description_level(item, sbuf, level + 1);
++			idx++;
++		}
+ 		break;
++	}
+ 
+ 	case _XPC_TYPE_BOOL:
+ 		sbuf_printf(sbuf, "%s\n",
+@@ -268,12 +294,22 @@ xpc_copy_description_level(xpc_object_t obj, struct sbuf *sbuf, int level)
+ 		    xpc_date_get_value(obj));
+ 		break;	
+ 
+-	case _XPC_TYPE_UUID:
+-		id = (struct uuid *)xpc_uuid_get_bytes(obj);
+-		uuid_to_string(id, &uuid_str, &uuid_status);
+-		sbuf_printf(sbuf, "%s\n", uuid_str);
++	case _XPC_TYPE_UUID: {
++		const uint8_t *id = xpc_uuid_get_bytes(obj);
++#if defined(__FreeBSD__)
++		char *uuid_str = NULL;
++		uint32_t uuid_status;
++		uuid_to_string((const struct uuid *)id, &uuid_str, &uuid_status);
++		sbuf_printf(sbuf, "%s\n", uuid_str != NULL ? uuid_str : "");
+ 		free(uuid_str);
++#else
++		/* uuid_unparse() from <uuid/uuid.h>, available on macOS/libc. */
++		char uuid_str[37];
++		uuid_unparse(*(const uuid_t *)id, uuid_str);
++		sbuf_printf(sbuf, "%s\n", uuid_str);
++#endif
+ 		break;
++	}
+ 
+ 	case _XPC_TYPE_ENDPOINT:
+ 		sbuf_printf(sbuf, "<%ld>\n", xo->xo_int);
+diff --git a/xpc_type.c b/xpc_type.c
+index 3f727a0..f256f1d 100644
+--- a/xpc_type.c
++++ b/xpc_type.c
+@@ -26,10 +26,15 @@
+  */
+ 
+ #include <sys/types.h>
++#include <sys/cdefs.h>
+ #include <time.h>
+ #include "xpc/xpc.h"
+ #include "xpc_internal.h"
+ 
++#ifndef __DECONST
++#define __DECONST(type, var) ((type)(uintptr_t)(const void *)(var))
++#endif
++
+ struct _xpc_type_s {
+ };
+ 
+@@ -289,7 +294,7 @@ xpc_data_create(const void *bytes, size_t length)
+ 	return _xpc_prim_create(_XPC_TYPE_DATA, val, length);
+ }
+ 
+-#ifdef MACH
++#if 0
+ xpc_object_t
+ xpc_data_create_with_dispatch_data(dispatch_data_t ddata)
+ {
+@@ -460,21 +465,26 @@ xpc_copy(xpc_object_t obj)
+ 			return (xpc_data_create(newdata,
+ 			    xpc_data_get_length(obj)));
+ 
+-		case _XPC_TYPE_DICTIONARY:
++		case _XPC_TYPE_DICTIONARY: {
++			struct xpc_dict_pair *pair;
++			struct xpc_object *xo = obj;
+ 			xotmp = xpc_dictionary_create(NULL, NULL, 0);
+-			xpc_dictionary_apply(obj, ^(const char *k, xpc_object_t v) {
+-			    xpc_dictionary_set_value(xotmp, k, xpc_copy(v));
+-			    return (bool)true;
+-			});
++			TAILQ_FOREACH(pair, &xo->xo_dict, xo_link) {
++				xpc_dictionary_set_value(xotmp, pair->key, xpc_copy(pair->value));
++			}
+ 			return (xotmp);
++		}
+ 
+-		case _XPC_TYPE_ARRAY:
++		case _XPC_TYPE_ARRAY: {
++			struct xpc_object *item, *xo = obj;
++			size_t idx = 0;
+ 			xotmp = xpc_array_create(NULL, 0);
+-			xpc_array_apply(obj, ^(size_t idx, xpc_object_t v) {
+-			    xpc_array_set_value(xotmp, idx, xpc_copy(v));
+-			    return ((bool)true);
+-			});
++			TAILQ_FOREACH(item, &xo->xo_array, xo_link) {
++				xpc_array_set_value(xotmp, idx, xpc_copy(item));
++				idx++;
++			}
+ 			return (xotmp);
++		}
+ 	}
+ 
+ 	return (0);
+@@ -495,7 +505,7 @@ size_t
+ xpc_hash(xpc_object_t obj)
+ {
+ 	struct xpc_object *xo;
+-	__block size_t hash = 0;
++	size_t hash = 0;
+ 
+ 	xo = obj;
+ 	switch (xo->xo_xpc_type) {
+@@ -516,21 +526,24 @@ xpc_hash(xpc_object_t obj)
+ 		    xpc_data_get_bytes_ptr(obj),
+ 		    xpc_data_get_length(obj)));
+ 
+-	case _XPC_TYPE_DICTIONARY:
+-		xpc_dictionary_apply(obj, ^(const char *k, xpc_object_t v) {
+-			hash ^= xpc_data_hash((const uint8_t *)k, strlen(k));
+-			hash ^= xpc_hash(v);
+-			return ((bool)true);
+-		});
++	case _XPC_TYPE_DICTIONARY: {
++		struct xpc_dict_pair *pair;
++		struct xpc_object *xo = obj;
++		TAILQ_FOREACH(pair, &xo->xo_dict, xo_link) {
++			hash ^= xpc_data_hash((const uint8_t *)pair->key, strlen(pair->key));
++			hash ^= xpc_hash(pair->value);
++		}
+ 		return (hash);
++	}
+ 
+-	case _XPC_TYPE_ARRAY:
+-		xpc_array_apply(obj, ^(size_t idx, xpc_object_t v) {
+-			hash ^= xpc_hash(v);
+-			return ((bool)true);
+-		});
++	case _XPC_TYPE_ARRAY: {
++		struct xpc_object *item, *xo = obj;
++		TAILQ_FOREACH(item, &xo->xo_array, xo_link) {
++			hash ^= xpc_hash(item);
++		}
+ 		return (hash);
+ 	}
++	}
+ 
+ 	return (0);
+ }
