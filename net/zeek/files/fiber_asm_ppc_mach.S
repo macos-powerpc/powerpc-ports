@@ -24,8 +24,7 @@
 
 #define FUNC(sym) \
   .globl _##sym; \
-  .align 4; \
-  _##sym:
+  .align 4
 
 #define END_FUNC(sym)
 
@@ -33,6 +32,7 @@
   .endm
 
 FUNC(fiber_asm_switch)
+_fiber_asm_switch:
 
   ; CR
   mfcr r5
@@ -192,6 +192,7 @@ END_FUNC(fiber_asm_switch)
 ; 8(sp):  old sp
 ; 12(sp): old lr
 FUNC(fiber_asm_invoke)
+_fiber_asm_invoke:
   lwz r3,  0(r1)          ; args    -> r3 (first argument)
   lwz r12, 4(r1)          ; func    -> r12/ctr
   mtctr r12
@@ -209,6 +210,7 @@ END_FUNC(fiber_asm_invoke)
 ; void fiber_asm_exec_on_stack(void *arg, FiberFunc f, void *stack)
 ; r3 = arg, r4 = f, r5 = new stack
 FUNC(fiber_asm_exec_on_stack)
+_fiber_asm_exec_on_stack:
   mflr r0
   mr r6, r31              ; save caller's r31
   mr r12, r4              ; f -> ctr
