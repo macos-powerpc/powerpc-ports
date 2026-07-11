@@ -1,0 +1,569 @@
+--- src/macho.cc	2026-06-01 00:14:40.000000000 +0800
++++ src/macho.cc	2026-07-11 19:43:50.000000000 +0800
+@@ -117,6 +117,40 @@
+         default:
+           return "arm";
+       }
++    case CPU_TYPE_POWERPC:
++      switch (cpusubtype) {
++        case CPU_SUBTYPE_POWERPC_601:
++          return "ppc601";
++        case CPU_SUBTYPE_POWERPC_602:
++          return "ppc602";
++        case CPU_SUBTYPE_POWERPC_603:
++          return "ppc603";
++        case CPU_SUBTYPE_POWERPC_603e:
++          return "ppc603e";
++        case CPU_SUBTYPE_POWERPC_603ev:
++          return "ppc603ev";
++        case CPU_SUBTYPE_POWERPC_604:
++          return "ppc604";
++        case CPU_SUBTYPE_POWERPC_604e:
++          return "ppc604e";
++        case CPU_SUBTYPE_POWERPC_750:
++          return "ppc750";
++        case CPU_SUBTYPE_POWERPC_7400:
++          return "ppc7400";
++        case CPU_SUBTYPE_POWERPC_7450:
++          return "ppc7450";
++        case CPU_SUBTYPE_POWERPC_970:
++          return "ppc970";
++        default:
++          return "ppc";
++      }
++    case CPU_TYPE_POWERPC64:
++      switch (cpusubtype) {
++        case CPU_SUBTYPE_POWERPC_970:
++          return "ppc970-64";
++        default:
++          return "ppc64";
++      }
+     default:
+       return absl::StrFormat("cpu_%d", cputype);
+   }
+@@ -124,6 +158,7 @@
+ 
+ struct LoadCommand {
+   bool is64bit;
++  bool is_byteswapped;
+   uint32_t cmd;
+   string_view command_data;
+   string_view file_data;
+@@ -135,39 +170,53 @@
+ template <>
+ bool Is64Bit<mach_header_64>() { return true; }
+ 
++// Byte-swap helpers for big-endian (PowerPC) Mach-O parsing.
++// When is_byteswapped is true all integer fields read from load command
++// structs must be swapped before use.
++static uint32_t MaybeSwap32(uint32_t v, bool swap) {
++  return swap ? ByteSwap(v) : v;
++}
++static uint64_t MaybeSwap64(uint64_t v, bool swap) {
++  return swap ? ByteSwap(v) : v;
++}
++
+ template <class Struct, class Func>
+ void ParseMachOHeaderImpl(string_view macho_data, RangeSink* overhead_sink,
+-                          Func&& loadcmd_func) {
++                          bool byteswap, Func&& loadcmd_func) {
+   string_view header_data = macho_data;
+   auto header = GetStructPointerAndAdvance<Struct>(&header_data);
+   MaybeAddOverhead(overhead_sink,
+                    "[Mach-O Headers]",
+                    macho_data.substr(0, sizeof(Struct)));
+-  uint32_t ncmds = header->ncmds;
++  uint32_t ncmds = MaybeSwap32(header->ncmds, byteswap);
+ 
+   for (uint32_t i = 0; i < ncmds; i++) {
+     auto command = GetStructPointer<load_command>(header_data);
+ 
++    uint32_t cmdsize = MaybeSwap32(command->cmdsize, byteswap);
++    uint32_t cmd     = MaybeSwap32(command->cmd,     byteswap);
++
+     // Validate load command size to prevent hangs or buffer overruns
+-    if (command->cmdsize == 0) {
++    if (cmdsize == 0) {
+       THROW("Mach-O load command had zero size.");
+     }
+-    if (command->cmdsize < sizeof(load_command)) {
++    if (cmdsize < sizeof(load_command)) {
+       THROW("Mach-O load command size smaller than minimum.");
+     }
+-    if (command->cmdsize > header_data.size()) {
++    if (cmdsize > header_data.size()) {
+       THROW("Mach-O load command size exceeds remaining header data.");
+     }
+ 
+     LoadCommand data;
+-    data.is64bit = Is64Bit<Struct>();
+-    data.cmd = command->cmd;
+-    data.command_data = StrictSubstr(header_data, 0, command->cmdsize);
+-    data.file_data = macho_data;
++    data.is64bit       = Is64Bit<Struct>();
++    data.is_byteswapped = byteswap;
++    data.cmd           = cmd;
++    data.command_data  = StrictSubstr(header_data, 0, cmdsize);
++    data.file_data     = macho_data;
+     std::forward<Func>(loadcmd_func)(data);
+ 
+     MaybeAddOverhead(overhead_sink, "[Mach-O Headers]", data.command_data);
+-    header_data = header_data.substr(command->cmdsize);
++    header_data = header_data.substr(cmdsize);
+   }
+ }
+ 
+@@ -184,28 +233,23 @@
+       // Still, you can build 32-bit binaries as of this writing, and
+       // there are existing 32-bit binaries floating around, so we might
+       // as well support them.
+-      ParseMachOHeaderImpl<mach_header>(macho_file, overhead_sink,
++      ParseMachOHeaderImpl<mach_header>(macho_file, overhead_sink, false,
+                                         std::forward<Func>(loadcmd_func));
+       break;
+     case MH_MAGIC_64:
+       ParseMachOHeaderImpl<mach_header_64>(
+-          macho_file, overhead_sink, std::forward<Func>(loadcmd_func));
++          macho_file, overhead_sink, false, std::forward<Func>(loadcmd_func));
+       break;
+     case MH_CIGAM:
++      // Big-endian 32-bit Mach-O (e.g. PowerPC).
++      ParseMachOHeaderImpl<mach_header>(macho_file, overhead_sink, true,
++                                        std::forward<Func>(loadcmd_func));
++      break;
+     case MH_CIGAM_64:
+-      // OS X and Darwin currently only run on x86/x86-64 (little-endian
+-      // platforms), so we expect basically all Mach-O files to be
+-      // little-endian.  Additionally, pretty much all CPU architectures
+-      // are little-endian these days.  ARM has the option to be
+-      // big-endian, but I can't find any OS that is actually compiled to
+-      // use big-endian mode.  debian-mips is the only big-endian OS I can
+-      // find (and maybe SPARC).
+-      //
+-      // All of this is to say, this case should only happen if you are
+-      // running Bloaty on debian-mips.  I consider that uncommon enough
+-      // (and hard enough to test) that we don't support this until there
+-      // is a demonstrated need.
+-      THROW("We don't support cross-endian Mach-O files.");
++      // Big-endian 64-bit Mach-O (e.g. PowerPC64).
++      ParseMachOHeaderImpl<mach_header_64>(
++          macho_file, overhead_sink, true, std::forward<Func>(loadcmd_func));
++      break;
+     default:
+       THROW("Corrupt Mach-O file");
+   }
+@@ -256,16 +300,16 @@
+ 
+ template <class Segment, class Section>
+ void AddSegmentAsFallback(string_view command_data, string_view file_data,
+-                          RangeSink* sink) {
++                          bool swap, RangeSink* sink) {
+   auto segment = GetStructPointerAndAdvance<Segment>(&command_data);
+ 
+-  if (segment->maxprot == VM_PROT_NONE) {
++  if (MaybeSwap32(segment->maxprot, swap) == VM_PROT_NONE) {
+     return;
+   }
+ 
+   string_view segname = ArrayToStr(segment->segname, 16);
+ 
+-  uint32_t nsects = segment->nsects;
++  uint32_t nsects = MaybeSwap32(segment->nsects, swap);
+ 
+   // Validate that nsects count doesn't exceed command data size
+   if (nsects > command_data.size() / sizeof(Section)) {
+@@ -275,9 +319,14 @@
+   for (uint32_t j = 0; j < nsects; j++) {
+     auto section = GetStructPointerAndAdvance<Section>(&command_data);
+ 
++    uint64_t sec_size   = MaybeSwap64((uint64_t)section->size,   swap);
++    uint64_t sec_addr   = MaybeSwap64((uint64_t)section->addr,   swap);
++    uint32_t sec_offset = MaybeSwap32(section->offset, swap);
++    uint32_t sec_flags  = MaybeSwap32(section->flags,  swap);
++
+     // filesize equals vmsize unless the section is zerofill
+-    uint64_t filesize = section->size;
+-    switch (section->flags & SECTION_TYPE) {
++    uint64_t filesize = sec_size;
++    switch (sec_flags & SECTION_TYPE) {
+       case S_ZEROFILL:
+       case S_GB_ZEROFILL:
+       case S_THREAD_LOCAL_ZEROFILL:
+@@ -290,17 +339,23 @@
+     std::string label = absl::StrJoin(
+         std::make_tuple(segname, ArrayToStr(section->sectname, 16)), ",");
+     label = "[" + label + "]";
+-    sink->AddRange("macho_fallback", label, section->addr, section->size,
+-                   StrictSubstr(file_data, section->offset, filesize));
++    sink->AddRange("macho_fallback", label, sec_addr, sec_size,
++                   StrictSubstr(file_data, sec_offset, filesize));
+   }
+ 
++  uint64_t vmaddr   = MaybeSwap64((uint64_t)segment->vmaddr,   swap);
++  uint64_t vmsize   = MaybeSwap64((uint64_t)segment->vmsize,   swap);
++  uint64_t fileoff  = MaybeSwap64((uint64_t)segment->fileoff,  swap);
++  uint64_t filesize = MaybeSwap64((uint64_t)segment->filesize, swap);
++
+   sink->AddRange("macho_fallback", "[" + std::string(segname) + "]",
+-                 segment->vmaddr, segment->vmsize,
+-                 StrictSubstr(file_data, segment->fileoff, segment->filesize));
++                 vmaddr, vmsize,
++                 StrictSubstr(file_data, fileoff, filesize));
+ }
+ 
+ template <class Segment, class Section>
+ void ParseSegment(LoadCommand cmd, RangeSink* sink) {
++  bool swap = cmd.is_byteswapped;
+   auto segment = GetStructPointerAndAdvance<Segment>(&cmd.command_data);
+   string_view segname = ArrayToStr(segment->segname, 16);
+ 
+@@ -312,20 +367,25 @@
+   //
+   // Since such segments should not be mapped, we simply ignore the
+   // vmaddr/vmsize of such segments.
+-  bool unmapped = segment->maxprot == VM_PROT_NONE;
++  bool unmapped = MaybeSwap32(segment->maxprot, swap) == VM_PROT_NONE;
++
++  uint64_t vmaddr   = MaybeSwap64((uint64_t)segment->vmaddr,   swap);
++  uint64_t vmsize   = MaybeSwap64((uint64_t)segment->vmsize,   swap);
++  uint64_t fileoff  = MaybeSwap64((uint64_t)segment->fileoff,  swap);
++  uint64_t filesize = MaybeSwap64((uint64_t)segment->filesize, swap);
+ 
+   if (sink->data_source() == DataSource::kSegments) {
+     if (unmapped) {
+       sink->AddFileRange(
+           "macho_segment", segname,
+-          StrictSubstr(cmd.file_data, segment->fileoff, segment->filesize));
++          StrictSubstr(cmd.file_data, fileoff, filesize));
+     } else {
+       sink->AddRange(
+-          "macho_segment", segname, segment->vmaddr, segment->vmsize,
+-          StrictSubstr(cmd.file_data, segment->fileoff, segment->filesize));
++          "macho_segment", segname, vmaddr, vmsize,
++          StrictSubstr(cmd.file_data, fileoff, filesize));
+     }
+   } else if (sink->data_source() == DataSource::kSections) {
+-    uint32_t nsects = segment->nsects;
++    uint32_t nsects = MaybeSwap32(segment->nsects, swap);
+ 
+     // Validate that nsects count doesn't exceed command data size
+     if (nsects > cmd.command_data.size() / sizeof(Section)) {
+@@ -335,13 +395,18 @@
+     for (uint32_t j = 0; j < nsects; j++) {
+       auto section = GetStructPointerAndAdvance<Section>(&cmd.command_data);
+ 
++      uint64_t sec_size   = MaybeSwap64((uint64_t)section->size,   swap);
++      uint64_t sec_addr   = MaybeSwap64((uint64_t)section->addr,   swap);
++      uint32_t sec_offset = MaybeSwap32(section->offset, swap);
++      uint32_t sec_flags  = MaybeSwap32(section->flags,  swap);
++
+       // filesize equals vmsize unless the section is zerofill
+-      uint64_t filesize = section->size;
+-      switch (section->flags & SECTION_TYPE) {
++      uint64_t sec_filesize = sec_size;
++      switch (sec_flags & SECTION_TYPE) {
+         case S_ZEROFILL:
+         case S_GB_ZEROFILL:
+         case S_THREAD_LOCAL_ZEROFILL:
+-          filesize = 0;
++          sec_filesize = 0;
+           break;
+         default:
+           break;
+@@ -352,10 +417,10 @@
+       if (unmapped) {
+         sink->AddFileRange(
+             "macho_section", label,
+-            StrictSubstr(cmd.file_data, section->offset, filesize));
++            StrictSubstr(cmd.file_data, sec_offset, sec_filesize));
+       } else {
+-        sink->AddRange("macho_section", label, section->addr, section->size,
+-                       StrictSubstr(cmd.file_data, section->offset, filesize));
++        sink->AddRange("macho_section", label, sec_addr, sec_size,
++                       StrictSubstr(cmd.file_data, sec_offset, sec_filesize));
+       }
+     }
+   } else {
+@@ -366,7 +431,9 @@
+ static bool IsObjectFile(string_view data) {
+   string_view header_data = data;
+   auto header = GetStructPointerAndAdvance<mach_header>(&header_data);
+-  return header->filetype == MH_OBJECT;
++  uint32_t magic = ReadMagic(data);
++  bool swap = (magic == MH_CIGAM || magic == MH_CIGAM_64);
++  return MaybeSwap32(header->filetype, swap) == MH_OBJECT;
+ }
+ 
+ static void CheckNotObject(const char* source, RangeSink* sink) {
+@@ -380,68 +447,89 @@
+ 
+ static void ParseDyldInfo(const LoadCommand& cmd, RangeSink* sink) {
+   auto info = GetStructPointer<dyld_info_command>(cmd.command_data);
++  bool swap = cmd.is_byteswapped;
+ 
+   sink->AddFileRange(
+       "macho_dyld", "Rebase Info",
+-      StrictSubstr(cmd.file_data, info->rebase_off, info->rebase_size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(info->rebase_off, swap),
++                   MaybeSwap32(info->rebase_size, swap)));
+   sink->AddFileRange(
+       "macho_dyld", "Binding Info",
+-      StrictSubstr(cmd.file_data, info->bind_off, info->bind_size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(info->bind_off, swap),
++                   MaybeSwap32(info->bind_size, swap)));
+   sink->AddFileRange(
+       "macho_dyld", "Weak Binding Info",
+-      StrictSubstr(cmd.file_data, info->weak_bind_off, info->weak_bind_size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(info->weak_bind_off, swap),
++                   MaybeSwap32(info->weak_bind_size, swap)));
+   sink->AddFileRange(
+       "macho_dyld", "Lazy Binding Info",
+-      StrictSubstr(cmd.file_data, info->lazy_bind_off, info->lazy_bind_size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(info->lazy_bind_off, swap),
++                   MaybeSwap32(info->lazy_bind_size, swap)));
+   sink->AddFileRange(
+       "macho_dyld", "Export Info",
+-      StrictSubstr(cmd.file_data, info->export_off, info->export_size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(info->export_off, swap),
++                   MaybeSwap32(info->export_size, swap)));
+ }
+ 
+ static void ParseSymbolTable(const LoadCommand& cmd, RangeSink* sink) {
+   auto symtab = GetStructPointer<symtab_command>(cmd.command_data);
++  bool swap = cmd.is_byteswapped;
+ 
+   size_t size = cmd.is64bit ? sizeof(nlist_64) : sizeof(struct nlist);
+   sink->AddFileRange(
+       "macho_symtab", "Symbol Table",
+-      StrictSubstr(cmd.file_data, symtab->symoff, symtab->nsyms * size));
++      StrictSubstr(cmd.file_data, MaybeSwap32(symtab->symoff, swap),
++                   MaybeSwap32(symtab->nsyms, swap) * size));
+   sink->AddFileRange(
+       "macho_symtab", "String Table",
+-      StrictSubstr(cmd.file_data, symtab->stroff, symtab->strsize));
++      StrictSubstr(cmd.file_data, MaybeSwap32(symtab->stroff, swap),
++                   MaybeSwap32(symtab->strsize, swap)));
+ }
+ 
+ static void ParseDynamicSymbolTable(const LoadCommand& cmd, RangeSink* sink) {
+   auto dysymtab = GetStructPointer<dysymtab_command>(cmd.command_data);
++  bool swap = cmd.is_byteswapped;
+ 
+   sink->AddFileRange(
+       "macho_dynsymtab", "Table of Contents",
+-      StrictSubstr(cmd.file_data, dysymtab->tocoff,
+-                   dysymtab->ntoc * sizeof(dylib_table_of_contents)));
+-  sink->AddFileRange("macho_dynsymtab", "Module Table",
+-                     StrictSubstr(cmd.file_data, dysymtab->modtaboff,
+-                                  dysymtab->nmodtab * sizeof(dylib_module_64)));
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->tocoff, swap),
++                   MaybeSwap32(dysymtab->ntoc, swap) *
++                       sizeof(dylib_table_of_contents)));
++  sink->AddFileRange(
++      "macho_dynsymtab", "Module Table",
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->modtaboff, swap),
++                   MaybeSwap32(dysymtab->nmodtab, swap) *
++                       sizeof(dylib_module_64)));
+   sink->AddFileRange(
+       "macho_dynsymtab", "Referenced Symbol Table",
+-      StrictSubstr(cmd.file_data, dysymtab->extrefsymoff,
+-                   dysymtab->nextrefsyms * sizeof(dylib_reference)));
+-  sink->AddFileRange("macho_dynsymtab", "Indirect Symbol Table",
+-                     StrictSubstr(cmd.file_data, dysymtab->indirectsymoff,
+-                                  dysymtab->nindirectsyms * sizeof(uint32_t)));
+-  sink->AddFileRange("macho_dynsymtab", "External Relocation Entries",
+-                     StrictSubstr(cmd.file_data, dysymtab->extreloff,
+-                                  dysymtab->nextrel * sizeof(relocation_info)));
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->extrefsymoff, swap),
++                   MaybeSwap32(dysymtab->nextrefsyms, swap) *
++                       sizeof(dylib_reference)));
++  sink->AddFileRange(
++      "macho_dynsymtab", "Indirect Symbol Table",
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->indirectsymoff, swap),
++                   MaybeSwap32(dysymtab->nindirectsyms, swap) *
++                       sizeof(uint32_t)));
++  sink->AddFileRange(
++      "macho_dynsymtab", "External Relocation Entries",
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->extreloff, swap),
++                   MaybeSwap32(dysymtab->nextrel, swap) *
++                       sizeof(relocation_info)));
+   sink->AddFileRange(
+       "macho_dynsymtab", "Local Relocation Entries",
+-      StrictSubstr(cmd.file_data, dysymtab->locreloff,
+-                   dysymtab->nlocrel * sizeof(struct relocation_info)));
++      StrictSubstr(cmd.file_data, MaybeSwap32(dysymtab->locreloff, swap),
++                   MaybeSwap32(dysymtab->nlocrel, swap) *
++                       sizeof(struct relocation_info)));
+ }
+ 
+ static void ParseLinkeditCommand(string_view label, const LoadCommand& cmd,
+                                  RangeSink* sink) {
+   auto linkedit = GetStructPointer<linkedit_data_command>(cmd.command_data);
++  bool swap = cmd.is_byteswapped;
+   sink->AddFileRange(
+       "macho_linkedit", label,
+-      StrictSubstr(cmd.file_data, linkedit->dataoff, linkedit->datasize));
++      StrictSubstr(cmd.file_data, MaybeSwap32(linkedit->dataoff, swap),
++                   MaybeSwap32(linkedit->datasize, swap)));
+ }
+ 
+ void ParseLoadCommand(const LoadCommand& cmd, RangeSink* sink) {
+@@ -499,17 +587,20 @@
+ void ParseSymbolsFromSymbolTable(const LoadCommand& cmd, SymbolTable* table,
+                                  RangeSink* sink) {
+   auto symtab_cmd = GetStructPointer<symtab_command>(cmd.command_data);
++  bool swap = cmd.is_byteswapped;
+ 
+   // Validate that nsyms count doesn't cause overflow or exceed file size
+-  uint32_t nsyms = symtab_cmd->nsyms;
++  uint32_t nsyms = MaybeSwap32(symtab_cmd->nsyms, swap);
+   if (nsyms > cmd.file_data.size() / sizeof(NList)) {
+     THROW("invalid symbol count in symbol table");
+   }
+ 
+-  string_view symtab = StrictSubstr(cmd.file_data, symtab_cmd->symoff,
+-                                    nsyms * sizeof(NList));
+-  string_view strtab =
+-      StrictSubstr(cmd.file_data, symtab_cmd->stroff, symtab_cmd->strsize);
++  uint32_t symoff  = MaybeSwap32(symtab_cmd->symoff,  swap);
++  uint32_t stroff  = MaybeSwap32(symtab_cmd->stroff,  swap);
++  uint32_t strsize = MaybeSwap32(symtab_cmd->strsize, swap);
++
++  string_view symtab = StrictSubstr(cmd.file_data, symoff, nsyms * sizeof(NList));
++  string_view strtab = StrictSubstr(cmd.file_data, stroff, strsize);
+ 
+   for (uint32_t i = 0; i < nsyms; i++) {
+     auto sym = GetStructPointerAndAdvance<NList>(&symtab);
+@@ -519,23 +610,26 @@
+       continue;
+     }
+ 
+-    string_view name_region = StrictSubstr(strtab, sym->n_un.n_strx);
++    uint64_t n_value = MaybeSwap64((uint64_t)sym->n_value, swap);
++    uint32_t n_strx  = MaybeSwap32(sym->n_un.n_strx, swap);
++
++    string_view name_region = StrictSubstr(strtab, n_strx);
+     string_view name = ReadNullTerminated(&name_region);
+ 
+     if (sink->data_source() >= DataSource::kSymbols) {
+-      sink->AddVMRange("macho_symbols", sym->n_value, RangeSink::kUnknownSize,
++      sink->AddVMRange("macho_symbols", n_value, RangeSink::kUnknownSize,
+                        ItaniumDemangle(name, sink->data_source()));
+     }
+ 
+     if (table) {
+       table->insert(std::make_pair(
+-          name, std::make_pair(sym->n_value, RangeSink::kUnknownSize)));
++          name, std::make_pair(n_value, RangeSink::kUnknownSize)));
+     }
+ 
+     // Capture the trailing NULL.
+     name = string_view(name.data(), name.size() + 1);
+-    sink->AddFileRangeForVMAddr("macho_symtab_name", sym->n_value, name);
+-    sink->AddFileRangeForVMAddr("macho_symtab_sym", sym->n_value, sym_range);
++    sink->AddFileRangeForVMAddr("macho_symtab_name", n_value, name);
++    sink->AddFileRangeForVMAddr("macho_symtab_sym", n_value, sym_range);
+   }
+ }
+ 
+@@ -565,11 +659,11 @@
+         switch (cmd.cmd) {
+           case LC_SEGMENT_64:
+             AddSegmentAsFallback<segment_command_64, section_64>(
+-                cmd.command_data, cmd.file_data, sink);
++                cmd.command_data, cmd.file_data, cmd.is_byteswapped, sink);
+             break;
+           case LC_SEGMENT:
+-            AddSegmentAsFallback<segment_command, section>(cmd.command_data,
+-                                                           cmd.file_data, sink);
++            AddSegmentAsFallback<segment_command, section>(
++                cmd.command_data, cmd.file_data, cmd.is_byteswapped, sink);
+             break;
+         }
+       });
+@@ -579,6 +673,7 @@
+ template <class Segment, class Section>
+ void ReadDebugSectionsFromSegment(LoadCommand cmd, dwarf::File *dwarf,
+                                   RangeSink *sink) {
++  bool swap = cmd.is_byteswapped;
+   auto segment = GetStructPointerAndAdvance<Segment>(&cmd.command_data);
+   string_view segname = ArrayToStr(segment->segname, 16);
+ 
+@@ -586,7 +681,7 @@
+     return;
+   }
+ 
+-  uint32_t nsects = segment->nsects;
++  uint32_t nsects = MaybeSwap32(segment->nsects, swap);
+ 
+   // Validate that nsects count doesn't exceed command data size
+   if (nsects > cmd.command_data.size() / sizeof(Section)) {
+@@ -597,9 +692,13 @@
+     auto section = GetStructPointerAndAdvance<Section>(&cmd.command_data);
+     string_view sectname = ArrayToStr(section->sectname, 16);
+ 
++    uint64_t sec_size   = MaybeSwap64((uint64_t)section->size,   swap);
++    uint32_t sec_offset = MaybeSwap32(section->offset, swap);
++    uint32_t sec_flags  = MaybeSwap32(section->flags,  swap);
++
+     // filesize equals vmsize unless the section is zerofill
+-    uint64_t filesize = section->size;
+-    switch (section->flags & SECTION_TYPE) {
++    uint64_t filesize = sec_size;
++    switch (sec_flags & SECTION_TYPE) {
+       case S_ZEROFILL:
+       case S_GB_ZEROFILL:
+       case S_THREAD_LOCAL_ZEROFILL:
+@@ -609,8 +708,7 @@
+         break;
+     }
+ 
+-    string_view contents =
+-        StrictSubstr(cmd.file_data, section->offset, filesize);
++    string_view contents = StrictSubstr(cmd.file_data, sec_offset, filesize);
+ 
+     if (sectname.find("__debug_") == 0) {
+       sectname.remove_prefix(string_view("__debug_").size());
+@@ -727,10 +825,10 @@
+ 
+       for (uint32_t i = 0; i < nfat_arch; i++) {
+         auto arch = GetStructPointerAndAdvance<fat_arch>(&header_data);
+-        uint32_t cputype = ByteSwap(arch->cputype);
++        uint32_t cputype    = ByteSwap(arch->cputype);
+         uint32_t cpusubtype = ByteSwap(arch->cpusubtype);
+-        uint32_t offset = ByteSwap(arch->offset);
+-        uint32_t size = ByteSwap(arch->size);
++        uint32_t offset     = ByteSwap(arch->offset);
++        uint32_t size       = ByteSwap(arch->size);
+ 
+         std::string arch_name = CpuTypeToString(cputype, cpusubtype);
+         string_view slice_data = StrictSubstr(file_data().data(), offset, size);
+@@ -739,7 +837,10 @@
+       }
+     } else {
+       auto header = GetStructPointer<mach_header>(file_data().data());
+-      std::string arch_name = CpuTypeToString(header->cputype, header->cpusubtype);
++      bool swap = (magic == MH_CIGAM || magic == MH_CIGAM_64);
++      uint32_t cputype    = MaybeSwap32(header->cputype,    swap);
++      uint32_t cpusubtype = MaybeSwap32(header->cpusubtype, swap);
++      std::string arch_name = CpuTypeToString(cputype, cpusubtype);
+ 
+       sink->AddFileRange("archs", arch_name, file_data().data());
+     }
+@@ -758,10 +859,12 @@
+ std::unique_ptr<ObjectFile> TryOpenMachOFile(std::unique_ptr<InputFile> &file) {
+   uint32_t magic = macho::ReadMagic(file->data());
+ 
+-  // We only support little-endian host and little endian binaries (see
+-  // ParseMachOHeader() for more rationale).  Fat headers are always on disk as
+-  // big-endian.
+-  if (magic == MH_MAGIC || magic == MH_MAGIC_64 || magic == FAT_CIGAM) {
++  // Support little-endian (MH_MAGIC/MH_MAGIC_64), big-endian thin binaries
++  // (MH_CIGAM/MH_CIGAM_64, e.g. PowerPC), and universal fat binaries
++  // (FAT_CIGAM, always big-endian on disk).
++  if (magic == MH_MAGIC || magic == MH_MAGIC_64 ||
++      magic == MH_CIGAM  || magic == MH_CIGAM_64 ||
++      magic == FAT_CIGAM) {
+     return std::unique_ptr<ObjectFile>(
+         new macho::MachOObjectFile(std::move(file)));
+   }
