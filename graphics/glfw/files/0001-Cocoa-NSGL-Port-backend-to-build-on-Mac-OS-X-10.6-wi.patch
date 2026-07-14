@@ -1,0 +1,1507 @@
+From 3e693cf6fdbb8f7ea8f854bea8b3e3ff584996e6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 14 Jul 2026 10:41:34 +0000
+Subject: [PATCH] Cocoa/NSGL: Port backend to build on Mac OS X 10.6 with GCC,
+ GL 2.0 only
+
+GCC (as shipped for 10.6) lacks clang-only Objective-C features used
+throughout the Cocoa backend, and the 10.6 SDK is missing several APIs
+introduced in later releases:
+
+- Replace all @autoreleasepool {} blocks with explicit NSAutoreleasePool
+  alloc/init/release, since @autoreleasepool is clang-only sugar.
+- Replace modern literals (@[], @{}, @(), dictionary/array subscripting)
+  with classic NSArray/NSDictionary/NSString factory-method calls.
+- Replace the block-based (^{}) local key-up event monitor, which
+  requires a blocks-capable compiler, with a GLFWApplication subclass
+  overriding -sendEvent: to forward Cmd+KeyUp to the key window.
+- Guard 10.7+/10.8+-only APIs (convertRectToBacking:, backingScaleFactor,
+  scrollingDeltaX/Y, hasPreciseScrollingDeltas, setWantsBestResolutionOpenGLSurface:,
+  kCGLPFASupportsAutomaticGraphicsSwitching, NSWindowCollectionBehaviorFullScreenPrimary/
+  Managed) behind MAC_OS_X_VERSION_MAX_ALLOWED checks with 10.6-appropriate
+  fallbacks (no HiDPI, plain scroll deltas, default collection behavior).
+- Remove the NSOpenGLPFAOpenGLProfile/core-profile pixel format code path,
+  since profile selection does not exist on the 10.6 SDK, and hard-reject
+  any requested OpenGL version above 2.1 in NSGL context creation.
+
+Only src/cocoa_*, src/nsgl_context.m, and src/context.c were in scope;
+context.c required no changes as it is platform-generic.
+---
+ src/cocoa_init.m     |  73 ++++++----
+ src/cocoa_monitor.m  |  41 +++---
+ src/cocoa_platform.h |  10 +-
+ src/cocoa_window.m   | 311 +++++++++++++++++++++++++++----------------
+ src/nsgl_context.m   |  80 +++++------
+ 5 files changed, 309 insertions(+), 206 deletions(-)
+
+diff --git a/src/cocoa_init.m b/src/cocoa_init.m
+index e75a5519..465e3a48 100644
+--- src/cocoa_init.m
++++ src/cocoa_init.m
+@@ -89,7 +89,7 @@ static void createMenuBar(void)
+ 
+     for (size_t i = 0;  i < sizeof(nameKeys) / sizeof(nameKeys[0]);  i++)
+     {
+-        id name = bundleInfo[nameKeys[i]];
++        id name = [bundleInfo objectForKey:nameKeys[i]];
+         if (name &&
+             [name isKindOfClass:[NSString class]] &&
+             ![name isEqualToString:@""])
+@@ -103,7 +103,7 @@ static void createMenuBar(void)
+     {
+         char** progname = _NSGetProgname();
+         if (progname && *progname)
+-            appName = @(*progname);
++            appName = [NSString stringWithUTF8String:*progname];
+         else
+             appName = @"GLFW Application";
+     }
+@@ -394,6 +394,34 @@ static GLFWbool initializeTIS(void)
+ 
+ @end // GLFWHelper
+ 
++// GLFW application class
++//
++// NOTE: This exists (instead of using -[NSEvent addLocalMonitorForEventsMatchingMask:handler:])
++//       so that forwarding Cmd+KeyUp events to the key window does not require
++//       an Objective-C block, which is unavailable without a blocks-capable
++//       compiler such as clang
++//
++@interface GLFWApplication : NSApplication
++@end
++
++@implementation GLFWApplication
++
++- (void)sendEvent:(NSEvent *)event
++{
++    // NOTE: This replaces the block-based local event monitor used upstream,
++    //       which always forwarded Cmd+KeyUp to the key window and then let
++    //       the event continue through the normal dispatch path below
++    if ([event type] == NSEventTypeKeyUp &&
++        ([event modifierFlags] & NSEventModifierFlagCommand))
++    {
++        [[self keyWindow] sendEvent:event];
++    }
++
++    [super sendEvent:event];
++}
++
++@end // GLFWApplication
++
+ @interface GLFWApplicationDelegate : NSObject <NSApplicationDelegate>
+ @end
+ 
+@@ -573,7 +601,7 @@ GLFWbool _glfwConnectCocoa(int platformID, _GLFWplatform* platform)
+ 
+ int _glfwInitCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     _glfw.ns.helper = [[GLFWHelper alloc] init];
+ 
+@@ -581,35 +609,30 @@ int _glfwInitCocoa(void)
+                              toTarget:_glfw.ns.helper
+                            withObject:nil];
+ 
+-    [NSApplication sharedApplication];
++    // NOTE: -[GLFWApplication sendEvent:] handles forwarding Cmd+KeyUp events
++    //       to the key window, replacing the block-based local event monitor
++    //       used upstream, so that this does not require a blocks-capable
++    //       compiler
++    [GLFWApplication sharedApplication];
+ 
+     _glfw.ns.delegate = [[GLFWApplicationDelegate alloc] init];
+     if (_glfw.ns.delegate == nil)
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR,
+                         "Cocoa: Failed to create application delegate");
++        [pool release];
+         return GLFW_FALSE;
+     }
+ 
+     [NSApp setDelegate:_glfw.ns.delegate];
+ 
+-    NSEvent* (^block)(NSEvent*) = ^ NSEvent* (NSEvent* event)
+-    {
+-        if ([event modifierFlags] & NSEventModifierFlagCommand)
+-            [[NSApp keyWindow] sendEvent:event];
+-
+-        return event;
+-    };
+-
+-    _glfw.ns.keyUpMonitor =
+-        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyUp
+-                                              handler:block];
+-
+     if (_glfw.hints.init.ns.chdir)
+         changeToResourcesDirectory();
+ 
+     // Press and Hold prevents some keys from emitting repeated characters
+-    NSDictionary* defaults = @{@"ApplePressAndHoldEnabled":@NO};
++    NSDictionary* defaults =
++        [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:NO]
++                                     forKey:@"ApplePressAndHoldEnabled"];
+     [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
+ 
+     [[NSNotificationCenter defaultCenter]
+@@ -622,12 +645,18 @@ int _glfwInitCocoa(void)
+ 
+     _glfw.ns.eventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+     if (!_glfw.ns.eventSource)
++    {
++        [pool release];
+         return GLFW_FALSE;
++    }
+ 
+     CGEventSourceSetLocalEventsSuppressionInterval(_glfw.ns.eventSource, 0.0);
+ 
+     if (!initializeTIS())
++    {
++        [pool release];
+         return GLFW_FALSE;
++    }
+ 
+     _glfwPollMonitorsCocoa();
+ 
+@@ -638,14 +667,13 @@ int _glfwInitCocoa(void)
+     if (_glfw.hints.init.ns.menubar)
+         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+ 
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ void _glfwTerminateCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (_glfw.ns.inputSource)
+     {
+@@ -679,16 +707,13 @@ void _glfwTerminateCocoa(void)
+         _glfw.ns.helper = nil;
+     }
+ 
+-    if (_glfw.ns.keyUpMonitor)
+-        [NSEvent removeMonitor:_glfw.ns.keyUpMonitor];
+-
+     _glfw_free(_glfw.ns.clipboardString);
+ 
+     _glfwTerminateNSGL();
+     _glfwTerminateEGL();
+     _glfwTerminateOSMesa();
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ #endif // _GLFW_COCOA
+diff --git a/src/cocoa_monitor.m b/src/cocoa_monitor.m
+index 641d5f0b..9a5837d5 100644
+--- src/cocoa_monitor.m
++++ src/cocoa_monitor.m
+@@ -323,7 +323,8 @@ void _glfwPollMonitorsCocoa(void)
+ 
+         for (screen in [NSScreen screens])
+         {
+-            NSNumber* screenNumber = [screen deviceDescription][@"NSScreenNumber"];
++            NSNumber* screenNumber =
++                [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+ 
+             // HACK: Compare unit numbers instead of display IDs to work around
+             //       display replacement on machines with automatic graphics
+@@ -449,7 +450,7 @@ void _glfwFreeMonitorCocoa(_GLFWmonitor* monitor)
+ 
+ void _glfwGetMonitorPosCocoa(_GLFWmonitor* monitor, int* xpos, int* ypos)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const CGRect bounds = CGDisplayBounds(monitor->ns.displayID);
+ 
+@@ -458,13 +459,13 @@ void _glfwGetMonitorPosCocoa(_GLFWmonitor* monitor, int* xpos, int* ypos)
+     if (ypos)
+         *ypos = (int) bounds.origin.y;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetMonitorContentScaleCocoa(_GLFWmonitor* monitor,
+                                       float* xscale, float* yscale)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (!monitor->ns.screen)
+     {
+@@ -473,21 +474,27 @@ void _glfwGetMonitorContentScaleCocoa(_GLFWmonitor* monitor,
+     }
+ 
+     const NSRect points = [monitor->ns.screen frame];
++    // NOTE: Mac OS X 10.6 has no backing-store scale concept; see the note in
++    //       cocoa_window.m
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     const NSRect pixels = [monitor->ns.screen convertRectToBacking:points];
++#else
++    const NSRect pixels = points;
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     if (xscale)
+         *xscale = (float) (pixels.size.width / points.size.width);
+     if (yscale)
+         *yscale = (float) (pixels.size.height / points.size.height);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetMonitorWorkareaCocoa(_GLFWmonitor* monitor,
+                                   int* xpos, int* ypos,
+                                   int* width, int* height)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (!monitor->ns.screen)
+     {
+@@ -506,12 +513,12 @@ void _glfwGetMonitorWorkareaCocoa(_GLFWmonitor* monitor,
+     if (height)
+         *height = frameRect.size.height;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ GLFWvidmode* _glfwGetVideoModesCocoa(_GLFWmonitor* monitor, int* count)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     *count = 0;
+ 
+@@ -544,32 +551,31 @@ GLFWvidmode* _glfwGetVideoModesCocoa(_GLFWmonitor* monitor, int* count)
+     }
+ 
+     CFRelease(modes);
++    [pool release];
+     return result;
+-
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwGetVideoModeCocoa(_GLFWmonitor* monitor, GLFWvidmode *mode)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     CGDisplayModeRef native = CGDisplayCopyDisplayMode(monitor->ns.displayID);
+     if (!native)
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR, "Cocoa: Failed to query display mode");
++        [pool release];
+         return GLFW_FALSE;
+     }
+ 
+     *mode = vidmodeFromCGDisplayMode(native, monitor->ns.fallbackRefreshRate);
+     CGDisplayModeRelease(native);
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwGetGammaRampCocoa(_GLFWmonitor* monitor, GLFWgammaramp* ramp)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     uint32_t size = CGDisplayGammaTableCapacity(monitor->ns.displayID);
+     CGGammaValue* values = _glfw_calloc(size * 3, sizeof(CGGammaValue));
+@@ -591,14 +597,13 @@ GLFWbool _glfwGetGammaRampCocoa(_GLFWmonitor* monitor, GLFWgammaramp* ramp)
+     }
+ 
+     _glfw_free(values);
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ void _glfwSetGammaRampCocoa(_GLFWmonitor* monitor, const GLFWgammaramp* ramp)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     CGGammaValue* values = _glfw_calloc(ramp->size * 3, sizeof(CGGammaValue));
+ 
+@@ -617,7 +622,7 @@ void _glfwSetGammaRampCocoa(_GLFWmonitor* monitor, const GLFWgammaramp* ramp)
+ 
+     _glfw_free(values);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ 
+diff --git a/src/cocoa_platform.h b/src/cocoa_platform.h
+index 39914554..0c6f2e07 100644
+--- src/cocoa_platform.h
++++ src/cocoa_platform.h
+@@ -62,6 +62,7 @@ typedef void* id;
+  #define NSEventModifierFlagOption NSAlternateKeyMask
+  #define NSEventModifierFlagShift NSShiftKeyMask
+  #define NSEventTypeApplicationDefined NSApplicationDefined
++ #define NSEventTypeKeyUp NSKeyUp
+  #define NSWindowStyleMaskBorderless NSBorderlessWindowMask
+  #define NSWindowStyleMaskClosable NSClosableWindowMask
+  #define NSWindowStyleMaskMiniaturizable NSMiniaturizableWindowMask
+@@ -69,6 +70,14 @@ typedef void* id;
+  #define NSWindowStyleMaskTitled NSTitledWindowMask
+ #endif
+ 
++// NOTE: The Lion full-screen window collection behaviors have no pre-10.7
++//       equivalent names, so on such SDKs they are mapped to the default,
++//       pre-Lion-full-screen-aware behavior instead of being renamed
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1070
++ #define NSWindowCollectionBehaviorFullScreenPrimary NSWindowCollectionBehaviorDefault
++ #define NSWindowCollectionBehaviorManaged NSWindowCollectionBehaviorDefault
++#endif
++
+ // NOTE: Many Cocoa dynamically linked constants have been renamed and we need
+ //       to build across SDK versions where one is unavailable or deprecated.
+ //       We use the newer names in code and replace them with the older names if
+@@ -169,7 +178,6 @@ typedef struct _GLFWlibraryNS
+     IOHIDManagerRef     hidManager;
+     id                  unicodeData;
+     id                  helper;
+-    id                  keyUpMonitor;
+     id                  nibObjects;
+ 
+     char                keynames[GLFW_KEY_LAST + 1][17];
+diff --git a/src/cocoa_window.m b/src/cocoa_window.m
+index 0dcf0a38..9495d7cc 100644
+--- src/cocoa_window.m
++++ src/cocoa_window.m
+@@ -242,7 +242,14 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+     }
+ 
+     const NSRect contentRect = [window->ns.view frame];
++    // NOTE: -convertRectToBacking: was added in the 10.7 SDK; Mac OS X 10.6 has
++    //       no backing-store scale concept, so the framebuffer is always the
++    //       same size as the content rect in points
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     const NSRect fbRect = [window->ns.view convertRectToBacking:contentRect];
++#else
++    const NSRect fbRect = contentRect;
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     if (fbRect.size.width != window->ns.fbWidth ||
+         fbRect.size.height != window->ns.fbHeight)
+@@ -350,7 +357,7 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+         markedText = [[NSMutableAttributedString alloc] init];
+ 
+         [self updateTrackingAreas];
+-        [self registerForDraggedTypes:@[NSPasteboardTypeURL]];
++        [self registerForDraggedTypes:[NSArray arrayWithObject:NSPasteboardTypeURL]];
+     }
+ 
+     return self;
+@@ -504,6 +511,11 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+     _glfwInputCursorEnter(window, GLFW_TRUE);
+ }
+ 
++// NOTE: -viewDidChangeBackingProperties is only ever invoked by AppKit on
++//       Mac OS X 10.7.4 and above, and relies on -convertRectToBacking: and
++//       -backingScaleFactor, neither of which exist on the 10.6 SDK, so this
++//       method is compiled out entirely for that target
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+ - (void)viewDidChangeBackingProperties
+ {
+     const NSRect contentRect = [window->ns.view frame];
+@@ -529,6 +541,7 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+         _glfwInputFramebufferSize(window, fbRect.size.width, fbRect.size.height);
+     }
+ }
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+ - (void)drawRect:(NSRect)rect
+ {
+@@ -566,7 +579,7 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+ 
+     _glfwInputKey(window, key, [event keyCode], GLFW_PRESS, mods);
+ 
+-    [self interpretKeyEvents:@[event]];
++    [self interpretKeyEvents:[NSArray arrayWithObject:event]];
+ }
+ 
+ - (void)flagsChanged:(NSEvent *)event
+@@ -600,6 +613,10 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+ 
+ - (void)scrollWheel:(NSEvent *)event
+ {
++    // NOTE: -scrollingDeltaX/Y and -hasPreciseScrollingDeltas are 10.7+
++    //       trackpad APIs that do not exist on the 10.6 SDK, which only
++    //       provides the plain -deltaX/-deltaY pair used below
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     double deltaX = [event scrollingDeltaX];
+     double deltaY = [event scrollingDeltaY];
+ 
+@@ -608,6 +625,10 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+         deltaX *= 0.1;
+         deltaY *= 0.1;
+     }
++#else
++    double deltaX = [event deltaX];
++    double deltaY = [event deltaY];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     if (fabs(deltaX) > 0.0 || fabs(deltaY) > 0.0)
+         _glfwInputScroll(window, deltaX, deltaY);
+@@ -628,8 +649,10 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+     _glfwInputCursorPos(window, pos.x, contentRect.size.height - pos.y);
+ 
+     NSPasteboard* pasteboard = [sender draggingPasteboard];
+-    NSDictionary* options = @{NSPasteboardURLReadingFileURLsOnlyKey:@YES};
+-    NSArray* urls = [pasteboard readObjectsForClasses:@[[NSURL class]]
++    NSDictionary* options =
++        [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES]
++                                     forKey:NSPasteboardURLReadingFileURLsOnlyKey];
++    NSArray* urls = [pasteboard readObjectsForClasses:[NSArray arrayWithObject:[NSURL class]]
+                                               options:options];
+     const NSUInteger count = [urls count];
+     if (count)
+@@ -637,7 +660,7 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+         char** paths = _glfw_calloc(count, sizeof(char*));
+ 
+         for (NSUInteger i = 0;  i < count;  i++)
+-            paths[i] = _glfw_strdup([urls[i] fileSystemRepresentation]);
++            paths[i] = _glfw_strdup([[urls objectAtIndex:i] fileSystemRepresentation]);
+ 
+         _glfwInputDrop(window, (int) count, (const char**) paths);
+ 
+@@ -869,7 +892,10 @@ static GLFWbool createNativeWindow(_GLFWwindow* window,
+     }
+ 
+     if (strlen(wndconfig->ns.frameName))
+-        [window->ns.object setFrameAutosaveName:@(wndconfig->ns.frameName)];
++    {
++        [window->ns.object setFrameAutosaveName:
++            [NSString stringWithUTF8String:wndconfig->ns.frameName]];
++    }
+ 
+     window->ns.view = [[GLFWContentView alloc] initWithGlfwWindow:window];
+     window->ns.scaleFramebuffer = wndconfig->scaleFramebuffer;
+@@ -883,7 +909,7 @@ static GLFWbool createNativeWindow(_GLFWwindow* window,
+ 
+     [window->ns.object setContentView:window->ns.view];
+     [window->ns.object makeFirstResponder:window->ns.view];
+-    [window->ns.object setTitle:@(wndconfig->title)];
++    [window->ns.object setTitle:[NSString stringWithUTF8String:wndconfig->title]];
+     [window->ns.object setDelegate:window->ns.delegate];
+     [window->ns.object setAcceptsMouseMovedEvents:YES];
+     [window->ns.object setRestorable:NO];
+@@ -921,19 +947,28 @@ GLFWbool _glfwCreateWindowCocoa(_GLFWwindow* window,
+                                 const _GLFWctxconfig* ctxconfig,
+                                 const _GLFWfbconfig* fbconfig)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (!createNativeWindow(window, wndconfig, fbconfig))
++    {
++        [pool release];
+         return GLFW_FALSE;
++    }
+ 
+     if (ctxconfig->client != GLFW_NO_API)
+     {
+         if (ctxconfig->source == GLFW_NATIVE_CONTEXT_API)
+         {
+             if (!_glfwInitNSGL())
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+             if (!_glfwCreateContextNSGL(window, ctxconfig, fbconfig))
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+         }
+         else if (ctxconfig->source == GLFW_EGL_CONTEXT_API)
+         {
+@@ -943,20 +978,35 @@ GLFWbool _glfwCreateWindowCocoa(_GLFWwindow* window,
+             window->ns.layer = [window->ns.view layer];
+ 
+             if (!_glfwInitEGL())
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+             if (!_glfwCreateContextEGL(window, ctxconfig, fbconfig))
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+         }
+         else if (ctxconfig->source == GLFW_OSMESA_CONTEXT_API)
+         {
+             if (!_glfwInitOSMesa())
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+             if (!_glfwCreateContextOSMesa(window, ctxconfig, fbconfig))
++            {
++                [pool release];
+                 return GLFW_FALSE;
++            }
+         }
+ 
+         if (!_glfwRefreshContextAttribs(window, ctxconfig))
++        {
++            [pool release];
+             return GLFW_FALSE;
++        }
+     }
+ 
+     if (wndconfig->mousePassthrough)
+@@ -981,14 +1031,13 @@ GLFWbool _glfwCreateWindowCocoa(_GLFWwindow* window,
+         }
+     }
+ 
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ void _glfwDestroyWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (_glfw.ns.disabledCursorWindow == window)
+         _glfw.ns.disabledCursorWindow = NULL;
+@@ -1014,18 +1063,18 @@ void _glfwDestroyWindowCocoa(_GLFWwindow* window)
+     // HACK: Allow Cocoa to catch up before returning
+     _glfwPollEventsCocoa();
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowTitleCocoa(_GLFWwindow* window, const char* title)
+ {
+-    @autoreleasepool {
+-    NSString* string = @(title);
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    NSString* string = [NSString stringWithUTF8String:title];
+     [window->ns.object setTitle:string];
+     // HACK: Set the miniwindow title explicitly as setTitle: doesn't update it
+     //       if the window lacks NSWindowStyleMaskTitled
+     [window->ns.object setMiniwindowTitle:string];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowIconCocoa(_GLFWwindow* window,
+@@ -1037,7 +1086,7 @@ void _glfwSetWindowIconCocoa(_GLFWwindow* window,
+ 
+ void _glfwGetWindowPosCocoa(_GLFWwindow* window, int* xpos, int* ypos)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect =
+         [window->ns.object contentRectForFrameRect:[window->ns.object frame]];
+@@ -1047,24 +1096,24 @@ void _glfwGetWindowPosCocoa(_GLFWwindow* window, int* xpos, int* ypos)
+     if (ypos)
+         *ypos = _glfwTransformYCocoa(contentRect.origin.y + contentRect.size.height - 1);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowPosCocoa(_GLFWwindow* window, int x, int y)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect = [window->ns.view frame];
+     const NSRect dummyRect = NSMakeRect(x, _glfwTransformYCocoa(y + contentRect.size.height - 1), 0, 0);
+     const NSRect frameRect = [window->ns.object frameRectForContentRect:dummyRect];
+     [window->ns.object setFrameOrigin:frameRect.origin];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetWindowSizeCocoa(_GLFWwindow* window, int* width, int* height)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect = [window->ns.view frame];
+ 
+@@ -1073,12 +1122,12 @@ void _glfwGetWindowSizeCocoa(_GLFWwindow* window, int* width, int* height)
+     if (height)
+         *height = contentRect.size.height;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowSizeCocoa(_GLFWwindow* window, int width, int height)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (window->monitor)
+     {
+@@ -1095,14 +1144,14 @@ void _glfwSetWindowSizeCocoa(_GLFWwindow* window, int width, int height)
+                             display:YES];
+     }
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowSizeLimitsCocoa(_GLFWwindow* window,
+                                    int minwidth, int minheight,
+                                    int maxwidth, int maxheight)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (minwidth == GLFW_DONT_CARE || minheight == GLFW_DONT_CARE)
+         [window->ns.object setContentMinSize:NSMakeSize(0, 0)];
+@@ -1114,39 +1163,45 @@ void _glfwSetWindowSizeLimitsCocoa(_GLFWwindow* window,
+     else
+         [window->ns.object setContentMaxSize:NSMakeSize(maxwidth, maxheight)];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowAspectRatioCocoa(_GLFWwindow* window, int numer, int denom)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if (numer == GLFW_DONT_CARE || denom == GLFW_DONT_CARE)
+         [window->ns.object setResizeIncrements:NSMakeSize(1.0, 1.0)];
+     else
+         [window->ns.object setContentAspectRatio:NSMakeSize(numer, denom)];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetFramebufferSizeCocoa(_GLFWwindow* window, int* width, int* height)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect = [window->ns.view frame];
++    // NOTE: Mac OS X 10.6 has no backing-store scale concept; see the note in
++    //       windowDidResize: above
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     const NSRect fbRect = [window->ns.view convertRectToBacking:contentRect];
++#else
++    const NSRect fbRect = contentRect;
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     if (width)
+         *width = (int) fbRect.size.width;
+     if (height)
+         *height = (int) fbRect.size.height;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetWindowFrameSizeCocoa(_GLFWwindow* window,
+                                   int* left, int* top,
+                                   int* right, int* bottom)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect = [window->ns.view frame];
+     const NSRect frameRect = [window->ns.object frameRectForContentRect:contentRect];
+@@ -1162,81 +1217,87 @@ void _glfwGetWindowFrameSizeCocoa(_GLFWwindow* window,
+     if (bottom)
+         *bottom = contentRect.origin.y - frameRect.origin.y;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetWindowContentScaleCocoa(_GLFWwindow* window,
+                                      float* xscale, float* yscale)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect points = [window->ns.view frame];
++    // NOTE: Mac OS X 10.6 has no backing-store scale concept; content scale
++    //       is always 1.0 there
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     const NSRect pixels = [window->ns.view convertRectToBacking:points];
++#else
++    const NSRect pixels = points;
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     if (xscale)
+         *xscale = (float) (pixels.size.width / points.size.width);
+     if (yscale)
+         *yscale = (float) (pixels.size.height / points.size.height);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwIconifyWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [window->ns.object miniaturize:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwRestoreWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if ([window->ns.object isMiniaturized])
+         [window->ns.object deminiaturize:nil];
+     else if ([window->ns.object isZoomed])
+         [window->ns.object zoom:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwMaximizeWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if (![window->ns.object isZoomed])
+         [window->ns.object zoom:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwShowWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [window->ns.object orderFront:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwHideWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [window->ns.object orderOut:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwRequestWindowAttentionCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [NSApp requestUserAttention:NSInformationalRequest];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwFocusWindowCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     // Make us the active application
+     // HACK: This is here to prevent applications using only hidden windows from
+     //       being activated, but should probably not be done every time any
+     //       window is shown
+     [NSApp activateIgnoringOtherApps:YES];
+     [window->ns.object makeKeyAndOrderFront:nil];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
+@@ -1245,7 +1306,7 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
+                                 int width, int height,
+                                 int refreshRate)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (window->monitor == monitor)
+     {
+@@ -1266,6 +1327,7 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
+             [window->ns.object setFrame:frameRect display:YES];
+         }
+ 
++        [pool release];
+         return;
+     }
+ 
+@@ -1364,70 +1426,67 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
+         [window->ns.object setTitle:[window->ns.object miniwindowTitle]];
+     }
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ GLFWbool _glfwWindowFocusedCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    [pool release];
+     return [window->ns.object isKeyWindow];
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwWindowIconifiedCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    [pool release];
+     return [window->ns.object isMiniaturized];
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwWindowVisibleCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    [pool release];
+     return [window->ns.object isVisible];
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwWindowMaximizedCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
+-
+-    if (window->resizable)
+-        return [window->ns.object isZoomed];
+-    else
+-        return GLFW_FALSE;
+-
+-    } // autoreleasepool
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    const GLFWbool maximized =
++        window->resizable ? [window->ns.object isZoomed] : GLFW_FALSE;
++    [pool release];
++    return maximized;
+ }
+ 
+ GLFWbool _glfwWindowHoveredCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSPoint point = [NSEvent mouseLocation];
+ 
+     if ([NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0] !=
+         [window->ns.object windowNumber])
+     {
++        [pool release];
+         return GLFW_FALSE;
+     }
+ 
++    [pool release];
+     return NSMouseInRect(point,
+         [window->ns.object convertRectToScreen:[window->ns.view frame]], NO);
+-
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwFramebufferTransparentCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    [pool release];
+     return ![window->ns.object isOpaque] && ![window->ns.view isOpaque];
+-    } // autoreleasepool
+ }
+ 
+ void _glfwSetWindowResizableCocoa(_GLFWwindow* window, GLFWbool enabled)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSUInteger styleMask = [window->ns.object styleMask];
+     if (enabled)
+@@ -1446,12 +1505,12 @@ void _glfwSetWindowResizableCocoa(_GLFWwindow* window, GLFWbool enabled)
+         [window->ns.object setCollectionBehavior:behavior];
+     }
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowDecoratedCocoa(_GLFWwindow* window, GLFWbool enabled)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     NSUInteger styleMask = [window->ns.object styleMask];
+     if (enabled)
+@@ -1468,38 +1527,38 @@ void _glfwSetWindowDecoratedCocoa(_GLFWwindow* window, GLFWbool enabled)
+     [window->ns.object setStyleMask:styleMask];
+     [window->ns.object makeFirstResponder:window->ns.view];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowFloatingCocoa(_GLFWwindow* window, GLFWbool enabled)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if (enabled)
+         [window->ns.object setLevel:NSFloatingWindowLevel];
+     else
+         [window->ns.object setLevel:NSNormalWindowLevel];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetWindowMousePassthroughCocoa(_GLFWwindow* window, GLFWbool enabled)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [window->ns.object setIgnoresMouseEvents:enabled];
+-    }
++    [pool release];
+ }
+ 
+ float _glfwGetWindowOpacityCocoa(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    [pool release];
+     return (float) [window->ns.object alphaValue];
+-    } // autoreleasepool
+ }
+ 
+ void _glfwSetWindowOpacityCocoa(_GLFWwindow* window, float opacity)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     [window->ns.object setAlphaValue:opacity];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetRawMouseMotionCocoa(_GLFWwindow *window, GLFWbool enabled)
+@@ -1515,7 +1574,7 @@ GLFWbool _glfwRawMouseMotionSupportedCocoa(void)
+ 
+ void _glfwPollEventsCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     for (;;)
+     {
+@@ -1529,12 +1588,12 @@ void _glfwPollEventsCocoa(void)
+         [NSApp sendEvent:event];
+     }
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwWaitEventsCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     // I wanted to pass NO to dequeue:, and rely on PollEvents to
+     // dequeue and send.  For reasons not at all clear to me, passing
+@@ -1547,12 +1606,12 @@ void _glfwWaitEventsCocoa(void)
+ 
+     _glfwPollEventsCocoa();
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwWaitEventsTimeoutCocoa(double timeout)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     NSDate* date = [NSDate dateWithTimeIntervalSinceNow:timeout];
+     NSEvent* event = [NSApp nextEventMatchingMask:NSEventMaskAny
+@@ -1564,12 +1623,12 @@ void _glfwWaitEventsTimeoutCocoa(double timeout)
+ 
+     _glfwPollEventsCocoa();
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwPostEmptyEventCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     NSEvent* event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                         location:NSMakePoint(0, 0)
+@@ -1582,12 +1641,12 @@ void _glfwPostEmptyEventCocoa(void)
+                                            data2:0];
+     [NSApp postEvent:event atStart:YES];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwGetCursorPosCocoa(_GLFWwindow* window, double* xpos, double* ypos)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     const NSRect contentRect = [window->ns.view frame];
+     // NOTE: The returned location uses base 0,1 not 0,0
+@@ -1598,12 +1657,12 @@ void _glfwGetCursorPosCocoa(_GLFWwindow* window, double* xpos, double* ypos)
+     if (ypos)
+         *ypos = contentRect.size.height - pos.y;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetCursorPosCocoa(_GLFWwindow* window, double x, double y)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     updateCursorImage(window);
+ 
+@@ -1634,12 +1693,12 @@ void _glfwSetCursorPosCocoa(_GLFWwindow* window, double x, double y)
+     if (window->cursorMode != GLFW_CURSOR_DISABLED)
+         CGAssociateMouseAndMouseCursorPosition(true);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetCursorModeCocoa(_GLFWwindow* window, int mode)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (mode == GLFW_CURSOR_CAPTURED)
+     {
+@@ -1650,22 +1709,26 @@ void _glfwSetCursorModeCocoa(_GLFWwindow* window, int mode)
+     if (_glfwWindowFocusedCocoa(window))
+         updateCursorMode(window);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ const char* _glfwGetScancodeNameCocoa(int scancode)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (scancode < 0 || scancode > 0xff)
+     {
+         _glfwInputError(GLFW_INVALID_VALUE, "Invalid scancode %i", scancode);
++        [pool release];
+         return NULL;
+     }
+ 
+     const int key = _glfw.ns.keycodes[scancode];
+     if (key == GLFW_KEY_UNKNOWN)
++    {
++        [pool release];
+         return NULL;
++    }
+ 
+     UInt32 deadKeyState = 0;
+     UniChar characters[4];
+@@ -1682,11 +1745,15 @@ const char* _glfwGetScancodeNameCocoa(int scancode)
+                        &characterCount,
+                        characters) != noErr)
+     {
++        [pool release];
+         return NULL;
+     }
+ 
+     if (!characterCount)
++    {
++        [pool release];
+         return NULL;
++    }
+ 
+     CFStringRef string = CFStringCreateWithCharactersNoCopy(kCFAllocatorDefault,
+                                                             characters,
+@@ -1698,9 +1765,8 @@ const char* _glfwGetScancodeNameCocoa(int scancode)
+                        kCFStringEncodingUTF8);
+     CFRelease(string);
+ 
++    [pool release];
+     return _glfw.ns.keynames[key];
+-
+-    } // autoreleasepool
+ }
+ 
+ int _glfwGetKeyScancodeCocoa(int key)
+@@ -1712,7 +1778,7 @@ GLFWbool _glfwCreateCursorCocoa(_GLFWcursor* cursor,
+                                 const GLFWimage* image,
+                                 int xhot, int yhot)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     NSImage* native;
+     NSBitmapImageRep* rep;
+@@ -1731,7 +1797,10 @@ GLFWbool _glfwCreateCursorCocoa(_GLFWcursor* cursor,
+                     bitsPerPixel:32];
+ 
+     if (rep == nil)
++    {
++        [pool release];
+         return GLFW_FALSE;
++    }
+ 
+     memcpy([rep bitmapData], image->pixels, image->width * image->height * 4);
+ 
+@@ -1745,16 +1814,18 @@ GLFWbool _glfwCreateCursorCocoa(_GLFWcursor* cursor,
+     [rep release];
+ 
+     if (cursor->ns.object == nil)
++    {
++        [pool release];
+         return GLFW_FALSE;
++    }
+ 
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ GLFWbool _glfwCreateStandardCursorCocoa(_GLFWcursor* cursor, int shape)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     SEL cursorSelector = NULL;
+ 
+@@ -1817,43 +1888,44 @@ GLFWbool _glfwCreateStandardCursorCocoa(_GLFWcursor* cursor, int shape)
+     {
+         _glfwInputError(GLFW_CURSOR_UNAVAILABLE,
+                         "Cocoa: Standard cursor shape unavailable");
++        [pool release];
+         return GLFW_FALSE;
+     }
+ 
+     [cursor->ns.object retain];
++    [pool release];
+     return GLFW_TRUE;
+-
+-    } // autoreleasepool
+ }
+ 
+ void _glfwDestroyCursorCocoa(_GLFWcursor* cursor)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if (cursor->ns.object)
+         [(NSCursor*) cursor->ns.object release];
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetCursorCocoa(_GLFWwindow* window, _GLFWcursor* cursor)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     if (cursorInContentArea(window))
+         updateCursorImage(window);
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ void _glfwSetClipboardStringCocoa(const char* string)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+     NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+-    [pasteboard declareTypes:@[NSPasteboardTypeString] owner:nil];
+-    [pasteboard setString:@(string) forType:NSPasteboardTypeString];
+-    } // autoreleasepool
++    [pasteboard declareTypes:[NSArray arrayWithObject:NSPasteboardTypeString] owner:nil];
++    [pasteboard setString:[NSString stringWithUTF8String:string]
++                   forType:NSPasteboardTypeString];
++    [pool release];
+ }
+ 
+ const char* _glfwGetClipboardStringCocoa(void)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+ 
+@@ -1861,6 +1933,7 @@ const char* _glfwGetClipboardStringCocoa(void)
+     {
+         _glfwInputError(GLFW_FORMAT_UNAVAILABLE,
+                         "Cocoa: Failed to retrieve string from pasteboard");
++        [pool release];
+         return NULL;
+     }
+ 
+@@ -1869,15 +1942,15 @@ const char* _glfwGetClipboardStringCocoa(void)
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR,
+                         "Cocoa: Failed to retrieve object from pasteboard");
++        [pool release];
+         return NULL;
+     }
+ 
+     _glfw_free(_glfw.ns.clipboardString);
+     _glfw.ns.clipboardString = _glfw_strdup([object UTF8String]);
+ 
++    [pool release];
+     return _glfw.ns.clipboardString;
+-
+-    } // autoreleasepool
+ }
+ 
+ EGLenum _glfwGetEGLPlatformCocoa(EGLint** attribs)
+@@ -1947,7 +2020,7 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+                                        const VkAllocationCallbacks* allocator,
+                                        VkSurfaceKHR* surface)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+ #if MAC_OS_X_VERSION_MAX_ALLOWED >= 101100
+     // HACK: Dynamically load Core Animation to avoid adding an extra
+@@ -1957,6 +2030,7 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR,
+                         "Cocoa: Failed to find QuartzCore.framework");
++        [pool release];
+         return VK_ERROR_EXTENSION_NOT_PRESENT;
+     }
+ 
+@@ -1966,6 +2040,7 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR,
+                         "Cocoa: Failed to create layer for view");
++        [pool release];
+         return VK_ERROR_EXTENSION_NOT_PRESENT;
+     }
+ 
+@@ -1988,6 +2063,7 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+         {
+             _glfwInputError(GLFW_API_UNAVAILABLE,
+                             "Cocoa: Vulkan instance missing VK_EXT_metal_surface extension");
++            [pool release];
+             return VK_ERROR_EXTENSION_NOT_PRESENT;
+         }
+ 
+@@ -2008,6 +2084,7 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+         {
+             _glfwInputError(GLFW_API_UNAVAILABLE,
+                             "Cocoa: Vulkan instance missing VK_MVK_macos_surface extension");
++            [pool release];
+             return VK_ERROR_EXTENSION_NOT_PRESENT;
+         }
+ 
+@@ -2025,12 +2102,12 @@ VkResult _glfwCreateWindowSurfaceCocoa(VkInstance instance,
+                         _glfwGetVulkanResultString(err));
+     }
+ 
++    [pool release];
+     return err;
+ #else
++    [pool release];
+     return VK_ERROR_EXTENSION_NOT_PRESENT;
+ #endif
+-
+-    } // autoreleasepool
+ }
+ 
+ 
+diff --git a/src/nsgl_context.m b/src/nsgl_context.m
+index daa8367a..eff8d173 100644
+--- src/nsgl_context.m
++++ src/nsgl_context.m
+@@ -33,7 +33,7 @@
+ 
+ static void makeContextCurrentNSGL(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     if (window)
+         [window->context.nsgl.object makeCurrentContext];
+@@ -42,12 +42,12 @@ static void makeContextCurrentNSGL(_GLFWwindow* window)
+ 
+     _glfwPlatformSetTls(&_glfw.contextSlot, window);
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ static void swapBuffersNSGL(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     // HACK: Simulate vsync with usleep as NSGL swap interval does not apply to
+     //       windows with a non-visible occlusion state
+@@ -73,12 +73,12 @@ static void swapBuffersNSGL(_GLFWwindow* window)
+ 
+     [window->context.nsgl.object flushBuffer];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ static void swapIntervalNSGL(int interval)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     _GLFWwindow* window = _glfwPlatformGetTls(&_glfw.contextSlot);
+     assert(window != NULL);
+@@ -86,7 +86,7 @@ static void swapIntervalNSGL(int interval)
+     [window->context.nsgl.object setValues:&interval
+                               forParameter:NSOpenGLContextParameterSwapInterval];
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ static int extensionSupportedNSGL(const char* extension)
+@@ -111,7 +111,7 @@ static GLFWglproc getProcAddressNSGL(const char* procname)
+ 
+ static void destroyContextNSGL(_GLFWwindow* window)
+ {
+-    @autoreleasepool {
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+     [window->context.nsgl.pixelFormat release];
+     window->context.nsgl.pixelFormat = nil;
+@@ -119,7 +119,7 @@ static void destroyContextNSGL(_GLFWwindow* window)
+     [window->context.nsgl.object release];
+     window->context.nsgl.object = nil;
+ 
+-    } // autoreleasepool
++    [pool release];
+ }
+ 
+ 
+@@ -165,20 +165,10 @@ GLFWbool _glfwCreateContextNSGL(_GLFWwindow* window,
+         return GLFW_FALSE;
+     }
+ 
+-    if (ctxconfig->major > 2)
+-    {
+-        if (ctxconfig->major == 3 && ctxconfig->minor < 2)
+-        {
+-            _glfwInputError(GLFW_VERSION_UNAVAILABLE,
+-                            "NSGL: The targeted version of macOS does not support OpenGL 3.0 or 3.1 but may support 3.2 and above");
+-            return GLFW_FALSE;
+-        }
+-    }
+-
+-    if (ctxconfig->major >= 3 && ctxconfig->profile == GLFW_OPENGL_COMPAT_PROFILE)
++    if (ctxconfig->major > 2 || (ctxconfig->major == 2 && ctxconfig->minor > 1))
+     {
+         _glfwInputError(GLFW_VERSION_UNAVAILABLE,
+-                        "NSGL: The compatibility profile is not available on macOS");
++                        "NSGL: OpenGL 2.1 or below is the only version available on Mac OS X 10.6");
+         return GLFW_FALSE;
+     }
+ 
+@@ -214,38 +204,32 @@ GLFWbool _glfwCreateContextNSGL(_GLFWwindow* window,
+         //       Info.plist for unbundled applications
+         // HACK: This assumes that NSOpenGLPixelFormat will remain
+         //       a straightforward wrapper of its CGL counterpart
++        // NOTE: kCGLPFASupportsAutomaticGraphicsSwitching was added in the
++        //       10.8 SDK and does not exist on Mac OS X 10.6
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1080
+         ADD_ATTRIB(kCGLPFASupportsAutomaticGraphicsSwitching);
+-    }
+-
+-#if MAC_OS_X_VERSION_MAX_ALLOWED >= 101000
+-    if (ctxconfig->major >= 4)
+-    {
+-        SET_ATTRIB(NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion4_1Core);
+-    }
+-    else
+ #endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+-    if (ctxconfig->major >= 3)
+-    {
+-        SET_ATTRIB(NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion3_2Core);
+     }
+ 
+-    if (ctxconfig->major <= 2)
+-    {
+-        if (fbconfig->auxBuffers != GLFW_DONT_CARE)
+-            SET_ATTRIB(NSOpenGLPFAAuxBuffers, fbconfig->auxBuffers);
++    // NOTE: OpenGL profile selection (NSOpenGLPFAOpenGLProfile) was added in
++    //       the 10.7 SDK; Mac OS X 10.6 only ever provides a legacy context,
++    //       which is all that is requested above, so there is nothing to add
++    //       here for this target
+ 
+-        if (fbconfig->accumRedBits != GLFW_DONT_CARE &&
+-            fbconfig->accumGreenBits != GLFW_DONT_CARE &&
+-            fbconfig->accumBlueBits != GLFW_DONT_CARE &&
+-            fbconfig->accumAlphaBits != GLFW_DONT_CARE)
+-        {
+-            const int accumBits = fbconfig->accumRedBits +
+-                                  fbconfig->accumGreenBits +
+-                                  fbconfig->accumBlueBits +
+-                                  fbconfig->accumAlphaBits;
++    if (fbconfig->auxBuffers != GLFW_DONT_CARE)
++        SET_ATTRIB(NSOpenGLPFAAuxBuffers, fbconfig->auxBuffers);
+ 
+-            SET_ATTRIB(NSOpenGLPFAAccumSize, accumBits);
+-        }
++    if (fbconfig->accumRedBits != GLFW_DONT_CARE &&
++        fbconfig->accumGreenBits != GLFW_DONT_CARE &&
++        fbconfig->accumBlueBits != GLFW_DONT_CARE &&
++        fbconfig->accumAlphaBits != GLFW_DONT_CARE)
++    {
++        const int accumBits = fbconfig->accumRedBits +
++                              fbconfig->accumGreenBits +
++                              fbconfig->accumBlueBits +
++                              fbconfig->accumAlphaBits;
++
++        SET_ATTRIB(NSOpenGLPFAAccumSize, accumBits);
+     }
+ 
+     if (fbconfig->redBits != GLFW_DONT_CARE &&
+@@ -340,7 +324,11 @@ GLFWbool _glfwCreateContextNSGL(_GLFWwindow* window,
+                                   forParameter:NSOpenGLContextParameterSurfaceOpacity];
+     }
+ 
++    // NOTE: -setWantsBestResolutionOpenGLSurface: was added in the 10.7 SDK
++    //       and Mac OS X 10.6 has no HiDPI/backing-store scale concept
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1070
+     [window->ns.view setWantsBestResolutionOpenGLSurface:window->ns.scaleFramebuffer];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     [window->context.nsgl.object setView:window->ns.view];
+ 
