@@ -6,7 +6,7 @@
 
 default categories              {php lang}
 
-default phpknownfails           {5.2 5.3 5.4 5.5 5.6 7.0 7.1 7.2 7.3 7.4 8.0}
+set phpknownfails               {5.2 5.3 5.4 5.5 5.6 7.0 7.1 7.2 7.3}
 
 # php.branches: the list of PHP branches for which the extension(s) will be
 # built. For unified extension ports (name begins with "php-") setting
@@ -97,14 +97,12 @@ proc php._set_name {option action args} {
     }
 }
 
-
 # php.latest_stable_branch: the latest stable branch of PHP in the php port.
 # Ports should not change this. It should be changed here in this portgroup
 # when the php port is updated.
 
 options php.latest_stable_branch
 default php.latest_stable_branch 8.5
-
 
 # php.default_branch: the branch of PHP for which the port should be installed
 # (i.e. the subport on which a dependency will be declared) if the user
@@ -128,7 +126,6 @@ proc php._set_default_branch {option action args} {
     }
 }
 
-
 # php.rootname: for normal extension ports, the part of the port name after the
 # "php-" prefix. The default distname is based on this, as are the names of the
 # subports (if any). Extension ports should not need to set this, but other
@@ -144,7 +141,6 @@ proc php._get_rootname {} {
     }
     return ${name}
 }
-
 
 # php.create_subports: creates subports for each PHP branch
 #
@@ -162,20 +158,17 @@ proc php.create_subports {} {
     }
 }
 
-
 # php.extension_ini: the name of the automatically-generated ini file that
 # loads the exension(s). There should be no need to change the default.
 
 options php.extension_ini
 default php.extension_ini       {${php.rootname}.ini}
 
-
 # php.extensions: the list of normal extensions that will be listed in the
 # port's ini file, which will cause PHP to load them. The default is to list
 # all installed extensions, and most ports won't need to change this.
 
 options php.extensions
-
 
 # php.extensions.zend: the list of Zend extensions that will be listed in the
 # port's ini file. The default is that none of the extensions are Zend
@@ -186,7 +179,6 @@ options php.extensions
 options php.extensions.zend
 default php.extensions.zend     {}
 
-
 # php.build_dirs: the list of directories we need to phpize, configure, build
 # and destroot in. Most ports only need to phpize, configure, build and destroot
 # in a single directory and so do not need to change this value, and should be
@@ -195,7 +187,6 @@ default php.extensions.zend     {}
 
 options php.build_dirs
 default php.build_dirs          {${worksrcpath}}
-
 
 # php.pecl: whether this extension is hosted on PECL or not. When set to "yes"
 # the homepage, master_sites, extract.suffix, and livecheck are set according
@@ -222,7 +213,6 @@ proc php._set_pecl {option action args} {
     }
 }
 
-
 # php.pecl.name: for PECL extensions, the name of the PECL project. The default
 # distname, homepage and livecheck.url are based on this. The default is based
 # on ${php.rootname} which is appropriate for most PECL extensions.
@@ -245,7 +235,6 @@ proc php._set_pecl_name {option action args} {
         livecheck.url           ${pecl_homepage}
     }
 }
-
 
 # php.pecl.prerelease: for PECL extensions, whether to allow livecheck to match
 # pre-release versions or only stable versions. For most PECL extensions the
@@ -274,7 +263,6 @@ proc php._set_pecl_prerelease {option action args} {
     }
 }
 
-
 # php.pecl.regex: for PECL extensions, the default regular expression to use
 # when matching version numbers in livecheck. Most ports don't need to change
 # this and should instead look at php.pecl.prerelease.
@@ -282,24 +270,20 @@ proc php._set_pecl_prerelease {option action args} {
 options php.pecl.regex
 default php.pecl.regex {(\[0-9a-zA-Z.]+)}
 
-
 # php: the name of this branch of PHP, e.g. "php53" or "php54".
 
 options php
 default php                     {php${php.suffix}}
-
 
 # php.branch: the version number of this branch of PHP, e.g. "5.3" or "5.4".
 
 options php.branch
 default php.branch              {[php.branch_from_subport]}
 
-
 # php.config: the path to the php-config script for this branch of PHP.
 
 options php.config
 default php.config              {${prefix}/bin/php-config${php.suffix}}
-
 
 # php.extension_dir: the path to the directory extensions will be installed into
 # for this branch of PHP.
@@ -307,12 +291,10 @@ default php.config              {${prefix}/bin/php-config${php.suffix}}
 options php.extension_dir
 default php.extension_dir       {[exec ${php.config} --extension-dir 2>/dev/null]}
 
-
 # php.ini: the path to the configuration file for this branch of PHP.
 
 options php.ini
 default php.ini                 {${prefix}/etc/${php}/php.ini}
-
 
 # php.ini_dir: the directory the automatically-generated extension ini files
 # will be installed into for this branch of PHP.
@@ -320,19 +302,16 @@ default php.ini                 {${prefix}/etc/${php}/php.ini}
 options php.ini_dir
 default php.ini_dir             {${prefix}/var/db/${php}}
 
-
 # php.ize: the path to the phpize script for this branch of PHP.
 
 options php.ize
 default php.ize                 {${prefix}/bin/phpize${php.suffix}}
-
 
 # php.suffix: the suffix appended to file and directory names for this branch of
 # PHP, e.g. "53" or "54".
 
 options php.suffix
 default php.suffix              {[php.suffix_from_branch ${php.branch}]}
-
 
 # php._first_version: keep track of the first version line in the port.
 
@@ -351,7 +330,6 @@ proc php._set_version {option action args} {
     }
 }
 
-
 # If a subport has not changed the version, disable livecheck.
 
 pre-livecheck {
@@ -360,7 +338,6 @@ pre-livecheck {
         livecheck.type          none
     }
 }
-
 
 # php.add_port_code: adds the code to the port or subport to do the actual
 # building. For normal extension ports, the portgroup automatically calls this
@@ -516,20 +493,17 @@ proc php.add_port_code {} {
     }
 }
 
-
 # php.suffix_from_branch: calculates the suffix from the given branch.
 
 proc php.suffix_from_branch {branch} {
     return [string map {. ""} ${branch}]
 }
 
-
 # php.branch_from_suffix: calculates the branch from the given suffix.
 
 proc php.branch_from_suffix {suffix} {
     return [string index ${suffix} 0].[string range ${suffix} 1 end]
 }
-
 
 # php.branch_from_subport: calculates the branch from the subport.
 
