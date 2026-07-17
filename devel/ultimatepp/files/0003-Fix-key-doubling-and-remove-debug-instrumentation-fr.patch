@@ -1,0 +1,225 @@
+From e32fd8c5d1c8b5c1ff9f61613e5d6fce0b0e46e3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 14 Jul 2026 09:54:29 +0000
+Subject: [PATCH] Fix key doubling and remove debug instrumentation from
+ powerpc-darwin fixes
+
+CocoView keyDown: dispatched printable characters twice: once via a
+manually-added direct-dispatch block, and again via the existing
+interpretKeyEvents:/insertText:/PreeditText path (plus the pre-existing
+Space special-case in KeyEvent). This produced doubled characters under
+Rosetta and doubled spaces natively on 10.6, since interpretKeyEvents
+already drives character input. Drop the redundant manual dispatch.
+
+Also remove unconditional NSLog calls left in CocoWin.mm, notably in
+the swizzled canBecomeKeyWindow, which AppKit calls very frequently
+during window activation - logging on every call adds overhead that
+shows up as UI instability on slower PPC hardware. Drop the pointless
+setContentView:nil + display forced redraw in WndDestroy, since the
+window is already ordered out and about to close.
+
+Finally, fix a latent big-endian bug introduced by making
+MAKEWORD/MAKELONG/MAKEQWORD swap argument-to-bit-position mapping on
+CPU_BE: HIWORD/LOWORD/HIDWORD/LODWORD are plain arithmetic and are not
+endian-branched, so code that round-trips values through them (e.g.
+CtrlKbd.cpp's keycode charset translation, which rebuilds a keycode via
+MAKELONG(newlow, HIWORD(keycode))) would silently transpose the high
+and low words on a big-endian build. Revert these macros to their
+original endian-independent form. String0's StW()/IsEqual(), which
+relied on MAKE4B/MAKE8B placing bytes at fixed chr[] indices, are
+updated to build their constants directly by chr[] index instead, so
+they remain correct on big-endian without depending on the reverted
+macros.
+---
+ uppsrc/Core/Defs.h          | 14 +++-----------
+ uppsrc/Core/String.h        | 20 ++++++++++++++++++--
+ uppsrc/CtrlCore/CocoProc.mm | 22 ++++------------------
+ uppsrc/CtrlCore/CocoWin.mm  | 27 +++------------------------
+ 4 files changed, 28 insertions(+), 55 deletions(-)
+
+diff --git a/uppsrc/Core/Defs.h b/uppsrc/Core/Defs.h
+index 3fd1d147f..47f23e41b 100644
+--- a/uppsrc/Core/Defs.h
++++ b/uppsrc/Core/Defs.h
+@@ -198,23 +198,15 @@ inline bool IsFin(double d)        { return !IsNaN(d) && !IsInf(d); }
+ #define HIWORD(a)        (word)((a) >> 16)
+ #define LOWORD(a)        word(a)
+ 
+-#ifdef CPU_LE
++// Value composition, not memory layout - keep identical on LE and BE so that
++// HIWORD/LOWORD/HIDWORD/LODWORD (which are plain arithmetic, not endian-branched)
++// round-trip MAKEWORD/MAKELONG/MAKEQWORD correctly on every platform.
+ #define MAKEWORD(l, h)   ((word)  (((byte) (l)) | ((word) ((byte) (h))) << 8))
+ #define MAKELONG(l, h)   ((dword) (((word) (l)) | ((dword) ((word) (h))) << 16))
+-#else
+-// Big-endian: swap byte positions to maintain chr[] array index compatibility
+-#define MAKEWORD(l, h)   ((word)  (((byte) (h)) | ((word) ((byte) (l))) << 8))
+-#define MAKELONG(l, h)   ((dword) (((word) (h)) | ((dword) ((word) (l))) << 16))
+-#endif
+ 
+ #endif
+ 
+-#ifdef CPU_LE
+ #define MAKEQWORD(l, h)  ((qword) (((dword) (l)) | ((qword) ((dword) (h))) << 32))
+-#else
+-// Big-endian: swap dword positions to maintain chr[] array index compatibility
+-#define MAKEQWORD(l, h)  ((qword) (((dword) (h)) | ((qword) ((dword) (l))) << 32))
+-#endif
+ #define HIDWORD(a)       (dword)(((uint64)a) >> 32)
+ #define LODWORD(a)       dword(a)
+ 
+diff --git a/uppsrc/Core/String.h b/uppsrc/Core/String.h
+index fd1681e65..6694a6232 100644
+--- a/uppsrc/Core/String.h
++++ b/uppsrc/Core/String.h
+@@ -239,7 +239,14 @@ class String0 {
+ 	void Swap(String0& b);
+ 	
+ 	// interface for Value
+-	static dword StW(byte st)     { return MAKE4B(0, st, 0, 0); }
++	// Built by chr[] index, not MAKE4B/bit-shifts, so it is correct regardless of CPU
++	// endianness (w[3] aliases chr[12..15]; SPECIAL/KIND are fixed indices into chr[]).
++	static dword StW(byte st) {
++		union { dword w; char chr[4]; } u;
++		u.w = 0;
++		u.chr[SPECIAL - 12] = st;
++		return u.w;
++	}
+ 	void SetSpecial0(byte st)     { w[3] = StW(st); }
+ 	void SetSpecial(byte st)      { ASSERT(IsSmall() && GetCount() == 0); SetSpecial0(st); }
+ 	byte GetSpecial() const       { return (chr[SLEN] | chr[KIND]) == 0 ? chr[SPECIAL] : 0; }
+@@ -291,9 +298,18 @@ protected:
+ public:
+ 	bool LEq(const String0& s) const;
+ 	bool IsEqual(const String0& s) const {
++		// Mask picks out chr[KIND] (byte index 6 within q[1], which aliases chr[8..15]);
++		// built by chr[] index rather than MAKE8B/bit-shifts so it is correct regardless
++		// of CPU endianness.
++		static const uint64 kind_mask = [] {
++			union { uint64 q; char chr[8]; } u;
++			u.q = 0;
++			u.chr[KIND - 8] = (char)255;
++			return u.q;
++		}();
+ 		uint64 q1 = q[1];
+ 		uint64 sq1 = s.q[1];
+-		return q1 == sq1 && q[0] == s.q[0] || ((q1 | sq1) & MAKE8B(0,0,0,0,0,0,255,0)) && LEq(s);
++		return q1 == sq1 && q[0] == s.q[0] || ((q1 | sq1) & kind_mask) && LEq(s);
+ 	}
+ 	bool IsEqual(const char *s) const;
+ 
+diff --git a/uppsrc/CtrlCore/CocoProc.mm b/uppsrc/CtrlCore/CocoProc.mm
+index ace03c742..5eec29011 100644
+--- a/uppsrc/CtrlCore/CocoProc.mm
++++ b/uppsrc/CtrlCore/CocoProc.mm
+@@ -451,27 +451,13 @@ void CocoMenuBarAction(void *bar, id sender);
+ 
+ - (void)keyDown:(NSEvent *)e {
+ 	Upp::GuiLock __;
+-	NSString *chars = [e characters];
+-
+-	// On macOS 10.6, interpretKeyEvents may not call insertText for simple characters
+-	// So we handle character input directly here for printable characters
+-	if(chars && [chars length] > 0) {
+-		unichar ch = [chars characterAtIndex:0];
+-		// Check if it's a printable character (not a control character)
+-		// and no command key is pressed
+-		if(ch >= 32 && ch != 127 && !([e modifierFlags] & NSEventModifierFlagCommand)) {
+-			Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
+-			if(ctrl) {
+-				// Dispatch the character directly using MMImp helper (DispatchKey is private)
+-				Upp::MMImp::DispatchKey(ctrl, ch);
+-			}
+-		}
+-	}
+ 
+-	// Still call interpretKeyEvents for IME support
++	// interpretKeyEvents drives insertText:/PreeditText for printable characters (incl. IME).
++	// Do not also dispatch characters manually here - that double-fires every keystroke
++	// (e.g. duplicated spaces/characters), since KeyEvent below independently handles
++	// non-character keys (arrows, function keys, the Space special-case, etc).
+ 	[self interpretKeyEvents: [NSArray arrayWithObject: e]];
+ 
+-	// And KeyEvent for special keys (arrows, function keys, etc.)
+ 	if(!Upp::MMImp::KeyEvent(CocoViewGetCtrl(self), e, 0))
+ 		[super keyDown:e];
+ }
+diff --git a/uppsrc/CtrlCore/CocoWin.mm b/uppsrc/CtrlCore/CocoWin.mm
+index 9ab967708..c8254a501 100644
+--- a/uppsrc/CtrlCore/CocoWin.mm
++++ b/uppsrc/CtrlCore/CocoWin.mm
+@@ -25,12 +25,9 @@ static BOOL Swizzled_canBecomeKeyWindow(id self, SEL _cmd)
+ 		Upp::TopWindow *tw = dynamic_cast<Upp::TopWindow*>(ctrl);
+ 		bool isTopWindow = (tw != NULL);
+ 		BOOL result = (active || isTopWindow) && ctrl->IsEnabled();
+-		NSLog(@"canBecomeKeyWindow: ctrl=%p active=%d tw=%p isTopWindow=%d enabled=%d result=%d",
+-		      ctrl, (int)active, tw, (int)isTopWindow, (int)ctrl->IsEnabled(), (int)result);
+ 		return result;
+ 	}
+ 	// Otherwise call original
+-	NSLog(@"canBecomeKeyWindow: no ctrl, calling original");
+ 	if(sOriginalCanBecomeKeyWindow)
+ 		return ((BOOL(*)(id, SEL))sOriginalCanBecomeKeyWindow)(self, _cmd);
+ 	return YES; // NSWindow default
+@@ -195,12 +192,9 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
+ 	[window setContentView:view];
+ 	[window setDelegate:view];
+ 	[window setAcceptsMouseMovedEvents:YES];
+-	BOOL frResult = [window makeFirstResponder:view];
+-	NSLog(@"Create: window=%p view=%p makeFirstResponder=%d", window, view, (int)frResult);
++	[window makeFirstResponder:view];
+ 	[window makeKeyAndOrderFront:window];
+-	NSLog(@"Create: after makeKeyAndOrderFront, isKeyWindow=%d firstResponder=%p",
+-	      (int)[window isKeyWindow], [window firstResponder]);
+-	
++
+ 	ONCELOCK {
+ 		[NSApp activateIgnoringOtherApps:YES];
+ 	}
+@@ -216,9 +210,6 @@ void Ctrl::Create(Ctrl *owner, dword style, bool active)
+ void Ctrl::WndDestroy()
+ {
+ 	LLOG("WndDestroy " << Name());
+-	NSLog(@"WndDestroy: ctrl=%p window=%p isTopWindow=%d",
+-	      this, top ? GetTop()->coco->window : nil,
+-	      dynamic_cast<TopWindow*>(this) != NULL);
+ 	if(!top)
+ 		return;
+ 	bool focus = HasFocusDeep();
+@@ -227,15 +218,10 @@ void Ctrl::WndDestroy()
+ 	auto* coco = GetTop()->coco;
+ 	auto* window = coco->window;
+ 
+-	NSLog(@"WndDestroy: before close, window=%p isVisible=%d retainCount=%lu parentWindow=%p",
+-	      window, (int)[window isVisible], (unsigned long)[window retainCount], [window parentWindow]);
+-
+ 	// Remove from parent window's child list first
+ 	NSWindow *parent = [window parentWindow];
+-	if(parent) {
+-		NSLog(@"WndDestroy: removing from parent window %p", parent);
++	if(parent)
+ 		[parent removeChildWindow:window];
+-	}
+ 
+ 	// Clear the delegate to prevent callbacks during close
+ 	[window setDelegate:nil];
+@@ -247,16 +233,9 @@ void Ctrl::WndDestroy()
+ 	// setContentView:nil helps force release of the view
+ 	[window setContentView:nil];
+ 
+-	// Order out and close
+ 	[window orderOut:nil];
+-
+-	// Force display update to ensure window disappears immediately
+-	[window display];
+-
+ 	[window close];
+ 
+-	NSLog(@"WndDestroy: after close, isVisible=%d", (int)[window isVisible]);
+-
+ 	delete coco;
+ 	DeleteTop();
+ 
+-- 
+2.43.0
+
