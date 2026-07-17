@@ -1,4 +1,4 @@
-From bf2d8ca242ad34a415ba85abbd0444b525e18ad9 Mon Sep 17 00:00:00 2001
+From 763aeab018824b827968ba76a2f2b1e9703e78cb Mon Sep 17 00:00:00 2001
 From: Sergey Fedorov <barracuda@macos-powerpc.org>
 Date: Tue, 14 Jul 2026 09:03:13 +0000
 Subject: [PATCH] Support powerpc
@@ -10,8 +10,8 @@ AltiVec-only fallbacks (vec_xl/vec_xst/vec_xxpermdi/vec_mergeo/etc.)
 in src/ppc/dav1d_types.h for the vec_* names that GCC's <altivec.h>
 otherwise only exposes as VSX builtins.
 
-Fixes two bit-exact bugs in the AltiVec fallbacks that corrupted
-CDEF/loop-restoration output on real big-endian hardware (verified
+Fixes three bit-exact bugs in the AltiVec fallbacks/CDEF that
+corrupted CDEF/loop-restoration output on real big-endian hardware (verified
 against a qemu-ppc-emulated gcc -maltivec build):
 
 - u8h_to_u16/u8l_to_u16/u8h_to_i16/u8l_to_i16/u16h_to_i32/u16l_to_i32
@@ -26,6 +26,15 @@ against a qemu-ppc-emulated gcc -maltivec build):
   (16 - sh + i) mod 32. The ones/zeros operand order in the mask's
   vec_perm must be swapped to match, or unaligned stores land in the
   wrong 16-byte block and corrupt neighboring memory.
+
+- copy4xN/copy8xN in src/ppc/cdef_tmpl.c built the CDEF padding
+  buffer with the aligned vec_st, but tmp is never 16-byte aligned
+  (tmp = tmp_buf + 2*tmp_stride + 2, i.e. tmp % 16 == 4). AltiVec
+  vec_st masks off the low 4 address bits, so each row store landed
+  at the wrong 16-byte-rounded address and scrambled the buffer;
+  this hit the 4x4 filter in every case (whose rows are 16 bytes
+  apart) and showed up as color/"purple" flare on object borders.
+  Use the unaligned vec_vsx_st for every tmp store.
 ---
  meson.build                |   4 +
  src/cdef_tmpl.c            |   4 +-
@@ -34,6 +43,7 @@ against a qemu-ppc-emulated gcc -maltivec build):
  src/looprestoration_tmpl.c |   4 +-
  src/meson.build            |  56 +++++++---
  src/ppc/cdef.h             |   3 +-
+ src/ppc/cdef_tmpl.c        |  44 +++++---
  src/ppc/cpu.c              |   5 +-
  src/ppc/cpu.h              |   5 +-
  src/ppc/dav1d_types.h      | 215 +++++++++++++++++++++++++++++++++++--
@@ -45,7 +55,7 @@ against a qemu-ppc-emulated gcc -maltivec build):
  src/ppc/mc.h               |   9 +-
  src/ppc/mc_tmpl.c          |   4 +
  tests/checkasm/checkasm.c  |   5 +-
- 18 files changed, 321 insertions(+), 32 deletions(-)
+ 19 files changed, 350 insertions(+), 47 deletions(-)
 
 diff --git a/meson.build b/meson.build
 index b7e4c4be..943085ab 100644
@@ -69,11 +79,11 @@ index b7e4c4be..943085ab 100644
      have_elf_aux_info = cc.has_function('elf_aux_info', prefix : '#include <sys/auxv.h>', args : test_args)
 @@ -511,6 +513,8 @@ if host_machine.cpu_family().startswith('x86')
  endif
-
+ 
  cdata.set10('ARCH_PPC64LE', host_machine.cpu() == 'ppc64le')
 +cdata.set10('ARCH_PPC', host_machine.cpu_family() == 'ppc')
 +cdata.set10('ARCH_PPC32', host_machine.cpu_family() == 'ppc' and host_machine.cpu() != 'ppc64le')
-
+ 
  cdata.set10('ARCH_RISCV', host_machine.cpu_family().startswith('riscv'))
  cdata.set10('ARCH_RV32', host_machine.cpu_family() == 'riscv32')
 diff --git a/src/cdef_tmpl.c b/src/cdef_tmpl.c
@@ -224,22 +234,126 @@ index b794ba53..88ea5e2c 100644
 --- a/src/ppc/cdef.h
 +++ b/src/ppc/cdef.h
 @@ -31,6 +31,7 @@
-
+ 
  #include "src/cdef.h"
  #include "src/cpu.h"
 +#include "src/ppc/cpu.h"
-
+ 
  #define cdef_vsx_fn(w, h) \
  void dav1d_cdef_filter_##w##x##h##_vsx(pixel *const dst, \
 @@ -51,7 +52,7 @@ cdef_vsx_fn(8, 8);
  static ALWAYS_INLINE void cdef_dsp_init_ppc(Dav1dCdefDSPContext *const c) {
      const unsigned flags = dav1d_get_cpu_flags();
-
+ 
 -    if (!(flags & DAV1D_PPC_CPU_FLAG_VSX)) return;
 +    if (!(flags & (DAV1D_PPC_CPU_FLAG_VSX | DAV1D_PPC_CPU_FLAG_ALTIVEC))) return;
-
+ 
  #if BITDEPTH == 8
      c->fb[0] = dav1d_cdef_filter_8x8_vsx;
+diff --git a/src/ppc/cdef_tmpl.c b/src/ppc/cdef_tmpl.c
+index 6ef87ad4..a4a6140c 100644
+--- a/src/ppc/cdef_tmpl.c
++++ b/src/ppc/cdef_tmpl.c
+@@ -56,6 +56,15 @@ static inline void copy4xN(uint16_t *tmp,
+ 
+     int y_start = -2, y_end = h + 2;
+ 
++    /*
++     * All stores here go to tmp-relative addresses. tmp is NOT 16-byte
++     * aligned (cdef_fn sets tmp = tmp_buf + 2*tmp_stride + 2, i.e. +36/+68
++     * bytes off a 16-aligned buffer => tmp % 16 == 4), and the 4-wide rows
++     * are 8 u16 = 16 bytes apart, so every tmp + y*8 address is also
++     * misaligned. The aligned vec_st masks off the low 4 address bits and
++     * would silently store to the wrong 16-byte-rounded location, scrambling
++     * the padding buffer. Use the unaligned vec_vsx_st for every tmp store.
++     */
+     // Copy top and bottom first
+     if (!(edges & CDEF_HAVE_TOP)) {
+         l0 = fill;
+@@ -66,8 +75,8 @@ static inline void copy4xN(uint16_t *tmp,
+         l1 = u8h_to_u16(vec_vsx_ld(0, top + 1 * src_stride - 2));
+     }
+ 
+-    vec_st(l0, 0, tmp - 2 * 8);
+-    vec_st(l1, 0, tmp - 1 * 8);
++    vec_vsx_st(l0, 0, tmp - 2 * 8);
++    vec_vsx_st(l1, 0, tmp - 1 * 8);
+ 
+     if (!(edges & CDEF_HAVE_BOTTOM)) {
+         l0 = fill;
+@@ -78,8 +87,8 @@ static inline void copy4xN(uint16_t *tmp,
+         l1 = u8h_to_u16(vec_vsx_ld(0, bottom + 1 * src_stride - 2));
+     }
+ 
+-    vec_st(l0, 0, tmp + (h + 0) * 8);
+-    vec_st(l1, 0, tmp + (h + 1) * 8);
++    vec_vsx_st(l0, 0, tmp + (h + 0) * 8);
++    vec_vsx_st(l1, 0, tmp + (h + 1) * 8);
+ 
+     int y_with_left_edge = 0;
+     if (!(edges & CDEF_HAVE_LEFT)) {
+@@ -91,7 +100,7 @@ static inline void copy4xN(uint16_t *tmp,
+ 
+     for (int y = y_with_left_edge; y < h; y++) {
+         u16x8 l = u8h_to_u16(vec_vsx_ld(0, src - 2 + y * src_stride));
+-        vec_st(l, 0, tmp + y * 8);
++        vec_vsx_st(l, 0, tmp + y * 8);
+     }
+ 
+     if (!(edges & CDEF_HAVE_LEFT)) {
+@@ -126,6 +135,11 @@ static inline void copy8xN(uint16_t *tmp,
+ 
+     int y_start = -2, y_end = h + 2;
+ 
++    /*
++     * As in copy4xN, tmp is not 16-byte aligned (tmp % 16 == 4), so the
++     * aligned vec_st would round the store address down and corrupt the
++     * padding buffer. Every tmp store below uses the unaligned vec_vsx_st.
++     */
+     // Copy top and bottom first
+     if (!(edges & CDEF_HAVE_TOP)) {
+         l0h = fill;
+@@ -142,10 +156,10 @@ static inline void copy8xN(uint16_t *tmp,
+         l1l = u8l_to_u16(l1);
+     }
+ 
+-    vec_st(l0h, 0, tmp - 4 * 8);
+-    vec_st(l0l, 0, tmp - 3 * 8);
+-    vec_st(l1h, 0, tmp - 2 * 8);
+-    vec_st(l1l, 0, tmp - 1 * 8);
++    vec_vsx_st(l0h, 0, tmp - 4 * 8);
++    vec_vsx_st(l0l, 0, tmp - 3 * 8);
++    vec_vsx_st(l1h, 0, tmp - 2 * 8);
++    vec_vsx_st(l1l, 0, tmp - 1 * 8);
+ 
+     if (!(edges & CDEF_HAVE_BOTTOM)) {
+         l0h = fill;
+@@ -162,10 +176,10 @@ static inline void copy8xN(uint16_t *tmp,
+         l1l = u8l_to_u16(l1);
+     }
+ 
+-    vec_st(l0h, 0, tmp + (h + 0) * 16);
+-    vec_st(l0l, 0, tmp + (h + 0) * 16 + 8);
+-    vec_st(l1h, 0, tmp + (h + 1) * 16);
+-    vec_st(l1l, 0, tmp + (h + 1) * 16 + 8);
++    vec_vsx_st(l0h, 0, tmp + (h + 0) * 16);
++    vec_vsx_st(l0l, 0, tmp + (h + 0) * 16 + 8);
++    vec_vsx_st(l1h, 0, tmp + (h + 1) * 16);
++    vec_vsx_st(l1l, 0, tmp + (h + 1) * 16 + 8);
+ 
+     int y_with_left_edge = 0;
+     if (!(edges & CDEF_HAVE_LEFT)) {
+@@ -182,8 +196,8 @@ static inline void copy8xN(uint16_t *tmp,
+         u8x16 l = vec_vsx_ld(0, src - 2 + y * src_stride);
+         u16x8 lh = u8h_to_u16(l);
+         u16x8 ll = u8l_to_u16(l);
+-        vec_st(lh, 0, tmp + y * 16);
+-        vec_st(ll, 0, tmp + 8 + y * 16);
++        vec_vsx_st(lh, 0, tmp + y * 16);
++        vec_vsx_st(ll, 0, tmp + 8 + y * 16);
+     }
+ 
+     if (!(edges & CDEF_HAVE_LEFT)) {
 diff --git a/src/ppc/cpu.c b/src/ppc/cpu.c
 index f6d9ac62..127cff08 100644
 --- a/src/ppc/cpu.c
@@ -247,7 +361,7 @@ index f6d9ac62..127cff08 100644
 @@ -32,7 +32,7 @@
  #include "src/cpu.h"
  #include "src/ppc/cpu.h"
-
+ 
 -#define HAVE_AUX ((HAVE_GETAUXVAL || HAVE_ELF_AUX_INFO) && ARCH_PPC64LE)
 +#define HAVE_AUX ((HAVE_GETAUXVAL || HAVE_ELF_AUX_INFO) && (ARCH_PPC64LE || ARCH_PPC))
  #if HAVE_AUX
@@ -271,7 +385,7 @@ index 02db7a60..9925cede 100644
 +++ b/src/ppc/cpu.h
 @@ -29,8 +29,9 @@
  #define DAV1D_SRC_PPC_CPU_H
-
+ 
  enum CpuFlags {
 -    DAV1D_PPC_CPU_FLAG_VSX = 1 << 0,
 -    DAV1D_PPC_CPU_FLAG_PWR9 = 1 << 1,
@@ -279,7 +393,7 @@ index 02db7a60..9925cede 100644
 +    DAV1D_PPC_CPU_FLAG_VSX = 1 << 1,
 +    DAV1D_PPC_CPU_FLAG_PWR9 = 1 << 2,
  };
-
+ 
  unsigned dav1d_get_cpu_flags_ppc(void);
 diff --git a/src/ppc/dav1d_types.h b/src/ppc/dav1d_types.h
 index 9a8bc7a7..eeeeb02f 100644
@@ -288,12 +402,12 @@ index 9a8bc7a7..eeeeb02f 100644
 @@ -28,9 +28,30 @@
  #ifndef DAV1D_SRC_PPC_TYPES_H
  #define DAV1D_SRC_PPC_TYPES_H
-
+ 
 +#include "config.h"
 +#include <stdint.h>
  #include <altivec.h>
  #undef pixel
-
+ 
 +/*
 + * On a plain AltiVec target (G4/G5, big-endian, no VSX) GCC's <altivec.h>
 + * still predefines a number of convenience names — vec_xl, vec_xst,
@@ -317,7 +431,7 @@ index 9a8bc7a7..eeeeb02f 100644
  #define i8x16 vector signed char
  #define b8x16 vector bool char
 @@ -46,13 +67,195 @@
-
+ 
  #define i8h_to_i16(v) ((i16x8) vec_unpackh((i8x16)v))
  #define i8l_to_i16(v) ((i16x8) vec_unpackl((i8x16)v))
 -#define u8h_to_i16(v) ((i16x8) vec_mergeh((u8x16) v, vec_splat_u8(0)))
@@ -334,7 +448,7 @@ index 9a8bc7a7..eeeeb02f 100644
 -#define u16l_to_i32(v) ((i32x4) vec_mergel((u16x8) v, vec_splat_u16(0)))
 +#define u16l_to_i32(v) ((i32x4) vec_mergel(vec_splat_u16(0), (u16x8) v))
  #define i16l_to_i32(v) ((i32x4) vec_unpackl((i16x8)v))
-
+ 
 +#if !ARCH_PPC64LE
 +
 +static inline u8x16 aligned_ld(unsigned long offset, const void *ptr) {
@@ -525,7 +639,7 @@ index 6bddf7a3..f27ebf4c 100644
 @@ -28,6 +28,10 @@
  #include "src/cpu.h"
  #include "src/itx.h"
-
+ 
 +/* The POWER9 code paths are only built for little-endian POWER (ppc64le);
 + * on big-endian/AltiVec-only targets (e.g. G4/G5) they are absent, so the
 + * declarations and assignments below must not reference their symbols. */
@@ -538,11 +652,11 @@ index 6bddf7a3..f27ebf4c 100644
  decl_itx_fn(BF(dav1d_inv_txfm_add_dct_dct_64x32, pwr9));
  decl_itx_fn(BF(dav1d_inv_txfm_add_dct_dct_64x64, pwr9));
 +#endif /* ARCH_PPC64LE */
-
+ 
  static ALWAYS_INLINE void itx_dsp_init_ppc(Dav1dInvTxfmDSPContext *const c, const int bpc) {
 +#if ARCH_PPC64LE
      const unsigned flags = dav1d_get_cpu_flags();
-
+ 
      if (!(flags & DAV1D_PPC_CPU_FLAG_PWR9)) return;
 @@ -62,4 +68,8 @@ static ALWAYS_INLINE void itx_dsp_init_ppc(Dav1dInvTxfmDSPContext *const c, cons
      assign_itx16_fn(R,  4, 16, pwr9);
@@ -560,7 +674,7 @@ index 81806552..9740c0f8 100644
 @@ -25,6 +25,8 @@
   * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
-
+ 
 +#if defined(__VSX__) || defined(__POWER9_VECTOR__)
 +
  #include "src/ppc/dav1d_types.h"
@@ -568,7 +682,7 @@ index 81806552..9740c0f8 100644
  #include "src/ppc/utils.h"
 @@ -2004,3 +2006,5 @@ inv_txfm_fn16x4_identity(adst)
  inv_txfm_fn16x4_identity(flipadst)
-
+ 
  #endif // BITDEPTH
 +
 +#endif // __VSX__ || __POWER9_VECTOR__
@@ -578,11 +692,11 @@ index fc97b375..6b857a8c 100644
 +++ b/src/ppc/loopfilter.h
 @@ -26,14 +26,20 @@
   */
-
+ 
  #include "src/cpu.h"
 +#include "src/ppc/cpu.h"
  #include "src/loopfilter.h"
-
+ 
 +/* The POWER9 loop filter is only built for little-endian POWER (ppc64le);
 + * on big-endian/AltiVec-only targets (e.g. G4/G5) its symbols do not exist. */
 +#if ARCH_PPC64LE
@@ -591,11 +705,11 @@ index fc97b375..6b857a8c 100644
  decl_loopfilter_sb_fn(BF(dav1d_lpf_h_sb_uv, pwr9));
  decl_loopfilter_sb_fn(BF(dav1d_lpf_v_sb_uv, pwr9));
 +#endif
-
+ 
  static ALWAYS_INLINE void loop_filter_dsp_init_ppc(Dav1dLoopFilterDSPContext *const c) {
 +#if ARCH_PPC64LE
      const unsigned flags = dav1d_get_cpu_flags();
-
+ 
      if (!(flags & DAV1D_PPC_CPU_FLAG_PWR9)) return;
 @@ -44,4 +50,7 @@ static ALWAYS_INLINE void loop_filter_dsp_init_ppc(Dav1dLoopFilterDSPContext *co
      c->loop_filter_sb[1][0] = BF(dav1d_lpf_h_sb_uv, pwr9);
@@ -610,17 +724,17 @@ index 107192f8..ac21cf9a 100644
 --- a/src/ppc/loopfilter_tmpl.c
 +++ b/src/ppc/loopfilter_tmpl.c
 @@ -28,6 +28,8 @@
-
+ 
  #include "config.h"
-
+ 
 +#if defined(__VSX__) || defined(__POWER9_VECTOR__)
 +
  #undef NDEBUG
  #include <assert.h>
-
+ 
 @@ -1688,3 +1690,5 @@ void LPF(v_sb_uv)(pixel *dst, const ptrdiff_t stride,
  }
-
+ 
  #endif // BITDEPTH
 +
 +#endif // __VSX__ || __POWER9_VECTOR__
@@ -630,19 +744,19 @@ index 614234ab..ef2c3f44 100644
 +++ b/src/ppc/looprestoration.h
 @@ -28,6 +28,7 @@
  #include "common/intops.h"
-
+ 
  #include "src/cpu.h"
 +#include "src/ppc/cpu.h"
  #include "src/looprestoration.h"
-
+ 
  void dav1d_wiener_filter_vsx(uint8_t *p, const ptrdiff_t stride,
 @@ -40,7 +41,7 @@ void dav1d_wiener_filter_vsx(uint8_t *p, const ptrdiff_t stride,
  static ALWAYS_INLINE void loop_restoration_dsp_init_ppc(Dav1dLoopRestorationDSPContext *const c, const int bpc) {
      const unsigned flags = dav1d_get_cpu_flags();
-
+ 
 -    if (!(flags & DAV1D_PPC_CPU_FLAG_VSX)) return;
 +    if (!(flags & (DAV1D_PPC_CPU_FLAG_VSX | DAV1D_PPC_CPU_FLAG_ALTIVEC))) return;
-
+ 
  #if BITDEPTH == 8
      c->wiener[0] = c->wiener[1] = dav1d_wiener_filter_vsx;
 diff --git a/src/ppc/mc.h b/src/ppc/mc.h
@@ -652,7 +766,7 @@ index 44fa142a..b946d47f 100644
 @@ -28,11 +28,16 @@
  #include "src/cpu.h"
  #include "src/mc.h"
-
+ 
 +/* The POWER9 mc code is only built for little-endian POWER (ppc64le);
 + * on big-endian/AltiVec-only targets (e.g. G4/G5) its symbols do not exist. */
 +#if ARCH_PPC64LE
@@ -660,11 +774,11 @@ index 44fa142a..b946d47f 100644
  decl_blend_dir_fn(BF(dav1d_blend_h, pwr9));
  decl_blend_dir_fn(BF(dav1d_blend_v, pwr9));
 +#endif
-
+ 
  static ALWAYS_INLINE void mc_dsp_init_ppc(Dav1dMCDSPContext *const c) {
 +#if ARCH_PPC64LE
    const unsigned flags = dav1d_get_cpu_flags();
-
+ 
    if (!(flags & DAV1D_PPC_CPU_FLAG_PWR9)) return;
 @@ -42,5 +47,7 @@ static ALWAYS_INLINE void mc_dsp_init_ppc(Dav1dMCDSPContext *const c) {
    c->blend_h = BF(dav1d_blend_h, pwr9);
@@ -682,7 +796,7 @@ index e00058e2..262eab35 100644
 @@ -25,6 +25,8 @@
   * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
-
+ 
 +#if defined(__VSX__) || defined(__POWER9_VECTOR__)
 +
  #include "common/attributes.h"
@@ -690,7 +804,7 @@ index e00058e2..262eab35 100644
  #include "src/tables.h"
 @@ -552,3 +554,5 @@ void dav1d_blend_h_8bpc_pwr9(pixel *dst, const ptrdiff_t dst_stride, const pixel
  }
-
+ 
  #endif // BITDEPTH
 +
 +#endif // __VSX__ || __POWER9_VECTOR__
@@ -712,3 +826,6 @@ index d9179f73..e776423c 100644
  #elif ARCH_RISCV
      { "RVV",                "rvv",       DAV1D_RISCV_CPU_FLAG_V },
  #endif
+-- 
+2.43.0
+
