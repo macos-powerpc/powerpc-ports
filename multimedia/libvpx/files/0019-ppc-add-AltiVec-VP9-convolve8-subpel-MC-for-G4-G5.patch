@@ -1,0 +1,487 @@
+From c54fbee73afd03a975aa6f46e6072061bbff3300 Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Fri, 17 Jul 2026 16:51:58 +0000
+Subject: [PATCH 20/22] ppc: add AltiVec VP9 convolve8 (subpel MC) for G4/G5
+
+VP9 subpixel motion compensation had a VSX implementation
+(ppc/vpx_convolve_vsx.c) but nothing for plain AltiVec, so on big-endian
+VSX-less PowerPC (G4/G5, incl. 32-bit Darwin) all subpel interpolation ran
+the C convolvers. Subpel MC dominates inter-frame decode, so this is the
+largest single decode win of the AltiVec additions.
+
+ppc/vpx_convolve8_altivec.c ports the seven subpel functions:
+vpx_convolve8 / _horiz / _vert / _avg / _avg_horiz / _avg_vert, plus the
+plain vpx_convolve_avg. vpx_convolve_copy is deliberately NOT here -- it is
+already implemented and registered for altivec in ppc/vpx_convolve_altivec.c.
+
+The 8-tap dot-product core (convolve_line: vec_msum, the 1<<(FILTER_BITS-1)
+rounding bias, vec_sums, vec_sr by FILTER_BITS, vec_packsu clamp to u8) is
+copied byte-for-byte from the VSX source -- all of those are base VMX
+instructions. The only VSX-specific ops were the unaligned vec_vsx_ld /
+vec_vsx_st, replaced with the big-endian lvsl-load / lvsr RMW-store helpers
+(the same ones ppc/intrapred_altivec.c and ppc/vpx_idct_altivec.c use), and
+unpack_to_s16_h with the zero-first big-endian merge order.
+
+Registered by appending altivec to the seven specialize lines in
+vpx_dsp_rtcd_defs.pl and adding the file under DSP_SRCS-$(HAVE_ALTIVEC)
+(the _altivec.c suffix picks up -maltivec). vpx_convolve_vsx.c and its vsx
+registrations are unchanged, so the ppc64le/VSX build is unaffected.
+
+Verified bit-exact against vpx_dsp/vpx_convolve.c for all seven functions
+under qemu-ppc (-cpu 7400, real 32-bit big-endian AltiVec): 0 mismatches
+over ~42M pixels, covering all 16 subpel phases (x0_q4/y0_q4 0..15,
+step 16), five real filter kernels (sub_pel_filters_8/_8lp/_8s/_4/bilinear),
+15 block sizes (4x4..64x64 incl. non-square), and 0/255 boundary inputs.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ vpx_dsp/ppc/vpx_convolve8_altivec.c | 389 ++++++++++++++++++++++++++++
+ vpx_dsp/vpx_dsp.mk                  |   1 +
+ vpx_dsp/vpx_dsp_rtcd_defs.pl        |  14 +-
+ 3 files changed, 397 insertions(+), 7 deletions(-)
+ create mode 100644 vpx_dsp/ppc/vpx_convolve8_altivec.c
+
+diff --git a/vpx_dsp/ppc/vpx_convolve8_altivec.c b/vpx_dsp/ppc/vpx_convolve8_altivec.c
+new file mode 100644
+index 000000000..a47dc6a38
+--- /dev/null
++++ b/vpx_dsp/ppc/vpx_convolve8_altivec.c
+@@ -0,0 +1,389 @@
++/*
++ *  Copyright (c) 2025 Contributors to libvpx PowerPC port. All Rights Reserved.
++ *
++ *  Use of this source code is governed by a BSD-style license
++ *  that can be found in the LICENSE file in the root of the source
++ *  tree. An additional intellectual property rights grant can be found
++ *  in the file PATENTS.  All contributing project authors may
++ *  be found in the AUTHORS file in the root of the source tree.
++ */
++
++/* AltiVec (VMX) VP9 subpel convolution (8-tap MC filter) for big-endian,
++ * VSX-less PowerPC (G4/G5).
++ *
++ * Straight port of vpx_dsp/ppc/vpx_convolve_vsx.c: the dot-product core
++ * (vec_msum / vec_sums / vec_sl / vec_sr / vec_pack / vec_packsu / vec_splat /
++ * vec_ste / vec_avg / vec_merge*) is all base AltiVec and kept byte-for-byte.
++ * The ONLY VSX-specific ops are the unaligned vec_vsx_ld / vec_vsx_st, replaced
++ * here by the classic big-endian lvsl (load) / lvsr (store) permute idioms
++ * (same as vpx_dsp/ppc/intrapred_altivec.c altivec_ld / altivec_st and
++ * vpx_dsp/ppc/vpx_idct_altivec.c).
++ *
++ * vpx_convolve_copy is NOT here -- it is already implemented and registered for
++ * altivec in vpx_dsp/ppc/vpx_convolve_altivec.c.
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include <altivec.h>
++
++#include "./vpx_dsp_rtcd.h"
++#include "vpx/vpx_integer.h"
++#include "vpx_dsp/vpx_filter.h"
++#include "vpx_ports/mem.h"
++
++typedef vector signed char int8x16_t;
++typedef vector unsigned char uint8x16_t;
++typedef vector signed short int16x8_t;
++typedef vector unsigned short uint16x8_t;
++typedef vector signed int int32x4_t;
++typedef vector unsigned int uint32x4_t;
++
++// Big-endian zero-extend the HIGH 8 bytes -> shorts.  On big-endian AltiVec
++// vec_mergeh(a, b) interleaves a0,b0,a1,b1,..., so putting the zero byte FIRST
++// makes it the high (MSB) byte of each output halfword = true zero-extension.
++#define unpack_to_s16_h(v) \
++  (int16x8_t) vec_mergeh(vec_splat_u8(0), (uint8x16_t)(v))
++
++// -------- big-endian unaligned 128-bit load / store (VMX, no VSX) -----------
++
++// Unaligned load: lvsl + double vec_ld + vec_perm.  Big-endian only.
++static INLINE uint8x16_t altivec_ld(int off, const void *base) {
++  const unsigned char *s = (const unsigned char *)base + off;
++  return vec_perm(vec_ld(0, s), vec_ld(16, s), vec_lvsl(0, s));
++}
++
++// Unaligned full-16-byte store: read-modify-write splice across the (at most
++// two) 16-byte-aligned vectors overlapping the destination.  Rotates v by
++// lvsr(0,d) so its bytes align to the destination misalignment, then vec_sel
++// only the target byte lanes into the aligned lo/hi vectors.  Big-endian only.
++static INLINE void altivec_st(uint8x16_t v, int off, void *base) {
++  unsigned char *d = (unsigned char *)base + off;
++  uintptr_t o = ((uintptr_t)d) & 15;
++  vector unsigned char algn = vec_lvsr(0, d);
++  vector unsigned char rot = vec_perm(v, v, algn);
++  const vector unsigned char idx = { 0,  1,  2,  3,  4,  5,  6,  7,
++                                     8,  9,  10, 11, 12, 13, 14, 15 };
++  vector unsigned char voff = vec_splats((unsigned char)o);
++  vector unsigned char vend = vec_splats((unsigned char)(o + 16));
++  vector unsigned char ge_off =
++      vec_nor((vector unsigned char)vec_cmplt(idx, voff),
++              (vector unsigned char)vec_cmplt(idx, voff));
++  vector unsigned char lt_end = (vector unsigned char)vec_cmplt(idx, vend);
++  vector unsigned char mask_lo = vec_and(ge_off, lt_end);
++  unsigned char hi_end_scalar =
++      (o + 16 > 16) ? (unsigned char)(o + 16 - 16) : (unsigned char)0;
++  vector unsigned char vend_hi = vec_splats(hi_end_scalar);
++  vector unsigned char mask_hi = (vector unsigned char)vec_cmplt(idx, vend_hi);
++  vector unsigned char lo = vec_ld(0, d);
++  vector unsigned char hi = vec_ld(16, d);
++  lo = vec_sel(lo, rot, mask_lo);
++  hi = vec_sel(hi, rot, mask_hi);
++  vec_st(lo, 0, d);
++  vec_st(hi, 16, d);
++}
++
++// Unaligned int16x8 load (8 filter taps).  altivec_ld returns the raw 16 bytes
++// at the (possibly unaligned) address; reinterpret as 8 int16.
++static INLINE int16x8_t load_filter(const int16_t *f) {
++  return (int16x8_t)altivec_ld(0, f);
++}
++
++// ---------------------------------------------------------------------------
++// vpx_convolve_avg: plain pixel average dst = (dst + src + 1) >> 1.
++// ---------------------------------------------------------------------------
++static INLINE void avg_w16(const uint8_t *src, ptrdiff_t src_stride,
++                           uint8_t *dst, ptrdiff_t dst_stride, int32_t h) {
++  int i;
++  for (i = h; i--;) {
++    const uint8x16_t v = vec_avg(altivec_ld(0, src), altivec_ld(0, dst));
++    altivec_st(v, 0, dst);
++    src += src_stride;
++    dst += dst_stride;
++  }
++}
++
++static INLINE void avg_w32(const uint8_t *src, ptrdiff_t src_stride,
++                           uint8_t *dst, ptrdiff_t dst_stride, int32_t h) {
++  int i;
++  for (i = h; i--;) {
++    const uint8x16_t v0 = vec_avg(altivec_ld(0, src), altivec_ld(0, dst));
++    const uint8x16_t v1 = vec_avg(altivec_ld(16, src), altivec_ld(16, dst));
++    altivec_st(v0, 0, dst);
++    altivec_st(v1, 16, dst);
++    src += src_stride;
++    dst += dst_stride;
++  }
++}
++
++static INLINE void avg_w64(const uint8_t *src, ptrdiff_t src_stride,
++                           uint8_t *dst, ptrdiff_t dst_stride, int32_t h) {
++  int i;
++  for (i = h; i--;) {
++    const uint8x16_t v0 = vec_avg(altivec_ld(0, src), altivec_ld(0, dst));
++    const uint8x16_t v1 = vec_avg(altivec_ld(16, src), altivec_ld(16, dst));
++    const uint8x16_t v2 = vec_avg(altivec_ld(32, src), altivec_ld(32, dst));
++    const uint8x16_t v3 = vec_avg(altivec_ld(48, src), altivec_ld(48, dst));
++    altivec_st(v0, 0, dst);
++    altivec_st(v1, 16, dst);
++    altivec_st(v2, 32, dst);
++    altivec_st(v3, 48, dst);
++    src += src_stride;
++    dst += dst_stride;
++  }
++}
++
++void vpx_convolve_avg_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                              uint8_t *dst, ptrdiff_t dst_stride,
++                              const InterpKernel *filter, int x0_q4,
++                              int x_step_q4, int y0_q4, int32_t y_step_q4,
++                              int32_t w, int32_t h) {
++  switch (w) {
++    case 16: {
++      avg_w16(src, src_stride, dst, dst_stride, h);
++      break;
++    }
++    case 32: {
++      avg_w32(src, src_stride, dst, dst_stride, h);
++      break;
++    }
++    case 64: {
++      avg_w64(src, src_stride, dst, dst_stride, h);
++      break;
++    }
++    default: {
++      vpx_convolve_avg_c(src, src_stride, dst, dst_stride, filter, x0_q4,
++                         x_step_q4, y0_q4, y_step_q4, w, h);
++      break;
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// 8-tap dot-product core (identical to the VSX convolve_line).
++// ---------------------------------------------------------------------------
++static INLINE void convolve_line(uint8_t *dst, const int16x8_t s,
++                                 const int16x8_t f) {
++  const int32x4_t sum = vec_msum(s, f, vec_splat_s32(0));
++  const int32x4_t bias =
++      vec_sl(vec_splat_s32(1), vec_splat_u32(FILTER_BITS - 1));
++  const int32x4_t avg = vec_sr(vec_sums(sum, bias), vec_splat_u32(FILTER_BITS));
++  const uint8x16_t v = vec_splat(
++      vec_packsu(vec_pack(avg, vec_splat_s32(0)), vec_splat_s16(0)), 3);
++  vec_ste(v, 0, dst);
++}
++
++static INLINE void convolve_line_h(uint8_t *dst, const uint8_t *const src_x,
++                                   const int16_t *const x_filter) {
++  const int16x8_t s = unpack_to_s16_h(altivec_ld(0, src_x));
++  const int16x8_t f = load_filter(x_filter);
++
++  convolve_line(dst, s, f);
++}
++
++static INLINE void convolve_horiz(const uint8_t *src, ptrdiff_t src_stride,
++                                  uint8_t *dst, ptrdiff_t dst_stride,
++                                  const InterpKernel *x_filters, int x0_q4,
++                                  int x_step_q4, int w, int h) {
++  int x, y;
++  src -= SUBPEL_TAPS / 2 - 1;
++
++  for (y = 0; y < h; ++y) {
++    int x_q4 = x0_q4;
++    for (x = 0; x < w; ++x) {
++      convolve_line_h(dst + x, &src[x_q4 >> SUBPEL_BITS],
++                      x_filters[x_q4 & SUBPEL_MASK]);
++      x_q4 += x_step_q4;
++    }
++    src += src_stride;
++    dst += dst_stride;
++  }
++}
++
++static INLINE void convolve_avg_horiz(const uint8_t *src, ptrdiff_t src_stride,
++                                      uint8_t *dst, ptrdiff_t dst_stride,
++                                      const InterpKernel *x_filters, int x0_q4,
++                                      int x_step_q4, int w, int h) {
++  int x, y;
++  src -= SUBPEL_TAPS / 2 - 1;
++
++  for (y = 0; y < h; ++y) {
++    int x_q4 = x0_q4;
++    for (x = 0; x < w; ++x) {
++      uint8_t v;
++      convolve_line_h(&v, &src[x_q4 >> SUBPEL_BITS],
++                      x_filters[x_q4 & SUBPEL_MASK]);
++      dst[x] = ROUND_POWER_OF_TWO(dst[x] + v, 1);
++      x_q4 += x_step_q4;
++    }
++    src += src_stride;
++    dst += dst_stride;
++  }
++}
++
++// Transpose the low bytes of 8 rows so column-0 vertical samples land in the
++// first 8 lanes (byte-for-byte port of the VSX transpose_line_u8_8x8).
++static INLINE uint8x16_t transpose_line_u8_8x8(uint8x16_t a, uint8x16_t b,
++                                               uint8x16_t c, uint8x16_t d,
++                                               uint8x16_t e, uint8x16_t f,
++                                               uint8x16_t g, uint8x16_t h) {
++  uint16x8_t ab = (uint16x8_t)vec_mergeh(a, b);
++  uint16x8_t cd = (uint16x8_t)vec_mergeh(c, d);
++  uint16x8_t ef = (uint16x8_t)vec_mergeh(e, f);
++  uint16x8_t gh = (uint16x8_t)vec_mergeh(g, h);
++
++  uint32x4_t abcd = (uint32x4_t)vec_mergeh(ab, cd);
++  uint32x4_t efgh = (uint32x4_t)vec_mergeh(ef, gh);
++
++  return (uint8x16_t)vec_mergeh(abcd, efgh);
++}
++
++static INLINE void convolve_line_v(uint8_t *dst, const uint8_t *const src_y,
++                                   ptrdiff_t src_stride,
++                                   const int16_t *const y_filter) {
++  uint8x16_t s0 = altivec_ld(0, src_y + 0 * src_stride);
++  uint8x16_t s1 = altivec_ld(0, src_y + 1 * src_stride);
++  uint8x16_t s2 = altivec_ld(0, src_y + 2 * src_stride);
++  uint8x16_t s3 = altivec_ld(0, src_y + 3 * src_stride);
++  uint8x16_t s4 = altivec_ld(0, src_y + 4 * src_stride);
++  uint8x16_t s5 = altivec_ld(0, src_y + 5 * src_stride);
++  uint8x16_t s6 = altivec_ld(0, src_y + 6 * src_stride);
++  uint8x16_t s7 = altivec_ld(0, src_y + 7 * src_stride);
++  const int16x8_t f = load_filter(y_filter);
++  const uint8x16_t s = transpose_line_u8_8x8(s0, s1, s2, s3, s4, s5, s6, s7);
++
++  convolve_line(dst, unpack_to_s16_h(s), f);
++}
++
++static INLINE void convolve_vert(const uint8_t *src, ptrdiff_t src_stride,
++                                 uint8_t *dst, ptrdiff_t dst_stride,
++                                 const InterpKernel *y_filters, int y0_q4,
++                                 int y_step_q4, int w, int h) {
++  int x, y;
++  src -= src_stride * (SUBPEL_TAPS / 2 - 1);
++
++  for (x = 0; x < w; ++x) {
++    int y_q4 = y0_q4;
++    for (y = 0; y < h; ++y) {
++      convolve_line_v(dst + y * dst_stride,
++                      &src[(y_q4 >> SUBPEL_BITS) * src_stride], src_stride,
++                      y_filters[y_q4 & SUBPEL_MASK]);
++      y_q4 += y_step_q4;
++    }
++    ++src;
++    ++dst;
++  }
++}
++
++static INLINE void convolve_avg_vert(const uint8_t *src, ptrdiff_t src_stride,
++                                     uint8_t *dst, ptrdiff_t dst_stride,
++                                     const InterpKernel *y_filters, int y0_q4,
++                                     int y_step_q4, int w, int h) {
++  int x, y;
++  src -= src_stride * (SUBPEL_TAPS / 2 - 1);
++
++  for (x = 0; x < w; ++x) {
++    int y_q4 = y0_q4;
++    for (y = 0; y < h; ++y) {
++      uint8_t v;
++      convolve_line_v(&v, &src[(y_q4 >> SUBPEL_BITS) * src_stride], src_stride,
++                      y_filters[y_q4 & SUBPEL_MASK]);
++      dst[y * dst_stride] = ROUND_POWER_OF_TWO(dst[y * dst_stride] + v, 1);
++      y_q4 += y_step_q4;
++    }
++    ++src;
++    ++dst;
++  }
++}
++
++static INLINE void convolve(const uint8_t *src, ptrdiff_t src_stride,
++                            uint8_t *dst, ptrdiff_t dst_stride,
++                            const InterpKernel *const filter, int x0_q4,
++                            int x_step_q4, int y0_q4, int y_step_q4, int w,
++                            int h) {
++  DECLARE_ALIGNED(16, uint8_t, temp[64 * 135]);
++  const int intermediate_height =
++      (((h - 1) * y_step_q4 + y0_q4) >> SUBPEL_BITS) + SUBPEL_TAPS;
++
++  assert(w <= 64);
++  assert(h <= 64);
++  assert(y_step_q4 <= 32);
++  assert(x_step_q4 <= 32);
++
++  convolve_horiz(src - src_stride * (SUBPEL_TAPS / 2 - 1), src_stride, temp, 64,
++                 filter, x0_q4, x_step_q4, w, intermediate_height);
++  convolve_vert(temp + 64 * (SUBPEL_TAPS / 2 - 1), 64, dst, dst_stride, filter,
++                y0_q4, y_step_q4, w, h);
++}
++
++void vpx_convolve8_horiz_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                                 uint8_t *dst, ptrdiff_t dst_stride,
++                                 const InterpKernel *filter, int x0_q4,
++                                 int x_step_q4, int y0_q4, int y_step_q4, int w,
++                                 int h) {
++  (void)y0_q4;
++  (void)y_step_q4;
++
++  convolve_horiz(src, src_stride, dst, dst_stride, filter, x0_q4, x_step_q4, w,
++                 h);
++}
++
++void vpx_convolve8_avg_horiz_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                                     uint8_t *dst, ptrdiff_t dst_stride,
++                                     const InterpKernel *filter, int x0_q4,
++                                     int x_step_q4, int y0_q4, int y_step_q4,
++                                     int w, int h) {
++  (void)y0_q4;
++  (void)y_step_q4;
++
++  convolve_avg_horiz(src, src_stride, dst, dst_stride, filter, x0_q4, x_step_q4,
++                     w, h);
++}
++
++void vpx_convolve8_vert_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                                uint8_t *dst, ptrdiff_t dst_stride,
++                                const InterpKernel *filter, int x0_q4,
++                                int x_step_q4, int y0_q4, int y_step_q4, int w,
++                                int h) {
++  (void)x0_q4;
++  (void)x_step_q4;
++
++  convolve_vert(src, src_stride, dst, dst_stride, filter, y0_q4, y_step_q4, w,
++                h);
++}
++
++void vpx_convolve8_avg_vert_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                                    uint8_t *dst, ptrdiff_t dst_stride,
++                                    const InterpKernel *filter, int x0_q4,
++                                    int x_step_q4, int y0_q4, int y_step_q4,
++                                    int w, int h) {
++  (void)x0_q4;
++  (void)x_step_q4;
++
++  convolve_avg_vert(src, src_stride, dst, dst_stride, filter, y0_q4, y_step_q4,
++                    w, h);
++}
++
++void vpx_convolve8_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                           uint8_t *dst, ptrdiff_t dst_stride,
++                           const InterpKernel *filter, int x0_q4, int x_step_q4,
++                           int y0_q4, int y_step_q4, int w, int h) {
++  convolve(src, src_stride, dst, dst_stride, filter, x0_q4, x_step_q4, y0_q4,
++           y_step_q4, w, h);
++}
++
++void vpx_convolve8_avg_altivec(const uint8_t *src, ptrdiff_t src_stride,
++                               uint8_t *dst, ptrdiff_t dst_stride,
++                               const InterpKernel *filter, int x0_q4,
++                               int x_step_q4, int y0_q4, int y_step_q4, int w,
++                               int h) {
++  // Fixed size intermediate buffer places limits on parameters.
++  DECLARE_ALIGNED(16, uint8_t, temp[64 * 64]);
++  assert(w <= 64);
++  assert(h <= 64);
++
++  vpx_convolve8_altivec(src, src_stride, temp, 64, filter, x0_q4, x_step_q4,
++                        y0_q4, y_step_q4, w, h);
++  vpx_convolve_avg_altivec(temp, 64, dst, dst_stride, NULL, 0, 0, 0, 0, w, h);
++}
+diff --git a/vpx_dsp/vpx_dsp.mk b/vpx_dsp/vpx_dsp.mk
+index 73966d3f4..4d5dcba80 100644
+--- a/vpx_dsp/vpx_dsp.mk
++++ b/vpx_dsp/vpx_dsp.mk
+@@ -184,6 +184,7 @@ DSP_SRCS-$(HAVE_DSPR2)  += mips/convolve8_vert_dspr2.c
+ 
+ DSP_SRCS-$(HAVE_VSX)  += ppc/vpx_convolve_vsx.c
+ DSP_SRCS-$(HAVE_ALTIVEC) += ppc/vpx_convolve_altivec.c
++DSP_SRCS-$(HAVE_ALTIVEC) += ppc/vpx_convolve8_altivec.c
+ 
+ # common (lsx)
+ DSP_SRCS-$(HAVE_LSX) += loongarch/vpx_convolve8_avg_horiz_lsx.c
+diff --git a/vpx_dsp/vpx_dsp_rtcd_defs.pl b/vpx_dsp/vpx_dsp_rtcd_defs.pl
+index a04a57c1e..b73fa0eb2 100644
+--- a/vpx_dsp/vpx_dsp_rtcd_defs.pl
++++ b/vpx_dsp/vpx_dsp_rtcd_defs.pl
+@@ -379,25 +379,25 @@
+ specialize qw/vpx_convolve_copy altivec neon dspr2 msa sse2 vsx lsx/;
+ 
+ add_proto qw/void vpx_convolve_avg/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve_avg neon dspr2 msa sse2 vsx mmi lsx/;
++specialize qw/vpx_convolve_avg altivec neon dspr2 msa sse2 vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8 sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8 altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8_horiz/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8_horiz sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8_horiz altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8_vert/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8_vert sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8_vert altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8_avg/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8_avg sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8_avg altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8_avg_horiz/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8_avg_horiz sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8_avg_horiz altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_convolve8_avg_vert/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+-specialize qw/vpx_convolve8_avg_vert sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
++specialize qw/vpx_convolve8_avg_vert altivec sse2 ssse3 avx2 neon neon_dotprod neon_i8mm dspr2 msa vsx mmi lsx/;
+ 
+ add_proto qw/void vpx_scaled_2d/, "const uint8_t *src, ptrdiff_t src_stride, uint8_t *dst, ptrdiff_t dst_stride, const InterpKernel *filter, int x0_q4, int x_step_q4, int y0_q4, int y_step_q4, int w, int h";
+ specialize qw/vpx_scaled_2d ssse3 neon msa/;
