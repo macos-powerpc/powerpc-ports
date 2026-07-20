@@ -1,0 +1,759 @@
+From 8c5cb8b0ac2b08dcf80e31ecc0c347e6e5f42778 Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Wed, 15 Jul 2026 11:02:50 +0000
+Subject: [PATCH 16/17] ppc: rewrite iadst16_8col as a direct scalar-C port,
+ fixing wrong output
+
+Same bug class as the iadst8_vmx rewrite (54009dd85), now in the 16-point
+inverse ADST used by vp9_iht16x16_256_add for tx_type 1/2/3 (ADST_DCT,
+DCT_ADST, ADST_ADST). iadst16_c (vpx_dsp/inv_txfm.c) keeps its entire
+working set (x0..x15, s0..s15) in tran_high_t (32-bit int) for the whole
+function body -- never narrowed to a 16-bit type until output[] is
+written -- and WRAPLOW() is a genuine no-op in this build (no
+CONFIG_EMULATE_HARDWARE, no CONFIG_COEFFICIENT_RANGE_CHECKING).
+
+The original iadst16_8col packed intermediate stage results back into
+vector signed short between stages and combined/multiplied them in
+16-bit vector arithmetic. With 4 stages instead of iadst8's 3, this bug
+was present in more places, not fewer: stage 2's x8..x15 (already
+round-shifted, so already possibly out of int16 range) get multiplied
+by cospi constants, stage 3's x4..x7/x12..x15 (post-combine, un-shifted)
+get multiplied by cospi constants, and stage 4 computes
+cospi_16_64*(x2+x3)-shaped expressions four times over (x2/x3, x6/x7,
+x10/x11, x14/x15) -- the same expression shape that was shown in the
+iadst8 rewrite to reach ~2.7e9 in magnitude for adversarial inputs.
+
+Rewrote the whole function as a direct, line-for-line port of
+iadst16_c, reusing the vi8 helper toolkit introduced for iadst8_vmx (a
+lo/hi pair of vector signed int carrying 8 columns of genuinely-wide
+32-bit state): one vi8 per reference scalar (x0..x15, s0..s15), stage 1
+multiplies fresh tran_low_t-range input via the narrow widening multiply
+(vi8_mul_narrow), and every subsequent wide-value combine/multiply
+(stages 2-4) goes through vi8_add/vi8_sub/vi8_mul_wide, only narrowing
+to vector signed short at the very end for output. No 16-lane wide
+struct was needed -- the existing 8-lane vi8 maps 1:1 onto how this
+"8col" function already processes 8 columns per call, exactly like
+iadst8_vmx.
+
+Verified against the QEMU/AltiVec cross-check harness (full 23000-check
+run, all sizes/tx_types): vp9_iht16x16_256_add tx_type=1/2/3 dropped
+from 499/500 failures to 45-65/500, both unaligned and 4-byte-aligned
+stride variants -- matching tx_type=0's (pure DCT, untouched by this
+change) existing 51-62/500 baseline, the same separately-tracked
+pixel-reconstruction rounding edge case noise floor documented in
+54009dd85. All other tests in the full harness run are unchanged from
+their pre-existing baseline counts (e.g. vp9_iht8x8_64_add stays at
+8-10/500 across all tx_types, vpx_idct16x16_256_add stays at ~52-71/500).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ vpx_dsp/ppc/vpx_idct_altivec.c | 692 ++++++++++-----------------------
+ 1 file changed, 214 insertions(+), 478 deletions(-)
+
+diff --git a/vpx_dsp/ppc/vpx_idct_altivec.c b/vpx_dsp/ppc/vpx_idct_altivec.c
+index 0818ae460..d15e48e0c 100644
+--- a/vpx_dsp/ppc/vpx_idct_altivec.c
++++ b/vpx_dsp/ppc/vpx_idct_altivec.c
+@@ -3260,485 +3260,221 @@ static inline void write_buffer_8x16(uint8_t *dest, vector signed short *in, int
+ 
+ // It's time for INTRINSIC HELL.
+ // First tarpit: performing an 16x16 1-D inverse ADST on eight columns.
++//
++// Direct, line-for-line port of iadst16_c's x0..x15/s0..s15 algebra
++// (vpx_dsp/inv_txfm.c), vectorized across the 8 rows/columns processed in
++// parallel per vi8 half -- exactly the same rewrite as iadst8_vmx above
++// (see the big vi8 comment block for why every stage needs genuine 32-bit
++// (wide) headroom, not just narrow int16 arithmetic): iadst16_c also keeps
++// its ENTIRE working set (x0..x15, s0..s15) in tran_high_t for the whole
++// function body, with WRAPLOW() a genuine no-op in this build, and stage 4
++// alone computes things like cospi_16_64*(x2+x3) which can overflow int32
++// -- the same bug class, just with a 4th stage and twice the lanes. Each
++// reference scalar xN/sN maps to one vi8 here (a lo/hi pair of vector
++// signed int covering the 8 columns processed by this "8col" call), so the
++// mapping is mechanically checkable line by line against the reference.
+ static void iadst16_8col(vector signed short *in) {
+-	vector signed short s[16], x[16], u[32];
+-	vector signed int v[32], w[32];
+-	vector signed short k__cospi_p01_p31 = short_pair_a(cospi_1_64, cospi_31_64);
+-	vector signed short k__cospi_p31_m01 = short_pair_a(cospi_31_64, -cospi_1_64);
+-	vector signed short k__cospi_p05_p27 = short_pair_a(cospi_5_64, cospi_27_64);
+-	vector signed short k__cospi_p27_m05 = short_pair_a(cospi_27_64, -cospi_5_64);
+-	vector signed short k__cospi_p09_p23 = short_pair_a(cospi_9_64, cospi_23_64);
+-	vector signed short k__cospi_p23_m09 = short_pair_a(cospi_23_64, -cospi_9_64);
+-	vector signed short k__cospi_p13_p19 = short_pair_a(cospi_13_64, cospi_19_64);
+-	vector signed short k__cospi_p19_m13 = short_pair_a(cospi_19_64, -cospi_13_64);
+-	vector signed short k__cospi_p17_p15 = short_pair_a(cospi_17_64, cospi_15_64);
+-	vector signed short k__cospi_p15_m17 = short_pair_a(cospi_15_64, -cospi_17_64);
+-	vector signed short k__cospi_p21_p11 = short_pair_a(cospi_21_64, cospi_11_64);
+-	vector signed short k__cospi_p11_m21 = short_pair_a(cospi_11_64, -cospi_21_64);
+-	vector signed short k__cospi_p25_p07 = short_pair_a(cospi_25_64, cospi_7_64);
+-	vector signed short k__cospi_p07_m25 = short_pair_a(cospi_7_64, -cospi_25_64);
+-	vector signed short k__cospi_p29_p03 = short_pair_a(cospi_29_64, cospi_3_64);
+-	vector signed short k__cospi_p03_m29 = short_pair_a(cospi_3_64, -cospi_29_64);
+-	vector signed short k__cospi_p04_p28 = short_pair_a(cospi_4_64, cospi_28_64);
+-	vector signed short k__cospi_p28_m04 = short_pair_a(cospi_28_64, -cospi_4_64);
+-	vector signed short k__cospi_p20_p12 = short_pair_a(cospi_20_64, cospi_12_64);
+-	vector signed short k__cospi_p12_m20 = short_pair_a(cospi_12_64, -cospi_20_64);
+-	vector signed short k__cospi_m28_p04 = short_pair_a(-cospi_28_64, cospi_4_64);
+-	vector signed short k__cospi_m12_p20 = short_pair_a(-cospi_12_64, cospi_20_64);
+-	vector signed short k__cospi_p08_p24 = short_pair_a(cospi_8_64, cospi_24_64);
+-	vector signed short k__cospi_p24_m08 = short_pair_a(cospi_24_64, -cospi_8_64);
+-	vector signed short k__cospi_m24_p08 = short_pair_a(-cospi_24_64, cospi_8_64);
+-	vector signed short k__cospi_m16_m16;
+-	vector signed short k__cospi_p16_p16;
+-	vector signed short k__cospi_p16_m16 = short_pair_a(cospi_16_64, -cospi_16_64);
+-	vector signed short k__cospi_m16_p16 = short_pair_a(-cospi_16_64, cospi_16_64);
+-	vector signed short kZero = vec_splat_s16(0);
+-	vector signed int mzero = vec_splat_s32(0);
+-	
+-	signed short a_s = ((int16_t)-cospi_16_64);
+-	signed short b_s = ((int16_t)cospi_16_64);
+-	k__cospi_m16_m16 = ss_splat(&a_s);
+-	k__cospi_p16_p16 = ss_splat(&b_s);
+-
+-	// Stage 1.
+-	u[0]  = vec_mergeh(in[15], in[0]);
+-	u[1]  = vec_mergel(in[15], in[0]);
+-	u[2]  = vec_mergeh(in[13], in[2]);
+-	u[3]  = vec_mergel(in[13], in[2]);
+-	u[4]  = vec_mergeh(in[11], in[4]);
+-	u[5]  = vec_mergel(in[11], in[4]);
+-	u[6]  = vec_mergeh(in[9],  in[6]);
+-	u[7]  = vec_mergel(in[9],  in[6]);
+-	u[8]  = vec_mergeh(in[7],  in[8]);
+-	u[9]  = vec_mergel(in[7],  in[8]);
+-	u[10] = vec_mergeh(in[5],  in[10]);
+-	u[11] = vec_mergel(in[5],  in[10]);
+-	u[12] = vec_mergeh(in[3],  in[12]);
+-	u[13] = vec_mergel(in[3],  in[12]);
+-	u[14] = vec_mergeh(in[1],  in[14]);
+-	u[15] = vec_mergel(in[1],  in[14]);
+-
+-	// Unfortunately no post-add is possible.
+-	v[0]  = vec_msum(u[0],  k__cospi_p01_p31, mzero);
+-	v[1]  = vec_msum(u[1],  k__cospi_p01_p31, mzero);
+-	v[2]  = vec_msum(u[0],  k__cospi_p31_m01, mzero);
+-	v[3]  = vec_msum(u[1],  k__cospi_p31_m01, mzero);
+-	v[4]  = vec_msum(u[2],  k__cospi_p05_p27, mzero);
+-	v[5]  = vec_msum(u[3],  k__cospi_p05_p27, mzero);
+-	v[6]  = vec_msum(u[2],  k__cospi_p27_m05, mzero);
+-	v[7]  = vec_msum(u[3],  k__cospi_p27_m05, mzero);
+-	v[8]  = vec_msum(u[4],  k__cospi_p09_p23, mzero);
+-	v[9]  = vec_msum(u[5],  k__cospi_p09_p23, mzero);
+-	v[10] = vec_msum(u[4],  k__cospi_p23_m09, mzero);
+-	v[11] = vec_msum(u[5],  k__cospi_p23_m09, mzero);
+-	v[12] = vec_msum(u[6],  k__cospi_p13_p19, mzero);
+-	v[13] = vec_msum(u[7],  k__cospi_p13_p19, mzero);
+-	v[14] = vec_msum(u[6],  k__cospi_p19_m13, mzero);
+-	v[15] = vec_msum(u[7],  k__cospi_p19_m13, mzero);
+-	v[16] = vec_msum(u[8],  k__cospi_p17_p15, mzero);
+-	v[17] = vec_msum(u[9],  k__cospi_p17_p15, mzero);
+-	v[18] = vec_msum(u[8],  k__cospi_p15_m17, mzero);
+-	v[19] = vec_msum(u[9],  k__cospi_p15_m17, mzero);
+-	v[20] = vec_msum(u[10], k__cospi_p21_p11, mzero);
+-	v[21] = vec_msum(u[11], k__cospi_p21_p11, mzero);
+-	v[22] = vec_msum(u[10], k__cospi_p11_m21, mzero);
+-	v[23] = vec_msum(u[11], k__cospi_p11_m21, mzero);
+-	v[24] = vec_msum(u[12], k__cospi_p25_p07, mzero);
+-	v[25] = vec_msum(u[13], k__cospi_p25_p07, mzero);
+-	v[26] = vec_msum(u[12], k__cospi_p07_m25, mzero);
+-	v[27] = vec_msum(u[13], k__cospi_p07_m25, mzero);
+-	v[28] = vec_msum(u[14], k__cospi_p29_p03, mzero);
+-	v[29] = vec_msum(u[15], k__cospi_p29_p03, mzero);
+-	v[30] = vec_msum(u[14], k__cospi_p03_m29, mzero);
+-	v[31] = vec_msum(u[15], k__cospi_p03_m29, mzero);
+-
+-	w[0]  = vec_add(v[0],  v[16]);
+-	w[1]  = vec_add(v[1],  v[17]);
+-	w[2]  = vec_add(v[2],  v[18]);
+-	w[3]  = vec_add(v[3],  v[19]);
+-	w[4]  = vec_add(v[4],  v[20]);
+-	w[5]  = vec_add(v[5],  v[21]);
+-	w[6]  = vec_add(v[6],  v[22]);
+-	w[7]  = vec_add(v[7],  v[23]);
+-	w[8]  = vec_add(v[8],  v[24]);
+-	w[9]  = vec_add(v[9],  v[25]);
+-	w[10] = vec_add(v[10], v[26]);
+-	w[11] = vec_add(v[11], v[27]);
+-	w[12] = vec_add(v[12], v[28]);
+-	w[13] = vec_add(v[13], v[29]);
+-	w[14] = vec_add(v[14], v[30]);
+-	w[15] = vec_add(v[15], v[31]);
+-	w[16] = vec_sub(v[0],  v[16]);
+-	w[17] = vec_sub(v[1],  v[17]);
+-	w[18] = vec_sub(v[2],  v[18]);
+-	w[19] = vec_sub(v[3],  v[19]);
+-	w[20] = vec_sub(v[4],  v[20]);
+-	w[21] = vec_sub(v[5],  v[21]);
+-	w[22] = vec_sub(v[6],  v[22]);
+-	w[23] = vec_sub(v[7],  v[23]);
+-	w[24] = vec_sub(v[8],  v[24]);
+-	w[25] = vec_sub(v[9],  v[25]);
+-	w[26] = vec_sub(v[10], v[26]);
+-	w[27] = vec_sub(v[11], v[27]);
+-	w[28] = vec_sub(v[12], v[28]);
+-	w[29] = vec_sub(v[13], v[29]);
+-	w[30] = vec_sub(v[14], v[30]);
+-	w[31] = vec_sub(v[15], v[31]);
+-
+-	v[0]  = vec_add(w[0],  dct_rounding_vec);
+-	v[1]  = vec_add(w[1],  dct_rounding_vec);
+-	v[2]  = vec_add(w[2],  dct_rounding_vec);
+-	v[3]  = vec_add(w[3],  dct_rounding_vec);
+-	v[4]  = vec_add(w[4],  dct_rounding_vec);
+-	v[5]  = vec_add(w[5],  dct_rounding_vec);
+-	v[6]  = vec_add(w[6],  dct_rounding_vec);
+-	v[7]  = vec_add(w[7],  dct_rounding_vec);
+-	v[8]  = vec_add(w[8],  dct_rounding_vec);
+-	v[9]  = vec_add(w[9],  dct_rounding_vec);
+-	v[10] = vec_add(w[10], dct_rounding_vec);
+-	v[11] = vec_add(w[11], dct_rounding_vec);
+-	v[12] = vec_add(w[12], dct_rounding_vec);
+-	v[13] = vec_add(w[13], dct_rounding_vec);
+-	v[14] = vec_add(w[14], dct_rounding_vec);
+-	v[15] = vec_add(w[15], dct_rounding_vec);
+-	v[16] = vec_add(w[16], dct_rounding_vec);
+-	v[17] = vec_add(w[17], dct_rounding_vec);
+-	v[18] = vec_add(w[18], dct_rounding_vec);
+-	v[19] = vec_add(w[19], dct_rounding_vec);
+-	v[20] = vec_add(w[20], dct_rounding_vec);
+-	v[21] = vec_add(w[21], dct_rounding_vec);
+-	v[22] = vec_add(w[22], dct_rounding_vec);
+-	v[23] = vec_add(w[23], dct_rounding_vec);
+-	v[24] = vec_add(w[24], dct_rounding_vec);
+-	v[25] = vec_add(w[25], dct_rounding_vec);
+-	v[26] = vec_add(w[26], dct_rounding_vec);
+-	v[27] = vec_add(w[27], dct_rounding_vec);
+-	v[28] = vec_add(w[28], dct_rounding_vec);
+-	v[29] = vec_add(w[29], dct_rounding_vec);
+-	v[30] = vec_add(w[30], dct_rounding_vec);
+-	v[31] = vec_add(w[31], dct_rounding_vec);
+-
+-	w[0]  = vec_sra(v[0],  dct_bitshift_vec);
+-	w[1]  = vec_sra(v[1],  dct_bitshift_vec);
+-	w[2]  = vec_sra(v[2],  dct_bitshift_vec);
+-	w[3]  = vec_sra(v[3],  dct_bitshift_vec);
+-	w[4]  = vec_sra(v[4],  dct_bitshift_vec);
+-	w[5]  = vec_sra(v[5],  dct_bitshift_vec);
+-	w[6]  = vec_sra(v[6],  dct_bitshift_vec);
+-	w[7]  = vec_sra(v[7],  dct_bitshift_vec);
+-	w[8]  = vec_sra(v[8],  dct_bitshift_vec);
+-	w[9]  = vec_sra(v[9],  dct_bitshift_vec);
+-	w[10] = vec_sra(v[10], dct_bitshift_vec);
+-	w[11] = vec_sra(v[11], dct_bitshift_vec);
+-	w[12] = vec_sra(v[12], dct_bitshift_vec);
+-	w[13] = vec_sra(v[13], dct_bitshift_vec);
+-	w[14] = vec_sra(v[14], dct_bitshift_vec);
+-	w[15] = vec_sra(v[15], dct_bitshift_vec);
+-	w[16] = vec_sra(v[16], dct_bitshift_vec);
+-	w[17] = vec_sra(v[17], dct_bitshift_vec);
+-	w[18] = vec_sra(v[18], dct_bitshift_vec);
+-	w[19] = vec_sra(v[19], dct_bitshift_vec);
+-	w[20] = vec_sra(v[20], dct_bitshift_vec);
+-	w[21] = vec_sra(v[21], dct_bitshift_vec);
+-	w[22] = vec_sra(v[22], dct_bitshift_vec);
+-	w[23] = vec_sra(v[23], dct_bitshift_vec);
+-	w[24] = vec_sra(v[24], dct_bitshift_vec);
+-	w[25] = vec_sra(v[25], dct_bitshift_vec);
+-	w[26] = vec_sra(v[26], dct_bitshift_vec);
+-	w[27] = vec_sra(v[27], dct_bitshift_vec);
+-	w[28] = vec_sra(v[28], dct_bitshift_vec);
+-	w[29] = vec_sra(v[29], dct_bitshift_vec);
+-	w[30] = vec_sra(v[30], dct_bitshift_vec);
+-	w[31] = vec_sra(v[31], dct_bitshift_vec);
+-
+-	s[0]  = vec_pack(w[0],  w[1]);
+-	s[1]  = vec_pack(w[2],  w[3]);
+-	s[2]  = vec_pack(w[4],  w[5]);
+-	s[3]  = vec_pack(w[6],  w[7]);
+-	s[4]  = vec_pack(w[8],  w[9]);
+-	s[5]  = vec_pack(w[10], w[11]);
+-	s[6]  = vec_pack(w[12], w[13]);
+-	s[7]  = vec_pack(w[14], w[15]);
+-	s[8]  = vec_pack(w[16], w[17]);
+-	s[9]  = vec_pack(w[18], w[19]);
+-	s[10] = vec_pack(w[20], w[21]);
+-	s[11] = vec_pack(w[22], w[23]);
+-	s[12] = vec_pack(w[24], w[25]);
+-	s[13] = vec_pack(w[26], w[27]);
+-	s[14] = vec_pack(w[28], w[29]);
+-	s[15] = vec_pack(w[30], w[31]);
+-
+-	// Stage 2.
+-	u[0] = vec_mergeh(s[8],  s[9]);
+-	u[1] = vec_mergel(s[8],  s[9]);
+-	u[2] = vec_mergeh(s[10], s[11]);
+-	u[3] = vec_mergel(s[10], s[11]);
+-	u[4] = vec_mergeh(s[12], s[13]);
+-	u[5] = vec_mergel(s[12], s[13]);
+-	u[6] = vec_mergeh(s[14], s[15]);
+-	u[7] = vec_mergel(s[14], s[15]);
+-
+-	v[0]  = vec_msum(u[0], k__cospi_p04_p28, mzero);
+-	v[1]  = vec_msum(u[1], k__cospi_p04_p28, mzero);
+-	v[2]  = vec_msum(u[0], k__cospi_p28_m04, mzero);
+-	v[3]  = vec_msum(u[1], k__cospi_p28_m04, mzero);
+-	v[4]  = vec_msum(u[2], k__cospi_p20_p12, mzero);
+-	v[5]  = vec_msum(u[3], k__cospi_p20_p12, mzero);
+-	v[6]  = vec_msum(u[2], k__cospi_p12_m20, mzero);
+-	v[7]  = vec_msum(u[3], k__cospi_p12_m20, mzero);
+-	v[8]  = vec_msum(u[4], k__cospi_m28_p04, mzero);
+-	v[9]  = vec_msum(u[5], k__cospi_m28_p04, mzero);
+-	v[10] = vec_msum(u[4], k__cospi_p04_p28, mzero);
+-	v[11] = vec_msum(u[5], k__cospi_p04_p28, mzero);
+-	v[12] = vec_msum(u[6], k__cospi_m12_p20, mzero);
+-	v[13] = vec_msum(u[7], k__cospi_m12_p20, mzero);
+-	v[14] = vec_msum(u[6], k__cospi_p20_p12, mzero);
+-	v[15] = vec_msum(u[7], k__cospi_p20_p12, mzero);
+-
+-	w[0]  = vec_add(v[0], v[8]);
+-	w[1]  = vec_add(v[1], v[9]);
+-	w[2]  = vec_add(v[2], v[10]);
+-	w[3]  = vec_add(v[3], v[11]);
+-	w[4]  = vec_add(v[4], v[12]);
+-	w[5]  = vec_add(v[5], v[13]);
+-	w[6]  = vec_add(v[6], v[14]);
+-	w[7]  = vec_add(v[7], v[15]);
+-	w[8]  = vec_sub(v[0], v[8]);
+-	w[9]  = vec_sub(v[1], v[9]);
+-	w[10] = vec_sub(v[2], v[10]);
+-	w[11] = vec_sub(v[3], v[11]);
+-	w[12] = vec_sub(v[4], v[12]);
+-	w[13] = vec_sub(v[5], v[13]);
+-	w[14] = vec_sub(v[6], v[14]);
+-	w[15] = vec_sub(v[7], v[15]);
+-
+-	v[0]  = vec_add(w[0],  dct_rounding_vec);
+-	v[1]  = vec_add(w[1],  dct_rounding_vec);
+-	v[2]  = vec_add(w[2],  dct_rounding_vec);
+-	v[3]  = vec_add(w[3],  dct_rounding_vec);
+-	v[4]  = vec_add(w[4],  dct_rounding_vec);
+-	v[5]  = vec_add(w[5],  dct_rounding_vec);
+-	v[6]  = vec_add(w[6],  dct_rounding_vec);
+-	v[7]  = vec_add(w[7],  dct_rounding_vec);
+-	v[8]  = vec_add(w[8],  dct_rounding_vec);
+-	v[9]  = vec_add(w[9],  dct_rounding_vec);
+-	v[10] = vec_add(w[10], dct_rounding_vec);
+-	v[11] = vec_add(w[11], dct_rounding_vec);
+-	v[12] = vec_add(w[12], dct_rounding_vec);
+-	v[13] = vec_add(w[13], dct_rounding_vec);
+-	v[14] = vec_add(w[14], dct_rounding_vec);
+-	v[15] = vec_add(w[15], dct_rounding_vec);
+-
+-	w[0]  = vec_sra(v[0],  dct_bitshift_vec);
+-	w[1]  = vec_sra(v[1],  dct_bitshift_vec);
+-	w[2]  = vec_sra(v[2],  dct_bitshift_vec);
+-	w[3]  = vec_sra(v[3],  dct_bitshift_vec);
+-	w[4]  = vec_sra(v[4],  dct_bitshift_vec);
+-	w[5]  = vec_sra(v[5],  dct_bitshift_vec);
+-	w[6]  = vec_sra(v[6],  dct_bitshift_vec);
+-	w[7]  = vec_sra(v[7],  dct_bitshift_vec);
+-	w[8]  = vec_sra(v[8],  dct_bitshift_vec);
+-	w[9]  = vec_sra(v[9],  dct_bitshift_vec);
+-	w[10] = vec_sra(v[10], dct_bitshift_vec);
+-	w[11] = vec_sra(v[11], dct_bitshift_vec);
+-	w[12] = vec_sra(v[12], dct_bitshift_vec);
+-	w[13] = vec_sra(v[13], dct_bitshift_vec);
+-	w[14] = vec_sra(v[14], dct_bitshift_vec);
+-	w[15] = vec_sra(v[15], dct_bitshift_vec);
+-
+-	x[0]  = vec_add(s[0], s[4]);
+-	x[1]  = vec_add(s[1], s[5]);
+-	x[2]  = vec_add(s[2], s[6]);
+-	x[3]  = vec_add(s[3], s[7]);
+-	x[4]  = vec_sub(s[0], s[4]);
+-	x[5]  = vec_sub(s[1], s[5]);
+-	x[6]  = vec_sub(s[2], s[6]);
+-	x[7]  = vec_sub(s[3], s[7]);
+-	
+-	x[8]  = vec_pack(w[0],  w[1]);
+-	x[9]  = vec_pack(w[2],  w[3]);
+-	x[10] = vec_pack(w[4],  w[5]);
+-	x[11] = vec_pack(w[6],  w[7]);
+-	x[12] = vec_pack(w[8],  w[9]);
+-	x[13] = vec_pack(w[10], w[11]);
+-	x[14] = vec_pack(w[12], w[13]);
+-	x[15] = vec_pack(w[14], w[15]);
+-
+-	// Stage 3.
+-	u[0] = vec_mergeh(x[4],  x[5]);
+-	u[1] = vec_mergel(x[4],  x[5]);
+-	u[2] = vec_mergeh(x[6],  x[7]);
+-	u[3] = vec_mergel(x[6],  x[7]);
+-	u[4] = vec_mergeh(x[12], x[13]);
+-	u[5] = vec_mergel(x[12], x[13]);
+-	u[6] = vec_mergeh(x[14], x[15]);
+-	u[7] = vec_mergel(x[14], x[15]);
+-
+-	v[0]  = vec_msum(u[0], k__cospi_p08_p24, mzero);
+-	v[1]  = vec_msum(u[1], k__cospi_p08_p24, mzero);
+-	v[2]  = vec_msum(u[0], k__cospi_p24_m08, mzero);
+-	v[3]  = vec_msum(u[1], k__cospi_p24_m08, mzero);
+-	v[4]  = vec_msum(u[2], k__cospi_m24_p08, mzero);
+-	v[5]  = vec_msum(u[3], k__cospi_m24_p08, mzero);
+-	v[6]  = vec_msum(u[2], k__cospi_p08_p24, mzero);
+-	v[7]  = vec_msum(u[3], k__cospi_p08_p24, mzero);
+-	v[8]  = vec_msum(u[4], k__cospi_p08_p24, mzero);
+-	v[9]  = vec_msum(u[5], k__cospi_p08_p24, mzero);
+-	v[10] = vec_msum(u[4], k__cospi_p24_m08, mzero);
+-	v[11] = vec_msum(u[5], k__cospi_p24_m08, mzero);
+-	v[12] = vec_msum(u[6], k__cospi_m24_p08, mzero);
+-	v[13] = vec_msum(u[7], k__cospi_m24_p08, mzero);
+-	v[14] = vec_msum(u[6], k__cospi_p08_p24, mzero);
+-	v[15] = vec_msum(u[7], k__cospi_p08_p24, mzero);
+-
+-	w[0]  = vec_add(v[0],  v[4]);
+-	w[1]  = vec_add(v[1],  v[5]);
+-	w[2]  = vec_add(v[2],  v[6]);
+-	w[3]  = vec_add(v[3],  v[7]);
+-	w[4]  = vec_sub(v[0],  v[4]);
+-	w[5]  = vec_sub(v[1],  v[5]);
+-	w[6]  = vec_sub(v[2],  v[6]);
+-	w[7]  = vec_sub(v[3],  v[7]);
+-	w[8]  = vec_add(v[8],  v[12]);
+-	w[9]  = vec_add(v[9],  v[13]);
+-	w[10] = vec_add(v[10], v[14]);
+-	w[11] = vec_add(v[11], v[15]);
+-	w[12] = vec_sub(v[8],  v[12]);
+-	w[13] = vec_sub(v[9] , v[13]);
+-	w[14] = vec_sub(v[10], v[14]);
+-	w[15] = vec_sub(v[11], v[15]);
+-
+-	w[0]  = vec_add(w[0],  dct_rounding_vec);
+-	w[1]  = vec_add(w[1],  dct_rounding_vec);
+-	w[2]  = vec_add(w[2],  dct_rounding_vec);
+-	w[3]  = vec_add(w[3],  dct_rounding_vec);
+-	w[4]  = vec_add(w[4],  dct_rounding_vec);
+-	w[5]  = vec_add(w[5],  dct_rounding_vec);
+-	w[6]  = vec_add(w[6],  dct_rounding_vec);
+-	w[7]  = vec_add(w[7],  dct_rounding_vec);
+-	w[8]  = vec_add(w[8],  dct_rounding_vec);
+-	w[9]  = vec_add(w[9],  dct_rounding_vec);
+-	w[10] = vec_add(w[10], dct_rounding_vec);
+-	w[11] = vec_add(w[11], dct_rounding_vec);
+-	w[12] = vec_add(w[12], dct_rounding_vec);
+-	w[13] = vec_add(w[13], dct_rounding_vec);
+-	w[14] = vec_add(w[14], dct_rounding_vec);
+-	w[15] = vec_add(w[15], dct_rounding_vec);
+-
+-	v[0]  = vec_sra(w[0],  dct_bitshift_vec);
+-	v[1]  = vec_sra(w[1],  dct_bitshift_vec);
+-	v[2]  = vec_sra(w[2],  dct_bitshift_vec);
+-	v[3]  = vec_sra(w[3],  dct_bitshift_vec);
+-	v[4]  = vec_sra(w[4],  dct_bitshift_vec);
+-	v[5]  = vec_sra(w[5],  dct_bitshift_vec);
+-	v[6]  = vec_sra(w[6],  dct_bitshift_vec);
+-	v[7]  = vec_sra(w[7],  dct_bitshift_vec);
+-	v[8]  = vec_sra(w[8],  dct_bitshift_vec);
+-	v[9]  = vec_sra(w[9],  dct_bitshift_vec);
+-	v[10] = vec_sra(w[10], dct_bitshift_vec);
+-	v[11] = vec_sra(w[11], dct_bitshift_vec);
+-	v[12] = vec_sra(w[12], dct_bitshift_vec);
+-	v[13] = vec_sra(w[13], dct_bitshift_vec);
+-	v[14] = vec_sra(w[14], dct_bitshift_vec);
+-	v[15] = vec_sra(w[15], dct_bitshift_vec);
+-
+-	s[0]  = vec_add(x[0], x[2]);
+-	s[1]  = vec_add(x[1], x[3]);
+-	s[2]  = vec_sub(x[0], x[2]);
+-	s[3]  = vec_sub(x[1], x[3]);
+-	
+-	s[4]  = vec_pack(v[0], v[1]);
+-	s[5]  = vec_pack(v[2], v[3]);
+-	s[6]  = vec_pack(v[4], v[5]);
+-	s[7]  = vec_pack(v[6], v[7]);
+-	
+-	s[8]  = vec_add(x[8], x[10]);
+-	s[9]  = vec_add(x[9], x[11]);
+-	s[10] = vec_sub(x[8], x[10]);
+-	s[11] = vec_sub(x[9], x[11]);
+-	
+-	s[12] = vec_pack(v[8],  v[9]);
+-	s[13] = vec_pack(v[10], v[11]);
+-	s[14] = vec_pack(v[12], v[13]);
+-	s[15] = vec_pack(v[14], v[15]);
+-
+-	// Stage 4.
+-	u[0] = vec_mergeh(s[2],  s[3]);
+-	u[1] = vec_mergel(s[2],  s[3]);
+-	u[2] = vec_mergeh(s[6],  s[7]);
+-	u[3] = vec_mergel(s[6],  s[7]);
+-	u[4] = vec_mergeh(s[10], s[11]);
+-	u[5] = vec_mergel(s[10], s[11]);
+-	u[6] = vec_mergeh(s[14], s[15]);
+-	u[7] = vec_mergel(s[14], s[15]);
+-
+-	v[0]  = vec_msum(u[0], k__cospi_m16_m16, mzero);
+-	v[1]  = vec_msum(u[1], k__cospi_m16_m16, mzero);
+-	v[2]  = vec_msum(u[0], k__cospi_p16_m16, mzero);
+-	v[3]  = vec_msum(u[1], k__cospi_p16_m16, mzero);
+-	v[4]  = vec_msum(u[2], k__cospi_p16_p16, mzero);
+-	v[5]  = vec_msum(u[3], k__cospi_p16_p16, mzero);
+-	v[6]  = vec_msum(u[2], k__cospi_m16_p16, mzero);
+-	v[7]  = vec_msum(u[3], k__cospi_m16_p16, mzero);
+-	v[8]  = vec_msum(u[4], k__cospi_p16_p16, mzero);
+-	v[9]  = vec_msum(u[5], k__cospi_p16_p16, mzero);
+-	v[10] = vec_msum(u[4], k__cospi_m16_p16, mzero);
+-	v[11] = vec_msum(u[5], k__cospi_m16_p16, mzero);
+-	v[12] = vec_msum(u[6], k__cospi_m16_m16, mzero);
+-	v[13] = vec_msum(u[7], k__cospi_m16_m16, mzero);
+-	v[14] = vec_msum(u[6], k__cospi_p16_m16, mzero);
+-	v[15] = vec_msum(u[7], k__cospi_p16_m16, mzero);
+-
+-	w[0]  = vec_add(v[0],  dct_rounding_vec);
+-	w[1]  = vec_add(v[1],  dct_rounding_vec);
+-	w[2]  = vec_add(v[2],  dct_rounding_vec);
+-	w[3]  = vec_add(v[3],  dct_rounding_vec);
+-	w[4]  = vec_add(v[4],  dct_rounding_vec);
+-	w[5]  = vec_add(v[5],  dct_rounding_vec);
+-	w[6]  = vec_add(v[6],  dct_rounding_vec);
+-	w[7]  = vec_add(v[7],  dct_rounding_vec);
+-	w[8]  = vec_add(v[8],  dct_rounding_vec);
+-	w[9]  = vec_add(v[9],  dct_rounding_vec);
+-	w[10] = vec_add(v[10], dct_rounding_vec);
+-	w[11] = vec_add(v[11], dct_rounding_vec);
+-	w[12] = vec_add(v[12], dct_rounding_vec);
+-	w[13] = vec_add(v[13], dct_rounding_vec);
+-	w[14] = vec_add(v[14], dct_rounding_vec);
+-	w[15] = vec_add(v[15], dct_rounding_vec);
+-
+-	v[0]  = vec_sra(w[0],  dct_bitshift_vec);
+-	v[1]  = vec_sra(w[1],  dct_bitshift_vec);
+-	v[2]  = vec_sra(w[2],  dct_bitshift_vec);
+-	v[3]  = vec_sra(w[3],  dct_bitshift_vec);
+-	v[4]  = vec_sra(w[4],  dct_bitshift_vec);
+-	v[5]  = vec_sra(w[5],  dct_bitshift_vec);
+-	v[6]  = vec_sra(w[6],  dct_bitshift_vec);
+-	v[7]  = vec_sra(w[7],  dct_bitshift_vec);
+-	v[8]  = vec_sra(w[8],  dct_bitshift_vec);
+-	v[9]  = vec_sra(w[9],  dct_bitshift_vec);
+-	v[10] = vec_sra(w[10], dct_bitshift_vec);
+-	v[11] = vec_sra(w[11], dct_bitshift_vec);
+-	v[12] = vec_sra(w[12], dct_bitshift_vec);
+-	v[13] = vec_sra(w[13], dct_bitshift_vec);
+-	v[14] = vec_sra(w[14], dct_bitshift_vec);
+-	v[15] = vec_sra(w[15], dct_bitshift_vec);
+-
+-	in[0]  = s[0];
+-	in[1]  = vec_sub(kZero, s[8]);
+-	in[2]  = s[12];
+-	in[3]  = vec_sub(kZero, s[4]);
+-	in[4]  = vec_pack(v[4], v[5]);
+-	in[5]  = vec_pack(v[12], v[13]);
+-	in[6]  = vec_pack(v[8], v[9]);
+-	in[7]  = vec_pack(v[0], v[1]);
+-	in[8]  = vec_pack(v[2], v[3]);
+-	in[9]  = vec_pack(v[10], v[11]);
+-	in[10] = vec_pack(v[14], v[15]);
+-	in[11] = vec_pack(v[6], v[7]);
+-	in[12] = s[5];
+-	in[13] = vec_sub(kZero, s[13]);
+-	in[14] = s[9];
+-	in[15] = vec_sub(kZero, s[1]);
++	vector signed short k__const_0 = vec_splat_s16(0);
++	vi8 s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15;
++	vi8 x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
++
++	// tran_high_t x0 = input[15]; x1 = input[0]; x2 = input[13]; x3 = input[2];
++	// x4 = input[11]; x5 = input[4]; x6 = input[9]; x7 = input[6];
++	// x8 = input[7]; x9 = input[8]; x10 = input[5]; x11 = input[10];
++	// x12 = input[3]; x13 = input[12]; x14 = input[1]; x15 = input[14];
++	// (in[] here is the "input" array indexed the same way the reference
++	// indexes input[]; no permutation needed beyond picking the right in[N]
++	// below, matching the original code's u[]-merge input pairing.)
++
++	// Stage 1. Inputs are genuine tran_low_t-range values straight from the
++	// caller, so these multiplies use the narrow (int16 operand) widening
++	// multiply.
++	// s0 = x0 * cospi_1_64 + x1 * cospi_31_64;
++	s0 = vi8_add(vi8_mul_narrow(in[15], cospi_1_64), vi8_mul_narrow(in[0], cospi_31_64));
++	// s1 = x0 * cospi_31_64 - x1 * cospi_1_64;
++	s1 = vi8_sub(vi8_mul_narrow(in[15], cospi_31_64), vi8_mul_narrow(in[0], cospi_1_64));
++	// s2 = x2 * cospi_5_64 + x3 * cospi_27_64;
++	s2 = vi8_add(vi8_mul_narrow(in[13], cospi_5_64), vi8_mul_narrow(in[2], cospi_27_64));
++	// s3 = x2 * cospi_27_64 - x3 * cospi_5_64;
++	s3 = vi8_sub(vi8_mul_narrow(in[13], cospi_27_64), vi8_mul_narrow(in[2], cospi_5_64));
++	// s4 = x4 * cospi_9_64 + x5 * cospi_23_64;
++	s4 = vi8_add(vi8_mul_narrow(in[11], cospi_9_64), vi8_mul_narrow(in[4], cospi_23_64));
++	// s5 = x4 * cospi_23_64 - x5 * cospi_9_64;
++	s5 = vi8_sub(vi8_mul_narrow(in[11], cospi_23_64), vi8_mul_narrow(in[4], cospi_9_64));
++	// s6 = x6 * cospi_13_64 + x7 * cospi_19_64;
++	s6 = vi8_add(vi8_mul_narrow(in[9], cospi_13_64), vi8_mul_narrow(in[6], cospi_19_64));
++	// s7 = x6 * cospi_19_64 - x7 * cospi_13_64;
++	s7 = vi8_sub(vi8_mul_narrow(in[9], cospi_19_64), vi8_mul_narrow(in[6], cospi_13_64));
++	// s8 = x8 * cospi_17_64 + x9 * cospi_15_64;
++	s8 = vi8_add(vi8_mul_narrow(in[7], cospi_17_64), vi8_mul_narrow(in[8], cospi_15_64));
++	// s9 = x8 * cospi_15_64 - x9 * cospi_17_64;
++	s9 = vi8_sub(vi8_mul_narrow(in[7], cospi_15_64), vi8_mul_narrow(in[8], cospi_17_64));
++	// s10 = x10 * cospi_21_64 + x11 * cospi_11_64;
++	s10 = vi8_add(vi8_mul_narrow(in[5], cospi_21_64), vi8_mul_narrow(in[10], cospi_11_64));
++	// s11 = x10 * cospi_11_64 - x11 * cospi_21_64;
++	s11 = vi8_sub(vi8_mul_narrow(in[5], cospi_11_64), vi8_mul_narrow(in[10], cospi_21_64));
++	// s12 = x12 * cospi_25_64 + x13 * cospi_7_64;
++	s12 = vi8_add(vi8_mul_narrow(in[3], cospi_25_64), vi8_mul_narrow(in[12], cospi_7_64));
++	// s13 = x12 * cospi_7_64 - x13 * cospi_25_64;
++	s13 = vi8_sub(vi8_mul_narrow(in[3], cospi_7_64), vi8_mul_narrow(in[12], cospi_25_64));
++	// s14 = x14 * cospi_29_64 + x15 * cospi_3_64;
++	s14 = vi8_add(vi8_mul_narrow(in[1], cospi_29_64), vi8_mul_narrow(in[14], cospi_3_64));
++	// s15 = x14 * cospi_3_64 - x15 * cospi_29_64;
++	s15 = vi8_sub(vi8_mul_narrow(in[1], cospi_3_64), vi8_mul_narrow(in[14], cospi_29_64));
++
++	// x0 = RS(s0+s8); ... x7 = RS(s7+s15); x8 = RS(s0-s8); ... x15 = RS(s7-s15);
++	x0 = vi8_round_shift(vi8_add(s0, s8));
++	x1 = vi8_round_shift(vi8_add(s1, s9));
++	x2 = vi8_round_shift(vi8_add(s2, s10));
++	x3 = vi8_round_shift(vi8_add(s3, s11));
++	x4 = vi8_round_shift(vi8_add(s4, s12));
++	x5 = vi8_round_shift(vi8_add(s5, s13));
++	x6 = vi8_round_shift(vi8_add(s6, s14));
++	x7 = vi8_round_shift(vi8_add(s7, s15));
++	x8 = vi8_round_shift(vi8_sub(s0, s8));
++	x9 = vi8_round_shift(vi8_sub(s1, s9));
++	x10 = vi8_round_shift(vi8_sub(s2, s10));
++	x11 = vi8_round_shift(vi8_sub(s3, s11));
++	x12 = vi8_round_shift(vi8_sub(s4, s12));
++	x13 = vi8_round_shift(vi8_sub(s5, s13));
++	x14 = vi8_round_shift(vi8_sub(s6, s14));
++	x15 = vi8_round_shift(vi8_sub(s7, s15));
++
++	// Stage 2. x0..x7 are wide pass-through; x8..x15 feed wide-by-cospi
++	// multiplies (x8..x15 are stage-1's round-shifted outputs, which can
++	// already exceed int16 range -- must use vi8_mul_wide, not narrow).
++	s0 = x0; s1 = x1; s2 = x2; s3 = x3; s4 = x4; s5 = x5; s6 = x6; s7 = x7;
++	// s8 = x8 * cospi_4_64 + x9 * cospi_28_64;
++	s8 = vi8_add(vi8_mul_wide(x8, cospi_4_64), vi8_mul_wide(x9, cospi_28_64));
++	// s9 = x8 * cospi_28_64 - x9 * cospi_4_64;
++	s9 = vi8_sub(vi8_mul_wide(x8, cospi_28_64), vi8_mul_wide(x9, cospi_4_64));
++	// s10 = x10 * cospi_20_64 + x11 * cospi_12_64;
++	s10 = vi8_add(vi8_mul_wide(x10, cospi_20_64), vi8_mul_wide(x11, cospi_12_64));
++	// s11 = x10 * cospi_12_64 - x11 * cospi_20_64;
++	s11 = vi8_sub(vi8_mul_wide(x10, cospi_12_64), vi8_mul_wide(x11, cospi_20_64));
++	// s12 = -x12 * cospi_28_64 + x13 * cospi_4_64;
++	s12 = vi8_add(vi8_mul_wide(x12, (int16_t)(-cospi_28_64)), vi8_mul_wide(x13, cospi_4_64));
++	// s13 = x12 * cospi_4_64 + x13 * cospi_28_64;
++	s13 = vi8_add(vi8_mul_wide(x12, cospi_4_64), vi8_mul_wide(x13, cospi_28_64));
++	// s14 = -x14 * cospi_12_64 + x15 * cospi_20_64;
++	s14 = vi8_add(vi8_mul_wide(x14, (int16_t)(-cospi_12_64)), vi8_mul_wide(x15, cospi_20_64));
++	// s15 = x14 * cospi_20_64 + x15 * cospi_12_64;
++	s15 = vi8_add(vi8_mul_wide(x14, cospi_20_64), vi8_mul_wide(x15, cospi_12_64));
++
++	// x0 = s0+s4; x1 = s1+s5; x2 = s2+s6; x3 = s3+s7; (no round-shift, wide)
++	// x4 = s0-s4; x5 = s1-s5; x6 = s2-s6; x7 = s3-s7;
++	x0 = vi8_add(s0, s4);
++	x1 = vi8_add(s1, s5);
++	x2 = vi8_add(s2, s6);
++	x3 = vi8_add(s3, s7);
++	x4 = vi8_sub(s0, s4);
++	x5 = vi8_sub(s1, s5);
++	x6 = vi8_sub(s2, s6);
++	x7 = vi8_sub(s3, s7);
++	// x8 = RS(s8+s12); x9 = RS(s9+s13); x10 = RS(s10+s14); x11 = RS(s11+s15);
++	// x12 = RS(s8-s12); x13 = RS(s9-s13); x14 = RS(s10-s14); x15 = RS(s11-s15);
++	x8 = vi8_round_shift(vi8_add(s8, s12));
++	x9 = vi8_round_shift(vi8_add(s9, s13));
++	x10 = vi8_round_shift(vi8_add(s10, s14));
++	x11 = vi8_round_shift(vi8_add(s11, s15));
++	x12 = vi8_round_shift(vi8_sub(s8, s12));
++	x13 = vi8_round_shift(vi8_sub(s9, s13));
++	x14 = vi8_round_shift(vi8_sub(s10, s14));
++	x15 = vi8_round_shift(vi8_sub(s11, s15));
++
++	// Stage 3. s0..s3 pass through wide; s4..s7/s12..s15 are wide-by-cospi
++	// multiplies of stage-2 outputs (already possibly out of int16 range);
++	// s8..s11 pass through wide.
++	s0 = x0; s1 = x1; s2 = x2; s3 = x3;
++	// s4 = x4 * cospi_8_64 + x5 * cospi_24_64;
++	s4 = vi8_add(vi8_mul_wide(x4, cospi_8_64), vi8_mul_wide(x5, cospi_24_64));
++	// s5 = x4 * cospi_24_64 - x5 * cospi_8_64;
++	s5 = vi8_sub(vi8_mul_wide(x4, cospi_24_64), vi8_mul_wide(x5, cospi_8_64));
++	// s6 = -x6 * cospi_24_64 + x7 * cospi_8_64;
++	s6 = vi8_add(vi8_mul_wide(x6, (int16_t)(-cospi_24_64)), vi8_mul_wide(x7, cospi_8_64));
++	// s7 = x6 * cospi_8_64 + x7 * cospi_24_64;
++	s7 = vi8_add(vi8_mul_wide(x6, cospi_8_64), vi8_mul_wide(x7, cospi_24_64));
++	s8 = x8; s9 = x9; s10 = x10; s11 = x11;
++	// s12 = x12 * cospi_8_64 + x13 * cospi_24_64;
++	s12 = vi8_add(vi8_mul_wide(x12, cospi_8_64), vi8_mul_wide(x13, cospi_24_64));
++	// s13 = x12 * cospi_24_64 - x13 * cospi_8_64;
++	s13 = vi8_sub(vi8_mul_wide(x12, cospi_24_64), vi8_mul_wide(x13, cospi_8_64));
++	// s14 = -x14 * cospi_24_64 + x15 * cospi_8_64;
++	s14 = vi8_add(vi8_mul_wide(x14, (int16_t)(-cospi_24_64)), vi8_mul_wide(x15, cospi_8_64));
++	// s15 = x14 * cospi_8_64 + x15 * cospi_24_64;
++	s15 = vi8_add(vi8_mul_wide(x14, cospi_8_64), vi8_mul_wide(x15, cospi_24_64));
++
++	// x0 = s0+s2; x1 = s1+s3; x2 = s0-s2; x3 = s1-s3; (wide, no round-shift)
++	x0 = vi8_add(s0, s2);
++	x1 = vi8_add(s1, s3);
++	x2 = vi8_sub(s0, s2);
++	x3 = vi8_sub(s1, s3);
++	// x4 = RS(s4+s6); x5 = RS(s5+s7); x6 = RS(s4-s6); x7 = RS(s5-s7);
++	x4 = vi8_round_shift(vi8_add(s4, s6));
++	x5 = vi8_round_shift(vi8_add(s5, s7));
++	x6 = vi8_round_shift(vi8_sub(s4, s6));
++	x7 = vi8_round_shift(vi8_sub(s5, s7));
++	// x8 = s8+s10; x9 = s9+s11; x10 = s8-s10; x11 = s9-s11; (wide)
++	x8 = vi8_add(s8, s10);
++	x9 = vi8_add(s9, s11);
++	x10 = vi8_sub(s8, s10);
++	x11 = vi8_sub(s9, s11);
++	// x12 = RS(s12+s14); x13 = RS(s13+s15); x14 = RS(s12-s14); x15 = RS(s13-s15);
++	x12 = vi8_round_shift(vi8_add(s12, s14));
++	x13 = vi8_round_shift(vi8_add(s13, s15));
++	x14 = vi8_round_shift(vi8_sub(s12, s14));
++	x15 = vi8_round_shift(vi8_sub(s13, s15));
++
++	// Stage 4. Every combine here (x2+x3 etc.) and every multiply by
++	// cospi_16_64 must be wide -- this is the stage that, in iadst8_c,
++	// was shown to reach ~2.7e9 in magnitude for adversarial inputs; the
++	// same shape of expression appears 4 times here (x2/x3, x6/x7,
++	// x10/x11, x14/x15), so all 4 must go through vi8_mul_wide.
++	// s2 = -cospi_16_64 * (x2 + x3); s3 = cospi_16_64 * (x2 - x3);
++	s2 = vi8_mul_wide(vi8_add(x2, x3), (int16_t)(-cospi_16_64));
++	s3 = vi8_mul_wide(vi8_sub(x2, x3), cospi_16_64);
++	// s6 = cospi_16_64 * (x6 + x7); s7 = cospi_16_64 * (-x6 + x7);
++	s6 = vi8_mul_wide(vi8_add(x6, x7), cospi_16_64);
++	s7 = vi8_mul_wide(vi8_sub(x7, x6), cospi_16_64);
++	// s10 = cospi_16_64 * (x10 + x11); s11 = cospi_16_64 * (-x10 + x11);
++	s10 = vi8_mul_wide(vi8_add(x10, x11), cospi_16_64);
++	s11 = vi8_mul_wide(vi8_sub(x11, x10), cospi_16_64);
++	// s14 = -cospi_16_64 * (x14 + x15); s15 = cospi_16_64 * (x14 - x15);
++	s14 = vi8_mul_wide(vi8_add(x14, x15), (int16_t)(-cospi_16_64));
++	s15 = vi8_mul_wide(vi8_sub(x14, x15), cospi_16_64);
++
++	// x2 = RS(s2); x3 = RS(s3); x6 = RS(s6); x7 = RS(s7);
++	// x10 = RS(s10); x11 = RS(s11); x14 = RS(s14); x15 = RS(s15);
++	x2 = vi8_round_shift(s2);
++	x3 = vi8_round_shift(s3);
++	x6 = vi8_round_shift(s6);
++	x7 = vi8_round_shift(s7);
++	x10 = vi8_round_shift(s10);
++	x11 = vi8_round_shift(s11);
++	x14 = vi8_round_shift(s14);
++	x15 = vi8_round_shift(s15);
++
++	// output[0]=x0; output[1]=-x8; output[2]=x12; output[3]=-x4;
++	// output[4]=x6; output[5]=x14; output[6]=x10; output[7]=x2;
++	// output[8]=x3; output[9]=x11; output[10]=x15; output[11]=x7;
++	// output[12]=x5; output[13]=-x13; output[14]=x9; output[15]=-x1;
++	// Narrow to int16 only now (matches output[] being tran_low_t).
++	in[0]  = vi8_pack(x0);
++	in[1]  = vec_sub(k__const_0, vi8_pack(x8));
++	in[2]  = vi8_pack(x12);
++	in[3]  = vec_sub(k__const_0, vi8_pack(x4));
++	in[4]  = vi8_pack(x6);
++	in[5]  = vi8_pack(x14);
++	in[6]  = vi8_pack(x10);
++	in[7]  = vi8_pack(x2);
++	in[8]  = vi8_pack(x3);
++	in[9]  = vi8_pack(x11);
++	in[10] = vi8_pack(x15);
++	in[11] = vi8_pack(x7);
++	in[12] = vi8_pack(x5);
++	in[13] = vec_sub(k__const_0, vi8_pack(x13));
++	in[14] = vi8_pack(x9);
++	in[15] = vec_sub(k__const_0, vi8_pack(x1));
+ }
+ 
+ // Second tarpit: 16x16 IDCT, same eight columns.
+-- 
+2.43.0
+

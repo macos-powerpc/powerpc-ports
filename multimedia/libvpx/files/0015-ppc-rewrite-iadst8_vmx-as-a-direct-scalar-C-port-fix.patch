@@ -1,0 +1,473 @@
+From 54009dd851e875f0454ed4307a89027d95de23dc Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Wed, 15 Jul 2026 10:52:24 +0000
+Subject: [PATCH 15/17] ppc: rewrite iadst8_vmx as a direct scalar-C port,
+ fixing wrong output
+
+Same bug class as the iadst4_vmx rewrite (6cd3a5439), but broader: this
+build has WRAPLOW() as a genuine no-op (no CONFIG_EMULATE_HARDWARE, no
+CONFIG_COEFFICIENT_RANGE_CHECKING -- see vpx_dsp/inv_txfm.h), and
+iadst8_c (vpx_dsp/inv_txfm.c) keeps its entire working set (x0..x7,
+s0..s7) in tran_high_t (32-bit int) for the whole function body --
+x0..x7 are declared once at the top and are NEVER narrowed to a 16-bit
+type until output[] is written at the very end.
+
+The original iadst8_vmx assumed stage-1's round-shifted x0..x7 were
+individually int16-representable (a reasonable-looking but false
+assumption -- dct_const_round_shift() rounds and shifts but does not
+clamp) and repacked them to vector signed short between every stage,
+then did stage-2's s0+s2/s1+s3/etc combine in 16-bit vector arithmetic.
+Brute-force bounds-checking every corner of the int16 input hypercube
+shows this is wrong at multiple points, not just one:
+  - stage 1's round-shifted x0..x7 can reach magnitude ~85000 (already
+    outside int16 range)
+  - stage 2's un-shifted x0..x3 combine (s0+s2 etc.) can reach ~167000
+  - stage 3's cospi_16_64*(x2+x3) can reach ~2.7e9 in magnitude, which
+    is what the plain-C reference itself computes into a 32-bit `int`
+    (i.e. the reference also only survives this via 32-bit wraparound,
+    same as plain C signed-overflow-wraps-in-practice behavior)
+
+So every stage needs 32-bit (or wraparound-at-32-bit) headroom, not
+just the stage-2 spot originally suspected. Rewrote the whole function
+as a direct, line-for-line port of iadst8_c, carrying x0..x7 as a
+genuinely wide value (vi8: a lo/hi pair of vector signed int covering
+all 8 lanes) through stages 1-3 exactly like the reference's tran_high_t
+x0..x7, only narrowing to vector signed short at the very end for
+output. Since this CPU (7400/G4, no VSX) has no 32x32 vector multiply,
+wide-by-constant multiplies (stage 2/3, where an already-wide value must
+be multiplied by a cospi constant) decompose each 32-bit lane into a
+sign-extended low16 and a corresponding high16 (both provably int16-safe
+for any int32 input), multiply each half against the 16-bit constant via
+the existing wide_mul16 (vec_mule/vec_mulo widening multiply) helper,
+and recombine -- verified bit-exact against plain int32 multiplication,
+including wraparound at the int32 boundary, across 500000 randomized and
+boundary-value test cases before use here.
+
+Verified against the QEMU/AltiVec cross-check harness (full 23000-check
+run, all sizes/tx_types): vp9_iht8x8_64_add tx_type=1/2/3 (ADST_DCT,
+DCT_ADST, ADST_ADST -- all three exercise iadst8_vmx) dropped from
+499/500 failures to 8-10/500, both unaligned and 4-byte-aligned stride
+variants -- matching tx_type=0's (pure DCT, untouched by this change)
+existing 5-9/500 baseline, which is the separately-tracked single-pixel
+saturation-boundary rounding edge case in the shared pixel-reconstruction
+path (not in iadst8_vmx). No other test in the full harness run changed
+from its pre-existing baseline count.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ vpx_dsp/ppc/vpx_idct_altivec.c | 386 +++++++++++++++------------------
+ 1 file changed, 173 insertions(+), 213 deletions(-)
+
+diff --git a/vpx_dsp/ppc/vpx_idct_altivec.c b/vpx_dsp/ppc/vpx_idct_altivec.c
+index 4b5690246..0818ae460 100644
+--- a/vpx_dsp/ppc/vpx_idct_altivec.c
++++ b/vpx_dsp/ppc/vpx_idct_altivec.c
+@@ -957,36 +957,103 @@ static void idct8_vmx(vector signed short *in) {
+ 			in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
+ }
+ 
++// ---- Helpers for a genuinely wide (32-bit-per-lane, 8 lanes split as a
++// lo/hi pair of vector signed int) intermediate value, needed below. ----
++//
++// iadst8_c (vpx_dsp/inv_txfm.c) keeps its whole working set (x0..x7, s0..s7)
++// in tran_high_t (== plain 32-bit int in this non-highbitdepth build) for
++// the ENTIRE function body -- x0..x7 are declared "tran_high_t x0 = ...;"
++// once at the top and never narrowed to a 16-bit type until output[] is
++// written. WRAPLOW() is a genuine no-op here (no CONFIG_EMULATE_HARDWARE,
++// see vpx_dsp/inv_txfm.h), so it does NOT truncate anything either. This
++// matters concretely: brute-force bounds-checking every corner of the
++// int16 input hypercube shows stage-1's round-shifted x0..x7 can reach
++// magnitude ~85000 (already outside int16!), stage-2's un-shifted x0..x3
++// combine can reach ~167000, and stage-3's cospi_16*(x2+x3) can reach
++// ~2.7e9 -- i.e. every stage genuinely needs 32-bit-or-wider headroom, not
++// just the one spot originally suspected. So this rewrite carries an
++// "8-lane 32-bit value" (vi8: a lo/hi pair of vector signed int, lo = lanes
++// 0-3, hi = lanes 4-7, matching this file's existing wide_mul16 convention)
++// through all three stages, exactly like the scalar reference's tran_high_t
++// x0..x7, and only narrows to vector signed short at the very end when
++// writing to output (matching output[] being tran_low_t).
++typedef struct { vector signed int lo, hi; } vi8;
++
++static inline vi8 vi8_add(vi8 a, vi8 b) {
++	vi8 r; r.lo = vec_add(a.lo, b.lo); r.hi = vec_add(a.hi, b.hi); return r;
++}
++static inline vi8 vi8_sub(vi8 a, vi8 b) {
++	vi8 r; r.lo = vec_sub(a.lo, b.lo); r.hi = vec_sub(a.hi, b.hi); return r;
++}
++// dct_const_round_shift(v), applied per-lane to a wide vi8.
++static inline vi8 vi8_round_shift(vi8 a) {
++	vi8 r;
++	r.lo = vec_sra(vec_add(a.lo, dct_rounding_vec), dct_bitshift_vec);
++	r.hi = vec_sra(vec_add(a.hi, dct_rounding_vec), dct_bitshift_vec);
++	return r;
++}
++// Widen a narrow (genuinely int16-range) vector signed short into a vi8
++// via a real signed 16x16->32 multiply against a scalar int16 constant c
++// (used for stage 1, where the reference's x-inputs are still tran_low_t-
++// range values straight from the caller). lo = lanes 0-3, hi = lanes 4-7.
++static inline vi8 vi8_mul_narrow(vector signed short a, int16_t c) {
++	vi8 r;
++	vector signed short cvec = (vector signed short){ c,c,c,c,c,c,c,c };
++	wide_mul16(a, cvec, &r.lo, &r.hi);
++	return r;
++}
++// Multiply an already-WIDE vi8 by a scalar int16 constant c, producing the
++// exact 32-bit-wraparound result per lane (matches plain 32-bit `int`
++// multiply overflow behavior, which is what the C reference's stage
++// 2/3 "s4 = cospi_8_64*x4 + ..." and "s2 = cospi_16_64*(x2+x3)" do -- and
++// per the bounds above, stage 3's product can genuinely overflow int32 for
++// adversarial inputs, same as the plain-C reference). There's no 32x32
++// vector multiply on this CPU (no VSX), so decompose each 32-bit lane v as
++// v = (v_hi << 16) + v_lo, where v_lo is the SIGN-EXTENDED low 16 bits
++// (fits int16 exactly, via a truncating vec_pack) and v_hi = (v - v_lo)>>16
++// (exact, and also always fits int16 for any int32 v). Then
++// v*c = (v_hi*c)<<16 + v_lo*c, both genuine signed 16x16->32 multiplies,
++// recombined with 32-bit wraparound add/shift -- verified bit-exact against
++// plain int32 `*` (including wraparound at the int32 boundary) for 500000
++// randomized/boundary cases before use here.
++static inline vector signed int vi4_mul32_by_const16(vector signed int a, int16_t c) {
++	vector signed short a_lo_s = vec_pack(a, a);          // truncating pack: sign-extended low 16 bits, duplicated
++	vector signed int a_lo_i = vec_unpackh(a_lo_s);        // back to 32-bit, lanes 0-3 = low-mem lanes (this ABI)
++	vector signed int a_hi = vec_sra(vec_sub(a, a_lo_i),
++	                                  ((vector unsigned int){ 16,16,16,16 }));
++	vector signed short a_hi_s = vec_pack(a_hi, a_hi);     // always fits int16, by construction above
++	vector signed short cvec = (vector signed short){ c,c,c,c,c,c,c,c };
++	vector signed int lo_lo, lo_hi, hi_lo, hi_hi;
++	wide_mul16(a_lo_s, cvec, &lo_lo, &lo_hi);
++	wide_mul16(a_hi_s, cvec, &hi_lo, &hi_hi);
++	return vec_add(vec_sl(hi_lo, ((vector unsigned int){ 16,16,16,16 })), lo_lo);
++}
++static inline vi8 vi8_mul_wide(vi8 a, int16_t c) {
++	vi8 r; r.lo = vi4_mul32_by_const16(a.lo, c); r.hi = vi4_mul32_by_const16(a.hi, c); return r;
++}
++// Narrow a vi8 to vector signed short (truncating, matching WRAPLOW's
++// no-op-but-eventually-stored-into-tran_low_t semantics at output time).
++static inline vector signed short vi8_pack(vi8 a) {
++	return vec_pack(a.lo, a.hi);
++}
++
++// Direct, line-for-line port of iadst8_c's x0..x7/s0..s7 algebra
++// (vpx_dsp/inv_txfm.c), vectorized across the 8 rows/columns processed in
++// parallel (one AltiVec vector op = 8 scalar column values, one lane per
++// column, matching idct8_vmx/IDCT8's calling convention). See the vi8
++// comment block above for why every stage must stay in wide (32-bit)
++// arithmetic, not just the stage-2 combine that was originally suspected.
+ static void iadst8_vmx(vector signed short *in) {
+-	vector signed short k__cospi_p02_p30 = short_pair_a(cospi_2_64, cospi_30_64);
+-	vector signed short k__cospi_p30_m02 = short_pair_a(cospi_30_64, -cospi_2_64);
+-	vector signed short k__cospi_p10_p22 = short_pair_a(cospi_10_64, cospi_22_64);
+-	vector signed short k__cospi_p22_m10 = short_pair_a(cospi_22_64, -cospi_10_64);
+-	vector signed short k__cospi_p18_p14 = short_pair_a(cospi_18_64, cospi_14_64);
+-	vector signed short k__cospi_p14_m18 = short_pair_a(cospi_14_64, -cospi_18_64);
+-	vector signed short k__cospi_p26_p06 = short_pair_a(cospi_26_64, cospi_6_64);
+-	vector signed short k__cospi_p06_m26 = short_pair_a(cospi_6_64, -cospi_26_64);
+-	vector signed short k__cospi_p08_p24 = short_pair_a(cospi_8_64, cospi_24_64);
+-	vector signed short k__cospi_p24_m08 = short_pair_a(cospi_24_64, -cospi_8_64);
+-	vector signed short k__cospi_m24_p08 = short_pair_a(-cospi_24_64, cospi_8_64);
+-	vector signed short k__cospi_p16_m16 = short_pair_a(cospi_16_64, -cospi_16_64);
+-	signed short a_s = (int16_t)cospi_16_64;
+-	vector signed short k__cospi_p16_p16;
+ 	vector signed short k__const_0 = vec_splat_s16(0);
+-	vector signed int zero_i = vec_splat_s32(0);
+-	vector signed int u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14, u15;
+-	vector signed int v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15;
+-	vector signed int w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
+-	vector signed short s0, s1, s2, s3, s4, s5, s6, s7;
+ 	vector signed short in0, in1, in2, in3, in4, in5, in6, in7;
+-	
+-	k__cospi_p16_p16 = ss_splat(&a_s);
++	vi8 s0, s1, s2, s3, s4, s5, s6, s7;
++	vi8 x0, x1, x2, x3, x4, x5, x6, x7;
++
+ 	TRANSPOSE_8X8(in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7],
+ 		in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
+ 
+-	// Align for butterfly input.
+-	// I don't understand why the Intel version does it this way,
+-	// but I'll do it the same way for consistency.
++	// Align for butterfly input: x0=input[7], x1=input[0], x2=input[5],
++	// x3=input[2], x4=input[3], x5=input[4], x6=input[1], x7=input[6].
+ 	in0 = in[7];
+ 	in1 = in[0];
+ 	in2 = in[5];
+@@ -996,195 +1063,88 @@ static void iadst8_vmx(vector signed short *in) {
+ 	in6 = in[1];
+ 	in7 = in[6];
+ 
+-	// Stage 1
+-	s0 = vec_mergeh(in0, in1);
+-	s1 = vec_mergel(in0, in1);
+-	s2 = vec_mergeh(in2, in3);
+-	s3 = vec_mergel(in2, in3);
+-	s4 = vec_mergeh(in4, in5);
+-	s5 = vec_mergel(in4, in5);
+-	s6 = vec_mergeh(in6, in7);
+-	s7 = vec_mergel(in6, in7);
+-
+-	// We can't take advantage of the third vec_msum
+-	// argument here since the vectors have to be computed
+-	// anyway for the differences and sums. But we can
+-	// hoist up the simpler arithmetic to keep both the
+-	// VSIU and VCIU busy.
+-	u0  = vec_msum(s0, k__cospi_p02_p30, zero_i);
+-	u8  = vec_msum(s4, k__cospi_p18_p14, zero_i);
+-	u1  = vec_msum(s1, k__cospi_p02_p30, zero_i);
+-	w0  = vec_add(u0, u8);
+-	w8  = vec_sub(u0, u8);
+-	u9  = vec_msum(s5, k__cospi_p18_p14, zero_i);
+-	u2  = vec_msum(s0, k__cospi_p30_m02, zero_i);
+-	w1  = vec_add(u1, u9);
+-	w9  = vec_sub(u1, u9);
+-	u10 = vec_msum(s4, k__cospi_p14_m18, zero_i);
+-	u3  = vec_msum(s1, k__cospi_p30_m02, zero_i);
+-	w2  = vec_add(u2, u10);
+-	w10 = vec_sub(u2, u10);
+-	u11 = vec_msum(s5, k__cospi_p14_m18, zero_i);
+-	u4  = vec_msum(s2, k__cospi_p10_p22, zero_i);
+-	w3  = vec_add(u3, u11);
+-	w11 = vec_sub(u3, u11);
+-	u12 = vec_msum(s6, k__cospi_p26_p06, zero_i);
+-	u5  = vec_msum(s3, k__cospi_p10_p22, zero_i);
+-	w4  = vec_add(u4, u12);
+-	w12 = vec_sub(u4, u12);
+-	u13 = vec_msum(s7, k__cospi_p26_p06, zero_i);
+-	u6  = vec_msum(s2, k__cospi_p22_m10, zero_i);
+-	w5  = vec_add(u5, u13);
+-	w13 = vec_sub(u5, u13);
+-	u14 = vec_msum(s6, k__cospi_p06_m26, zero_i);
+-	u7  = vec_msum(s3, k__cospi_p22_m10, zero_i);
+-	w6  = vec_add(u6, u14);
+-	w14 = vec_sub(u6, u14);
+-	u15 = vec_msum(s7, k__cospi_p06_m26, zero_i);
+-	w7  = vec_add(u7, u15);
+-	w15 = vec_sub(u7, u15);
+-
+-	v0  = vec_add(w0,  dct_rounding_vec);
+-	v1  = vec_add(w1,  dct_rounding_vec);
+-	v2  = vec_add(w2,  dct_rounding_vec);
+-	v3  = vec_add(w3,  dct_rounding_vec);
+-	v4  = vec_add(w4,  dct_rounding_vec);
+-	v5  = vec_add(w5,  dct_rounding_vec);
+-	v6  = vec_add(w6,  dct_rounding_vec);
+-	v7  = vec_add(w7,  dct_rounding_vec);
+-	v8  = vec_add(w8,  dct_rounding_vec);
+-	v9  = vec_add(w9,  dct_rounding_vec);
+-	v10 = vec_add(w10, dct_rounding_vec);
+-	v11 = vec_add(w11, dct_rounding_vec);
+-	v12 = vec_add(w12, dct_rounding_vec);
+-	v13 = vec_add(w13, dct_rounding_vec);
+-	v14 = vec_add(w14, dct_rounding_vec);
+-	v15 = vec_add(w15, dct_rounding_vec);
+-
+-	u0  = vec_sra(v0,  dct_bitshift_vec);
+-	u1  = vec_sra(v1,  dct_bitshift_vec);
+-	u2  = vec_sra(v2,  dct_bitshift_vec);
+-	u3  = vec_sra(v3,  dct_bitshift_vec);
+-	u4  = vec_sra(v4,  dct_bitshift_vec);
+-	u5  = vec_sra(v5,  dct_bitshift_vec);
+-	u6  = vec_sra(v6,  dct_bitshift_vec);
+-	u7  = vec_sra(v7,  dct_bitshift_vec);
+-	u8  = vec_sra(v8,  dct_bitshift_vec);
+-	u9  = vec_sra(v9,  dct_bitshift_vec);
+-	u10 = vec_sra(v10, dct_bitshift_vec);
+-	u11 = vec_sra(v11, dct_bitshift_vec);
+-	u12 = vec_sra(v12, dct_bitshift_vec);
+-	u13 = vec_sra(v13, dct_bitshift_vec);
+-	u14 = vec_sra(v14, dct_bitshift_vec);
+-	u15 = vec_sra(v15, dct_bitshift_vec);
+-
+-	// Repack to 16 bits for stage 2.
+-	in[0] = vec_pack(u0,  u1);
+-	in[1] = vec_pack(u2,  u3);
+-	in[2] = vec_pack(u4,  u5);
+-	in[3] = vec_pack(u6,  u7);
+-	in[4] = vec_pack(u8,  u9);
+-	in[5] = vec_pack(u10, u11);
+-	in[6] = vec_pack(u12, u13);
+-	in[7] = vec_pack(u14, u15);
+-
+-	// Stage 2.
+-	// Interleave the VPERM intrinsics with the VSIUs.
+-	s0 = vec_add(in[0], in[2]);
+-	s4 = vec_mergeh(in[4], in[5]);
+-	s1 = vec_add(in[1], in[3]);
+-	s5 = vec_mergel(in[4], in[5]);
+-	s2 = vec_sub(in[0], in[2]);
+-	s6 = vec_mergeh(in[6], in[7]);
+-	s3 = vec_sub(in[1], in[3]);
+-	s7 = vec_mergel(in[6], in[7]);
+-	// s0, s1, s2 and s3 are used in the result, so
+-	// we can't clobber them in the repack.
+-
+-	// Same problem as above, so we interleave here too.
+-	v0 = vec_msum(s4, k__cospi_p08_p24, zero_i);
+-	v4 = vec_msum(s6, k__cospi_m24_p08, zero_i);
+-	v1 = vec_msum(s5, k__cospi_p08_p24, zero_i);
+-	w0 = vec_add(v0, v4);
+-	w4 = vec_sub(v0, v4);
+-	v5 = vec_msum(s7, k__cospi_m24_p08, zero_i);
+-	v2 = vec_msum(s4, k__cospi_p24_m08, zero_i);
+-	w1 = vec_add(v1, v5);
+-	w5 = vec_sub(v1, v5);
+-	v6 = vec_msum(s6, k__cospi_p08_p24, zero_i);
+-	v3 = vec_msum(s5, k__cospi_p24_m08, zero_i);
+-	w2 = vec_add(v2, v6);
+-	w6 = vec_sub(v2, v6);
+-	v7 = vec_msum(s7, k__cospi_p08_p24, zero_i);
+-	w3 = vec_add(v3, v7);
+-	w7 = vec_sub(v3, v7);
+-
+-	v0 = vec_add(w0, dct_rounding_vec);
+-	v1 = vec_add(w1, dct_rounding_vec);
+-	v2 = vec_add(w2, dct_rounding_vec);
+-	v3 = vec_add(w3, dct_rounding_vec);
+-	v4 = vec_add(w4, dct_rounding_vec);
+-	v5 = vec_add(w5, dct_rounding_vec);
+-	v6 = vec_add(w6, dct_rounding_vec);
+-	v7 = vec_add(w7, dct_rounding_vec);
+-
+-	u0 = vec_sra(v0, dct_bitshift_vec);
+-	u1 = vec_sra(v1, dct_bitshift_vec);
+-	u2 = vec_sra(v2, dct_bitshift_vec);
+-	u3 = vec_sra(v3, dct_bitshift_vec);
+-	u4 = vec_sra(v4, dct_bitshift_vec);
+-	u5 = vec_sra(v5, dct_bitshift_vec);
+-	u6 = vec_sra(v6, dct_bitshift_vec);
+-	u7 = vec_sra(v7, dct_bitshift_vec);
+-
+-	// Repack for stage 3.
+-	s4 = vec_pack(u0, u1);
+-	s5 = vec_pack(u2, u3);
+-	s6 = vec_pack(u4, u5);
+-	s7 = vec_pack(u6, u7);
+-	// s4 and s5 are also used in the result, so we
+-	// can't clobber them either.
+-	
+-	// Stage 3.
+-	// Since we're running out of shorts, reuse inx.
+-	in0 = vec_mergeh(s2, s3);
+-	in1 = vec_mergel(s2, s3);
+-	in2 = vec_mergeh(s6, s7);
+-	in3 = vec_mergel(s6, s7);
+-	
+-	// At last we can use vec_msum as intended!
+-	v0 = vec_msum(in0, k__cospi_p16_p16, dct_rounding_vec);
+-	v1 = vec_msum(in1, k__cospi_p16_p16, dct_rounding_vec);
+-	v2 = vec_msum(in0, k__cospi_p16_m16, dct_rounding_vec);
+-	v3 = vec_msum(in1, k__cospi_p16_m16, dct_rounding_vec);
+-	v4 = vec_msum(in2, k__cospi_p16_p16, dct_rounding_vec);
+-	v5 = vec_msum(in3, k__cospi_p16_p16, dct_rounding_vec);
+-	v6 = vec_msum(in2, k__cospi_p16_m16, dct_rounding_vec);
+-	v7 = vec_msum(in3, k__cospi_p16_m16, dct_rounding_vec);
+-
+-	u0 = vec_sra(v0, dct_bitshift_vec);
+-	u1 = vec_sra(v1, dct_bitshift_vec);
+-	u2 = vec_sra(v2, dct_bitshift_vec);
+-	u3 = vec_sra(v3, dct_bitshift_vec);
+-	u4 = vec_sra(v4, dct_bitshift_vec);
+-	u5 = vec_sra(v5, dct_bitshift_vec);
+-	u6 = vec_sra(v6, dct_bitshift_vec);
+-	u7 = vec_sra(v7, dct_bitshift_vec);
+-
+-	// Back to shorts and emit final vectors.
+-	s2 = vec_pack(u0, u1);
+-	s3 = vec_pack(u2, u3);
+-	s6 = vec_pack(u4, u5);
+-	s7 = vec_pack(u6, u7);
+-
+-	in[0] = s0;
+-	in[1] = vec_sub(k__const_0, s4);
+-	in[2] = s6;
+-	in[3] = vec_sub(k__const_0, s2);
+-	in[4] = s3;
+-	in[5] = vec_sub(k__const_0, s7);
+-	in[6] = s5;
+-	in[7] = vec_sub(k__const_0, s1);
++	// Stage 1. Inputs (in0..in7) are genuine tran_low_t-range values here,
++	// so the multiplies use the narrow (int16 operand) widening multiply.
++	// s0 = cospi_2_64 * x0 + cospi_30_64 * x1;
++	s0 = vi8_add(vi8_mul_narrow(in0, cospi_2_64), vi8_mul_narrow(in1, cospi_30_64));
++	// s1 = cospi_30_64 * x0 - cospi_2_64 * x1;
++	s1 = vi8_sub(vi8_mul_narrow(in0, cospi_30_64), vi8_mul_narrow(in1, cospi_2_64));
++	// s2 = cospi_10_64 * x2 + cospi_22_64 * x3;
++	s2 = vi8_add(vi8_mul_narrow(in2, cospi_10_64), vi8_mul_narrow(in3, cospi_22_64));
++	// s3 = cospi_22_64 * x2 - cospi_10_64 * x3;
++	s3 = vi8_sub(vi8_mul_narrow(in2, cospi_22_64), vi8_mul_narrow(in3, cospi_10_64));
++	// s4 = cospi_18_64 * x4 + cospi_14_64 * x5;
++	s4 = vi8_add(vi8_mul_narrow(in4, cospi_18_64), vi8_mul_narrow(in5, cospi_14_64));
++	// s5 = cospi_14_64 * x4 - cospi_18_64 * x5;
++	s5 = vi8_sub(vi8_mul_narrow(in4, cospi_14_64), vi8_mul_narrow(in5, cospi_18_64));
++	// s6 = cospi_26_64 * x6 + cospi_6_64 * x7;
++	s6 = vi8_add(vi8_mul_narrow(in6, cospi_26_64), vi8_mul_narrow(in7, cospi_6_64));
++	// s7 = cospi_6_64 * x6 - cospi_26_64 * x7;
++	s7 = vi8_sub(vi8_mul_narrow(in6, cospi_6_64), vi8_mul_narrow(in7, cospi_26_64));
++
++	// x0 = WRAPLOW(dct_const_round_shift(s0 + s4)); ... x7 = ...(s3 - s7);
++	// Results stay WIDE (vi8) -- the reference's x0..x7 are tran_high_t,
++	// never narrowed here, and can exceed int16 range (verified up to
++	// ~85000 in magnitude for adversarial int16 inputs).
++	x0 = vi8_round_shift(vi8_add(s0, s4));
++	x1 = vi8_round_shift(vi8_add(s1, s5));
++	x2 = vi8_round_shift(vi8_add(s2, s6));
++	x3 = vi8_round_shift(vi8_add(s3, s7));
++	x4 = vi8_round_shift(vi8_sub(s0, s4));
++	x5 = vi8_round_shift(vi8_sub(s1, s5));
++	x6 = vi8_round_shift(vi8_sub(s2, s6));
++	x7 = vi8_round_shift(vi8_sub(s3, s7));
++
++	// Stage 2. s0=x0; s1=x1; s2=x2; s3=x3 (wide pass-through).
++	s0 = x0; s1 = x1; s2 = x2; s3 = x3;
++	// s4 = cospi_8_64 * x4 + cospi_24_64 * x5;
++	s4 = vi8_add(vi8_mul_wide(x4, cospi_8_64), vi8_mul_wide(x5, cospi_24_64));
++	// s5 = cospi_24_64 * x4 - cospi_8_64 * x5;
++	s5 = vi8_sub(vi8_mul_wide(x4, cospi_24_64), vi8_mul_wide(x5, cospi_8_64));
++	// s6 = -cospi_24_64 * x6 + cospi_8_64 * x7;
++	s6 = vi8_add(vi8_mul_wide(x6, (int16_t)(-cospi_24_64)), vi8_mul_wide(x7, cospi_8_64));
++	// s7 = cospi_8_64 * x6 + cospi_24_64 * x7;
++	s7 = vi8_add(vi8_mul_wide(x6, cospi_8_64), vi8_mul_wide(x7, cospi_24_64));
++
++	// x0 = WRAPLOW(s0 + s2); x1 = WRAPLOW(s1 + s3);
++	// x2 = WRAPLOW(s0 - s2); x3 = WRAPLOW(s1 - s3);
++	// No round-shift here (matches reference exactly) -- stays wide.
++	x0 = vi8_add(s0, s2);
++	x1 = vi8_add(s1, s3);
++	x2 = vi8_sub(s0, s2);
++	x3 = vi8_sub(s1, s3);
++	// x4 = RS(s4 + s6); x5 = RS(s5 + s7); x6 = RS(s4 - s6); x7 = RS(s5 - s7);
++	x4 = vi8_round_shift(vi8_add(s4, s6));
++	x5 = vi8_round_shift(vi8_add(s5, s7));
++	x6 = vi8_round_shift(vi8_sub(s4, s6));
++	x7 = vi8_round_shift(vi8_sub(s5, s7));
++
++	// Stage 3. Only x2, x3, x6, x7 change; each combine (x2+x3 etc.) and
++	// the multiply by cospi_16_64 must both be wide (verified above that
++	// cospi_16_64*(x2+x3) alone can reach ~2.7e9 in magnitude).
++	// s2 = cospi_16_64 * (x2 + x3); s3 = cospi_16_64 * (x2 - x3);
++	vi8 s2n = vi8_mul_wide(vi8_add(x2, x3), cospi_16_64);
++	vi8 s3n = vi8_mul_wide(vi8_sub(x2, x3), cospi_16_64);
++	// s6 = cospi_16_64 * (x6 + x7); s7 = cospi_16_64 * (x6 - x7);
++	vi8 s6n = vi8_mul_wide(vi8_add(x6, x7), cospi_16_64);
++	vi8 s7n = vi8_mul_wide(vi8_sub(x6, x7), cospi_16_64);
++
++	x2 = vi8_round_shift(s2n);
++	x3 = vi8_round_shift(s3n);
++	x6 = vi8_round_shift(s6n);
++	x7 = vi8_round_shift(s7n);
++
++	// output[0]=x0; output[1]=-x4; output[2]=x6; output[3]=-x2;
++	// output[4]=x3; output[5]=-x7; output[6]=x5; output[7]=-x1;
++	// Narrow to int16 only now (matches output[] being tran_low_t).
++	in[0] = vi8_pack(x0);
++	in[1] = vec_sub(k__const_0, vi8_pack(x4));
++	in[2] = vi8_pack(x6);
++	in[3] = vec_sub(k__const_0, vi8_pack(x2));
++	in[4] = vi8_pack(x3);
++	in[5] = vec_sub(k__const_0, vi8_pack(x7));
++	in[6] = vi8_pack(x5);
++	in[7] = vec_sub(k__const_0, vi8_pack(x1));
+ }
+ 
+ void vp9_iht8x8_64_add_altivec(const tran_low_t *input, uint8_t *dest, int stride,
+-- 
+2.43.0
+

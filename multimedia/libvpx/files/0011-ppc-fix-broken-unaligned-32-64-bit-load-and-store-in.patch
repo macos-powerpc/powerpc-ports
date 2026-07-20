@@ -1,0 +1,125 @@
+From f571f6cf3cc56e74518c2b1fe2fc68dd14eff5b1 Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Tue, 14 Jul 2026 20:52:33 +0000
+Subject: [PATCH 11/17] ppc: fix broken unaligned 32/64-bit load and store in
+ vpx_idct_altivec.c
+
+Two real correctness bugs, found by cross-checking every AltiVec IDCT/IADST
+function in this file against the plain-C reference under a PowerPC/QEMU
++ AltiVec test harness (visible as severe blocky decode corruption when
+actually decoding real VP9 video with this build).
+
+_unaligned_load32 used vec_lde (which loads exactly one word-lane and
+leaves the AltiVec ISA's other three lanes architecturally undefined) and
+then vec_perm'd as though all 16 bytes were valid. The comment already
+admitted "(Other 96 bits undefined.)", but callers (vec_mergeh against a
+zero vector, or merging two of these loads before zero-extending) treat
+the upper bytes as the zero-fill that _mm_cvtsi32_si128 -- the SSE2
+intrinsic this is emulating -- actually guarantees. Fixed by doing a real
+16-byte load via vec_ld/vec_perm/vec_lvsl (the same idiom _unaligned_load128
+already uses correctly) and then explicitly zeroing everything past the
+first 4 bytes with a mask.
+
+_unaligned_store32/_unaligned_store64 used vec_ste, which silently
+word-aligns its own effective address -- so any store to a destination
+that isn't itself 4-byte aligned lands in the wrong slot and corrupts
+neighboring pixels. Since these are pixel-row stores at stride-dependent
+offsets, non-4-byte-aligned destinations are routine, not an edge case.
+Replaced with a proper unaligned store: rotate the source bytes into
+position for the target address, build a matching byte mask, and splice
+into the (at most two) 16-byte-aligned vectors spanning the destination
+via vec_sel, mirroring the read-modify-write approach any unaligned
+AltiVec store needs.
+
+Verified with a standalone harness (PowerPC cross-compiler + QEMU user-mode
+AltiVec emulation) that links the real vpx_dsp/ppc/vpx_idct_altivec.c
+against vpx_dsp/inv_txfm.c and cross-checks every function's output
+pixel-for-pixel against the C reference over hundreds of randomized
+coefficient blocks per function, at every unaligned byte offset from 0-19
+for the store fix specifically. All four DC-only functions
+(vpx_idct{4x4,8x8,16x16,32x32}_1_add_altivec), which depend on nothing
+else in this file, now match the reference exactly (0/500 failures) where
+they previously failed on essentially every input.
+
+The remaining IDCT/IADST functions still fail the cross-check on
+large-magnitude coefficients due to a separate, unrelated saturation-order
+mismatch between this file's 16-bit AltiVec butterfly math and the
+reference's wider 32-bit intermediates -- tracked separately, not fixed
+by this commit.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DLC53yuiz8taQDNndUp4rs
+---
+ vpx_dsp/ppc/vpx_idct_altivec.c | 54 ++++++++++++++++++++++++++++------
+ 1 file changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/vpx_dsp/ppc/vpx_idct_altivec.c b/vpx_dsp/ppc/vpx_idct_altivec.c
+index 4f7a0fcee..3fcb01f08 100644
+--- a/vpx_dsp/ppc/vpx_idct_altivec.c
++++ b/vpx_dsp/ppc/vpx_idct_altivec.c
+@@ -30,17 +30,53 @@
+ // Basic notion.
+ #define _unaligned_load128(v,s) { v=vec_perm(vec_ld(0,s),vec_ld(16,s),vec_lvsl(0,s)); }
+ 
+-// Equivalent for _mm_cvtsi32_si128. (Other 96 bits undefined.)
+-#define _unaligned_load32(v,s) { v=vec_lde(0,s); v=vec_perm(v,v,vec_lvsl(0,s)); }
+-// Equivalent for _mm_cvtsi128_si32.
+-#define _unaligned_store32(v,vv,s) { vv=vec_splat((vector unsigned int)v,0); vec_ste(vv,0,s); }
++// Equivalent for _mm_cvtsi32_si128, which per the SSE2 semantics being
++// emulated here zero-extends the loaded word to fill the rest of the
++// register -- callers (e.g. vec_mergeh with a zero vector, or merging two
++// of these loads together before zero-extending) depend on that, so the
++// upper 96 bits must be genuine zero, not whatever vec_lde/vec_perm leaves
++// behind in the untouched lanes.
++#define _unaligned_load32_mask() vec_perm(vec_splat_u8(0), vec_splat_u8(-1), \
++	((vector unsigned char){ 16,16,16,16, 0,0,0,0, 0,0,0,0, 0,0,0,0 }))
++#define _unaligned_load32(v,s) { \
++	v = vec_perm(vec_ld(0,s), vec_ld(16,s), vec_lvsl(0,s)); \
++	v = vec_and(v, (__typeof__(v))_unaligned_load32_mask()); \
++}
++// Equivalent for _mm_cvtsi128_si32 / _mm_storel_epi64: store the low N
++// bytes of v to a byte-granularity (not just word-granularity) unaligned
++// address. vec_ste() word-aligns its own effective address, so a bare
++// vec_ste() silently writes to the wrong 4-byte slot whenever s isn't
++// itself 4-byte aligned -- which stride-dependent destinations in this
++// file are not guaranteed to be. Do a proper unaligned store instead: a
++// read-modify-write splice across the (at most two) 16-byte-aligned
++// vectors overlapping the target range.
++#define _unaligned_store_bytes(v, s, n) { \
++	unsigned char *_d = (unsigned char *)(s); \
++	uintptr_t _off = ((uintptr_t)_d) & 15; \
++	vector unsigned char _algn = vec_lvsr(0, _d); \
++	vector unsigned char _vb = (vector unsigned char)(v); \
++	vector unsigned char _rot = vec_perm(_vb, _vb, _algn); \
++	vector unsigned char _idx = (vector unsigned char){ 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 }; \
++	vector unsigned char _voff = vec_splats((unsigned char)_off); \
++	vector unsigned char _vend = vec_splats((unsigned char)(_off + (n))); \
++	vector unsigned char _ge_off = vec_nor((vector unsigned char)vec_cmplt(_idx, _voff), \
++	                                        (vector unsigned char)vec_cmplt(_idx, _voff)); \
++	vector unsigned char _lt_end = (vector unsigned char)vec_cmplt(_idx, _vend); \
++	vector unsigned char _mask_lo = vec_and(_ge_off, _lt_end); \
++	unsigned char _hi_end_scalar = (_off + (n) > 16) ? (unsigned char)(_off + (n) - 16) : (unsigned char)0; \
++	vector unsigned char _vend_hi = vec_splats(_hi_end_scalar); \
++	vector unsigned char _mask_hi = (vector unsigned char)vec_cmplt(_idx, _vend_hi); \
++	vector unsigned char _lo = vec_ld(0, _d); \
++	vector unsigned char _hi = vec_ld(16, _d); \
++	_lo = vec_sel(_lo, _rot, _mask_lo); \
++	_hi = vec_sel(_hi, _rot, _mask_hi); \
++	vec_st(_lo, 0, _d); \
++	vec_st(_hi, 16, _d); \
++}
++#define _unaligned_store32(v,vv,s) { vv = (__typeof__(vv))(v); _unaligned_store_bytes(v, s, 4); }
+ // Equivalent for _mm_loadl_epi64. Simplest just to make this a full load right now.
+ #define _unaligned_load64(v,s) _unaligned_load128(v,s)
+-// Equivalent for _mm_storel_epi64. Essentially acts as two store32s on different elements.
+-#define _unaligned_store64(v,vv,s) {\
+-	vv = vec_splat((vector unsigned int)v, 0); vec_ste(vv,0,s);\
+-	vv = vec_splat((vector unsigned int)v, 1); vec_ste(vv,4,s);\
+-}
++#define _unaligned_store64(v,vv,s) { vv = (__typeof__(vv))(v); _unaligned_store_bytes(v, s, 8); }
+ 
+ #define ALIGN16 __attribute__((aligned(16)))
+ #define short_pair_a(b, a) \
+-- 
+2.43.0
+

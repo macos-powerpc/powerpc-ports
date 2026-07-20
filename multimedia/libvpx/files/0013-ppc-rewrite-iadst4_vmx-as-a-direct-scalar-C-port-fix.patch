@@ -1,0 +1,197 @@
+From 6cd3a54399a03228299e77426c757160ba821777 Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Tue, 14 Jul 2026 21:33:36 +0000
+Subject: [PATCH 13/17] ppc: rewrite iadst4_vmx as a direct scalar-C port,
+ fixing wrong output
+
+The existing iadst4_vmx used a hand-optimized "multiply-add-add" form
+whose constant pairings didn't verifiably match either the plain-C
+reference (iadst4_c in vpx_dsp/inv_txfm.c) or the SSE2 reference it
+claimed to be ported from (iadst4_sse2 in vpx_dsp/x86/inv_txfm_sse2.c) --
+the in-code comment says it was "collapsed" from SSE2, but tracing the
+actual constants shows a different, unverified rearrangement. It produced
+wrong output for specific extreme-magnitude coefficient combinations
+(e.g. x1=32767, x2=-32768 reliably mispredicted 1-3 output pixels).
+
+Replaced it with a line-for-line port of iadst4_c's s0..s7 computation,
+vectorized across the 4 rows/columns processed in parallel via a small
+wide_mul16 helper (vec_mule/vec_mulo widening multiply, re-merged to
+preserve lane order). This is mechanically checkable against the
+reference -- every vector op maps to one scalar statement -- rather than
+requiring a fresh algebraic derivation to trust.
+
+Root cause of the wrong output, found only after this rewrite ALSO
+initially failed the same way: WRAPLOW is configured as a pure no-op in
+this build (no CONFIG_EMULATE_HARDWARE, no CONFIG_COEFFICIENT_RANGE_CHECKING
+-- see vpx_dsp/inv_txfm.h), so s7 = WRAPLOW(x0 - x2 + x3) must be computed
+as a genuine 32-bit sum and is explicitly NOT truncated to 16 bits (e.g.
+x0=0, x2=-32768, x3=0 must yield s7=32768, not a wrapped -32768). The
+original code computed this sum in 16-bit vector arithmetic, which
+wraps -- a real, separate bug from the saturating-vs-wraparound class
+fixed in the previous two commits. Fixed by widening x0/x2/x3 via
+vec_unpackh/vec_unpackl (sign-extend, no truncation) before combining.
+
+Verified against the QEMU/AltiVec cross-check harness: vp9_iht4x4_16_add
+tx_type=3 (pure ADST_ADST, exercises iadst4_vmx on both passes) now
+matches the C reference exactly across randomized full-int16-range
+coefficients (0/500 failures, [aligned] and unaligned strides). The three
+mixed DCT/ADST tx_types dropped from 400-499/500 failures to 0-3/500,
+all single-pixel mismatches at saturation boundaries in the shared pixel
+reconstruction path (not iadst4_vmx itself) -- tracked as a follow-up,
+not blocking. iadst8_vmx/iadst16_8col (8x8/16x16 IADST) likely have the
+same class of bug and are being reworked separately using this same
+direct-port approach.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DLC53yuiz8taQDNndUp4rs
+---
+ vpx_dsp/ppc/vpx_idct_altivec.c | 124 ++++++++++++++++++++-------------
+ 1 file changed, 74 insertions(+), 50 deletions(-)
+
+diff --git a/vpx_dsp/ppc/vpx_idct_altivec.c b/vpx_dsp/ppc/vpx_idct_altivec.c
+index 3268222fd..f4d2e5917 100644
+--- a/vpx_dsp/ppc/vpx_idct_altivec.c
++++ b/vpx_dsp/ppc/vpx_idct_altivec.c
+@@ -544,65 +544,89 @@ static void idct4_vmx(vector signed short *in) {
+ 	in[1] = vec_sld(in[1], in[1], 8);
+ }
+ 
++// Widening 16x16->32 multiply that keeps every lane in its original
++// position (vec_mule/vec_mulo split even/odd lanes; re-merge them back).
++static inline void wide_mul16(vector signed short a, vector signed short b,
++                              vector signed int *lo, vector signed int *hi) {
++	vector signed int e = vec_mule(a, b);
++	vector signed int o = vec_mulo(a, b);
++	*lo = vec_mergeh(e, o);
++	*hi = vec_mergel(e, o);
++}
++
++// Direct, line-for-line port of iadst4_c's s0..s7 algebra (vpx_dsp/inv_txfm.c),
++// vectorized across the 4 rows/columns processed in parallel. This trades a
++// few extra instructions for being mechanically checkable against the
++// reference, rather than reusing the original hand-collapsed multiply-add
++// form, whose constant pairings didn't verifiably match either the C or the
++// SSE2 reference and produced wrong output for some extreme-magnitude inputs.
+ static void iadst4_vmx(vector signed short *in) {
+-	vector signed short k__sinpi_p01_p04 = short_pair_a(sinpi_1_9, sinpi_4_9);
+-	vector signed short k__sinpi_p03_p02 = short_pair_a(sinpi_3_9, sinpi_2_9);
+-	vector signed short k__sinpi_p02_m01 = short_pair_a(sinpi_2_9, -sinpi_1_9);
+-	vector signed short k__sinpi_p03_m04 = short_pair_a(sinpi_3_9, -sinpi_4_9);
+-	vector signed short k__sinpi_p03_p03 = short_pair_a(sinpi_3_9, sinpi_3_9);
+-	vector signed short zero = vec_splat_s16(0);
+-	vector unsigned int twoi = vec_splat_u32(2);
+-	vector signed short u[7], in7;
+-	vector signed int v[7], w[7];
+-	// For easier hand modeling I manually inlined the SSE2 transposition function.
+ 	vector signed short tr0_0, tr0_1;
++	vector signed short k_sinpi1, k_sinpi2, k_sinpi3, k_sinpi4;
++	vector signed int lo, hi;
++	vector signed int s0, s1, s2, s3, s4, s5, s6, s7;
++	vector signed int ns0, ns1, ns2, ns3;
++	vector signed int o0, o1, o2, o3;
++	vector signed int x0w, x2w, x3w;
++	vector signed int k_sinpi3_32;
+ 
+-	// Transposition.
++	// For easier hand modeling I manually inlined the SSE2 transposition function.
+ 	tr0_0 = vec_mergeh(in[0], in[1]);
+ 	tr0_1 = vec_mergel(in[0], in[1]);
+ 
+-	// Transform.
++	// Transform. After this, in[0] = {x0 x4rows, x1 x4rows},
++	// in[1] = {x2 x4rows, x3 x4rows}.
+ 	in[0] = vec_mergeh(tr0_0, tr0_1);
+ 	in[1] = vec_mergel(tr0_0, tr0_1);
+ 
+-	in7 = vec_sld(in[1], zero, 8);
+-	in7 = vec_add(in7, in[0]);
+-	in7 = vec_sub(in7, in[1]);
+-
+-	u[0] = vec_mergeh(in[0], in[1]);
+-	u[1] = vec_mergel(in[0], in[1]);
+-	u[2] = vec_mergeh(in7, zero);
+-	u[3] = vec_mergel(in[0], zero);
+-
+-	// I've tagged where these came from in the SSE2 version
+-	// before collapsing them into the multiply-add-add form.
+-	v[1] = vec_msum(u[1], k__sinpi_p03_p02, (vector signed int)zero);
+-	w[0] = vec_msum(u[0], k__sinpi_p01_p04, v[1]); // was v[0]
+-	v[2] = vec_msum(u[2], k__sinpi_p03_p03, dct_rounding_vec);
+-	v[4] = vec_msum(u[1], k__sinpi_p03_m04, (vector signed int)zero);
+-	w[1] = vec_msum(u[0], k__sinpi_p02_m01, v[4]); // was v[3]
+-	v[5] = vec_msum(u[3], k__sinpi_p03_p03, (vector signed int)zero);
+-
+-	//w[0] = vec_add(v[0], v[1]);
+-	//w[1] = vec_add(v[3], v[4]);
+-	//w[2] = v[2];
+-	w[3] = vec_add(w[0], w[1]);
+-	w[4] = vec_sl(v[5], twoi);
+-	w[5] = vec_add(w[3], v[5]);
+-	w[6] = vec_sub(w[5], w[4]);
+-
+-	v[0] = vec_add(w[0], dct_rounding_vec);
+-	v[1] = vec_add(w[1], dct_rounding_vec);
+-	//v[2] = vec_add(w[2], dct_rounding_vec);
+-	v[3] = vec_add(w[6], dct_rounding_vec);
+-
+-	w[0] = vec_sra(v[0], dct_bitshift_vec);
+-	w[1] = vec_sra(v[1], dct_bitshift_vec);
+-	w[2] = vec_sra(v[2], dct_bitshift_vec);
+-	w[3] = vec_sra(v[3], dct_bitshift_vec);
+-
+-	in[0] = vec_pack(w[0], w[1]);
+-	in[1] = vec_pack(w[2], w[3]);
++	// s7 = WRAPLOW(x0 - x2 + x3). In this build WRAPLOW is a no-op (no
++	// range checking, no truncation -- see vpx_dsp/inv_txfm.h) so this
++	// must be computed as a genuine 32-bit sum, NOT wrapped to 16 bits:
++	// x0=0, x2=-32768, x3=0 must yield s7=32768, not -32768. Widen each
++	// operand (sign-extend, no truncation) before combining.
++	x0w = vec_unpackh(in[0]); // x0
++	x2w = vec_unpackh(in[1]); // x2
++	x3w = vec_unpackl(in[1]); // x3
++	s7 = vec_sub(vec_add(x0w, x3w), x2w);
++
++	k_sinpi1 = (vector signed short){ sinpi_1_9, sinpi_1_9, sinpi_1_9, sinpi_1_9,
++	                                  sinpi_1_9, sinpi_1_9, sinpi_1_9, sinpi_1_9 };
++	k_sinpi2 = (vector signed short){ sinpi_2_9, sinpi_2_9, sinpi_2_9, sinpi_2_9,
++	                                  sinpi_2_9, sinpi_2_9, sinpi_2_9, sinpi_2_9 };
++	k_sinpi3 = (vector signed short){ sinpi_3_9, sinpi_3_9, sinpi_3_9, sinpi_3_9,
++	                                  sinpi_3_9, sinpi_3_9, sinpi_3_9, sinpi_3_9 };
++	k_sinpi4 = (vector signed short){ sinpi_4_9, sinpi_4_9, sinpi_4_9, sinpi_4_9,
++	                                  sinpi_4_9, sinpi_4_9, sinpi_4_9, sinpi_4_9 };
++	k_sinpi3_32 = (vector signed int){ sinpi_3_9, sinpi_3_9, sinpi_3_9, sinpi_3_9 };
++
++	wide_mul16(in[0], k_sinpi1, &lo, &hi); s0 = lo; // s0 = sinpi_1_9 * x0
++	wide_mul16(in[0], k_sinpi2, &lo, &hi); s1 = lo; // s1 = sinpi_2_9 * x0
++	wide_mul16(in[0], k_sinpi3, &lo, &hi); s2 = hi; // s2 = sinpi_3_9 * x1
++	wide_mul16(in[1], k_sinpi4, &lo, &hi); s3 = lo; // s3 = sinpi_4_9 * x2
++	wide_mul16(in[1], k_sinpi1, &lo, &hi); s4 = lo; // s4 = sinpi_1_9 * x2
++	wide_mul16(in[1], k_sinpi2, &lo, &hi); s5 = hi; // s5 = sinpi_2_9 * x3
++	wide_mul16(in[1], k_sinpi4, &lo, &hi); s6 = hi; // s6 = sinpi_4_9 * x3
++	s7 = s7 * k_sinpi3_32;                          // s2(new) = sinpi_3_9 * s7 (s7 is >16-bit-wide)
++
++	// s0 = s0 + s3 + s5; s1 = s1 - s4 - s6; s3(new) = s2(old); s2(new) = s7 above.
++	ns0 = vec_add(vec_add(s0, s3), s5);
++	ns1 = vec_sub(vec_sub(s1, s4), s6);
++	ns3 = s2;
++	ns2 = s7;
++
++	// output[0]=RS(ns0+ns3) output[1]=RS(ns1+ns3) output[2]=RS(ns2) output[3]=RS(ns0+ns1-ns3)
++	o0 = vec_add(vec_add(ns0, ns3), dct_rounding_vec);
++	o1 = vec_add(vec_add(ns1, ns3), dct_rounding_vec);
++	o2 = vec_add(ns2, dct_rounding_vec);
++	o3 = vec_add(vec_sub(vec_add(ns0, ns1), ns3), dct_rounding_vec);
++
++	o0 = vec_sra(o0, dct_bitshift_vec);
++	o1 = vec_sra(o1, dct_bitshift_vec);
++	o2 = vec_sra(o2, dct_bitshift_vec);
++	o3 = vec_sra(o3, dct_bitshift_vec);
++
++	in[0] = vec_pack(o0, o1);
++	in[1] = vec_pack(o2, o3);
+ }
+ 
+ void vp9_iht4x4_16_add_altivec(const tran_low_t *input, uint8_t *dest, int stride, int tx_type) {
+-- 
+2.43.0
+

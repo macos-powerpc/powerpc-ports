@@ -1,0 +1,362 @@
+From ef62413b88452535ac5dd0f1e0da1f454a3df111 Mon Sep 17 00:00:00 2001
+From: Developer <dev@localhost>
+Date: Fri, 17 Jul 2026 13:03:50 +0000
+Subject: [PATCH] ppc: load VP9 coefficients at correct width under
+ highbitdepth
+
+vpx_idct_altivec.c loaded every VP9 transform coefficient block with
+vec_ld(offset, (const signed short *)input), i.e. it assumed
+tran_low_t == int16_t and read 8 coefficients per 16-byte vector. That
+holds only for the non-highbitdepth build. This port ships with
+--enable-vp9-highbitdepth (the MacPorts Portfile enables it), which makes
+tran_low_t == int32_t. Reading the 32-bit coefficient array through a
+16-bit view on big-endian PowerPC splits every coefficient into its
+(usually zero) high halfword and its low halfword, so every coefficient
+of every block is misread -- corrupting every VP9 frame. VP8 is
+unaffected because VP8 coefficients are genuinely 16-bit shorts, which is
+why VP8 decode looked fine while VP9 was unusable.
+
+Fix: introduce LOAD_COEF8()/LOAD_COEF8_U() macros that, under
+CONFIG_VP9_HIGHBITDEPTH, do two 32-bit loads and a saturating vec_packs
+to narrow int32 -> int16 before the transform -- the same thing the
+upstream VSX path already does via load_tran_low() in
+bitdepth_conversion_vsx.h. For 8-bit content (whose dequantized
+coefficients fit int16) the pack is lossless, matching that path's
+contract. In the non-highbitdepth build the macros expand to exactly the
+original vec_ld / _unaligned_load128, so that path is byte-for-byte
+unchanged. All 100 coefficient-load sites (98 aligned + the 2 unaligned
+loads in vp9_iht4x4) are converted; the scalar input[0] reads in the
+DC-only functions and the element-arithmetic input += advances are
+already correct at either width and are left as-is.
+
+Verified with the PowerPC/QEMU + AltiVec cross-check harness (real
+vpx_dsp/ppc/vpx_idct_altivec.c vs the vpx_dsp/inv_txfm.c C reference over
+randomized coefficient blocks, run under qemu-ppc -cpu 7400): with
+highbitdepth enabled, idct4x4 and idct8x8 go from 100% of trials
+mismatched to 0%, and the non-highbitdepth path stays at its prior 0%
+(no regression). idct16x16 still shows a residual under adversarial
+dense high-magnitude coefficients from a separate, pre-existing int16
+inter-pass intermediate limitation, addressed in a following commit.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ vpx_dsp/ppc/vpx_idct_altivec.c | 233 +++++++++++++++++++--------------
+ 1 file changed, 133 insertions(+), 100 deletions(-)
+
+diff --git a/vpx_dsp/ppc/vpx_idct_altivec.c b/vpx_dsp/ppc/vpx_idct_altivec.c
+index 3f4c484ec..1567b666a 100644
+--- a/vpx_dsp/ppc/vpx_idct_altivec.c
++++ b/vpx_dsp/ppc/vpx_idct_altivec.c
+@@ -78,6 +78,39 @@
+ #define _unaligned_load64(v,s) _unaligned_load128(v,s)
+ #define _unaligned_store64(v,vv,s) { vv = (__typeof__(vv))(v); _unaligned_store_bytes(v, s, 8); }
+ 
++// Coefficient load. `input` is a `const tran_low_t *`. In the non-HBD build
++// tran_low_t is int16_t and the original raw 16-bit load is exactly right. In
++// the HBD build tran_low_t is int32_t, so reading it through an int16 view on
++// big-endian scrambles every coefficient; instead load the coeffs as two
++// vectors of int32 and pack (saturating) back to int16x8, matching the layout
++// the rest of this file expects. This mirrors upstream VSX load_tran_low()
++// (bitdepth_conversion_vsx.h): two 32-bit loads + vec_packs. 8-bit content's
++// dequantized coeffs fit int16, so the saturation is lossless there -- same
++// contract as load_tran_low.
++//
++// The macros take the SAME byte offset B the int16 code already used:
++// vec_ld(B, (short*)input) reads bytes [B, B+16) of the int16 view = coeffs
++// [B/2, B/2+8). In the int32 array those coeffs live at BYTE offset (B/2)*4 =
++// B*2, spanning [B*2, B*2+32) = two 16-byte vec_ld at byte offsets B*2 and
++// B*2+16. (Every B here is a multiple of 16, so B*2 and B*2+16 stay 16-byte
++// aligned and vec_ld's aligned-load contract holds.) vec_packs on
++// vector signed int -> vector signed short is the saturating pack and keeps
++// coeff k in lane k, so the packed order matches the original int16 load.
++#if CONFIG_VP9_HIGHBITDEPTH
++#define LOAD_COEF8(B, input) \
++    vec_packs(vec_ld((B) * 2,      (const signed int *)(input)), \
++              vec_ld((B) * 2 + 16, (const signed int *)(input)))
++#define LOAD_COEF8_U(v, ptr) { \
++    const signed int *_p = (const signed int *)(ptr); \
++    vector signed int _a = vec_perm(vec_ld(0, _p),  vec_ld(16, _p), vec_lvsl(0, _p)); \
++    vector signed int _b = vec_perm(vec_ld(16, _p), vec_ld(32, _p), vec_lvsl(0, _p)); \
++    (v) = vec_packs(_a, _b); \
++}
++#else
++#define LOAD_COEF8(B, input) vec_ld((B), (const signed short *)(input))
++#define LOAD_COEF8_U(v, ptr) _unaligned_load128((v), (const signed short *)(ptr))
++#endif
++
+ #define ALIGN16 __attribute__((aligned(16)))
+ #define short_pair_a(b, a) \
+   { (int16_t)(b), (int16_t)(a), (int16_t)(b), (int16_t)(a), \
+@@ -178,8 +211,8 @@ void vpx_idct4x4_16_add_altivec(const tran_low_t *input, uint8_t *dest, int stri
+ 	};
+ 
+ 	// The Intel intrinsics used imply the input is aligned.
+-	input0 = vec_ld(0, (const signed short *)input);
+-	input2 = vec_ld(16, (const signed short *)input);
++	input0 = LOAD_COEF8(0, input);
++	input2 = LOAD_COEF8(16, input);
+ 
+ 	// ALL HAIL THE ALTIVEC PERMUTE UNIT!
+ 	// SUCK IT, INTEL!
+@@ -639,8 +672,8 @@ void vp9_iht4x4_16_add_altivec(const tran_low_t *input, uint8_t *dest, int strid
+ 	vector unsigned short four = vec_splat_u16(4);
+ 	vector signed short eight = vec_splat_s16(8);
+ 
+-	_unaligned_load128(in[0], (const signed short *)(input));
+-	_unaligned_load128(in[1], (const signed short *)(input + 8));
++	LOAD_COEF8_U(in[0], (input));
++	LOAD_COEF8_U(in[1], (input + 8));
+ 
+ 	switch (tx_type) {
+ 		case 0: { // DCT_DCT
+@@ -851,14 +884,14 @@ void vpx_idct8x8_64_add_altivec(const tran_low_t *input, uint8_t *dest, int stri
+ 	final_rounding = (vector signed short)vec_rl(one, four);
+ 	
+ 	// The Intel mnemonic implies these loads are aligned.
+-	in0 = vec_ld(0,   (const signed short *)input);
+-	in1 = vec_ld(16,  (const signed short *)input);
+-	in2 = vec_ld(32,  (const signed short *)input);
+-	in3 = vec_ld(48,  (const signed short *)input);
+-	in4 = vec_ld(64,  (const signed short *)input);
+-	in5 = vec_ld(80,  (const signed short *)input);
+-	in6 = vec_ld(96,  (const signed short *)input);
+-	in7 = vec_ld(112, (const signed short *)input);
++	in0 = LOAD_COEF8(0, input);
++	in1 = LOAD_COEF8(16, input);
++	in2 = LOAD_COEF8(32, input);
++	in3 = LOAD_COEF8(48, input);
++	in4 = LOAD_COEF8(64, input);
++	in5 = LOAD_COEF8(80, input);
++	in6 = LOAD_COEF8(96, input);
++	in7 = LOAD_COEF8(112, input);
+ 
+ 	TRANSPOSE_8X8(in0, in1, in2, in3, in4, in5, in6, in7,
+ 			in0, in1, in2, in3, in4, in5, in6, in7);
+@@ -1162,14 +1195,14 @@ void vp9_iht8x8_64_add_altivec(const tran_low_t *input, uint8_t *dest, int strid
+ 	final_rounding = (vector signed short)vec_rl(one, four);
+ 
+ 	// The Intel mnemonic implies these loads are aligned.
+-	in[0] = vec_ld(0,   (const signed short *)input);
+-	in[1] = vec_ld(16,  (const signed short *)input);
+-	in[2] = vec_ld(32,  (const signed short *)input);
+-	in[3] = vec_ld(48,  (const signed short *)input);
+-	in[4] = vec_ld(64,  (const signed short *)input);
+-	in[5] = vec_ld(80,  (const signed short *)input);
+-	in[6] = vec_ld(96,  (const signed short *)input);
+-	in[7] = vec_ld(112, (const signed short *)input);
++	in[0] = LOAD_COEF8(0, input);
++	in[1] = LOAD_COEF8(16, input);
++	in[2] = LOAD_COEF8(32, input);
++	in[3] = LOAD_COEF8(48, input);
++	in[4] = LOAD_COEF8(64, input);
++	in[5] = LOAD_COEF8(80, input);
++	in[6] = LOAD_COEF8(96, input);
++	in[7] = LOAD_COEF8(112, input);
+ 
+ 	switch (tx_type) {
+ 		case 0:  // DCT_DCT
+@@ -1325,10 +1358,10 @@ void vpx_idct8x8_12_add_altivec(const tran_low_t *input, uint8_t *dest, int stri
+ 
+ 	// Rows. Load 4-row input data.
+ 	// Praise the Lord it's still aligned, yes?
+-	in0 = vec_ld(0,  (const signed short *)input);
+-	in1 = vec_ld(16, (const signed short *)input);
+-	in2 = vec_ld(32, (const signed short *)input);
+-	in3 = vec_ld(48, (const signed short *)input);
++	in0 = LOAD_COEF8(0, input);
++	in1 = LOAD_COEF8(16, input);
++	in2 = LOAD_COEF8(32, input);
++	in3 = LOAD_COEF8(48, input);
+ 
+ 	// 8x4 transpose.
+ 	TRANSPOSE_8X8_10(in0, in1, in2, in3, in0, in1);
+@@ -1687,22 +1720,22 @@ void vpx_idct16x16_256_add_altivec(const tran_low_t *input, uint8_t *dest,
+ 		// 1-D IDCT.
+ 		// Load (aligned) input.
+ 		
+-		in[0]  = vec_ld(0,   (const signed short *)input);
+-		in[8]  = vec_ld(16,  (const signed short *)input);
+-		in[1]  = vec_ld(32,  (const signed short *)input);
+-		in[9]  = vec_ld(48,  (const signed short *)input);
+-		in[2]  = vec_ld(64,  (const signed short *)input);
+-		in[10] = vec_ld(80,  (const signed short *)input);
+-		in[3]  = vec_ld(96,  (const signed short *)input);
+-		in[11] = vec_ld(112, (const signed short *)input);
+-		in[4]  = vec_ld(128, (const signed short *)input);
+-		in[12] = vec_ld(144, (const signed short *)input);
+-		in[5]  = vec_ld(160, (const signed short *)input);
+-		in[13] = vec_ld(176, (const signed short *)input);
+-		in[6]  = vec_ld(192, (const signed short *)input);
+-		in[14] = vec_ld(208, (const signed short *)input);
+-		in[7]  = vec_ld(224, (const signed short *)input);
+-		in[15] = vec_ld(240, (const signed short *)input);
++		in[0]  = LOAD_COEF8(0, input);
++		in[8]  = LOAD_COEF8(16, input);
++		in[1]  = LOAD_COEF8(32, input);
++		in[9]  = LOAD_COEF8(48, input);
++		in[2]  = LOAD_COEF8(64, input);
++		in[10] = LOAD_COEF8(80, input);
++		in[3]  = LOAD_COEF8(96, input);
++		in[11] = LOAD_COEF8(112, input);
++		in[4]  = LOAD_COEF8(128, input);
++		in[12] = LOAD_COEF8(144, input);
++		in[5]  = LOAD_COEF8(160, input);
++		in[13] = LOAD_COEF8(176, input);
++		in[6]  = LOAD_COEF8(192, input);
++		in[14] = LOAD_COEF8(208, input);
++		in[7]  = LOAD_COEF8(224, input);
++		in[15] = LOAD_COEF8(240, input);
+ 		array_transpose_8x8(in, in);
+ 		array_transpose_8x8(in + 8, in + 8);
+ 
+@@ -1964,10 +1997,10 @@ void vpx_idct16x16_10_add_altivec(const tran_low_t *input, uint8_t *dest,
+ 
+ 	// First 1-D inverse DCT.
+ 	// Stage 1: load input data (aligned).
+-	in[0] = vec_ld(0,  (const signed short *)input);
+-	in[1] = vec_ld(32, (const signed short *)input); // Yes, really. We're skipping every other.
+-	in[2] = vec_ld(64, (const signed short *)input);
+-	in[3] = vec_ld(96, (const signed short *)input);
++	in[0] = LOAD_COEF8(0, input);
++	in[1] = LOAD_COEF8(32, input); // Yes, really. We're skipping every other.
++	in[2] = LOAD_COEF8(64, input);
++	in[3] = LOAD_COEF8(96, input);
+ 
+ 	TRANSPOSE_8X4(in[0], in[1], in[2], in[3], in[0], in[1]);
+ 
+@@ -2496,14 +2529,14 @@ void vpx_idct32x32_34_add_altivec(const tran_low_t *input, uint8_t *dest,
+ 	final_rounding = (vector signed short)vec_rl(one, five);
+ 	
+ 	// Load vectors from top left 8x8 block.
+-	in[0] = vec_ld(0,   (const signed short *)input);
+-	in[1] = vec_ld(64,  (const signed short *)input);
+-	in[2] = vec_ld(128, (const signed short *)input);
+-	in[3] = vec_ld(192, (const signed short *)input);
+-	in[4] = vec_ld(256, (const signed short *)input);
+-	in[5] = vec_ld(320, (const signed short *)input);
+-	in[6] = vec_ld(384, (const signed short *)input);
+-	in[7] = vec_ld(448, (const signed short *)input);
++	in[0] = LOAD_COEF8(0, input);
++	in[1] = LOAD_COEF8(64, input);
++	in[2] = LOAD_COEF8(128, input);
++	in[3] = LOAD_COEF8(192, input);
++	in[4] = LOAD_COEF8(256, input);
++	in[5] = LOAD_COEF8(320, input);
++	in[6] = LOAD_COEF8(384, input);
++	in[7] = LOAD_COEF8(448, input);
+ 
+ 	// 1-D IDCT.
+ 	// Store intermediate results for each 8x32 block.
+@@ -3001,38 +3034,38 @@ void vpx_idct32x32_1024_add_altivec(const tran_low_t *input, uint8_t *dest,
+ 		// Load next block.
+ 		i32 = (i << 5);
+ 		
+-		in[0]  = vec_ld(0,   (const signed short *)input);
+-		in[8]  = vec_ld(16,  (const signed short *)input);
+-		in[16] = vec_ld(32,  (const signed short *)input);
+-		in[24] = vec_ld(48,  (const signed short *)input);
+-		in[1]  = vec_ld(64,  (const signed short *)input);
+-		in[9]  = vec_ld(80,  (const signed short *)input);
+-		in[17] = vec_ld(96,  (const signed short *)input);
+-		in[25] = vec_ld(112, (const signed short *)input);
+-		in[2]  = vec_ld(128, (const signed short *)input);
+-		in[10] = vec_ld(144, (const signed short *)input);
+-		in[18] = vec_ld(160, (const signed short *)input);
+-		in[26] = vec_ld(176, (const signed short *)input);
+-		in[3]  = vec_ld(192, (const signed short *)input);
+-		in[11] = vec_ld(208, (const signed short *)input);
+-		in[19] = vec_ld(224, (const signed short *)input);
+-		in[27] = vec_ld(240, (const signed short *)input);
+-		in[4]  = vec_ld(256, (const signed short *)input);
+-		in[12] = vec_ld(272, (const signed short *)input);
+-		in[20] = vec_ld(288, (const signed short *)input);
+-		in[28] = vec_ld(304, (const signed short *)input);
+-		in[5]  = vec_ld(320, (const signed short *)input);
+-		in[13] = vec_ld(336, (const signed short *)input);
+-		in[21] = vec_ld(352, (const signed short *)input);
+-		in[29] = vec_ld(368, (const signed short *)input);
+-		in[6]  = vec_ld(384, (const signed short *)input);
+-		in[14] = vec_ld(400, (const signed short *)input);
+-		in[22] = vec_ld(416, (const signed short *)input);
+-		in[30] = vec_ld(432, (const signed short *)input);
+-		in[7]  = vec_ld(448, (const signed short *)input);
+-		in[15] = vec_ld(464, (const signed short *)input);
+-		in[23] = vec_ld(480, (const signed short *)input);
+-		in[31] = vec_ld(496, (const signed short *)input);
++		in[0]  = LOAD_COEF8(0, input);
++		in[8]  = LOAD_COEF8(16, input);
++		in[16] = LOAD_COEF8(32, input);
++		in[24] = LOAD_COEF8(48, input);
++		in[1]  = LOAD_COEF8(64, input);
++		in[9]  = LOAD_COEF8(80, input);
++		in[17] = LOAD_COEF8(96, input);
++		in[25] = LOAD_COEF8(112, input);
++		in[2]  = LOAD_COEF8(128, input);
++		in[10] = LOAD_COEF8(144, input);
++		in[18] = LOAD_COEF8(160, input);
++		in[26] = LOAD_COEF8(176, input);
++		in[3]  = LOAD_COEF8(192, input);
++		in[11] = LOAD_COEF8(208, input);
++		in[19] = LOAD_COEF8(224, input);
++		in[27] = LOAD_COEF8(240, input);
++		in[4]  = LOAD_COEF8(256, input);
++		in[12] = LOAD_COEF8(272, input);
++		in[20] = LOAD_COEF8(288, input);
++		in[28] = LOAD_COEF8(304, input);
++		in[5]  = LOAD_COEF8(320, input);
++		in[13] = LOAD_COEF8(336, input);
++		in[21] = LOAD_COEF8(352, input);
++		in[29] = LOAD_COEF8(368, input);
++		in[6]  = LOAD_COEF8(384, input);
++		in[14] = LOAD_COEF8(400, input);
++		in[22] = LOAD_COEF8(416, input);
++		in[30] = LOAD_COEF8(432, input);
++		in[7]  = LOAD_COEF8(448, input);
++		in[15] = LOAD_COEF8(464, input);
++		in[23] = LOAD_COEF8(480, input);
++		in[31] = LOAD_COEF8(496, input);
+ 		input += 256;
+ 		
+ 		// Are all entries zero? If so, the result is zero.
+@@ -3227,22 +3260,22 @@ static inline void array_transpose_16x16(vector signed short *res0, vector signe
+ }
+ 
+ static inline void load_buffer_8x16(const tran_low_t *input, vector signed short *in) {
+-  	in[0]  = vec_ld(0,   (const signed short *)input);
+-  	in[1]  = vec_ld(32,  (const signed short *)input);
+-  	in[2]  = vec_ld(64,  (const signed short *)input);
+-  	in[3]  = vec_ld(96,  (const signed short *)input);
+-  	in[4]  = vec_ld(128, (const signed short *)input);
+-  	in[5]  = vec_ld(160, (const signed short *)input);
+-  	in[6]  = vec_ld(192, (const signed short *)input);
+-  	in[7]  = vec_ld(224, (const signed short *)input);
+-  	in[8]  = vec_ld(256, (const signed short *)input);
+-  	in[9]  = vec_ld(288, (const signed short *)input);
+-  	in[10] = vec_ld(320, (const signed short *)input);
+-  	in[11] = vec_ld(352, (const signed short *)input);
+-  	in[12] = vec_ld(384, (const signed short *)input);
+-  	in[13] = vec_ld(416, (const signed short *)input);
+-  	in[14] = vec_ld(448, (const signed short *)input);
+-  	in[15] = vec_ld(480, (const signed short *)input);
++  	in[0]  = LOAD_COEF8(0, input);
++  	in[1]  = LOAD_COEF8(32, input);
++  	in[2]  = LOAD_COEF8(64, input);
++  	in[3]  = LOAD_COEF8(96, input);
++  	in[4]  = LOAD_COEF8(128, input);
++  	in[5]  = LOAD_COEF8(160, input);
++  	in[6]  = LOAD_COEF8(192, input);
++  	in[7]  = LOAD_COEF8(224, input);
++  	in[8]  = LOAD_COEF8(256, input);
++  	in[9]  = LOAD_COEF8(288, input);
++  	in[10] = LOAD_COEF8(320, input);
++  	in[11] = LOAD_COEF8(352, input);
++  	in[12] = LOAD_COEF8(384, input);
++  	in[13] = LOAD_COEF8(416, input);
++  	in[14] = LOAD_COEF8(448, input);
++  	in[15] = LOAD_COEF8(480, input);
+ }
+ 
+ static inline void write_buffer_8x16(uint8_t *dest, vector signed short *in, int stride) {
+-- 
+2.43.0
+
