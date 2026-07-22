@@ -1,0 +1,1184 @@
+From d98cd766f6051f6024930dfde370919deec758e6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 22 Jul 2026 16:21:58 +0000
+Subject: [PATCH 3/6] Upgrade wl_seat to version 5 and overhaul input handling
+
+Clients like foot require wl_seat >= 5, which obligates the
+compositor to terminate every pointer event group with a
+wl_pointer.frame event and lets it announce key repeat parameters.
+
+- wl_pointer: send frame events, axis_discrete for wheel detents,
+  scale wheel deltas to sensible axis values, add the release
+  handler, and implement set_cursor using NSCursor built from the
+  committed cursor surface's buffer.
+- wl_keyboard: send repeat_info to version 4+ clients and stop
+  forwarding Cocoa autorepeat to them (they repeat themselves);
+  replace the partial keycode table with a complete macOS to evdev
+  translation (adapted from Wawona, MIT); send modifier keys as
+  real key events derived from NSFlagsChanged, with modifier masks
+  matching the shipped keymap (Shift, Control, Mod1=Option,
+  Mod4=Command, Lock=Caps); send the mandatory modifiers event
+  after keyboard enter; drop keys we cannot translate instead of
+  sending keycode 0.
+- wl_seat: handle get_touch (inert) and release so no request hits
+  a NULL vtable slot.
+- wl_surface: implement damage_buffer (mandatory in practice for
+  wl_compositor version 4 clients); fire frame callbacks on
+  damage-less and unmapping commits so clients waiting for a frame
+  done event never deadlock; treat ARGB shm buffers as
+  premultiplied, as the protocol specifies.
+- Run the Wayland event loop source and client flushes in the
+  common run loop modes so clients keep updating during native
+  interactive window moves and resizes.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0187CcHcrnoWzf7rzCaEDpR1
+---
+ Sources/Compositor/OwlBuffer.h    |   3 +
+ Sources/Compositor/OwlBuffer.m    |   6 +
+ Sources/Compositor/OwlShmBuffer.h |   3 +
+ Sources/Compositor/OwlShmBuffer.m |  25 +-
+ Sources/Compositor/OwlSurface.h   |   6 +
+ Sources/Compositor/OwlSurface.m   |  90 ++++++--
+ Sources/Seat/OwlKeyboard.h        |   4 +
+ Sources/Seat/OwlKeyboard.m        | 367 ++++++++++++++++++++++--------
+ Sources/Seat/OwlPointer.h         |  10 +
+ Sources/Seat/OwlPointer.m         | 185 +++++++++++++--
+ Sources/Seat/OwlSeat.m            |  45 +++-
+ Sources/Server/OwlRunLoopSource.m |   7 +-
+ Sources/Server/OwlServer.m        |   5 +-
+ 13 files changed, 619 insertions(+), 137 deletions(-)
+
+diff --git a/Sources/Compositor/OwlBuffer.h b/Sources/Compositor/OwlBuffer.h
+index 3ca0d78..a34b369 100644
+--- a/Sources/Compositor/OwlBuffer.h
++++ b/Sources/Compositor/OwlBuffer.h
+@@ -38,6 +38,9 @@
+ - (BOOL) needsGLForRendering;
+ - (void) drawInRect: (NSRect) rect;
+ 
++/* Returns an NSImage for cursor creation (may return nil) */
++- (NSImage *) createNSImage;
++
+ - (void) sendRelease;
+ - (void) notifyDetached;
+ 
+diff --git a/Sources/Compositor/OwlBuffer.m b/Sources/Compositor/OwlBuffer.m
+index fb0877e..ecfcb0b 100644
+--- a/Sources/Compositor/OwlBuffer.m
++++ b/Sources/Compositor/OwlBuffer.m
+@@ -100,6 +100,12 @@ static const struct wl_buffer_interface buffer_impl = {
+     // Do nothing, subclasses override this.
+ }
+ 
++- (NSImage *) createNSImage {
++    // Default implementation returns nil.
++    // Subclasses (like OwlShmBuffer) override this.
++    return nil;
++}
++
+ - (void) sendRelease {
+     wl_buffer_send_release(_resource);
+ }
+diff --git a/Sources/Compositor/OwlShmBuffer.h b/Sources/Compositor/OwlShmBuffer.h
+index 672da4e..68e3493 100644
+--- a/Sources/Compositor/OwlShmBuffer.h
++++ b/Sources/Compositor/OwlShmBuffer.h
+@@ -32,4 +32,7 @@
+ #endif
+ }
+ 
++/* Returns an NSImage suitable for creating an NSCursor */
++- (NSImage *) createNSImage;
++
+ @end
+diff --git a/Sources/Compositor/OwlShmBuffer.m b/Sources/Compositor/OwlShmBuffer.m
+index e984ef1..9b75192 100644
+--- a/Sources/Compositor/OwlShmBuffer.m
++++ b/Sources/Compositor/OwlShmBuffer.m
+@@ -29,7 +29,8 @@
+     case WL_SHM_FORMAT_XRGB8888:
+         return kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little;
+     case WL_SHM_FORMAT_ARGB8888:
+-        return kCGImageAlphaFirst | kCGBitmapByteOrder32Little;
++        // Wayland ARGB buffers use premultiplied alpha.
++        return kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little;
+     default:
+         NSLog(@"Unknown shm format");
+         return 0;
+@@ -172,7 +173,7 @@ static void dataReleaseCallback(void *info, const void *data, size_t size) {
+ #ifdef OWL_PLATFORM_APPLE
+     CGContextRef context = [[NSGraphicsContext currentContext] graphicsPort];
+     CGContextSetBlendMode(context, kCGBlendModeCopy);
+-    CGContextDrawImage(context, rect, _image);
++    CGContextDrawImage(context, NSRectToCGRect(rect), _image);
+ #else
+     [_rep drawInRect: rect
+             fromRect: rect
+@@ -183,4 +184,24 @@ static void dataReleaseCallback(void *info, const void *data, size_t size) {
+ #endif
+ }
+ 
++- (NSImage *) createNSImage {
++    NSSize size = [self size];
++    NSImage *image = [[NSImage alloc] initWithSize: size];
++
++#ifdef OWL_PLATFORM_APPLE
++    if (_image != NULL) {
++        /* Create NSImage from CGImage */
++        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage: _image];
++        [image addRepresentation: rep];
++        [rep release];
++    }
++#else
++    if (_rep != nil) {
++        [image addRepresentation: _rep];
++    }
++#endif
++
++    return image;
++}
++
+ @end
+diff --git a/Sources/Compositor/OwlSurface.h b/Sources/Compositor/OwlSurface.h
+index 084e75b..27eb657 100644
+--- a/Sources/Compositor/OwlSurface.h
++++ b/Sources/Compositor/OwlSurface.h
+@@ -72,4 +72,10 @@
+ 
+ - (NSSize) geometrySizeAdjustements;
+ 
++/* Returns an NSImage of the current buffer content (for cursor use) */
++- (NSImage *) createCursorImage;
++
++/* Send out and clear any pending frame callbacks. */
++- (void) fireCallbacks;
++
+ @end
+diff --git a/Sources/Compositor/OwlSurface.m b/Sources/Compositor/OwlSurface.m
+index 0774a05..100a3d7 100644
+--- a/Sources/Compositor/OwlSurface.m
++++ b/Sources/Compositor/OwlSurface.m
+@@ -76,6 +76,19 @@ static void surface_damage_handler(
+     [self->_pendingState addDamage: rect];
+ }
+ 
++static void surface_damage_buffer_handler(
++    struct wl_client *client,
++    struct wl_resource *resource,
++    int32_t x,
++    int32_t y,
++    int32_t width,
++    int32_t height
++) {
++    // We don't support buffer scales or transforms, so buffer
++    // coordinates are the same as surface coordinates.
++    surface_damage_handler(client, resource, x, y, width, height);
++}
++
+ - (void) setPendingGeometry: (NSRect) geometry {
+     [_pendingState setGeometry: geometry];
+ }
+@@ -162,17 +175,25 @@ static void surface_damage_handler(
+ 
+     if (unmap) {
+         [_role unmap];
+-        // Nothing further to do, as we have no buffer.
++        // We have no buffer, so -drawRect: is not going to run;
++        // fire any pending frame callbacks so the client doesn't
++        // wait for them forever.
++        [self fireCallbacks];
+         return;
+     }
+ 
++    BOOL willRedraw = NO;
++
+     if (!NSEqualSizes([self frame].size, [newBuffer size])) {
+         [self setFrameSize: [newBuffer size]];
+         [self updateTrackingRect];
++        [self setNeedsDisplay: YES];
++        willRedraw = YES;
+     }
+ 
+     if (map) {
+         [_role map];
++        willRedraw = YES;
+     } else {
+         [_role update];
+     }
+@@ -180,13 +201,36 @@ static void surface_damage_handler(
+     // Now, tell Cocoa to redraw this view.
+     if (damageAll) {
+         [self setNeedsDisplay: YES];
++        willRedraw = YES;
+     } else {
+         for (NSValue *value in [_currentState damage]) {
+             NSRect rect = [value rectValue];
+             rect.origin.y = [newBuffer size].height - rect.size.height - rect.origin.y;
+             [self setNeedsDisplayInRect: rect];
++            willRedraw = YES;
+         }
+     }
++
++    // If the client requested frame callbacks but this commit
++    // won't cause a redraw (e.g. a commit with no damage), the
++    // callbacks would never fire from -drawRect:, deadlocking
++    // clients that wait for them before rendering. Fire them
++    // right away instead.
++    if (!willRedraw) {
++        [self fireCallbacks];
++    }
++}
++
++- (void) fireCallbacks {
++    if ([_callbacks count] == 0) {
++        return;
++    }
++    uint32_t timestamp = [OwlServer timestamp];
++    for (OwlCallback *callback in _callbacks) {
++        [callback sendDoneWithData: timestamp];
++    }
++    [_callbacks removeAllObjects];
++    [[OwlServer sharedServer] flushClientsLater];
+ }
+ 
+ static void surface_commit_handler(
+@@ -195,6 +239,9 @@ static void surface_commit_handler(
+ ) {
+     OwlSurface *self = wl_resource_get_user_data(resource);
+     [self commit];
++
++    /* Notify pointer in case this is a cursor surface */
++    [OwlPointer notifyCursorSurfaceCommit: resource];
+ }
+ 
+ - (void) drawRect: (NSRect) dirtyRect {
+@@ -206,15 +253,9 @@ static void surface_commit_handler(
+     [[_currentState buffer] drawInRect: [self bounds]];
+ 
+     // We have painted; so send out all callbacks.
+-    uint32_t timestamp = [OwlServer timestamp];
+-    for (OwlCallback *callback in _callbacks) {
+-        [callback sendDoneWithData: timestamp];
+-    }
+-    [_callbacks removeAllObjects];
++    [self fireCallbacks];
+ 
+     [[self window] invalidateShadow];
+-
+-    [[OwlServer sharedServer] flushClientsLater];
+ }
+ 
+ static void surface_set_opaque_region_handler(
+@@ -275,8 +316,8 @@ static const struct wl_surface_interface surface_interface = {
+     .set_opaque_region = surface_set_opaque_region_handler,
+     .set_input_region = surface_set_input_region_handler,
+     .set_buffer_scale = surface_set_buffer_scale_handler,
+-    .set_buffer_transform = surface_set_buffer_transform_handler
+-    // TODO
++    .set_buffer_transform = surface_set_buffer_transform_handler,
++    .damage_buffer = surface_damage_buffer_handler
+ };
+ 
+ - (id) initWithResource: (struct wl_resource *) resource {
+@@ -310,6 +351,14 @@ static const struct wl_surface_interface surface_interface = {
+     _role = newRole;
+ }
+ 
++- (NSImage *) createCursorImage {
++    OwlBuffer *buffer = [_currentState buffer];
++    if (buffer == nil) {
++        return nil;
++    }
++    return [buffer createNSImage];
++}
++
+ - (OwlPointer *) pointer {
+     struct wl_client *client = wl_resource_get_client(_resource);
+     return [OwlPointer pointerForClient: client];
+@@ -415,7 +464,19 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) keyDown: (NSEvent *) event {
+-    [[self keyboard] sendKey: [event keyCode] isPressed: YES];
++    OwlKeyboard *keyboard = [self keyboard];
++    if (keyboard == nil) {
++        return;
++    }
++    // Don't forward Cocoa's autorepeat to version 4+ keyboards:
++    // those clients repeat keys themselves based on the
++    // repeat_info event we send them. Older clients rely on
++    // the compositor repeating, so let repeats through.
++    if ([event isARepeat]
++        && wl_resource_get_version([keyboard resource]) >= 4) {
++        return;
++    }
++    [keyboard sendKey: [event keyCode] isPressed: YES];
+     [[OwlServer sharedServer] flushClientsLater];
+ }
+ 
+@@ -425,12 +486,7 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) flagsChanged: (NSEvent *) event {
+-    NSUInteger flags = [event modifierFlags];
+-    BOOL shift = (flags & NSShiftKeyMask) ? YES : NO;
+-    BOOL ctrl = (flags & NSCommandKeyMask) ? YES : NO;
+-    BOOL alt = (flags & NSAlternateKeyMask) ? YES : NO;
+-    uint32_t mods = shift + ctrl * 4 + alt * 262152;
+-    [[self keyboard] sendModifiers: mods];
++    [[self keyboard] handleFlagsChanged: event];
+     [[OwlServer sharedServer] flushClientsLater];
+ }
+ 
+diff --git a/Sources/Seat/OwlKeyboard.h b/Sources/Seat/OwlKeyboard.h
+index ab89317..edb53a5 100644
+--- a/Sources/Seat/OwlKeyboard.h
++++ b/Sources/Seat/OwlKeyboard.h
+@@ -36,4 +36,8 @@
+ - (void) sendKey: (unsigned short) keyCode isPressed: (BOOL) isPressed;
+ - (void) sendModifiers: (uint32_t) modifiers;
+ 
++/* Translate an NSFlagsChanged event into modifier key events
++ * plus a wl_keyboard.modifiers event. */
++- (void) handleFlagsChanged: (NSEvent *) event;
++
+ @end
+diff --git a/Sources/Seat/OwlKeyboard.m b/Sources/Seat/OwlKeyboard.m
+index 399be1b..dee99f4 100644
+--- a/Sources/Seat/OwlKeyboard.m
++++ b/Sources/Seat/OwlKeyboard.m
+@@ -2,6 +2,10 @@
+  *
+  * Copyright © 2019-2021 Sergey Bugaev <bugaevc@gmail.com>
+  *
++ * XKB keycode translation table adapted from Wawona:
++ * Copyright © 2025 Alex Spaulding (MIT License)
++ * https://github.com/Wawona/Wawona
++ *
+  * Owl is free software: you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published
+  * by the Free Software Foundation, either version 3 of the License,
+@@ -17,7 +21,6 @@
+  */
+ 
+ #import "OwlKeyboard.h"
+-#import <xkbcommon/xkbcommon.h>
+ #import <fcntl.h>
+ #import <unistd.h>
+ #import "OwlServer.h"
+@@ -28,11 +31,38 @@
+     #import <Carbon/Carbon.h>
+ #endif
+ 
++/* Modifier masks as laid out in our keymap.xkb
++ * (the standard pc105 real-modifier assignment). */
++#define OWL_MOD_SHIFT   1
++#define OWL_MOD_LOCK    2
++#define OWL_MOD_CONTROL 4
++#define OWL_MOD_MOD1    8   /* Option/Alt */
++#define OWL_MOD_MOD4    64  /* Command/Super */
++
++/* Evdev keycodes for (left) modifier keys. */
++#define OWL_KEY_LEFTCTRL   29
++#define OWL_KEY_LEFTSHIFT  42
++#define OWL_KEY_LEFTALT    56
++#define OWL_KEY_CAPSLOCK   58
++#define OWL_KEY_LEFTMETA   125
++
++/* The keyboard repeat parameters we advertise to version 4+
++ * clients; the clients implement the repeating themselves. */
++#define OWL_KEY_REPEAT_RATE  25   /* keys per second */
++#define OWL_KEY_REPEAT_DELAY 400  /* milliseconds */
+ 
+ @implementation OwlKeyboard
+ 
+ static NSMutableArray *keyboards;
+ 
++/* The state of the physical modifiers. This is global rather
++ * than per-client: there is only one physical keyboard, and we
++ * need to replay its state to a client when its surface gains
++ * keyboard focus. */
++static uint32_t current_mods_depressed;
++static uint32_t current_mods_locked;
++static NSUInteger previous_cocoa_flags;
++
+ + (void) initialize {
+     if (keyboards == nil) {
+         keyboards = [[NSMutableArray alloc] initWithCapacity: 1];
+@@ -94,6 +124,14 @@ static const struct wl_keyboard_interface keyboard_impl = {
+ 
+     [self sendKeymap];
+ 
++    if (wl_resource_get_version(resource) >= 4) {
++        wl_keyboard_send_repeat_info(
++            resource,
++            OWL_KEY_REPEAT_RATE,
++            OWL_KEY_REPEAT_DELAY
++        );
++    }
++
+     return self;
+ }
+ 
+@@ -102,104 +140,157 @@ static const struct wl_keyboard_interface keyboard_impl = {
+ }
+ 
+ #ifdef OWL_PLATFORM_APPLE
+-static const struct {
+-    unsigned short cocoaKeyCode;
+-    uint32_t xkbKeyCode;
+-} keymap[] = {
+-    {kVK_Escape, 1},
+-
+-    {kVK_ANSI_1, 2},
+-    {kVK_ANSI_2, 3},
+-    {kVK_ANSI_3, 4},
+-    {kVK_ANSI_4, 5},
+-    {kVK_ANSI_5, 6},
+-    {kVK_ANSI_6, 7},
+-    {kVK_ANSI_7, 8},
+-    {kVK_ANSI_8, 9},
+-    {kVK_ANSI_9, 10},
+-    {kVK_ANSI_0, 11},
+-
+-    {kVK_ANSI_Minus, 12},
+-    {kVK_ANSI_Equal, 13},
+-    {kVK_Delete, 14}, // backspace
+-    {kVK_Tab, 15},
+-
+-    {kVK_ANSI_Q, 16},
+-    {kVK_ANSI_W, 17},
+-    {kVK_ANSI_E, 18},
+-    {kVK_ANSI_R, 19},
+-    {kVK_ANSI_T, 20},
+-    {kVK_ANSI_Y, 21},
+-    {kVK_ANSI_U, 22},
+-    {kVK_ANSI_I, 23},
+-    {kVK_ANSI_O, 24},
+-    {kVK_ANSI_P, 25},
+-
+-    {kVK_ANSI_LeftBracket, 26},
+-    {kVK_ANSI_RightBracket, 27},
+-    {kVK_Return, 28}, // enter
+-
+-    {kVK_ANSI_A, 30},
+-    {kVK_ANSI_S, 31},
+-    {kVK_ANSI_D, 32},
+-    {kVK_ANSI_F, 33},
+-    {kVK_ANSI_G, 34},
+-    {kVK_ANSI_H, 35},
+-    {kVK_ANSI_J, 36},
+-    {kVK_ANSI_K, 37},
+-    {kVK_ANSI_L, 38},
+-
+-    {kVK_ANSI_Semicolon, 39},
+-    {kVK_ANSI_Quote, 40},
+-    {kVK_ANSI_Grave, 41},
+-    {kVK_ANSI_Backslash, 43},
+-
+-    {kVK_ANSI_Z, 44},
+-    {kVK_ANSI_X, 45},
+-    {kVK_ANSI_C, 46},
+-    {kVK_ANSI_V, 47},
+-    {kVK_ANSI_B, 48},
+-    {kVK_ANSI_N, 49},
+-    {kVK_ANSI_M, 50},
+-
+-    {kVK_ANSI_Comma, 51},
+-    {kVK_ANSI_Period, 52},
+-    {kVK_ANSI_Slash, 53},
+-    {kVK_Space, 57},
+-
+-    {kVK_F1, 59},
+-    {kVK_F2, 60},
+-    {kVK_F3, 61},
+-    {kVK_F4, 62},
+-    {kVK_F5, 63},
+-    {kVK_F6, 64},
+-    {kVK_F7, 65},
+-    {kVK_F8, 66},
+-    {kVK_F9, 67},
+-    {kVK_F10, 68},
+-
+-    {kVK_F11, 87},
+-    {kVK_F12, 88},
+-
+-    {kVK_Home, 102},
+-    {kVK_UpArrow, 103},
+-    {kVK_PageUp, 104},
+-    {kVK_LeftArrow, 105},
+-    {kVK_RightArrow, 106},
+-    {kVK_End, 107},
+-    {kVK_DownArrow, 108},
+-    {kVK_PageDown, 109},
+-    {kVK_ForwardDelete, 111}
+-};
+ 
+-- (uint32_t) xkbKeyCodeForCocoaKeyCode: (unsigned short) cocoaKeyCode {
+-    size_t keymap_size = sizeof(keymap) / sizeof(*keymap);
+-    for (size_t i = 0; i < keymap_size; i++) {
+-        if (keymap[i].cocoaKeyCode == cocoaKeyCode) {
+-            return keymap[i].xkbKeyCode;
+-        }
++/* BEGIN: Adapted from Wawona (MIT License)
++ * https://github.com/Wawona/Wawona/blob/master/src/platform/macos/WWNWindow.m
++ * Copyright © 2025 Alex Spaulding
++ *
++ * Complete macOS → XKB/Evdev keycode translation table.
++ */
++static uint32_t MacosToXkbKeycode(unsigned short macCode) {
++    switch (macCode) {
++        /* Letters */
++        case kVK_ANSI_A: return 30;
++        case kVK_ANSI_B: return 48;
++        case kVK_ANSI_C: return 46;
++        case kVK_ANSI_D: return 32;
++        case kVK_ANSI_E: return 18;
++        case kVK_ANSI_F: return 33;
++        case kVK_ANSI_G: return 34;
++        case kVK_ANSI_H: return 35;
++        case kVK_ANSI_I: return 23;
++        case kVK_ANSI_J: return 36;
++        case kVK_ANSI_K: return 37;
++        case kVK_ANSI_L: return 38;
++        case kVK_ANSI_M: return 50;
++        case kVK_ANSI_N: return 49;
++        case kVK_ANSI_O: return 24;
++        case kVK_ANSI_P: return 25;
++        case kVK_ANSI_Q: return 16;
++        case kVK_ANSI_R: return 19;
++        case kVK_ANSI_S: return 31;
++        case kVK_ANSI_T: return 20;
++        case kVK_ANSI_U: return 22;
++        case kVK_ANSI_V: return 47;
++        case kVK_ANSI_W: return 17;
++        case kVK_ANSI_X: return 45;
++        case kVK_ANSI_Y: return 21;
++        case kVK_ANSI_Z: return 44;
++
++        /* Numbers */
++        case kVK_ANSI_1: return 2;
++        case kVK_ANSI_2: return 3;
++        case kVK_ANSI_3: return 4;
++        case kVK_ANSI_4: return 5;
++        case kVK_ANSI_5: return 6;
++        case kVK_ANSI_6: return 7;
++        case kVK_ANSI_7: return 8;
++        case kVK_ANSI_8: return 9;
++        case kVK_ANSI_9: return 10;
++        case kVK_ANSI_0: return 11;
++
++        /* Punctuation and symbols */
++        case kVK_ANSI_Minus: return 12;
++        case kVK_ANSI_Equal: return 13;
++        case kVK_ANSI_LeftBracket: return 26;
++        case kVK_ANSI_RightBracket: return 27;
++        case kVK_ANSI_Backslash: return 43;
++        case kVK_ANSI_Semicolon: return 39;
++        case kVK_ANSI_Quote: return 40;
++        case kVK_ANSI_Grave: return 41;
++        case kVK_ANSI_Comma: return 51;
++        case kVK_ANSI_Period: return 52;
++        case kVK_ANSI_Slash: return 53;
++        case kVK_ISO_Section: return 86; /* extra key on ISO keyboards */
++
++        /* Special keys */
++        case kVK_Return: return 28;
++        case kVK_Tab: return 15;
++        case kVK_Space: return 57;
++        case kVK_Delete: return 14;             /* Backspace */
++        case kVK_ForwardDelete: return 111;     /* Delete */
++        case kVK_Escape: return 1;
++
++        /* Modifier keys */
++        case kVK_Shift: return OWL_KEY_LEFTSHIFT;
++        case kVK_RightShift: return 54;
++        case kVK_Control: return OWL_KEY_LEFTCTRL;
++        case kVK_RightControl: return 97;
++        case kVK_Option: return OWL_KEY_LEFTALT;
++        case kVK_RightOption: return 100;
++        case kVK_Command: return OWL_KEY_LEFTMETA;
++        case 0x36: return 126;                  /* Right Command; no kVK_
++                                                   constant in the 10.5 SDK */
++        case kVK_CapsLock: return OWL_KEY_CAPSLOCK;
++
++        /* Function keys */
++        case kVK_F1: return 59;
++        case kVK_F2: return 60;
++        case kVK_F3: return 61;
++        case kVK_F4: return 62;
++        case kVK_F5: return 63;
++        case kVK_F6: return 64;
++        case kVK_F7: return 65;
++        case kVK_F8: return 66;
++        case kVK_F9: return 67;
++        case kVK_F10: return 68;
++        case kVK_F11: return 87;
++        case kVK_F12: return 88;
++        case kVK_F13: return 183;
++        case kVK_F14: return 184;
++        case kVK_F15: return 185;
++        case kVK_F16: return 186;
++        case kVK_F17: return 187;
++        case kVK_F18: return 188;
++        case kVK_F19: return 189;
++        case kVK_F20: return 190;
++
++        /* Arrow keys */
++        case kVK_LeftArrow: return 105;
++        case kVK_RightArrow: return 106;
++        case kVK_UpArrow: return 103;
++        case kVK_DownArrow: return 108;
++
++        /* Navigation keys */
++        case kVK_Home: return 102;
++        case kVK_End: return 107;
++        case kVK_PageUp: return 104;
++        case kVK_PageDown: return 109;
++
++        /* Keypad */
++        case kVK_ANSI_KeypadDecimal: return 83;
++        case kVK_ANSI_KeypadMultiply: return 55;
++        case kVK_ANSI_KeypadPlus: return 78;
++        case kVK_ANSI_KeypadClear: return 69;   /* Num Lock position */
++        case kVK_ANSI_KeypadDivide: return 98;
++        case kVK_ANSI_KeypadEnter: return 96;
++        case kVK_ANSI_KeypadMinus: return 74;
++        case kVK_ANSI_KeypadEquals: return 117;
++        case kVK_ANSI_Keypad0: return 82;
++        case kVK_ANSI_Keypad1: return 79;
++        case kVK_ANSI_Keypad2: return 80;
++        case kVK_ANSI_Keypad3: return 81;
++        case kVK_ANSI_Keypad4: return 75;
++        case kVK_ANSI_Keypad5: return 76;
++        case kVK_ANSI_Keypad6: return 77;
++        case kVK_ANSI_Keypad7: return 71;
++        case kVK_ANSI_Keypad8: return 72;
++        case kVK_ANSI_Keypad9: return 73;
++
++        /* Media and system keys */
++        case kVK_Help: return 138;
++        case kVK_VolumeUp: return 115;
++        case kVK_VolumeDown: return 114;
++        case kVK_Mute: return 113;
++
++        /* Unknown key */
++        default: return 0;
+     }
+-    return 0;
++}
++/* END: Wawona code */
++
++- (uint32_t) xkbKeyCodeForCocoaKeyCode: (unsigned short) cocoaKeyCode {
++    return MacosToXkbKeycode(cocoaKeyCode);
+ }
+ 
+ #else /* OWL_PLATFORM_APPLE */
+@@ -234,11 +325,32 @@ static const struct {
+         ? WL_KEYBOARD_KEY_STATE_PRESSED
+         : WL_KEYBOARD_KEY_STATE_RELEASED;
+ 
++    uint32_t xkbKeyCode = [self xkbKeyCodeForCocoaKeyCode: keyCode];
++    if (xkbKeyCode == 0) {
++        // We don't know how to translate this key; it's better
++        // to say nothing than to send a bogus keycode.
++        return;
++    }
++
+     wl_keyboard_send_key(
+         _resource,
+         [[OwlServer sharedServer] nextSerial],
+         [OwlServer timestamp],
+-        [self xkbKeyCodeForCocoaKeyCode: keyCode],
++        xkbKeyCode,
++        state
++    );
++}
++
++- (void) sendKeyRaw: (uint32_t) xkbKeyCode isPressed: (BOOL) isPressed {
++    enum wl_keyboard_key_state state = isPressed
++        ? WL_KEYBOARD_KEY_STATE_PRESSED
++        : WL_KEYBOARD_KEY_STATE_RELEASED;
++
++    wl_keyboard_send_key(
++        _resource,
++        [[OwlServer sharedServer] nextSerial],
++        [OwlServer timestamp],
++        xkbKeyCode,
+         state
+     );
+ }
+@@ -248,12 +360,71 @@ static const struct {
+     wl_keyboard_send_modifiers(_resource, serial, modifiers, 0, 0, 0);
+ }
+ 
++- (void) sendCurrentModifiers {
++    uint32_t serial = [[OwlServer sharedServer] nextSerial];
++    wl_keyboard_send_modifiers(
++        _resource,
++        serial,
++        current_mods_depressed,
++        0,
++        current_mods_locked,
++        0
++    );
++}
++
++- (void) handleFlagsChanged: (NSEvent *) event {
++    static const struct {
++        NSUInteger cocoaMask;
++        uint32_t modMask;
++        uint32_t evdevCode;
++    } modifiers[] = {
++        {NSShiftKeyMask, OWL_MOD_SHIFT, OWL_KEY_LEFTSHIFT},
++        {NSControlKeyMask, OWL_MOD_CONTROL, OWL_KEY_LEFTCTRL},
++        {NSAlternateKeyMask, OWL_MOD_MOD1, OWL_KEY_LEFTALT},
++        {NSCommandKeyMask, OWL_MOD_MOD4, OWL_KEY_LEFTMETA}
++    };
++    size_t modifiers_size = sizeof(modifiers) / sizeof(modifiers[0]);
++
++    NSUInteger flags = [event modifierFlags];
++    NSUInteger changed = flags ^ previous_cocoa_flags;
++    size_t i;
++
++    for (i = 0; i < modifiers_size; i++) {
++        if (!(changed & modifiers[i].cocoaMask)) {
++            continue;
++        }
++        BOOL isPressed = (flags & modifiers[i].cocoaMask) ? YES : NO;
++        if (isPressed) {
++            current_mods_depressed |= modifiers[i].modMask;
++        } else {
++            current_mods_depressed &= ~modifiers[i].modMask;
++        }
++        [self sendKeyRaw: modifiers[i].evdevCode isPressed: isPressed];
++    }
++
++    if (changed & NSAlphaShiftKeyMask) {
++        // Caps Lock is special: Cocoa reports the lock state, not
++        // the key state, so fake a full press-release and toggle
++        // the locked modifier.
++        current_mods_locked ^= OWL_MOD_LOCK;
++        [self sendKeyRaw: OWL_KEY_CAPSLOCK isPressed: YES];
++        [self sendKeyRaw: OWL_KEY_CAPSLOCK isPressed: NO];
++    }
++
++    previous_cocoa_flags = flags;
++
++    [self sendCurrentModifiers];
++}
++
+ - (void) sendEnterSurface: (OwlSurface *) surface {
+     uint32_t serial = [[OwlServer sharedServer] nextSerial];
+     struct wl_array keys;
+     wl_array_init(&keys);
+     wl_keyboard_send_enter(_resource, serial, [surface resource], &keys);
+     wl_array_release(&keys);
++
++    // The protocol requires a modifiers event to follow enter.
++    [self sendCurrentModifiers];
+ }
+ 
+ - (void) sendLeaveSurface: (OwlSurface *) surface {
+diff --git a/Sources/Seat/OwlPointer.h b/Sources/Seat/OwlPointer.h
+index f69a105..6c08287 100644
+--- a/Sources/Seat/OwlPointer.h
++++ b/Sources/Seat/OwlPointer.h
+@@ -30,6 +30,11 @@
+ 
+ @interface OwlPointer : NSObject {
+     struct wl_resource *_resource;
++    struct wl_resource *_cursorSurface;
++    struct wl_listener _cursorSurfaceDestroyListener;
++    int32_t _hotspotX;
++    int32_t _hotspotY;
++    NSCursor *_cursor;
+ }
+ 
+ - (id) initWithResource: (struct wl_resource *) resource;
+@@ -42,4 +47,9 @@
+ - (void) sendScrollByX: (CGFloat) deltaX byY: (CGFloat) deltaY;
+ - (void) sendButton: (uint32_t) button isPressed: (BOOL) isPressed;
+ 
++/* Cursor management */
++- (void) updateCursorFromSurface;
++- (void) applyCursor;
+++ (void) notifyCursorSurfaceCommit: (struct wl_resource *) surfaceResource;
++
+ @end
+diff --git a/Sources/Seat/OwlPointer.m b/Sources/Seat/OwlPointer.m
+index d754754..a09d17c 100644
+--- a/Sources/Seat/OwlPointer.m
++++ b/Sources/Seat/OwlPointer.m
+@@ -20,6 +20,7 @@
+ #import <wayland-server.h>
+ #import "OwlServer.h"
+ #import "OwlSurface.h"
++#import "OwlBuffer.h"
+ 
+ 
+ @implementation OwlPointer
+@@ -42,6 +43,79 @@ static NSMutableArray *pointers;
+     return nil;
+ }
+ 
+++ (void) notifyCursorSurfaceCommit: (struct wl_resource *) surfaceResource {
++    /* Check if any pointer is using this surface as cursor */
++    NSUInteger i, count = [pointers count];
++    for (i = 0; i < count; i++) {
++        OwlPointer *pointer = [pointers objectAtIndex: i];
++        if (pointer->_cursorSurface == surfaceResource) {
++            [pointer updateCursorFromSurface];
++            [pointer applyCursor];
++        }
++    }
++}
++
++static void cursor_surface_destroy_notify(struct wl_listener *listener, void *data) {
++    /* Get the OwlPointer from the listener using container_of pattern */
++    OwlPointer *self = nil;
++    for (OwlPointer *pointer in pointers) {
++        if (&pointer->_cursorSurfaceDestroyListener == listener) {
++            self = pointer;
++            break;
++        }
++    }
++    if (self == nil) {
++        return;
++    }
++
++    /* Clear the cursor surface since it's being destroyed */
++    self->_cursorSurface = NULL;
++    wl_list_remove(&self->_cursorSurfaceDestroyListener.link);
++    wl_list_init(&self->_cursorSurfaceDestroyListener.link);
++}
++
++- (void) updateCursorFromSurface {
++    [_cursor release];
++    _cursor = nil;
++
++    if (_cursorSurface == NULL) {
++        /* Hide cursor - use invisible cursor */
++        NSImage *emptyImage = [[NSImage alloc] initWithSize: NSMakeSize(1, 1)];
++        _cursor = [[NSCursor alloc] initWithImage: emptyImage
++                                          hotSpot: NSZeroPoint];
++        [emptyImage release];
++        return;
++    }
++
++    /* Get the cursor surface */
++    OwlSurface *surface = wl_resource_get_user_data(_cursorSurface);
++    if (surface == nil) {
++        _cursor = [[NSCursor arrowCursor] retain];
++        return;
++    }
++
++    /* Get cursor image from the surface */
++    NSImage *cursorImage = [surface createCursorImage];
++    if (cursorImage == nil) {
++        /* No buffer yet, use default arrow */
++        _cursor = [[NSCursor arrowCursor] retain];
++        return;
++    }
++
++    /* Create cursor with hotspot */
++    NSPoint hotspot = NSMakePoint(_hotspotX, _hotspotY);
++    _cursor = [[NSCursor alloc] initWithImage: cursorImage hotSpot: hotspot];
++    [cursorImage release];
++}
++
++- (void) applyCursor {
++    if (_cursor != nil) {
++        [_cursor set];
++    } else {
++        [[NSCursor arrowCursor] set];
++    }
++}
++
+ static void pointer_set_cursor(
+     struct wl_client *client,
+     struct wl_resource *resource,
+@@ -50,11 +124,51 @@ static void pointer_set_cursor(
+     int32_t hotspot_x,
+     int32_t hotspot_y
+ ) {
+-    // TODO
++    OwlPointer *self = wl_resource_get_user_data(resource);
++
++    /* Remove listener from old cursor surface if any */
++    if (self->_cursorSurface != NULL) {
++        wl_list_remove(&self->_cursorSurfaceDestroyListener.link);
++        wl_list_init(&self->_cursorSurfaceDestroyListener.link);
++    }
++
++    self->_cursorSurface = surface_resource;
++    self->_hotspotX = hotspot_x;
++    self->_hotspotY = hotspot_y;
++
++    if (surface_resource == NULL) {
++        /* Client wants to hide cursor */
++        [self->_cursor release];
++        self->_cursor = nil;
++
++        /* Create invisible cursor */
++        NSImage *emptyImage = [[NSImage alloc] initWithSize: NSMakeSize(1, 1)];
++        self->_cursor = [[NSCursor alloc] initWithImage: emptyImage
++                                                hotSpot: NSZeroPoint];
++        [emptyImage release];
++    } else {
++        /* Add destroy listener to new cursor surface */
++        wl_resource_add_destroy_listener(
++            surface_resource,
++            &self->_cursorSurfaceDestroyListener
++        );
++        /* Cursor will be updated when surface commits */
++        [self updateCursorFromSurface];
++    }
++
++    [self applyCursor];
++}
++
++static void pointer_release_handler(
++    struct wl_client *client,
++    struct wl_resource *resource
++) {
++    wl_resource_destroy(resource);
+ }
+ 
+ static const struct wl_pointer_interface pointer_impl = {
+-    .set_cursor = pointer_set_cursor
++    .set_cursor = pointer_set_cursor,
++    .release = pointer_release_handler
+ };
+ 
+ static void pointer_destroy(struct wl_resource *resource) {
+@@ -63,8 +177,20 @@ static void pointer_destroy(struct wl_resource *resource) {
+     [self release];
+ }
+ 
++- (void) dealloc {
++    /* Remove destroy listener if still active */
++    if (_cursorSurface != NULL) {
++        wl_list_remove(&_cursorSurfaceDestroyListener.link);
++    }
++    [_cursor release];
++    [super dealloc];
++}
++
+ - (id) initWithResource: (struct wl_resource *) resource {
+     _resource = resource;
++    _cursorSurface = NULL;
++    wl_list_init(&_cursorSurfaceDestroyListener.link);
++    _cursorSurfaceDestroyListener.notify = cursor_surface_destroy_notify;
+     [pointers addObject: self];
+     wl_resource_set_implementation(
+         resource,
+@@ -79,6 +205,15 @@ static void pointer_destroy(struct wl_resource *resource) {
+     return _resource;
+ }
+ 
++// Since version 5 of wl_pointer, clients group the incoming
++// events by frames, and expect a frame event to terminate each
++// group; without it, they may defer processing indefinitely.
++- (void) sendFrame {
++    if (wl_resource_get_version(_resource) >= 5) {
++        wl_pointer_send_frame(_resource);
++    }
++}
++
+ - (void) sendEnterSurface: (OwlSurface *) surface atPoint: (NSPoint) point {
+     wl_pointer_send_enter(
+         _resource,
+@@ -87,6 +222,10 @@ static void pointer_destroy(struct wl_resource *resource) {
+         wl_fixed_from_double(point.x),
+         wl_fixed_from_double(point.y)
+     );
++    [self sendFrame];
++
++    /* Apply current cursor when entering a surface */
++    [self applyCursor];
+ }
+ 
+ - (void) sendMotionAtPoint: (NSPoint) point {
+@@ -96,6 +235,7 @@ static void pointer_destroy(struct wl_resource *resource) {
+         wl_fixed_from_double(point.x),
+         wl_fixed_from_double(point.y)
+     );
++    [self sendFrame];
+ }
+ 
+ - (void) sendLeaveSurface: (OwlSurface *) surface {
+@@ -104,28 +244,42 @@ static void pointer_destroy(struct wl_resource *resource) {
+         [[OwlServer sharedServer] nextSerial],
+         [surface resource]
+     );
++    [self sendFrame];
++}
++
++- (void) sendAxis: (enum wl_pointer_axis) axis value: (CGFloat) value {
++    // The axis value is expressed in surface-local coordinate
++    // units; Cocoa gives us wheel deltas in lines. Scale by
++    // roughly a line height so that scrolling feels right, and
++    // let version 5+ clients know the exact detent count.
++    if (wl_resource_get_version(_resource) >= 5) {
++        int32_t discrete = (int32_t) (value > 0 ? value + 0.5 : value - 0.5);
++        if (discrete != 0) {
++            wl_pointer_send_axis_discrete(_resource, axis, discrete);
++        }
++    }
++    wl_pointer_send_axis(
++        _resource,
++        [OwlServer timestamp],
++        axis,
++        wl_fixed_from_double(value * 10.0)
++    );
+ }
+ 
+ - (void) sendScrollByX: (CGFloat) deltaX byY: (CGFloat) deltaY {
+-    uint32_t timestamp = [OwlServer timestamp];
++    if (deltaX == 0.0 && deltaY == 0.0) {
++        return;
++    }
+ 
+     if (deltaX != 0.0) {
+-        wl_pointer_send_axis(
+-            _resource,
+-            timestamp,
+-            WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+-            wl_fixed_from_double(deltaX)
+-        );
++        [self sendAxis: WL_POINTER_AXIS_HORIZONTAL_SCROLL value: deltaX];
+     }
+ 
+     if (deltaY != 0.0) {
+-        wl_pointer_send_axis(
+-            _resource,
+-            timestamp,
+-            WL_POINTER_AXIS_VERTICAL_SCROLL,
+-            wl_fixed_from_double(-deltaY)
+-        );
++        [self sendAxis: WL_POINTER_AXIS_VERTICAL_SCROLL value: -deltaY];
+     }
++
++    [self sendFrame];
+ }
+ 
+ - (void) sendButton: (uint32_t) button isPressed: (BOOL) isPressed {
+@@ -140,6 +294,7 @@ static void pointer_destroy(struct wl_resource *resource) {
+         button,
+         state
+     );
++    [self sendFrame];
+ }
+ 
+ @end
+diff --git a/Sources/Seat/OwlSeat.m b/Sources/Seat/OwlSeat.m
+index 94cfa6e..d077527 100644
+--- a/Sources/Seat/OwlSeat.m
++++ b/Sources/Seat/OwlSeat.m
+@@ -53,9 +53,47 @@ static void seat_get_keyboard(
+     [[[OwlKeyboard alloc] initWithResource: keyboard_resource] release];
+ }
+ 
++static void touch_release_handler(
++    struct wl_client *client,
++    struct wl_resource *resource
++) {
++    wl_resource_destroy(resource);
++}
++
++static const struct wl_touch_interface touch_impl = {
++    .release = touch_release_handler
++};
++
++static void seat_get_touch(
++    struct wl_client *client,
++    struct wl_resource *resource,
++    uint32_t id
++) {
++    // We never advertise the touch capability, so a well-behaved
++    // client will not request a touch object; still, don't crash
++    // if one does. Give it an inert wl_touch.
++    uint32_t version = wl_resource_get_version(resource);
++    struct wl_resource *touch_resource = wl_resource_create(
++        client,
++        &wl_touch_interface,
++        version,
++        id
++    );
++    wl_resource_set_implementation(touch_resource, &touch_impl, NULL, NULL);
++}
++
++static void seat_release_handler(
++    struct wl_client *client,
++    struct wl_resource *resource
++) {
++    wl_resource_destroy(resource);
++}
++
+ static const struct wl_seat_interface seat_impl = {
+     .get_pointer = seat_get_pointer,
+-    .get_keyboard = seat_get_keyboard
++    .get_keyboard = seat_get_keyboard,
++    .get_touch = seat_get_touch,
++    .release = seat_release_handler
+ };
+ 
+ static void seat_destroy(struct wl_resource *resource) {
+@@ -101,7 +139,10 @@ static void seat_bind(
+ }
+ 
+ + (void) addGlobalToDisplay: (struct wl_display *) display {
+-    wl_global_create(display, &wl_seat_interface, 2, NULL, seat_bind);
++    // Version 5 is required by clients like foot; it obligates
++    // us to send wl_pointer.frame events and keyboard repeat
++    // information, which OwlPointer and OwlKeyboard handle.
++    wl_global_create(display, &wl_seat_interface, 5, NULL, seat_bind);
+ }
+ 
+ @end
+diff --git a/Sources/Server/OwlRunLoopSource.m b/Sources/Server/OwlRunLoopSource.m
+index 2205021..d88853c 100644
+--- a/Sources/Server/OwlRunLoopSource.m
++++ b/Sources/Server/OwlRunLoopSource.m
+@@ -86,7 +86,10 @@ static void socketCallback(
+ 
+ - (void) addToRunLoop {
+ #ifndef OWL_PLATFORM_GNUSTEP
+-    CFRunLoopAddSource(CFRunLoopGetCurrent(), _source, kCFRunLoopDefaultMode);
++    // Use the common modes rather than just the default mode, so
++    // that we keep serving clients during nested event-tracking
++    // loops, such as native interactive window moves and resizes.
++    CFRunLoopAddSource(CFRunLoopGetCurrent(), _source, kCFRunLoopCommonModes);
+ #else
+     int fd = wl_event_loop_get_fd(_event_loop);
+ 
+@@ -99,7 +102,7 @@ static void socketCallback(
+ 
+ - (void) removeFromRunLoop {
+ #ifndef OWL_PLATFORM_GNUSTEP
+-    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), _source, kCFRunLoopDefaultMode);
++    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), _source, kCFRunLoopCommonModes);
+ #else
+     int fd = wl_event_loop_get_fd(_event_loop);
+ 
+diff --git a/Sources/Server/OwlServer.m b/Sources/Server/OwlServer.m
+index 7ac2feb..ee7c9d3 100644
+--- a/Sources/Server/OwlServer.m
++++ b/Sources/Server/OwlServer.m
+@@ -203,7 +203,10 @@
+ // Cocoa run loop. See the comment on -flushClients for why you would
+ // want to use this method instead of that one.
+ - (void) flushClientsLater {
+-    NSArray *modes = [NSArray arrayWithObject: NSDefaultRunLoopMode];
++    // Flush in the common modes so that events sent during
++    // nested tracking loops (interactive move/resize) still
++    // reach the clients promptly.
++    NSArray *modes = [NSArray arrayWithObject: NSRunLoopCommonModes];
+     NSRunLoop *loop = [NSRunLoop currentRunLoop];
+     // The order argument below represents which order these delayed
+     // selectors should be executed in; lower values go first. We do
+-- 
+2.43.0
+
