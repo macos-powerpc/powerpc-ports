@@ -289,14 +289,14 @@ proc rust::old_macos_compatibility {cname cversion} {
 
     switch ${cname} {
         "cc" {
-            if { [vercmp ${cversion} < 1.0.94] && [vercmp ${cversion} >= 1.0.85] } {
+            if {[vercmp ${cversion} < 1.0.94] && [vercmp ${cversion} >= 1.0.85]} {
                 # see https://github.com/rust-lang/cc-rs/pull/1007
                 reinplace "s|--show-sdk-platform-version|--show-sdk-version|g" \
                     ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
             }
         }
         "curl-sys" {
-            if { [vercmp ${cversion} < 0.4.56] } {
+            if {[vercmp ${cversion} < 0.4.56]} {
                 # on Mac OS X 10.6, clang exists, but `clang --print-search-dirs` returns an empty library directory
                 # see https://github.com/alexcrichton/curl-rust/commit/b3a3ce876921f2e82a145d9abd539cd8f9b7ab7b
                 # see https://trac.macports.org/ticket/64146#comment:16
@@ -312,7 +312,7 @@ proc rust::old_macos_compatibility {cname cversion} {
             }
         }
         "kqueue" {
-            if { [vercmp ${cversion} < 1.0.5] && "i386" in [option muniversal.architectures] } {
+            if {[vercmp ${cversion} < 1.0.5] && "i386" in [option muniversal.architectures]} {
                 # see https://gitlab.com/worr/rust-kqueue/-/merge_requests/10
                 reinplace {s|all(target_os = "freebsd", target_arch = "x86")|all(any(target_os = "freebsd", target_os = "macos"), any(target_arch = "x86", target_arch = "powerpc"))|g} \
                     ${cargo.home}/macports/${cname}-${cversion}/src/time.rs
@@ -320,7 +320,7 @@ proc rust::old_macos_compatibility {cname cversion} {
             }
         }
         "rustix" {
-            if { [vercmp ${cversion} < 0.38.31] && [vercmp ${cversion} >= 0.0] && ("i386" in [option muniversal.architectures] || "ppc" in [option muniversal.architectures]) } {
+            if {[vercmp ${cversion} < 0.38.31] && [vercmp ${cversion} >= 0.0] && ("i386" in [option muniversal.architectures] || "ppc" in [option muniversal.architectures])} {
                 # see https://github.com/bytecodealliance/rustix/issues/991
                 reinplace "s|utimensat_old(dirfd, path, times, flags)|//utimensat_old(dirfd, path, times, flags)|g" \
                     ${cargo.home}/macports/${cname}-${cversion}/src/backend/libc/fs/syscalls.rs
@@ -394,6 +394,21 @@ proc rust::old_macos_compatibility {cname cversion} {
             # disable GIT_SECURE_TRANSPORT to avoid calling of SSLCreateContext and use OpenSSL instead
             reinplace "s|else if target.contains(\"apple\")|else if target.contains(\"apple_disabled\")|g" \
                 ${cargo.home}/macports/${cname}-${cversion}/build.rs
+        }
+    }
+
+    if {[option os.platform] ne "darwin" || [vercmp [option macosx_deployment_target] >= 10.7]} {
+        return
+    }
+
+    switch ${cname} {
+        "cc" {
+            if {[vercmp ${cversion} < 1.1.1] && [vercmp ${cversion} >= 1.0.85]} {
+                reinplace "s|\"i686\" => AppleArchSpec::Device(\"-m32\")|\"powerpc\" => AppleArchSpec::Device(\"-m32\")|" \
+                    ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
+                reinplace "s|\"aarch64\" => AppleArchSpec::Device(\"-m64\")|\"powerpc64\" => AppleArchSpec::Device(\"-m64\")|" \
+                    ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
+            }
         }
     }
 
@@ -585,6 +600,7 @@ proc rust::set_environment {} {
     global subport configure.build_arch configure.universal_archs
 
     rust::append_envs     "RUST_BACKTRACE=1"
+    rust::append_envs     "MRUSTC_LIFETIME_ERRORS=warn"     {build destroot}
 
     rust::append_envs     CC=[compwrap::wrap_compiler cc]   {build destroot}
     rust::append_envs     CXX=[compwrap::wrap_compiler cxx] {build destroot}
@@ -623,7 +639,7 @@ proc rust::rust_pg_callback {} {
     global  subport \
             prefix
 
-    if { ${subport} ne "rust" && [join [lrange [split ${subport} -] 0 1] -] ne "rust-bootstrap" } {
+    if {${subport} ne "rust" && [join [lrange [split ${subport} -] 0 1] -] ne "rust-bootstrap"} {
         # port is *not* building Rust
 
         foreach {f s} [option rust.remap] {
@@ -641,7 +657,7 @@ proc rust::rust_pg_callback {} {
     }
 
     # rust-bootstrap requires `macosx_deployment_target` instead of `os.major`
-    if { [option os.platform] eq "darwin" && [vercmp [option macosx_deployment_target] < 10.12]} {
+    if {[option os.platform] eq "darwin" && [vercmp [option macosx_deployment_target] < 10.12]} {
         if { [join [lrange [split ${subport} -] 0 1] -] eq "rust-bootstrap" } {
             # Bootstrap compilers are building on newer machines to be run on older ones.
             # Use libMacportsLegacySystem.B.dylib since it is able to use the `__asm("$ld$add$os10.5$...")` trick for symbols that are part of legacy-support *only* on older systems.
@@ -663,7 +679,7 @@ proc rust::rust_pg_callback {} {
         configure.ldflags-append        -Wl,${prefix}/lib/${legacyLib}
     }
 
-    if { [string match "macports-clang*" [option configure.compiler]] && [option os.major] < 11 } {
+    if {[string match "macports-clang*" [option configure.compiler]] && [option os.major] < 11} {
         # by default, ld64 uses ld64-127 when 9 <= ${os.major} < 11
         # Rust fails to build when architecture is x86_64 and ld64 uses ld64-127
         depends_build-delete            port:ld64-274
@@ -675,7 +691,7 @@ proc rust::rust_pg_callback {} {
     }
 
     # rust-bootstrap requires `macosx_deployment_target` instead of `os.major`
-    if { [option os.platform] eq "darwin" && [vercmp [option macosx_deployment_target] < 10.6]} {
+    if {[option os.platform] eq "darwin" && [vercmp [option macosx_deployment_target] < 10.6]} {
         # __Unwind_RaiseException
         depends_lib-delete              port:libunwind
         depends_lib-append              port:libunwind

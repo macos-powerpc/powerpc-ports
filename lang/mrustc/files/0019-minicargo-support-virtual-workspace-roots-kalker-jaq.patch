@@ -1,0 +1,226 @@
+From 3df047872606560e64b01366c7a51456c909b080 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 23 Jul 2026 01:48:29 +0000
+Subject: [PATCH] minicargo: support virtual workspace roots (kalker, jaq)
+
+A Cargo.toml with only a [workspace] section previously failed with
+"Manifest file ... doesn't specify a package name". Now the workspace
+members list is recorded, and when the requested directory is such a
+virtual root, a member is picked and built from its directory instead:
+
+- `--package <name>`/`-p` selects a member by package name;
+- otherwise a sole member, then a member whose package name matches the
+  workspace directory name (with any `-<version>` suffix stripped, as
+  in release tarballs: kalker-2.2.2 -> the `cli` member named
+  `kalker`), then a sole binary member (src/main.rs or [[bin]]);
+- anything still ambiguous errors with the member list and a hint.
+
+Glob members are skipped for auto-selection.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013wCVW89GjmNyYviEcANPHM
+---
+ tools/minicargo/main.cpp     | 112 +++++++++++++++++++++++++++++++++++
+ tools/minicargo/manifest.cpp |  19 +++++-
+ tools/minicargo/manifest.h   |   3 +
+ 3 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index e81edcea..36584407 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -63,6 +63,10 @@ struct ProgramOptions
+     bool no_default_features = false;
+     ::std::vector<::std::string>    features;
+ 
++    /// Workspace member (package name) to build when the manifest is a virtual
++    /// workspace root ([workspace] with no [package])
++    const char* package_name = nullptr;
++
+     int parse(int argc, const char* argv[]);
+     void usage(::std::ostream& os) const;
+     void help() const;
+@@ -172,6 +176,106 @@ int main(int argc, const char* argv[])
+             repo.set_workspace(workspace_manifest);
+         }
+ 
++        // Handle virtual workspace roots: a Cargo.toml with a [workspace] section but no
++        // [package] (e.g. kalker, jaq). Pick a member and build from its directory instead.
++        if( workspace_manifest_path.is_valid() && workspace_manifest_path == dir / "Cargo.toml" )
++        {
++            bool has_package = false;
++            {
++                TomlFile    toml_file(workspace_manifest_path);
++                for(auto key_val : toml_file)
++                {
++                    if( key_val.path[0] == "package" ) {
++                        has_package = true;
++                        break;
++                    }
++                }
++            }
++            if( !has_package )
++            {
++                struct Candidate {
++                    ::std::string   rel_path;
++                    ::std::string   name;
++                    bool    has_bin;
++                };
++                ::std::vector<Candidate>    candidates;
++                for(const auto& member : workspace_manifest.members())
++                {
++                    if( member.find('*') != ::std::string::npos ) {
++                        // Glob members: not supported for auto-selection
++                        continue;
++                    }
++                    auto member_dir = dir / member.c_str();
++                    auto member_toml = member_dir / "Cargo.toml";
++                    if( !::std::ifstream(member_toml.str()).is_open() )
++                        continue;
++                    Candidate   c;
++                    c.rel_path = member;
++                    c.has_bin = ::std::ifstream((member_dir / "src" / "main.rs").str()).is_open();
++                    TomlFile    toml_file(member_toml);
++                    for(auto key_val : toml_file)
++                    {
++                        if( key_val.path.size() == 2 && key_val.path[0] == "package" && key_val.path[1] == "name" )
++                            c.name = key_val.value.as_string();
++                        else if( key_val.path[0] == "bin" )
++                            c.has_bin = true;
++                    }
++                    candidates.push_back(::std::move(c));
++                }
++
++                const Candidate*    sel = nullptr;
++                if( opts.package_name )
++                {
++                    for(const auto& c : candidates)
++                        if( c.name == opts.package_name )
++                            { sel = &c; break; }
++                    if( !sel )
++                        throw ::std::runtime_error(format("Workspace has no member named '", opts.package_name, "' (from --package)"));
++                }
++                else if( candidates.size() == 1 )
++                {
++                    sel = &candidates.front();
++                }
++                if( !sel )
++                {
++                    // Prefer the member whose package name matches the workspace directory
++                    // name (with any `-<version>` suffix removed, as in release tarballs:
++                    // `kalker-2.2.2` -> `kalker`)
++                    auto dir_name = dir.basename();
++                    for(size_t pos = dir_name.find('-'); pos != ::std::string::npos; pos = dir_name.find('-', pos+1))
++                    {
++                        if( pos + 1 < dir_name.size() && '0' <= dir_name[pos+1] && dir_name[pos+1] <= '9' ) {
++                            dir_name.resize(pos);
++                            break;
++                        }
++                    }
++                    for(const auto& c : candidates)
++                        if( c.name == dir_name )
++                            { sel = &c; break; }
++                }
++                if( !sel )
++                {
++                    // Last resort: a single binary member
++                    for(const auto& c : candidates)
++                    {
++                        if( c.has_bin ) {
++                            if( sel ) { sel = nullptr; break; }
++                            sel = &c;
++                        }
++                    }
++                }
++                if( !sel )
++                {
++                    ::std::cerr << "Virtual workspace root - unable to pick a member to build. Members:" << ::std::endl;
++                    for(const auto& c : candidates)
++                        ::std::cerr << " - " << c.name << " (" << c.rel_path << (c.has_bin ? ", bin" : "") << ")" << ::std::endl;
++                    throw ::std::runtime_error("Virtual workspace root: pass `--package <name>` to select a member");
++                }
++                ::std::cout << "Virtual workspace root: building member '" << sel->name << "' (" << sel->rel_path << ")" << ::std::endl;
++                dir = dir / sel->rel_path.c_str();
++            }
++        }
++
+         // 1. Load the Cargo.toml file from the passed directory
+         Debug_SetPhase("Load Root");
+         auto m = PackageManifest::load_from_toml( dir / "Cargo.toml", &workspace_manifest );
+@@ -453,6 +557,13 @@ int ProgramOptions::parse(int argc, const char* argv[])
+             else if( ::std::strcmp(arg, "--no-default-features") == 0 ) {
+                 this->no_default_features = true;
+             }
++            else if( ::std::strcmp(arg, "--package") == 0 || ::std::strcmp(arg, "-p") == 0 ) {
++                if(i+1 == argc) {
++                    ::std::cerr << "Flag " << arg << " takes an argument" << ::std::endl;
++                    return 1;
++                }
++                this->package_name = argv[++i];
++            }
+             else if( ::std::strcmp(arg, "--pause") == 0 ) {
+                 this->pause_before_quit = true;
+             }
+@@ -497,6 +608,7 @@ void ProgramOptions::help() const
+         << "-j <count>               : Run at most <count> build tasks at once (default is to run only one)\n"
+         << "-n                       : Don't build any packages, just list the packages that would be built\n"
+         << "-g                       : Pass `-g` to compiler\n"
++        << "--package,-p <name>      : Workspace member to build (for virtual workspace roots)\n"
+         << "--no-default-features    : \n"
+         << "--features <list>        : \n"
+         ;
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index a14ce348..c91fdb94 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -185,9 +185,24 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
+             {
+                 // Resolver version, doesn't really matter for minicargo?
+             }
+-            else if( key == "members" || key == "exclude" )
++            else if( key == "members" )
+             {
+-                // Ignore members list, for now.
++                // Recorded to support virtual workspace roots (manifests with only
++                // a [workspace] section)
++                if( key_val.path.size() == 2 && key_val.value.m_type == TomlValue::Type::List )
++                {
++                    for(const auto& sv : key_val.value.m_sub_values)
++                    {
++                        if( sv.m_type == TomlValue::Type::String )
++                        {
++                            rv.m_members.push_back(sv.as_string());
++                        }
++                    }
++                }
++            }
++            else if( key == "exclude" )
++            {
++                // Ignore the exclusion list (only members are candidates here)
+             }
+             else if( key == "package" )
+             {
+diff --git a/tools/minicargo/manifest.h b/tools/minicargo/manifest.h
+index 0a18cce7..f88a173d 100644
+--- a/tools/minicargo/manifest.h
++++ b/tools/minicargo/manifest.h
+@@ -321,6 +321,8 @@ class WorkspaceManifest
+ {
+     ::std::map< ::std::string, ::helpers::path> m_patches;
+ 
++    ::std::vector<::std::string>    m_members;
++
+     Edition m_edition = Edition::Unspec;
+     struct Dependencies {
+         ::std::vector<PackageRef>   main;
+@@ -334,6 +336,7 @@ public:
+     static WorkspaceManifest load_from_toml(const ::helpers::path& workspace_manifest_path);
+ 
+     Edition edition() const { return m_edition; }
++    const ::std::vector<::std::string>& members() const { return m_members; }
+     const ::std::map< ::std::string, ::helpers::path>& patches() const { return m_patches; }
+     const ::std::vector<PackageRef>& dependencies() const { return m_dependencies.main; }
+     const ::std::vector<PackageRef>& build_dependencies() const { return m_dependencies.build; }
+-- 
+2.43.0
+

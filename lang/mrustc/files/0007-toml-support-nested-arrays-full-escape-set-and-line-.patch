@@ -1,0 +1,252 @@
+From 9fa2a3dd00a0fdbcc649c1f1ec74d4628fc8767b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 22 Jul 2026 19:37:31 +0000
+Subject: [PATCH 07/13] toml: support nested arrays, full escape set, and
+ line-ending backslash
+
+The streaming TOML parser only accepted plain strings inside arrays and
+only \" \\ \n in strings. Modern Cargo.tomls hit both limits:
+- `package.metadata.deb.assets = [["path", "usr/bin/", "755"], ...]`
+  (arrays of arrays; oxipng 10.1.1, ripgrep 15.2.0) - now parsed
+  recursively; inline tables inside arrays are consumed and stored as an
+  empty list (they only appear in sections minicargo ignores)
+- `extended-description = """\` (line-ending backslash continuation) -
+  now trims following whitespace per the TOML spec; also adds the
+  remaining standard escapes (\b \t \f \r \uXXXX \UXXXXXXXX)
+
+Verified: both crates' real manifests now load fully in minicargo.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011M9MvswSD3mEeJcBm6S8z7
+---
+ tools/common/toml.cpp | 158 +++++++++++++++++++++++++++++++++---------
+ tools/common/toml.h   |   3 +
+ 2 files changed, 127 insertions(+), 34 deletions(-)
+
+diff --git a/tools/common/toml.cpp b/tools/common/toml.cpp
+index 074e3a1e..a378386b 100644
+--- a/tools/common/toml.cpp
++++ b/tools/common/toml.cpp
+@@ -205,37 +205,7 @@ TomlKeyValue TomlFile::get_next_value()
+     // Array: Parse the entire list and return as Type::List
+     case TomlToken::Type::SquareOpen:
+         rv.path = this->get_path(std::move(key_name));
+-        rv.value.m_type = TomlValue::Type::List;
+-        while( (t = m_lexer.get_token()).m_type != TomlToken::Type::SquareClose )
+-        {
+-            while( t.m_type == TomlToken::Type::Newline )
+-            {
+-                t = m_lexer.get_token();
+-            }
+-            if( t.m_type == TomlToken::Type::SquareClose )
+-                break;
+-
+-            // TODO: Recursively parse a value
+-            // TODO: OR, support other value types
+-            switch(t.m_type)
+-            {
+-            case TomlToken::Type::String:
+-                rv.value.m_sub_values.push_back(TomlValue { t.as_string() });
+-                break;
+-            default:
+-                throw ::std::runtime_error(::format(m_lexer, ": Unexpected token in array value position - ", t));
+-            }
+-
+-            t = m_lexer.get_token();
+-            if(t.m_type != TomlToken::Type::Comma)
+-                break;
+-        }
+-        while( t.m_type == TomlToken::Type::Newline )
+-        {
+-            t = m_lexer.get_token();
+-        }
+-        if(t.m_type != TomlToken::Type::SquareClose)
+-            throw ::std::runtime_error(::format(m_lexer, ": Unexpected token after array - ", t));
++        rv.value = this->parse_array_body();
+         break;
+     case TomlToken::Type::BraceOpen:
+         m_current_composite.push_back(std::move(key_name));
+@@ -287,6 +257,78 @@ TomlKeyValue TomlFile::get_next_value()
+     return rv;
+ }
+ 
++TomlValue TomlFile::parse_array_body()
++{
++    TomlValue   rv;
++    rv.m_type = TomlValue::Type::List;
++    TomlToken   t(TomlToken::Type::Newline);
++    while( (t = m_lexer.get_token()).m_type != TomlToken::Type::SquareClose )
++    {
++        while( t.m_type == TomlToken::Type::Newline )
++        {
++            t = m_lexer.get_token();
++        }
++        if( t.m_type == TomlToken::Type::SquareClose )
++            break;
++
++        switch(t.m_type)
++        {
++        case TomlToken::Type::String:
++            rv.m_sub_values.push_back(TomlValue { t.as_string() });
++            break;
++        case TomlToken::Type::Integer:
++            rv.m_sub_values.push_back(TomlValue { t.m_intval });
++            break;
++        case TomlToken::Type::Ident:
++            if( t.m_data == "true" )
++                rv.m_sub_values.push_back(TomlValue { true });
++            else if( t.m_data == "false" )
++                rv.m_sub_values.push_back(TomlValue { false });
++            else
++                throw ::std::runtime_error(::format(m_lexer, ": Unexpected identifier in array value position - ", t));
++            break;
++        // Nested array, e.g. `package.metadata.deb.assets = [["target/release/...", "usr/bin/", "755"], ...]`
++        case TomlToken::Type::SquareOpen:
++            rv.m_sub_values.push_back(this->parse_array_body());
++            break;
++        // Inline table: only appears in sections minicargo ignores (e.g. package metadata), so
++        // consume the balanced token stream and store an empty list as a placeholder
++        case TomlToken::Type::BraceOpen: {
++            unsigned depth = 1;
++            while(depth > 0)
++            {
++                t = m_lexer.get_token();
++                switch(t.m_type)
++                {
++                case TomlToken::Type::BraceOpen:    depth ++;   break;
++                case TomlToken::Type::BraceClose:   depth --;   break;
++                case TomlToken::Type::Eof:
++                    throw ::std::runtime_error(::format(m_lexer, ": Unexpected EOF in inline table in array"));
++                default:
++                    break;
++                }
++            }
++            TomlValue   placeholder;
++            placeholder.m_type = TomlValue::Type::List;
++            rv.m_sub_values.push_back(::std::move(placeholder));
++            break; }
++        default:
++            throw ::std::runtime_error(::format(m_lexer, ": Unexpected token in array value position - ", t));
++        }
++
++        t = m_lexer.get_token();
++        if(t.m_type != TomlToken::Type::Comma)
++            break;
++    }
++    while( t.m_type == TomlToken::Type::Newline )
++    {
++        t = m_lexer.get_token();
++    }
++    if(t.m_type != TomlToken::Type::SquareClose)
++        throw ::std::runtime_error(::format(m_lexer, ": Unexpected token after array - ", t));
++    return rv;
++}
++
+ std::vector<std::string> TomlFile::get_path(std::vector<std::string> tail) const
+ {
+     std::vector<std::string>    path;
+@@ -328,13 +370,61 @@ TomlToken TomlToken::lex_from(::std::ifstream& is, unsigned& m_line)
+     return rv;
+ }
+ namespace {
+-    void handle_escape(::std::string& str, ::std::ifstream& is) {
++    void handle_escape(::std::string& str, ::std::ifstream& is, unsigned& line) {
+         char c = is.get();
+         switch(c)
+         {
+         case '"':  str += '"'; break;
++        case '\'': str += '\''; break;
+         case '\\': str += '\\'; break;
++        case 'b':  str += '\b'; break;
++        case 't':  str += '\t'; break;
+         case 'n':  str += '\n'; break;
++        case 'f':  str += '\f'; break;
++        case 'r':  str += '\r'; break;
++        case 'u': case 'U': {
++            unsigned n_digits = (c == 'u' ? 4 : 8);
++            uint32_t v = 0;
++            for(unsigned i = 0; i < n_digits; i++) {
++                int h = is.get();
++                if('0' <= h && h <= '9') v = v*16 + (h - '0');
++                else if('a' <= h && h <= 'f') v = v*16 + (h - 'a' + 10);
++                else if('A' <= h && h <= 'F') v = v*16 + (h - 'A' + 10);
++                else throw ::std::runtime_error("toml.cpp handle_escape: Invalid hex digit in unicode escape");
++            }
++            // Encode as UTF-8
++            if( v < 0x80 ) {
++                str += static_cast<char>(v);
++            }
++            else if( v < 0x800 ) {
++                str += static_cast<char>(0xC0 | (v >> 6));
++                str += static_cast<char>(0x80 | (v & 0x3F));
++            }
++            else if( v < 0x10000 ) {
++                str += static_cast<char>(0xE0 | (v >> 12));
++                str += static_cast<char>(0x80 | ((v >> 6) & 0x3F));
++                str += static_cast<char>(0x80 | (v & 0x3F));
++            }
++            else {
++                str += static_cast<char>(0xF0 | (v >> 18));
++                str += static_cast<char>(0x80 | ((v >> 12) & 0x3F));
++                str += static_cast<char>(0x80 | ((v >> 6) & 0x3F));
++                str += static_cast<char>(0x80 | (v & 0x3F));
++            }
++            break; }
++        // "Line ending backslash" (multi-line strings): trims all whitespace,
++        // including newlines, up to the next non-whitespace character
++        case '\r':
++        case '\n': {
++            if( c == '\n' )
++                line ++;
++            int next;
++            while( (next = is.peek()) != EOF && isspace(next) ) {
++                if( next == '\n' )
++                    line ++;
++                is.get();
++            }
++            break; }
+         default:
+             throw ::std::runtime_error(format("toml.cpp handle_escape: TODO: Escape sequences in strings - `", c, "`"));
+         }
+@@ -461,7 +551,7 @@ TomlToken TomlToken::lex_from_inner(::std::ifstream& is, unsigned& m_line)
+                     if( c == EOF )
+                         throw ::std::runtime_error("Unexpected EOF in triple-quoted string");
+                     if(c == '\\') {
+-                        handle_escape(str, is);
++                        handle_escape(str, is, m_line);
+                     }
+                     else {
+                         str += (char)c;
+@@ -481,7 +571,7 @@ TomlToken TomlToken::lex_from_inner(::std::ifstream& is, unsigned& m_line)
+                     throw ::std::runtime_error("Unexpected EOF in double-quoted string");
+                 if (c == '\\')
+                 {
+-                    handle_escape(str, is);
++                    handle_escape(str, is, m_line);
+                     c = is.get();
+                     continue ;
+                 }
+diff --git a/tools/common/toml.h b/tools/common/toml.h
+index 3c8dfec3..4a17718d 100644
+--- a/tools/common/toml.h
++++ b/tools/common/toml.h
+@@ -15,6 +15,7 @@
+ 
+ class TomlFileIter;
+ struct TomlKeyValue;
++struct TomlValue;
+ 
+ struct TomlToken;
+ class TomlLexer
+@@ -63,6 +64,8 @@ public:
+ 
+ private:
+     std::vector<std::string>    get_path(std::vector<std::string> tail) const;
++    /// Parse the body of an array value (after the opening `[`), consuming the closing `]`
++    TomlValue parse_array_body();
+ };
+ 
+ struct TomlValue
+-- 
+2.43.0
+

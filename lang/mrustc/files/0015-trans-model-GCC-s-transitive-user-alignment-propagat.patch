@@ -1,0 +1,140 @@
+From 181e14f33870966c28755542c46d907d12453b88 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 22 Jul 2026 23:46:15 +0000
+Subject: [PATCH] trans: model GCC's transitive user-alignment propagation on
+ Darwin ppc32
+
+GCC propagates user alignment upwards through aggregates: in
+stor-layout.cc's update_alignment_for_field, `TYPE_USER_ALIGN (rli->t)
+|= user_align`, where a field's DECL_USER_ALIGN is inherited from its
+type's TYPE_USER_ALIGN (do_type_align), and arrays inherit it from
+their element (layout_type). Since user-aligned fields are exempt from
+the Darwin ADJUST_FIELD_ALIGN 8->4 cap, one repr(align(8)) type defeats
+the cap in every aggregate that (transitively) contains it.
+
+darwin_ppc32_type_has_c_user_align modelled only the immediate
+attribute emission, so mrustc kept capping where GCC no longer does.
+Seen building libstd 1.90: ArcInner<MaybeUninit<thread::Inner>> -
+thread::Inner is repr(align(8)), the user alignment flows through
+ManuallyDrop and the MaybeUninit union into the repr(C) ArcInner, whose
+GCC alignment is 8 while mrustc computed 4 (sizeof agreed by chance,
+alignof assert fired).
+
+The model now recurses into emitted members (structs/tuples: non-ZST
+fields only, since ZST fields aren't emitted in C; unions: all members;
+enums: non-ZST fields) with the existing attribute conditions kept.
+Verified with a replica matrix (user-aligned type nested via wrapper
+struct, union, array, enum payload + no-user-align controls): all
+sizes/aligns/offsets match hand-evaluated GCC-16 rules; x86_64 native
+output passes all asserts (no regression).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013wCVW89GjmNyYviEcANPHM
+---
+ src/trans/target.cpp | 54 ++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index 5efbf7ce..7ede5849 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -1063,11 +1063,22 @@ namespace {
+     // replicated here exactly (including which fields codegen_c emits, e.g. ZST struct fields
+     // are omitted from the C source).
+ 
+-    /// Does the C type emitted for `ty` carry an explicit `__attribute__((aligned))`?
+-    /// (mirrors `has_manual_align` in codegen_c's emit_struct_inner)
+-    bool darwin_ppc32_type_has_c_user_align(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& in_ty)
++    /// Is `TYPE_USER_ALIGN` set on the C type emitted for `ty`?
++    /// True when the emitted type carries an explicit `__attribute__((aligned))` (mirrors
++    /// `has_manual_align` in codegen_c's emit_struct_inner), and ALSO when any emitted
++    /// member (at any depth) does: GCC propagates user alignment upwards through
++    /// containing records/unions (`TYPE_USER_ALIGN (rli->t) |= user_align` in
++    /// stor-layout.cc's update_alignment_for_field, DECL_USER_ALIGN being inherited from
++    /// the member type via do_type_align; arrays inherit it from their element in
++    /// layout_type). A user-aligned field is exempt from the `ADJUST_FIELD_ALIGN` cap,
++    /// so this propagation defeats the Darwin 8->4 capping transitively - e.g.
++    /// `ArcInner<MaybeUninit<T>>` where `T` is `repr(align(8))`.
++    bool darwin_ppc32_type_has_c_user_align(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& in_ty, unsigned depth = 0)
+     {
+-        // Arrays inherit the element type's alignment attribute
++        // (depth limited out of caution; types can't actually recurse by value)
++        if( depth > 64 )
++            return false;
++        // Arrays inherit the element type's user alignment
+         const auto* cur = &in_ty;
+         while(true)
+         {
+@@ -1077,10 +1088,20 @@ namespace {
+         }
+         const auto& t = *cur;
+ 
++        // Which checks apply to this aggregate:
++        // - structs/tuples can carry the attribute themselves (ZST-carrier or align
++        //   mismatch - the emit_struct_inner conditions)
++        // - unions/enums never carry an attribute, but propagation from members applies
++        // - ZST struct fields are not emitted in the C source, so they can't propagate;
++        //   union members are all emitted (see emit_union), enum DATA unions skip ZST
++        //   variants
++        bool self_attr = false;
++        bool zst_members = false;
+         if( t.data().is_Tuple() )
+         {
+             if( t.data().as_Tuple().size() == 0 )
+                 return false;
++            self_attr = true;
+         }
+         else if( t.data().is_Path() && t.data().as_Path().binding.is_Struct() )
+         {
+@@ -1088,17 +1109,24 @@ namespace {
+             // repr(align(N)) is emitted as an explicit alignment attribute
+             if( str.m_forced_alignment > 0 )
+                 return true;
+-            // Packed structs are emitted with `#pragma pack` instead
++            // Packed structs are emitted with `#pragma pack` instead (and rustc's E0588
++            // rejects user-aligned types inside packed ones, so no propagation either)
+             if( str.m_max_field_alignment > 0 )
+                 return false;
++            self_attr = true;
++        }
++        else if( t.data().is_Path() && t.data().as_Path().binding.is_Union() )
++        {
++            zst_members = true;
++        }
++        else if( t.data().is_Path() && t.data().as_Path().binding.is_Enum() )
++        {
+         }
+         else
+         {
+-            // Unions and enums are never emitted with an alignment attribute, scalars have none
++            // Scalars/pointers have no user alignment
+             return false;
+         }
+-        // An explicit `__attribute__((aligned))` is also emitted when the computed alignment
+-        // doesn't match the largest field alignment, or when a ZST field carries the alignment
+         const auto* repr = Target_GetTypeRepr(sp, resolve, t);
+         if( !repr )
+             return false;
+@@ -1108,11 +1136,17 @@ namespace {
+             size_t sz = 0, al = 0;
+             if( !Target_GetSizeAndAlignOf(sp, resolve, f.ty, sz, al) )
+                 continue;
+-            if( sz == 0 && al == repr->align && al > 0 )
++            // An explicit attribute is emitted when a ZST field carries the alignment
++            if( self_attr && sz == 0 && al == repr->align && al > 0 )
+                 return true;
+             max_field_align = ::std::max(max_field_align, al);
++            // GCC's upward propagation from emitted members
++            if( (sz != 0 || zst_members) && darwin_ppc32_type_has_c_user_align(sp, resolve, f.ty, depth+1) )
++                return true;
+         }
+-        return max_field_align != repr->align;
++        // An explicit attribute is emitted when the computed alignment doesn't match the
++        // largest field alignment
++        return self_attr && max_field_align != repr->align;
+     }
+ 
+     /// Which member of this type's repr is emitted first in the generated C source?
+-- 
+2.43.0
+

@@ -1,0 +1,90 @@
+From 2ec9805316ff136bc8d80951555f728c414a8e2a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 22 Jul 2026 19:45:46 +0000
+Subject: [PATCH 09/13] hir/mir: accept diverging operands of `&&`/`||`
+
+`(consume(Brace) || break)` in syn 2.0's data.rs has a right operand of
+type `!`, which coerces to bool in rustc. Three places assumed exact
+bool / a produced value:
+- ufcs_everything's assert now permits diverging operand types
+- MIR lowering of short-circuit ops skips the result assignment and
+  marks the split arm unreachable when the RHS diverged
+- emit_if returns early (both branches unreachable) when the condition
+  itself diverged, which happens when the op is part of an `if`
+  condition chain like syn's
+
+Verified with expression- and condition-position `|| break`/`|| return`
+test functions; generated C control flow checked by hand.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011M9MvswSD3mEeJcBm6S8z7
+---
+ src/hir_expand/ufcs_everything.cpp |  5 +++--
+ src/mir/from_hir.cpp               | 27 ++++++++++++++++++++++-----
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/src/hir_expand/ufcs_everything.cpp b/src/hir_expand/ufcs_everything.cpp
+index 55a92319..2bebf406 100644
+--- a/src/hir_expand/ufcs_everything.cpp
++++ b/src/hir_expand/ufcs_everything.cpp
+@@ -436,8 +436,9 @@ namespace {
+ 
+             case ::HIR::ExprNode_BinOp::Op::BoolAnd:
+             case ::HIR::ExprNode_BinOp::Op::BoolOr:
+-                ASSERT_BUG(sp, ty_l == ::HIR::TypeRef(::HIR::CoreType::Bool), "&& operator requires bool");
+-                ASSERT_BUG(sp, ty_r == ::HIR::TypeRef(::HIR::CoreType::Bool), "&& operator requires bool");
++                // NOTE: A diverging operand is valid (`!` coerces to bool), e.g. `foo() || break` (seen in syn 2.0)
++                ASSERT_BUG(sp, ty_l == ::HIR::TypeRef(::HIR::CoreType::Bool) || ty_l.data().is_Diverge(), "&& operator requires bool, got " << ty_l);
++                ASSERT_BUG(sp, ty_r == ::HIR::TypeRef(::HIR::CoreType::Bool) || ty_r.data().is_Diverge(), "&& operator requires bool, got " << ty_r);
+                 return ;
+             }
+             assert(langitem);
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index 3d27ae3a..0f01e603 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -1154,7 +1154,14 @@ namespace {
+             {
+                 auto scope = m_builder.new_scope_temp( cond->span() );
+                 this->visit_node_ptr(*cond_p);
+-                ASSERT_BUG(cond->span(), cond->m_res_type == ::HIR::CoreType::Bool, "If condition wasn't a bool");
++                if( !m_builder.block_active() && !m_builder.has_result() )
++                {
++                    // The condition diverged (e.g. `break` as an operand of a short-circuit op),
++                    // neither branch is reachable from here
++                    m_builder.terminate_scope(cond->span(), mv$(scope), false);
++                    return ;
++                }
++                ASSERT_BUG(cond->span(), cond->m_res_type == ::HIR::CoreType::Bool || cond->m_res_type.data().is_Diverge(), "If condition wasn't a bool");
+                 decision_val = m_builder.get_result_in_if_cond(cond->span());
+                 m_builder.terminate_scope(cond->span(), mv$(scope));
+             }
+@@ -1371,11 +1378,21 @@ namespace {
+                 DEBUG("- ShortCircuit Right");
+                 auto tmp_scope = m_builder.new_scope_temp(node.m_right->span());
+                 this->visit_node_ptr(node.m_right);
+-                m_builder.push_stmt_assign(node.span(), res.clone(), m_builder.get_result(node.m_right->span()));
+-                m_builder.terminate_scope(node.m_right->span(), mv$(tmp_scope));
++                if( m_builder.block_active() || m_builder.has_result() )
++                {
++                    m_builder.push_stmt_assign(node.span(), res.clone(), m_builder.get_result(node.m_right->span()));
++                    m_builder.terminate_scope(node.m_right->span(), mv$(tmp_scope));
+ 
+-                m_builder.end_split_arm(node.m_right->span(), split_scope, /*reachable=*/true);
+-                m_builder.end_block( ::MIR::Terminator::make_Goto(bb_next) );
++                    m_builder.end_split_arm(node.m_right->span(), split_scope, /*reachable=*/true);
++                    m_builder.end_block( ::MIR::Terminator::make_Goto(bb_next) );
++                }
++                else
++                {
++                    // The right-hand side diverged (e.g. `foo() || break`) - only the short-circuit
++                    // path reaches the end
++                    m_builder.terminate_scope(node.m_right->span(), mv$(tmp_scope), false);
++                    m_builder.end_split_arm(node.m_right->span(), split_scope, /*reachable=*/false);
++                }
+ 
+                 m_builder.set_cur_block( bb_next );
+                 m_builder.terminate_scope(node.span(), mv$(split_scope));
+-- 
+2.43.0
+
