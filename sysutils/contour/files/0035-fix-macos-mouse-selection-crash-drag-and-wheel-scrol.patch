@@ -1,0 +1,180 @@
+From 33474f90c7bf145090586db59ea5216236605dd5 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 15:37:10 +0000
+Subject: [PATCH 35/67] fix(macos): mouse selection crash + drag, and wheel
+ scrolling
+
+- Selection crash (std::bad_function_call): Terminal::setWordDelimiters() is what
+  assigns the selection helper's `wordDelimited` std::function; the session never
+  called it, so the first selection invoked an empty function and threw. Seed the
+  standard word/extended-word delimiters right after constructing the Terminal.
+- Selection also never extended because only mouse press/release were sent, not the
+  drags between them. Wire -mouseDragged: -> bridge_mouse_move ->
+  Terminal::sendMouseMoveEvent (with a pixel->cell mapping helper on the session).
+- Wheel scrolling: wire -scrollWheel: -> bridge_scroll ->
+  viewport().scrollUp/scrollDown.
+
+Remaining reported issues are separate: sixel post-image ANSI echo glitch, and
+drag & drop (not yet implemented).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/SessionBridge.cpp   | 19 +++++++++++++++++++
+ src/contour_macos/SessionBridge.h     |  5 +++++
+ src/contour_macos/TerminalSession.cpp | 16 ++++++++++++++++
+ src/contour_macos/TerminalSession.h   |  3 +++
+ src/contour_macos/TerminalView.mm     | 26 ++++++++++++++++++++++++++
+ 5 files changed, 69 insertions(+)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index af229ed0..559a2ddd 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -180,6 +180,16 @@ void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifie
+                                             false);
+ }
+ 
++void bridge_mouse_move(TerminalSession* session, int x, int y, uint32_t modifiers)
++{
++    // The engine derives the cell from the pixel position; pass a best-effort cell too.
++    auto const cell = session->pixelToCell(x, y);
++    session->terminal().sendMouseMoveEvent(toKeyboardModifiers(modifiers).chord,
++                                           cell,
++                                           vtbackend::PixelCoordinate { { x }, { y } },
++                                           false);
++}
++
+ void bridge_mouse_release(TerminalSession* session, int x, int y, uint32_t modifiers)
+ {
+     session->terminal().sendMouseReleaseEvent(toKeyboardModifiers(modifiers).chord,
+@@ -193,6 +203,15 @@ void bridge_focus_in(TerminalSession* session)
+     session->terminal().sendFocusInEvent();
+ }
+ 
++bool bridge_scroll(TerminalSession* session, int lines)
++{
++    if (lines == 0)
++        return false;
++    auto& vp = session->terminal().viewport();
++    return lines > 0 ? vp.scrollUp(vtbackend::LineCount(lines))
++                     : vp.scrollDown(vtbackend::LineCount(-lines));
++}
++
+ char* bridge_copy_selection(TerminalSession* session)
+ {
+     std::string const text = session->terminal().extractSelectionText();
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index c937e0d7..329b7d2e 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -121,9 +121,14 @@ void bridge_send_key(TerminalSession* session, int bridgeKey, uint32_t modifiers
+ void bridge_send_char(TerminalSession* session, uint32_t codepoint, uint32_t modifiers);
+ 
+ void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifiers);
++void bridge_mouse_move(TerminalSession* session, int x, int y, uint32_t modifiers);
+ void bridge_mouse_release(TerminalSession* session, int x, int y, uint32_t modifiers);
+ void bridge_focus_in(TerminalSession* session);
+ 
++/// Scrolls the viewport by the given number of lines (positive = toward older/scrollback,
++/// negative = toward newer/bottom). Returns true if the viewport moved.
++bool bridge_scroll(TerminalSession* session, int lines);
++
+ // --- edit operations (for the Edit menu) ---
+ 
+ /// Returns the currently selected text as a freshly malloc()'d UTF-8 C string (caller frees),
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 1f87a85e..5e464f98 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -76,6 +76,12 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _terminal = std::make_unique<vtbackend::Terminal>(
+         *this, makePty(_pageSize), makeSettings(_pageSize), steady_clock::now());
+ 
++    // setWordDelimiters() is what actually assigns the selection helper's `wordDelimited`
++    // std::function; without calling it, mouse selection invokes an empty std::function and
++    // throws std::bad_function_call. Seed with the usual terminal word-boundary set.
++    _terminal->setWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?│");
++    _terminal->setExtendedWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?");
++
+     _renderTarget.setRenderSize(surfaceSize);
+     _renderer.applyResize(
+         surfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
+@@ -100,6 +106,16 @@ vtbackend::PageSize TerminalSession::derivePageSize(ImageSize surfaceSize) const
+                                  vtbackend::ColumnCount(static_cast<int>(columns)) };
+ }
+ 
++vtbackend::CellLocation TerminalSession::pixelToCell(int x, int y) const
++{
++    auto const cell = _renderer.gridMetrics().cellSize;
++    auto const cw = std::max(1, static_cast<int>(unbox(cell.width)));
++    auto const ch = std::max(1, static_cast<int>(unbox(cell.height)));
++    auto const col = std::max(0, (x - PageMarginPx) / cw);
++    auto const line = std::max(0, (y - PageMarginPx) / ch);
++    return vtbackend::CellLocation { vtbackend::LineOffset(line), vtbackend::ColumnOffset(col) };
++}
++
+ void TerminalSession::start()
+ {
+     if (_started)
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+index de306073..3087ab5c 100644
+--- a/src/contour_macos/TerminalSession.h
++++ b/src/contour_macos/TerminalSession.h
+@@ -56,6 +56,9 @@ class TerminalSession: public vtbackend::Terminal::Events
+     [[nodiscard]] vtrasterizer::Renderer& renderer() noexcept { return _renderer; }
+     [[nodiscard]] SoftwareRenderTarget& renderTarget() noexcept { return _renderTarget; }
+ 
++    /// Maps a view pixel coordinate (top-left origin) to a grid cell location.
++    [[nodiscard]] vtbackend::CellLocation pixelToCell(int x, int y) const;
++
+     /// Renders one frame into the render target's output buffer. Call on the main thread
+     /// (e.g. from -drawRect:). Clears, ticks, renders.
+     void renderFrame();
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index c863422a..39e36208 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -313,6 +313,18 @@ void cbOnClosed(void* userData)
+     [self setNeedsDisplay:YES];
+ }
+ 
++- (void)mouseDragged:(NSEvent*)event
++{
++    // A drag is a move with the button held — this is what extends a mouse selection.
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
++    contour_macos::bridge_mouse_move(
++        session, (int) p.x, (int) p.y, bridgeModifiers([event modifierFlags]));
++    [self setNeedsDisplay:YES];
++}
++
+ - (void)mouseUp:(NSEvent*)event
+ {
+     TerminalSession* session = [self session];
+@@ -324,6 +336,20 @@ void cbOnClosed(void* userData)
+     [self setNeedsDisplay:YES];
+ }
+ 
++- (void)scrollWheel:(NSEvent*)event
++{
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    // deltaY > 0 is a scroll toward the top (show older lines); map to scrollback lines.
++    CGFloat const dy = [event deltaY];
++    int lines = (int) dy;
++    if (lines == 0)
++        lines = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
++    if (lines != 0 && contour_macos::bridge_scroll(session, lines))
++        [self setNeedsDisplay:YES];
++}
++
+ - (BOOL)becomeFirstResponder
+ {
+     TerminalSession* session = [self session];
+-- 
+2.43.0
+

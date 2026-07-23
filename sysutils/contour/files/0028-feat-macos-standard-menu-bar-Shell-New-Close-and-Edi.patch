@@ -1,0 +1,284 @@
+From f941f2c417b2e84f42cc6cb5676f5f4702167f35 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 14:02:01 +0000
+Subject: [PATCH 28/67] =?UTF-8?q?feat(macos):=20standard=20menu=20bar=20?=
+ =?UTF-8?q?=E2=80=94=20Shell=20(New/Close)=20and=20Edit=20(Copy/Paste/Sele?=
+ =?UTF-8?q?ct=20All)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a minimal main menu: application menu (Quit), Shell (New Window Cmd-N, Close
+Window Cmd-W), and Edit (Copy Cmd-C, Paste Cmd-V, Select All Cmd-A). New Window
+targets the app delegate (openTerminalWindow, now reusable and multi-window);
+Copy/Paste/Select All target the first responder, implemented on TerminalView via
+new bridge calls: bridge_copy_selection (Terminal::extractSelectionText ->
+NSPasteboard), bridge_paste (NSPasteboard -> Terminal::sendPaste), bridge_select_all
+(Terminal::selectAll). Cmd-C/V do not clash with the terminal's Ctrl-C/V, which are
+Control (routed through keyDown to the engine).
+
+Tabs and split panes are supported by the engine model (vtmux, already linked) but
+not yet wired in the frontend; the menu/window structure leaves room to add them.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/SessionBridge.cpp |  23 ++++++
+ src/contour_macos/SessionBridge.h   |  12 ++++
+ src/contour_macos/TerminalView.mm   |  41 +++++++++++
+ src/contour_macos/main.mm           | 104 ++++++++++++++++++++--------
+ 4 files changed, 153 insertions(+), 27 deletions(-)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index 0488c1e7..d6a51846 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -187,4 +187,27 @@ void bridge_focus_in(TerminalSession* session)
+     session->terminal().sendFocusInEvent();
+ }
+ 
++char* bridge_copy_selection(TerminalSession* session)
++{
++    std::string const text = session->terminal().extractSelectionText();
++    if (text.empty())
++        return nullptr;
++    char* out = static_cast<char*>(std::malloc(text.size() + 1));
++    if (!out)
++        return nullptr;
++    std::memcpy(out, text.c_str(), text.size() + 1);
++    return out;
++}
++
++void bridge_paste(TerminalSession* session, char const* utf8Text)
++{
++    if (utf8Text)
++        session->terminal().sendPaste(std::string_view(utf8Text));
++}
++
++void bridge_select_all(TerminalSession* session)
++{
++    session->terminal().selectAll();
++}
++
+ } // namespace contour_macos
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 8ba63be8..7c8ac9e1 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -121,4 +121,16 @@ void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifie
+ void bridge_mouse_release(TerminalSession* session, int x, int y, uint32_t modifiers);
+ void bridge_focus_in(TerminalSession* session);
+ 
++// --- edit operations (for the Edit menu) ---
++
++/// Returns the currently selected text as a freshly malloc()'d UTF-8 C string (caller frees),
++/// or null if there is no selection.
++char* bridge_copy_selection(TerminalSession* session);
++
++/// Sends the given UTF-8 text to the shell as a paste (bracketed-paste aware).
++void bridge_paste(TerminalSession* session, char const* utf8Text);
++
++/// Selects the entire scrollback+screen.
++void bridge_select_all(TerminalSession* session);
++
+ } // namespace contour_macos
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index cf3c0185..6640891e 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -320,4 +320,45 @@ void cbOnClosed(void* userData)
+     return [super becomeFirstResponder];
+ }
+ 
++// --- Edit menu / standard first-responder actions ---
++
++- (void)copy:(id)sender
++{
++    (void) sender;
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    char* text = contour_macos::bridge_copy_selection(session);
++    if (!text)
++        return;
++    NSString* s = [[NSString alloc] initWithUTF8String:text];
++    free(text);
++    NSPasteboard* pb = [NSPasteboard generalPasteboard];
++    [pb clearContents];
++    [pb setString:s forType:NSPasteboardTypeString];
++    [s release];
++}
++
++- (void)paste:(id)sender
++{
++    (void) sender;
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    NSPasteboard* pb = [NSPasteboard generalPasteboard];
++    NSString* s = [pb stringForType:NSPasteboardTypeString];
++    if (s)
++        contour_macos::bridge_paste(session, [s UTF8String]);
++}
++
++- (void)selectAll:(id)sender
++{
++    (void) sender;
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    contour_macos::bridge_select_all(session);
++    [self setNeedsDisplay:YES];
++}
++
+ @end
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index 013411c3..0b3aca9b 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -1,43 +1,52 @@
+ // SPDX-License-Identifier: Apache-2.0
++//
++// Objective-C++ app entry point, compiled by gcc-4.2 (C++98) — no C++11, no ObjC blocks,
++// no @{}/@[]/@() literal sugar.
++
+ #import <contour_macos/TerminalView.h>
+ 
+ #import <AppKit/AppKit.h>
+ 
+-// Minimal application delegate: creates one window with a TerminalView, and quits when the
+-// last window closes.
++// Application delegate: owns the terminal windows and the menu bar, quits on last-window-close.
+ @interface ContourAppDelegate: NSObject <NSApplicationDelegate>
+-{
+-@private
+-    NSWindow* _window;
+-}
++- (void)newWindow:(id)sender;
+ @end
+ 
+ @implementation ContourAppDelegate
+ 
+-- (void)applicationDidFinishLaunching:(NSNotification*)note
++- (void)openTerminalWindow
+ {
+-    (void) note;
+-
+     NSRect const frame = NSMakeRect(0, 0, 720, 432);
+     NSUInteger const style = NSTitledWindowMask | NSClosableWindowMask | NSMiniaturizableWindowMask
+                              | NSResizableWindowMask;
+-    _window = [[NSWindow alloc] initWithContentRect:frame
+-                                          styleMask:style
+-                                            backing:NSBackingStoreBuffered
+-                                              defer:NO];
+-    [_window setTitle:@"contour"];
++    NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
++                                                   styleMask:style
++                                                     backing:NSBackingStoreBuffered
++                                                       defer:NO];
++    [window setTitle:@"contour"];
++    [window setReleasedWhenClosed:YES];
+ 
+     TerminalView* view = [[TerminalView alloc] initWithFrame:frame fontFamily:@"Menlo" fontSize:14.0];
+-    [_window setContentView:view];
++    if (view)
++    {
++        [window setContentView:view];
++        [view release];
++    }
++    [window center];
++    [window makeKeyAndOrderFront:nil];
++}
+ 
+-    [_window center];
+-    [_window makeKeyAndOrderFront:nil];
+-    [NSApp activateIgnoringOtherApps:YES];
++- (void)newWindow:(id)sender
++{
++    (void) sender;
++    [self openTerminalWindow];
++}
+ 
+-    // Make the view first responder after the window is on screen and key. Doing it before
+-    // the window was ordered front crashed inside -[NSWindow makeFirstResponder:] on 10.6.
+-    [_window makeFirstResponder:view];
+-    [view release];
++- (void)applicationDidFinishLaunching:(NSNotification*)note
++{
++    (void) note;
++    [self openTerminalWindow];
++    [NSApp activateIgnoringOtherApps:YES];
+ }
+ 
+ - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app
+@@ -46,14 +55,54 @@
+     return YES;
+ }
+ 
+-- (void)dealloc
++@end
++
++// Builds a minimal standard menu bar: application menu (Quit), Shell (New/Close), Edit
++// (Copy/Paste/Select All). Copy/Paste/Select All target the first responder (the focused
++// TerminalView), which implements copy:/paste:/selectAll:.
++static void installMainMenu(NSApplication* app, ContourAppDelegate* delegate)
+ {
+-    [_window release];
+-    [super dealloc];
++    NSMenu* menubar = [[NSMenu alloc] init];
++    [app setMainMenu:menubar];
++
++    // Application menu.
++    NSMenuItem* appItem = [[NSMenuItem alloc] init];
++    [menubar addItem:appItem];
++    NSMenu* appMenu = [[NSMenu alloc] init];
++    [appItem setSubmenu:appMenu];
++    [appMenu addItemWithTitle:@"Quit contour" action:@selector(terminate:) keyEquivalent:@"q"];
++    [appMenu release];
++    [appItem release];
++
++    // Shell menu.
++    NSMenuItem* shellItem = [[NSMenuItem alloc] init];
++    [menubar addItem:shellItem];
++    NSMenu* shellMenu = [[NSMenu alloc] initWithTitle:@"Shell"];
++    [shellItem setSubmenu:shellMenu];
++    NSMenuItem* newItem = [shellMenu addItemWithTitle:@"New Window"
++                                               action:@selector(newWindow:)
++                                        keyEquivalent:@"n"];
++    [newItem setTarget:delegate];
++    [shellMenu addItemWithTitle:@"Close Window"
++                         action:@selector(performClose:)
++                  keyEquivalent:@"w"];
++    [shellMenu release];
++    [shellItem release];
++
++    // Edit menu (first-responder actions).
++    NSMenuItem* editItem = [[NSMenuItem alloc] init];
++    [menubar addItem:editItem];
++    NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
++    [editItem setSubmenu:editMenu];
++    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
++    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
++    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
++    [editMenu release];
++    [editItem release];
++
++    [menubar release];
+ }
+ 
+-@end
+-
+ int main(int argc, char const** argv)
+ {
+     (void) argc;
+@@ -65,6 +114,7 @@ int main(int argc, char const** argv)
+ 
+     ContourAppDelegate* delegate = [[ContourAppDelegate alloc] init];
+     [app setDelegate:delegate];
++    installMainMenu(app, delegate);
+ 
+     [app run];
+ 
+-- 
+2.43.0
+

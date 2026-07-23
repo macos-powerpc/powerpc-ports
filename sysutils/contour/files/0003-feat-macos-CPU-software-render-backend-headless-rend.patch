@@ -1,0 +1,930 @@
+From ee35d6e5916361deace73b19bd7f24b37de29b71 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 06:39:40 +0000
+Subject: [PATCH 03/67] feat(macos): CPU software render backend + headless
+ render probe
+
+Implement the software (CoreGraphics-free) render backend that reproduces the
+Qt RHI renderer's exact per-pixel semantics, and a headless probe that verifies
+it end-to-end against the real engine with no window.
+
+- PixelBuffer.h: RGBA8 top-left-origin buffer + straight-alpha src-over blend
+  (RGB: s*a + d*(1-a); A: s.a + d.a, additive), matching the pipeline blend
+  state and the /255 non-premultiplied color convention.
+
+- SoftwareRenderTarget.{h,cpp}: implements RenderTarget + AtlasBackend +
+  ImageTextureBackend over CPU buffers. Single RGBA8 atlas (uploadTile converts
+  Red->(c,0,0,255)/RGB->(r,g,b,255)/RGBA verbatim); whole-image RGBA8 textures;
+  renderTile applies the per-selector tint (GLYPH_ALPHA: text color with red-
+  channel coverage; IMAGE_BGRA: texel verbatim) with nearest+clamp sampling
+  scaled to target; renderRectangle/renderImageGap solid fills; scissor clip
+  converted bottom-left->top-left. execute() composites accumulated commands in
+  z-order: rects -> below-text images -> text -> above-text images. beginFrame()
+  clears the surface (the frontend owns frame edges). LCD (selectors 2/3) and
+  OUTLINED (4) deferred; default grayscale AA path is complete.
+
+- render_probe.cpp: drives a MockTerm with a canned colored VT stream, renders
+  one frame through the backend, writes a PPM for visual inspection. Builds as
+  contour_macos_render_probe.
+
+The pure-C++ core carries no AppKit/CoreGraphics types, so it is the correctness
+reference and fallback, and is buildable/verifiable on any platform. A GL 2.0
+backend will implement the same interfaces and be validated against this output.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt           |  36 +-
+ src/contour_macos/PixelBuffer.h            | 101 +++++
+ src/contour_macos/SoftwareRenderTarget.cpp | 446 +++++++++++++++++++++
+ src/contour_macos/SoftwareRenderTarget.h   | 151 +++++++
+ src/contour_macos/render_probe.cpp         | 102 +++++
+ 5 files changed, 824 insertions(+), 12 deletions(-)
+ create mode 100644 src/contour_macos/PixelBuffer.h
+ create mode 100644 src/contour_macos/SoftwareRenderTarget.cpp
+ create mode 100644 src/contour_macos/SoftwareRenderTarget.h
+ create mode 100644 src/contour_macos/render_probe.cpp
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index cab014a0..b5793c06 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -1,27 +1,39 @@
+ # Native macOS (AppKit + CoreGraphics) frontend — no Qt.
+ #
+-# At this stage the target set is intentionally minimal: a header-only stub RenderTarget
+-# and a smoke-test executable that links the whole engine stack without a window, to
+-# confirm the C++23 engine builds and links on the macOS/GCC toolchain. The real
+-# CoreGraphics RenderTarget, AppKit shell, and session layer land here later.
++# Current targets: the software (CPU) render backend and its headless verification probe.
++# The AppKit window/session/PTY layer and the GL 2.0 backend land here later. The pure-C++
++# core (PixelBuffer, SoftwareRenderTarget) is deliberately free of AppKit/CoreGraphics types
++# so it can be built and verified on any platform.
+ 
+ set(_header_files
++    PixelBuffer.h
++    SoftwareRenderTarget.h
+     StubRenderTarget.h
+ )
+ 
++set(_source_files
++    SoftwareRenderTarget.cpp
++)
++
+ source_group(Headers FILES ${_header_files})
++source_group(Sources FILES ${_source_files})
+ 
+-# Interface library carrying the frontend's headers and public include path. It grows
+-# real translation units (the CoreGraphics backend, the AppKit view, the session) as
+-# they are written.
+-add_library(contour_macos INTERFACE)
+-target_sources(contour_macos INTERFACE ${_header_files})
+-target_include_directories(contour_macos INTERFACE ${PROJECT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src)
+-target_link_libraries(contour_macos INTERFACE vtrasterizer vtbackend vtmux text_shaper crispy::core)
++add_library(contour_macos STATIC ${_source_files} ${_header_files})
++target_include_directories(contour_macos PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src)
++target_link_libraries(contour_macos PUBLIC vtrasterizer vtbackend vtmux text_shaper crispy::core)
++if(NOT WIN32)
++    target_compile_options(contour_macos PRIVATE -Wno-c2y-extensions)
++endif()
+ 
+-# Engine build smoke test.
++# Engine build smoke test (constructs Renderer + a no-op target; no window/PTY).
+ add_executable(contour_macos_smoke smoke_main.cpp)
+ target_link_libraries(contour_macos_smoke PRIVATE contour_macos)
++
++# Headless render probe: drives a real Terminal, renders one frame, dumps a PPM.
++add_executable(contour_macos_render_probe render_probe.cpp)
++target_link_libraries(contour_macos_render_probe PRIVATE contour_macos)
++
+ if(NOT WIN32)
+     target_compile_options(contour_macos_smoke PRIVATE -Wno-c2y-extensions)
++    target_compile_options(contour_macos_render_probe PRIVATE -Wno-c2y-extensions)
+ endif()
+diff --git a/src/contour_macos/PixelBuffer.h b/src/contour_macos/PixelBuffer.h
+new file mode 100644
+index 00000000..3a1a9291
+--- /dev/null
++++ b/src/contour_macos/PixelBuffer.h
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <vtbackend/primitives.h>
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace contour_macos
++{
++
++/// A tightly-packed RGBA8 (8 bits per channel, 4 bytes per pixel) pixel buffer with a
++/// top-left origin: row 0 is the top, byte order is R,G,B,A. This is the storage and
++/// software-compositing primitive shared by the atlas, whole-image textures, and the
++/// output surface of the CPU render backend.
++///
++/// Colors are stored straight (non-premultiplied), matching the contour render pipeline.
++class PixelBuffer
++{
++  public:
++    PixelBuffer() = default;
++
++    PixelBuffer(uint32_t width, uint32_t height):
++        _width { width }, _height { height }, _data(static_cast<size_t>(width) * height * 4, 0)
++    {
++    }
++
++    [[nodiscard]] uint32_t width() const noexcept { return _width; }
++    [[nodiscard]] uint32_t height() const noexcept { return _height; }
++    [[nodiscard]] bool empty() const noexcept { return _data.empty(); }
++
++    [[nodiscard]] uint8_t* data() noexcept { return _data.data(); }
++    [[nodiscard]] uint8_t const* data() const noexcept { return _data.data(); }
++    [[nodiscard]] std::vector<uint8_t> const& bytes() const noexcept { return _data; }
++
++    void resize(uint32_t width, uint32_t height)
++    {
++        _width = width;
++        _height = height;
++        _data.assign(static_cast<size_t>(width) * height * 4, 0);
++    }
++
++    void fillTransparent() noexcept { std::fill(_data.begin(), _data.end(), uint8_t { 0 }); }
++
++    /// Pointer to the first byte (R) of pixel (x, y). No bounds checking.
++    [[nodiscard]] uint8_t* pixel(uint32_t x, uint32_t y) noexcept
++    {
++        return _data.data() + (static_cast<size_t>(y) * _width + x) * 4;
++    }
++
++    [[nodiscard]] uint8_t const* pixel(uint32_t x, uint32_t y) const noexcept
++    {
++        return _data.data() + (static_cast<size_t>(y) * _width + x) * 4;
++    }
++
++  private:
++    uint32_t _width = 0;
++    uint32_t _height = 0;
++    std::vector<uint8_t> _data;
++};
++
++/// A straight-alpha RGBA color in [0,1], the working type for compositing.
++struct FloatColor
++{
++    float r = 0.0f;
++    float g = 0.0f;
++    float b = 0.0f;
++    float a = 0.0f;
++};
++
++[[nodiscard]] inline FloatColor fromBytes(uint8_t const* p) noexcept
++{
++    return FloatColor { static_cast<float>(p[0]) / 255.0f,
++                        static_cast<float>(p[1]) / 255.0f,
++                        static_cast<float>(p[2]) / 255.0f,
++                        static_cast<float>(p[3]) / 255.0f };
++}
++
++[[nodiscard]] inline uint8_t toByte(float v) noexcept
++{
++    auto const clamped = std::clamp(v, 0.0f, 1.0f);
++    return static_cast<uint8_t>(clamped * 255.0f + 0.5f);
++}
++
++/// Composites a straight-alpha source color over the destination pixel, matching the
++/// contour render pipeline's blend state exactly:
++///   RGB: src.rgb * src.a + dst.rgb * (1 - src.a)   (SrcAlpha / OneMinusSrcAlpha)
++///   A:   src.a + dst.a                              (One / One, additive, saturating)
++inline void blendOver(uint8_t* dst, FloatColor const& src) noexcept
++{
++    auto const d = fromBytes(dst);
++    auto const inv = 1.0f - src.a;
++    dst[0] = toByte(src.r * src.a + d.r * inv);
++    dst[1] = toByte(src.g * src.a + d.g * inv);
++    dst[2] = toByte(src.b * src.a + d.b * inv);
++    dst[3] = toByte(src.a + d.a);
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/SoftwareRenderTarget.cpp b/src/contour_macos/SoftwareRenderTarget.cpp
+new file mode 100644
+index 00000000..4fbc94e4
+--- /dev/null
++++ b/src/contour_macos/SoftwareRenderTarget.cpp
+@@ -0,0 +1,446 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <contour_macos/SoftwareRenderTarget.h>
++
++#include <vtrasterizer/shared_defines.h>
++
++#include <algorithm>
++#include <ostream>
++#include <utility>
++
++using vtrasterizer::atlas::ConfigureAtlas;
++using vtrasterizer::atlas::CreateImageTexture;
++using vtrasterizer::atlas::DestroyImageTexture;
++using vtrasterizer::atlas::Format;
++using vtrasterizer::atlas::ImageTextureId;
++using vtrasterizer::atlas::NormalizedTileLocation;
++using vtrasterizer::atlas::RenderImageGap;
++using vtrasterizer::atlas::RenderImageQuad;
++using vtrasterizer::atlas::RenderTile;
++using vtrasterizer::atlas::UploadTile;
++
++namespace contour_macos
++{
++
++namespace
++{
++    [[nodiscard]] uint32_t widthOf(vtrasterizer::ImageSize s) noexcept
++    {
++        return static_cast<uint32_t>(unbox(s.width));
++    }
++    [[nodiscard]] uint32_t heightOf(vtrasterizer::ImageSize s) noexcept
++    {
++        return static_cast<uint32_t>(unbox(s.height));
++    }
++
++    [[nodiscard]] int firstNonZero(int a, int b) noexcept { return a != 0 ? a : b; }
++
++    [[nodiscard]] FloatColor fromRGBA(vtbackend::RGBAColor c) noexcept
++    {
++        return FloatColor { static_cast<float>(c.red()) / 255.0f,
++                            static_cast<float>(c.green()) / 255.0f,
++                            static_cast<float>(c.blue()) / 255.0f,
++                            static_cast<float>(c.alpha()) / 255.0f };
++    }
++
++    /// Nearest-neighbour sample of a normalized sub-rect, clamped to edge, from an RGBA8 buffer.
++    /// u,v in [0,1] over the whole source; returns straight-alpha float RGBA.
++    [[nodiscard]] FloatColor sampleNearestClamp(PixelBuffer const& src, float u, float v) noexcept
++    {
++        if (src.empty())
++            return FloatColor {};
++        auto const w = static_cast<int>(src.width());
++        auto const h = static_cast<int>(src.height());
++        auto sx = static_cast<int>(u * static_cast<float>(w));
++        auto sy = static_cast<int>(v * static_cast<float>(h));
++        sx = std::clamp(sx, 0, w - 1);
++        sy = std::clamp(sy, 0, h - 1);
++        return fromBytes(src.pixel(static_cast<uint32_t>(sx), static_cast<uint32_t>(sy)));
++    }
++} // namespace
++
++SoftwareRenderTarget::SoftwareRenderTarget(ImageSize size):
++    _renderSize { size }, _output { widthOf(size), heightOf(size) }
++{
++}
++
++void SoftwareRenderTarget::beginFrame()
++{
++    _output.fillTransparent();
++    _rects.clear();
++    _imagesBelowText.clear();
++    _textTiles.clear();
++    _imagesAboveText.clear();
++}
++
++void SoftwareRenderTarget::setRenderSize(ImageSize size)
++{
++    if (size == _renderSize)
++        return;
++    _renderSize = size;
++    _output.resize(widthOf(size), heightOf(size));
++}
++
++std::optional<SoftwareRenderTarget::ClipRect> SoftwareRenderTarget::currentClip() const noexcept
++{
++    if (!_scissorBottomLeft)
++        return std::nullopt;
++    // Scissor rects are issued in bottom-left origin device pixels; convert to top-left.
++    auto const& s = *_scissorBottomLeft;
++    ClipRect r;
++    r.x = s.x;
++    r.y = static_cast<int>(_output.height()) - (s.y + s.height);
++    r.width = s.width;
++    r.height = s.height;
++    return r;
++}
++
++void SoftwareRenderTarget::setScissorRect(int x, int y, int width, int height)
++{
++    _scissorBottomLeft = ClipRect { x, y, width, height };
++}
++
++void SoftwareRenderTarget::clearScissorRect()
++{
++    _scissorBottomLeft = std::nullopt;
++}
++
++// --- AtlasBackend ---
++
++void SoftwareRenderTarget::configureAtlas(ConfigureAtlas atlas)
++{
++    _atlasSize = atlas.size;
++    auto const w = widthOf(atlas.size);
++    auto const h = heightOf(atlas.size);
++    // Reuse the buffer when the size is unchanged (matches the Qt backend's no-realloc path).
++    if (_atlas.width() != w || _atlas.height() != h)
++        _atlas.resize(w, h);
++}
++
++void SoftwareRenderTarget::uploadTile(UploadTile tile)
++{
++    auto const tw = widthOf(tile.bitmapSize);
++    auto const th = heightOf(tile.bitmapSize);
++    if (tw == 0 || th == 0 || _atlas.empty())
++        return;
++
++    auto const dstX = tile.location.x.value;
++    auto const dstY = tile.location.y.value;
++
++    // Source rows are tightly packed. Convert to RGBA8 into the atlas at (dstX, dstY),
++    // matching the Qt backend: Red -> (c,0,0,255); RGB -> (r,g,b,255); RGBA -> verbatim.
++    auto const channels = static_cast<uint32_t>(tile.bitmapFormat);
++    for (uint32_t row = 0; row < th; ++row)
++    {
++        auto const dy = dstY + row;
++        if (dy >= _atlas.height())
++            break;
++        uint8_t const* srcRow = tile.bitmap.data() + static_cast<size_t>(row) * tw * channels;
++        uint8_t* dstRow = _atlas.pixel(dstX, dy);
++        for (uint32_t col = 0; col < tw; ++col)
++        {
++            auto const dx = dstX + col;
++            if (dx >= _atlas.width())
++                break;
++            uint8_t const* s = srcRow + static_cast<size_t>(col) * channels;
++            uint8_t* d = dstRow + static_cast<size_t>(col) * 4;
++            switch (tile.bitmapFormat)
++            {
++                case Format::Red:
++                    d[0] = s[0];
++                    d[1] = 0;
++                    d[2] = 0;
++                    d[3] = 255;
++                    break;
++                case Format::RGB:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = 255;
++                    break;
++                case Format::RGBA:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = s[3];
++                    break;
++            }
++        }
++    }
++}
++
++void SoftwareRenderTarget::renderTile(RenderTile tile)
++{
++    _textTiles.push_back(TileCommand { std::move(tile), currentClip() });
++}
++
++// --- ImageTextureBackend ---
++
++void SoftwareRenderTarget::createImageTexture(CreateImageTexture param)
++{
++    auto const w = widthOf(param.size);
++    auto const h = heightOf(param.size);
++    if (w == 0 || h == 0)
++    {
++        _failedImageTextures.push_back(param.id);
++        return;
++    }
++
++    // The caller widens non-RGBA image data to RGBA8, tightly packed at width*4.
++    PixelBuffer buffer { w, h };
++    auto const expected = static_cast<size_t>(w) * h * 4;
++    if (param.data.size() >= expected)
++        std::copy_n(param.data.data(), expected, buffer.data());
++    else
++    {
++        _failedImageTextures.push_back(param.id);
++        return;
++    }
++    _imageTextures[param.id.value] = std::move(buffer);
++}
++
++void SoftwareRenderTarget::destroyImageTexture(DestroyImageTexture param)
++{
++    _imageTextures.erase(param.id.value);
++}
++
++void SoftwareRenderTarget::renderImageQuad(RenderImageQuad param)
++{
++    ImageLayerEntry entry;
++    entry.quad = QuadCommand { std::move(param), currentClip() };
++    if (entry.quad->quad.aboveText)
++        _imagesAboveText.push_back(std::move(entry));
++    else
++        _imagesBelowText.push_back(std::move(entry));
++}
++
++void SoftwareRenderTarget::renderImageGap(RenderImageGap param)
++{
++    RectCommand gap;
++    gap.x = param.x;
++    gap.y = param.y;
++    gap.width = static_cast<int>(widthOf(param.size));
++    gap.height = static_cast<int>(heightOf(param.size));
++    gap.color = fromRGBA(param.color);
++    gap.clip = currentClip();
++
++    ImageLayerEntry entry;
++    entry.gap = std::move(gap);
++    if (param.aboveText)
++        _imagesAboveText.push_back(std::move(entry));
++    else
++        _imagesBelowText.push_back(std::move(entry));
++}
++
++std::vector<ImageTextureId> SoftwareRenderTarget::takeFailedImageTextures()
++{
++    return std::exchange(_failedImageTextures, {});
++}
++
++// --- RenderTarget draw + execute ---
++
++void SoftwareRenderTarget::renderRectangle(int x, int y, Width width, Height height, RGBAColor color)
++{
++    _rects.push_back(RectCommand { x,
++                                   y,
++                                   static_cast<int>(unbox(width)),
++                                   static_cast<int>(unbox(height)),
++                                   fromRGBA(color),
++                                   currentClip() });
++}
++
++void SoftwareRenderTarget::fillRect(int x, int y, int w, int h, FloatColor const& c, std::optional<ClipRect> const& clip)
++{
++    if (w <= 0 || h <= 0 || c.a <= 0.0f)
++        return;
++
++    int x0 = x;
++    int y0 = y;
++    int x1 = x + w;
++    int y1 = y + h;
++    if (clip)
++    {
++        x0 = std::max(x0, clip->x);
++        y0 = std::max(y0, clip->y);
++        x1 = std::min(x1, clip->x + clip->width);
++        y1 = std::min(y1, clip->y + clip->height);
++    }
++    x0 = std::max(x0, 0);
++    y0 = std::max(y0, 0);
++    x1 = std::min(x1, static_cast<int>(_output.width()));
++    y1 = std::min(y1, static_cast<int>(_output.height()));
++
++    for (int py = y0; py < y1; ++py)
++        for (int px = x0; px < x1; ++px)
++            blendOver(_output.pixel(static_cast<uint32_t>(px), static_cast<uint32_t>(py)), c);
++}
++
++void SoftwareRenderTarget::blitAtlasTile(RenderTile const& tile, std::optional<ClipRect> const& clip)
++{
++    auto const targetW = firstNonZero(static_cast<int>(widthOf(tile.targetSize)),
++                                      static_cast<int>(widthOf(tile.bitmapSize)));
++    auto const targetH = firstNonZero(static_cast<int>(heightOf(tile.targetSize)),
++                                      static_cast<int>(heightOf(tile.bitmapSize)));
++    if (targetW <= 0 || targetH <= 0 || _atlas.empty())
++        return;
++
++    NormalizedTileLocation const& n = tile.normalizedLocation;
++    FloatColor const tint { tile.color[0], tile.color[1], tile.color[2], tile.color[3] };
++
++    int const x0src = tile.x.value;
++    int const y0src = tile.y.value;
++
++    int x0 = x0src;
++    int y0 = y0src;
++    int x1 = x0src + targetW;
++    int y1 = y0src + targetH;
++    if (clip)
++    {
++        x0 = std::max(x0, clip->x);
++        y0 = std::max(y0, clip->y);
++        x1 = std::min(x1, clip->x + clip->width);
++        y1 = std::min(y1, clip->y + clip->height);
++    }
++    x0 = std::max(x0, 0);
++    y0 = std::max(y0, 0);
++    x1 = std::min(x1, static_cast<int>(_output.width()));
++    y1 = std::min(y1, static_cast<int>(_output.height()));
++
++    for (int py = y0; py < y1; ++py)
++    {
++        float const v = n.y + n.height * ((static_cast<float>(py - y0src) + 0.5f) / static_cast<float>(targetH));
++        for (int px = x0; px < x1; ++px)
++        {
++            float const u = n.x + n.width * ((static_cast<float>(px - x0src) + 0.5f) / static_cast<float>(targetW));
++            FloatColor const texel = sampleNearestClamp(_atlas, u, v);
++
++            FloatColor out;
++            switch (tile.fragmentShaderSelector)
++            {
++                case FRAGMENT_SELECTOR_IMAGE_BGRA:
++                    out = texel; // verbatim; tint ignored
++                    break;
++                case FRAGMENT_SELECTOR_GLYPH_ALPHA:
++                default:
++                {
++                    // Coverage carried in the red channel; emit tint color with coverage*tint.a.
++                    float const coverage = texel.r;
++                    out = FloatColor { tint.r, tint.g, tint.b, coverage * tint.a };
++                    break;
++                }
++            }
++            blendOver(_output.pixel(static_cast<uint32_t>(px), static_cast<uint32_t>(py)), out);
++        }
++    }
++}
++
++void SoftwareRenderTarget::blitImageQuad(RenderImageQuad const& q, std::optional<ClipRect> const& clip)
++{
++    auto const it = _imageTextures.find(q.texture.value);
++    if (it == _imageTextures.end())
++        return;
++    PixelBuffer const& tex = it->second;
++
++    int const targetW = static_cast<int>(widthOf(q.targetSize));
++    int const targetH = static_cast<int>(heightOf(q.targetSize));
++    if (targetW <= 0 || targetH <= 0 || tex.empty())
++        return;
++
++    NormalizedTileLocation const& n = q.source;
++
++    int const x0src = q.x;
++    int const y0src = q.y;
++    int x0 = x0src;
++    int y0 = y0src;
++    int x1 = x0src + targetW;
++    int y1 = y0src + targetH;
++    if (clip)
++    {
++        x0 = std::max(x0, clip->x);
++        y0 = std::max(y0, clip->y);
++        x1 = std::min(x1, clip->x + clip->width);
++        y1 = std::min(y1, clip->y + clip->height);
++    }
++    x0 = std::max(x0, 0);
++    y0 = std::max(y0, 0);
++    x1 = std::min(x1, static_cast<int>(_output.width()));
++    y1 = std::min(y1, static_cast<int>(_output.height()));
++
++    for (int py = y0; py < y1; ++py)
++    {
++        float const v = n.y + n.height * ((static_cast<float>(py - y0src) + 0.5f) / static_cast<float>(targetH));
++        for (int px = x0; px < x1; ++px)
++        {
++            float const u = n.x + n.width * ((static_cast<float>(px - x0src) + 0.5f) / static_cast<float>(targetW));
++            FloatColor const texel = sampleNearestClamp(tex, u, v); // verbatim, tint ignored
++            blendOver(_output.pixel(static_cast<uint32_t>(px), static_cast<uint32_t>(py)), texel);
++        }
++    }
++}
++
++void SoftwareRenderTarget::execute(std::chrono::steady_clock::time_point /*now*/)
++{
++    auto const compositeImageLayer = [&](std::vector<ImageLayerEntry> const& layer) {
++        for (auto const& entry: layer)
++        {
++            if (entry.quad)
++                blitImageQuad(entry.quad->quad, entry.quad->clip);
++            else if (entry.gap)
++            {
++                auto const& g = *entry.gap;
++                fillRect(g.x, g.y, g.width, g.height, g.color, g.clip);
++            }
++        }
++    };
++
++    // Composite in z-order: background rects -> below-text images -> text -> above-text images.
++    for (auto const& r: _rects)
++        fillRect(r.x, r.y, r.width, r.height, r.color, r.clip);
++    compositeImageLayer(_imagesBelowText);
++    for (auto const& t: _textTiles)
++        blitAtlasTile(t.tile, t.clip);
++    compositeImageLayer(_imagesAboveText);
++
++    _rects.clear();
++    _imagesBelowText.clear();
++    _textTiles.clear();
++    _imagesAboveText.clear();
++
++    if (_pendingScreenshot)
++    {
++        auto cb = std::move(*_pendingScreenshot);
++        _pendingScreenshot.reset();
++        cb(_output.bytes(), _renderSize);
++    }
++}
++
++void SoftwareRenderTarget::scheduleScreenshot(ScreenshotCallback callback)
++{
++    _pendingScreenshot = std::move(callback);
++}
++
++void SoftwareRenderTarget::clearCache()
++{
++    _imageTextures.clear();
++    _failedImageTextures.clear();
++}
++
++std::optional<vtrasterizer::AtlasTextureScreenshot> SoftwareRenderTarget::readAtlas()
++{
++    if (_atlas.empty())
++        return std::nullopt;
++    vtrasterizer::AtlasTextureScreenshot shot;
++    shot.atlasInstanceId = 0;
++    shot.size = _atlasSize;
++    shot.format = Format::RGBA;
++    shot.buffer = _atlas.bytes();
++    return shot;
++}
++
++void SoftwareRenderTarget::inspect(std::ostream& output) const
++{
++    output << "SoftwareRenderTarget: render " << widthOf(_renderSize) << 'x' << heightOf(_renderSize)
++           << ", atlas " << widthOf(_atlasSize) << 'x' << heightOf(_atlasSize) << ", "
++           << _imageTextures.size() << " image texture(s)\n";
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/SoftwareRenderTarget.h b/src/contour_macos/SoftwareRenderTarget.h
+new file mode 100644
+index 00000000..3e7ba315
+--- /dev/null
++++ b/src/contour_macos/SoftwareRenderTarget.h
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <contour_macos/PixelBuffer.h>
++
++#include <vtrasterizer/ImageTextureBackend.h>
++#include <vtrasterizer/RenderTarget.h>
++#include <vtrasterizer/TextureAtlas.h>
++
++#include <cstdint>
++#include <optional>
++#include <unordered_map>
++#include <vector>
++
++namespace contour_macos
++{
++
++/// CPU (software) implementation of the contour render backend.
++///
++/// Composites glyph tiles, whole-image (sixel/emoji) textures, and solid rectangles into an
++/// owned RGBA8, top-left-origin output buffer, reproducing the exact per-pixel semantics of
++/// the Qt RHI renderer (straight-alpha src-over blend, per-selector glyph tint, nearest+clamp
++/// sampling with scale-to-target). It is deliberately free of any AppKit/CoreGraphics types so
++/// it can be driven and verified headlessly; the window layer wraps outputBuffer() as a CGImage.
++///
++/// This is both the correctness reference and the fallback backend; a GL 2.0 backend implements
++/// the same three interfaces and is validated against this one's output.
++class SoftwareRenderTarget final:
++    public vtrasterizer::RenderTarget,
++    public vtrasterizer::atlas::AtlasBackend,
++    public vtrasterizer::atlas::ImageTextureBackend
++{
++  public:
++    using ImageSize = vtrasterizer::ImageSize;
++    using PageMargin = vtrasterizer::PageMargin;
++
++    explicit SoftwareRenderTarget(ImageSize size);
++
++    /// Clears the output surface to transparent for a new frame. The frontend calls this
++    /// before driving vtrasterizer::Renderer::render(), which issues one or more execute()
++    /// calls that composite onto the cleared surface. Not part of the RenderTarget interface
++    /// (the Qt backend relies on its render-pass clear); here the frontend owns frame edges.
++    void beginFrame();
++
++    /// The composited frame, RGBA8, top-left origin, tightly packed (width*height*4 bytes).
++    [[nodiscard]] PixelBuffer const& outputBuffer() const noexcept { return _output; }
++
++    // --- vtrasterizer::RenderTarget ---
++    void setRenderSize(ImageSize size) override;
++    [[nodiscard]] ImageSize renderSize() const noexcept override { return _renderSize; }
++    void setMargin(PageMargin /*margin*/) override {} // baked into vertex coords upstream; no-op
++    vtrasterizer::atlas::AtlasBackend& textureScheduler() override { return *this; }
++    vtrasterizer::atlas::ImageTextureBackend& imageScheduler() override { return *this; }
++    void renderRectangle(int x, int y, Width width, Height height, RGBAColor color) override;
++    void scheduleScreenshot(ScreenshotCallback callback) override;
++    void setScissorRect(int x, int y, int width, int height) override;
++    void clearScissorRect() override;
++    void execute(std::chrono::steady_clock::time_point now) override;
++    void clearCache() override;
++    std::optional<vtrasterizer::AtlasTextureScreenshot> readAtlas() override;
++    void inspect(std::ostream& output) const override;
++
++    // --- vtrasterizer::atlas::AtlasBackend ---
++    [[nodiscard]] ImageSize atlasSize() const noexcept override { return _atlasSize; }
++    void configureAtlas(vtrasterizer::atlas::ConfigureAtlas atlas) override;
++    void uploadTile(vtrasterizer::atlas::UploadTile tile) override;
++    void renderTile(vtrasterizer::atlas::RenderTile tile) override;
++
++    // --- vtrasterizer::atlas::ImageTextureBackend ---
++    void createImageTexture(vtrasterizer::atlas::CreateImageTexture param) override;
++    void destroyImageTexture(vtrasterizer::atlas::DestroyImageTexture param) override;
++    void renderImageQuad(vtrasterizer::atlas::RenderImageQuad param) override;
++    void renderImageGap(vtrasterizer::atlas::RenderImageGap param) override;
++    [[nodiscard]] std::vector<vtrasterizer::atlas::ImageTextureId> takeFailedImageTextures() override;
++
++  private:
++    /// An axis-aligned clip rectangle in top-left output-buffer pixel space.
++    struct ClipRect
++    {
++        int x = 0;
++        int y = 0;
++        int width = 0;
++        int height = 0;
++    };
++
++    /// The active scissor converted to top-left space, or nullopt for "no clip" (full target).
++    [[nodiscard]] std::optional<ClipRect> currentClip() const noexcept;
++
++    void blitAtlasTile(vtrasterizer::atlas::RenderTile const& tile, std::optional<ClipRect> const& clip);
++    void blitImageQuad(vtrasterizer::atlas::RenderImageQuad const& q, std::optional<ClipRect> const& clip);
++    void fillRect(int x, int y, int w, int h, FloatColor const& c, std::optional<ClipRect> const& clip);
++
++    /// A solid-fill command (from renderRectangle or renderImageGap), carrying its clip.
++    struct RectCommand
++    {
++        int x = 0;
++        int y = 0;
++        int width = 0;
++        int height = 0;
++        FloatColor color {};
++        std::optional<ClipRect> clip {};
++    };
++
++    /// A recorded draw command tagging which primitive to composite, each with its clip.
++    struct TileCommand
++    {
++        vtrasterizer::atlas::RenderTile tile;
++        std::optional<ClipRect> clip {};
++    };
++    struct QuadCommand
++    {
++        vtrasterizer::atlas::RenderImageQuad quad;
++        std::optional<ClipRect> clip {};
++    };
++    /// An image-layer entry is either a textured quad or a solid gap-fill, kept in issue order.
++    struct ImageLayerEntry
++    {
++        std::optional<QuadCommand> quad {}; // set for a textured image quad
++        std::optional<RectCommand> gap {};  // set for a solid gap fill
++    };
++
++    // Geometry / sizing
++    ImageSize _renderSize;
++
++    // Output surface
++    PixelBuffer _output;
++
++    // Texture atlas (single RGBA8 buffer)
++    ImageSize _atlasSize {};
++    PixelBuffer _atlas;
++
++    // Whole-image textures keyed by ImageTextureId::value
++    std::unordered_map<uint32_t, PixelBuffer> _imageTextures;
++    std::vector<vtrasterizer::atlas::ImageTextureId> _failedImageTextures;
++
++    // Scissor, stored raw (bottom-left origin device pixels, as issued).
++    std::optional<ClipRect> _scissorBottomLeft;
++
++    // Per-execute() accumulators, composited in this order then cleared: background rects,
++    // below-text image layer, text/glyph tiles, above-text image layer. This partition-by-
++    // category (issue order within each) is the frame's z-order.
++    std::vector<RectCommand> _rects;
++    std::vector<ImageLayerEntry> _imagesBelowText;
++    std::vector<TileCommand> _textTiles;
++    std::vector<ImageLayerEntry> _imagesAboveText;
++
++    // Deferred screenshot request: satisfied at end of the current frame's execute().
++    std::optional<ScreenshotCallback> _pendingScreenshot;
++};
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/render_probe.cpp b/src/contour_macos/render_probe.cpp
+new file mode 100644
+index 00000000..dff745a4
+--- /dev/null
++++ b/src/contour_macos/render_probe.cpp
+@@ -0,0 +1,102 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// Headless render probe: drives a real vtbackend::Terminal (via MockTerm, no PTY / no window)
++// with a canned VT stream, renders exactly one frame through the SoftwareRenderTarget, and
++// writes the composited RGBA8 surface to a PPM file for visual inspection. This verifies the
++// CPU compositing backend (glyph tint math, image path, blend, ordering) end-to-end against
++// the real engine, on any machine, with no GUI.
++//
++// Usage: contour_macos_render_probe [output.ppm]
++
++#include <contour_macos/SoftwareRenderTarget.h>
++
++#include <vtbackend/MockTerm.h>
++
++#include <vtpty/MockPty.h>
++
++#include <vtrasterizer/Decorator.h>
++#include <vtrasterizer/FontDescriptions.h>
++#include <vtrasterizer/Renderer.h>
++
++#include <crispy/StrongLRUHashtable.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <fstream>
++#include <string>
++
++namespace
++{
++
++void writePpm(std::string const& path, contour_macos::PixelBuffer const& buf)
++{
++    std::ofstream out(path, std::ios::binary);
++    out << "P6\n" << buf.width() << ' ' << buf.height() << "\n255\n";
++    for (uint32_t y = 0; y < buf.height(); ++y)
++    {
++        for (uint32_t x = 0; x < buf.width(); ++x)
++        {
++            uint8_t const* p = buf.pixel(x, y);
++            // Composite the straight-alpha pixel over an opaque black background for viewing.
++            auto const a = static_cast<float>(p[3]) / 255.0f;
++            char const rgb[3] = { static_cast<char>(static_cast<uint8_t>(p[0] * a)),
++                                  static_cast<char>(static_cast<uint8_t>(p[1] * a)),
++                                  static_cast<char>(static_cast<uint8_t>(p[2] * a)) };
++            out.write(rgb, 3);
++        }
++    }
++}
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++    using namespace vtbackend;
++    using namespace vtrasterizer;
++
++    std::string const outputPath = argc > 1 ? argv[1] : "render_probe.ppm";
++
++    auto const pageSize = PageSize { LineCount { 10 }, ColumnCount { 40 } };
++
++    MockTerm<vtpty::MockPty> mock { pageSize, {}, 65536, [](auto& m) {
++        m.writeToScreen("\033[1;37mcontour\033[0m on \033[1;32mmacOS PowerPC\033[0m\r\n");
++        m.writeToScreen("\033[31mred \033[32mgreen \033[33myellow \033[34mblue\033[0m\r\n");
++        m.writeToScreen("\033[7mreverse\033[0m normal \033[4munderline\033[0m\r\n");
++        m.writeToScreen("the quick brown fox 0123456789\r\n");
++    } };
++
++    auto& terminal = mock.terminal;
++
++    auto const colorPalette = terminal.colorPalette();
++    auto fonts = FontDescriptions {};
++
++    auto renderer = Renderer { pageSize,
++                               fonts,
++                               colorPalette,
++                               crispy::strong_hashtable_size { 4096 },
++                               crispy::lru_capacity { 4000 },
++                               /* atlasDirectMapping */ true,
++                               Decorator::Underline,
++                               Decorator::CurlyUnderline };
++
++    auto const cellSize = renderer.gridMetrics().cellSize;
++    auto const pixelWidth = Width::cast_from(unbox(cellSize.width) * unbox(pageSize.columns));
++    auto const pixelHeight = Height::cast_from(unbox(cellSize.height) * unbox(pageSize.lines));
++    auto const surfaceSize = ImageSize { pixelWidth, pixelHeight };
++
++    auto target = contour_macos::SoftwareRenderTarget { surfaceSize };
++    renderer.setRenderTarget(target);
++    (void) renderer.applyStagedReconfigDuringSetup();
++
++    target.setRenderSize(surfaceSize);
++
++    target.beginFrame();
++    (void) renderer.render(terminal, /* pressureHint */ false);
++
++    writePpm(outputPath, target.outputBuffer());
++    std::printf("render_probe: wrote %s (%ux%u)\n",
++                outputPath.c_str(),
++                target.outputBuffer().width(),
++                target.outputBuffer().height());
++    return 0;
++}
+-- 
+2.43.0
+

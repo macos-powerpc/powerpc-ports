@@ -1,0 +1,460 @@
+From 2104b4f53282ff68368ae9a728cb09f0011ab069 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 04:34:35 +0000
+Subject: [PATCH 02/67] feat(macos): native frontend skeleton and design doc
+
+Add the scaffold for a native AppKit/CoreGraphics macOS frontend under
+src/contour_macos, plus the port's design reference.
+
+- StubRenderTarget.h: a no-op implementation of vtrasterizer::RenderTarget,
+  atlas::AtlasBackend and atlas::ImageTextureBackend. It satisfies the full
+  contract and draws nothing, to bring up and smoke-test the engine build
+  before the real CoreGraphics backend exists.
+
+- smoke_main.cpp: constructs a vtrasterizer::Renderer against the stub and runs
+  one setup pass, with no window and no PTY, so a clean run proves the C++23
+  engine stack (vtrasterizer -> vtbackend -> text_shaper -> crispy) links
+  without Qt on the target toolchain.
+
+- CMakeLists.txt: an INTERFACE library contour_macos linking the engine libs,
+  and the contour_macos_smoke executable.
+
+- docs/macos-port.md: what is reused vs written fresh, the Terminal::Events and
+  RenderTarget seams, the per-frame drive, the threading model, the vtpty
+  portability notes, the ObjC/GCC constraints, and the build order.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ docs/macos-port.md                   | 258 +++++++++++++++++++++++++++
+ src/contour_macos/CMakeLists.txt     |  27 +++
+ src/contour_macos/StubRenderTarget.h |  64 +++++++
+ src/contour_macos/smoke_main.cpp     |  46 +++++
+ 4 files changed, 395 insertions(+)
+ create mode 100644 docs/macos-port.md
+ create mode 100644 src/contour_macos/CMakeLists.txt
+ create mode 100644 src/contour_macos/StubRenderTarget.h
+ create mode 100644 src/contour_macos/smoke_main.cpp
+
+diff --git a/docs/macos-port.md b/docs/macos-port.md
+new file mode 100644
+index 00000000..cd88329a
+--- /dev/null
++++ b/docs/macos-port.md
+@@ -0,0 +1,258 @@
++# contour on macOS PowerPC — port design
++
++This document is the reference for the macOS/PowerPC port of contour. It records
++what is reused, what is written fresh, the exact seam between them, and the build
++plan. It is the design counterpart to the higher-level `ANALYSIS.md` in the repo
++that this checkout was created from.
++
++## Goal
++
++A modern, TUI-correct terminal emulator for macOS PowerPC (Darwin 10 / macOS 10.6
++is the primary target), with true color and sixel image support, that also runs on
++modern macOS. Visual parity with upstream's Qt6 GUI is a non-goal — the engine is
++kept, the GUI is replaced.
++
++## Toolchain
++
++- C++ engine is built with a modern GCC (gcc 16) and its own libstdc++, **not**
++  Apple's toolchain. The engine uses genuine C++23 (`std::expected`,
++  `std::ranges::to`, `std::format`, concepts), so a real C++23 standard library is
++  required. This holds even on the x86 test machines: do not build the engine with
++  Apple clang / Apple libc++, which may not have the needed C++23 support.
++- The Objective-C(++) GUI must compile with the same modern GCC — its ObjC frontend,
++  not only Apple clang. See `AppKit + Objective-C constraints` below.
++
++## Hard constraints
++
++- **No Qt, at all.** Not even `Qt6::Core`. Qt6 does not work on 10.6 or with GCC, and
++  is too heavy a dependency regardless. Qt4 would be considered only as a last resort
++  and is currently not planned. Every reused component must be Qt-free.
++
++## What is reused, unmodified
++
++The Qt-free engine libraries under `src/`, kept as-is (small Darwin portability
++patches to `vtpty` aside):
++
++- `vtparser` — VT escape-sequence tokenizer
++- `vtbackend` — VT100/VTE state machine, screen buffer, **sixel parse/decode**
++  (`SixelParser`, `Image`), input generation
++- `vtpty` — PTY handling (POSIX; see patches below)
++- `vtmux` — Qt-free tab/session/pane model
++- `vtrasterizer` — glyph atlas layout, cell-grid render math, image-quad scheduling
++- `text_shaper` — Freetype/HarfBuzz shaping; on macOS also the CoreText font locator
++- `crispy` — utility library
++
++## What is deleted / not built on macOS
++
++- `src/contour/display/` — the Qt RHI (Vulkan/Metal/GL) renderer and GLSL shaders.
++- `src/contour/ui/` — QML declarative UI.
++- `src/contour/` frontend object library (`contour_core`): `TerminalSession`,
++  `ContourGuiApp`, `Config`, etc. These are Qt-coupled at the source level
++  (`Q_OBJECT`, `Q_PROPERTY`, `QAbstractItemModel`, `QFileSystemWatcher`, `QThread`,
++  `QJSValue`). They are **not** reused; the equivalent orchestration is written fresh
++  in the new frontend.
++
++Upstream `src/contour/{display,ui}` are left on disk pristine (not deleted) so the
++tree can be rebased on upstream contour later. They are simply excluded from the
++macOS build.
++
++## What is written fresh — `src/contour_macos/`
++
++All new code lives in a new in-tree directory `src/contour_macos/`, alongside (not
++replacing) `src/contour/`. It contains:
++
++1. **`CGRenderTarget`** — a `vtrasterizer::RenderTarget` implementation backed by
++   CoreGraphics CPU compositing. It also implements `atlas::AtlasBackend` and
++   `atlas::ImageTextureBackend`. No shaders, no Metal, no OpenGL. This is the single
++   most important new component and the whole reason the port is tractable.
++
++2. **`TerminalView`** — an `NSView` subclass whose `-drawRect:` drives one frame, and
++   whose `NSEvent` handlers translate input into engine calls.
++
++3. **A session object** implementing `vtbackend::Terminal::Events` — the Qt-free
++   callback interface (see the seam below). Owns the PTY spawn and the read loop.
++
++4. **App scaffolding** — `NSApplication`/`AppDelegate`, window management, config
++   loading, clipboard via `NSPasteboard`.
++
++## The seam: `vtbackend::Terminal::Events`
++
++The host↔engine boundary is **not** contour's `TerminalSession` (which is Qt). It is
++`vtbackend::Terminal::Events` (`src/vtbackend/Terminal.h`), a pure-virtual listener
++that is 100% Qt-free — every method takes plain types (`std::string_view`,
++`RGBColor`, `LineCount`, …) and almost all have default no-op bodies. The new session
++object implements it. Relevant callbacks include: `screenUpdated`,
++`renderBufferUpdated`, `bufferChanged`, `bell`, `copyToClipboard`,
++`pasteFromClipboard`, `setWindowTitle`, `requestWindowResize`, `discardImage`,
++`notify`, `onClosed`, `openDocument` (the only pure-virtual one).
++
++The `vtbackend::Terminal` constructor takes `(Events&, unique_ptr<vtpty::Pty>,
++settings, now)`. The Terminal owns the Pty and calls back into the session.
++
++## The render seam: three interfaces, all CPU-friendly
++
++`CGRenderTarget` implements exactly these (`src/vtrasterizer/`):
++
++- **`RenderTarget`** (`RenderTarget.h`): `setRenderSize`, `renderSize`, `setMargin`,
++  `textureScheduler()`, `imageScheduler()`, `renderRectangle`, `scheduleScreenshot`,
++  `setScissorRect`/`clearScissorRect` (bottom-left origin!), `execute(now)`,
++  `clearCache`, `readAtlas`, `inspect`, optional `setTextOutline`.
++- **`atlas::AtlasBackend`** (`TextureAtlas.h`) — four methods: `atlasSize`,
++  `configureAtlas`, `uploadTile`, `renderTile`. The atlas is a CPU pixel buffer;
++  `uploadTile` blits a bitmap into a tile slot at its pixel offset; `renderTile`
++  composites a tile sub-rect onto the target surface.
++- **`atlas::ImageTextureBackend`** (`ImageTextureBackend.h`) — whole-image textures
++  for sixel/images: `createImageTexture`, `destroyImageTexture`, `renderImageQuad`,
++  `renderImageGap`, `takeFailedImageTextures`.
++
++Ordering contract: commands issued through `textureScheduler()` and `imageScheduler()`
++composite in issue order. The CoreGraphics backend records scheduled commands and
++executes them, in order, inside `execute()` (invoked from `-drawRect:`). Because a
++CPU compositor draws immediately, the Qt RHI split of upload-vs-record is not needed;
++all scheduling and drawing happen in `execute()`.
++
++## Per-frame drive (reproduced from `TerminalDisplay::paint()`)
++
++1. `terminal.tick(now)`
++2. `bool fontReconfigApplied = renderer.render(terminal, pressureHint)`
++   — this internally calls `terminal.refreshRenderBuffer()`, takes the front-buffer
++   lock via `terminal.renderBuffer()`, feeds cells/lines to the sub-renderers (which
++   call into `CGRenderTarget`'s schedulers and `renderRectangle`), and finally calls
++   `RenderTarget::execute(now)`.
++3. If `fontReconfigApplied`, re-derive the page size against the new cell size.
++
++`vtrasterizer::Renderer` is the engine-side orchestrator driven by the new frontend.
++Key calls: constructor `(PageSize, FontDescriptions, ColorPalette const&,
++hashtableSlotCount, tileCount, atlasDirectMapping, hyperlinkNormal, hyperlinkHover)`;
++`setRenderTarget(CGRenderTarget&)` (injection point); `applyResize(pixelSize,
++pageSize, margin)` on resize; `render(...)` per frame; `applyStagedReconfigDuringSetup()`
++once after construction to materialize cell metrics before sizing anything.
++
++## Input path
++
++`NSEvent` handlers on `TerminalView` translate native events and call the engine.
++Because the Qt `TerminalSession` (which owned keybinding dispatch, mouse-protocol
++encoding, hide-cursor-while-typing) is not reused, the new session/view layer
++reimplements that translation against `vtbackend::Terminal` directly. Upstream's
++`src/contour/helper.cpp` (keymap tables, modifier inference, wheel→mouse mapping) is
++the behavioral reference to port from, not to link.
++
++Engine input entry points on `vtbackend::Terminal`: key press/release, char/text
++input (the IME / `-insertText:` funnel), mouse press/move/release, focus in/out.
++
++## Threading model
++
++Three logical roles, collapsed from Qt's four to three here:
++
++- **Parser thread** — a dedicated thread runs the blocking PTY read + VT parse loop
++  (`Terminal::processInputOnce`), exactly as upstream does. Kept.
++- **Main thread** — `NSApplication` run loop; `-drawRect:` renders here. Qt's separate
++  scene-graph render thread is *not* reproduced; rendering happens on the main thread.
++  This simplifies things, but the parser thread is still separate, so
++  `Renderer`'s internal reconfig mutexes still matter for font/geometry changes.
++
++The one cross-thread seam to replace is upstream's `postToObject`
++(`QMetaObject::invokeMethod(..., Qt::QueuedConnection)`): every backend→GUI hop
++(schedule-redraw, title change, resize request, …) goes through it. It is replaced by
++a single function that enqueues onto the main run loop —
++`dispatch_async(dispatch_get_main_queue(), ^{ … })` (libdispatch, available on 10.6+),
++or `CFRunLoopPerformBlock` + `CFRunLoopWakeUp`. Dispatched blocks must re-check object
++liveness (window/session still alive) before touching them, as the Qt lambdas do.
++
++Cross-thread render safety is preserved by continuing to use
++`refreshRenderBuffer()` + `renderBuffer()` (double buffer + RAII front-buffer lock)
++rather than reading screen state directly.
++
++## vtpty Darwin portability patches
++
++`vtpty` is already cross-platform (openpty via `<util.h>` on Apple, `pipe2`→`pipe`
++fallback, epoll/eventfd/utempter all behind `__linux__`, and the read loop falls back
++to `select()` + self-pipe via `crispy::read_selector` on non-Linux).
++
++The port depends on [macports-legacy-support](https://github.com/macports/macports-legacy-support)
++(via the MacPorts `legacysupport` PortGroup), which supplies real, tested
++implementations of older-SDK gaps as wrapper headers on the include path — including a
++genuine `O_CLOEXEC` (it patches `sys/fcntl.h`) and `clock_gettime`. We therefore
++**assume those exist and work** and do not shim them; defining `O_CLOEXEC` to `0` would
++mask legacy-support's real close-on-exec support.
++
++That leaves one genuine, SDK-independent bug to patch:
++
++- **`strerror_r` return type** — the `ExitStatus` formatter in `Process.h` used the
++  return value of `strerror_r` as a `char*`. That is only correct for glibc's GNU
++  variant; Darwin, the BSDs, and plain POSIX ship the XSI (`int`-returning) variant,
++  where the message is written into the buffer and the return is a status code. Fixed
++  to take the GNU path only under glibc and use the XSI path (call for effect, format
++  the buffer) everywhere else.
++
++Left alone deliberately: the `<utmp.h>` include is dead on Apple (utmp symbols are used
++only on the `__linux__` path) but harmless; it is not pre-emptively narrowed. If it
++raises a `-Werror` deprecation warning at build time it will be addressed then.
++
++To verify at build time (no code change expected): `proc_pidinfo` /
++`PROC_PIDVNODEPATHINFO` on 10.6, and that CMake's `check_function_exists(close_range)`
++reports absent so `HAVE_CLOSE_RANGE` stays undefined.
++
++## AppKit + Objective-C constraints (GCC, not Apple clang)
++
++The GUI is Objective-C(++) that must compile with modern GCC's ObjC frontend:
++
++- No ARC. Manual retain/release/autorelease; explicit `NSAutoreleasePool`.
++- No `__bridge` / `CFBridgingRelease` toll-free-bridging casts; use plain C casts and
++  manual `CFRelease`.
++- Avoid ObjC literal sugar the GCC frontend may reject: `@{…}`/`@[…]`/`@(…)`. Use
++  `CFDictionaryCreate` / `[NSArray arrayWithObjects:]` / `[NSNumber numberWithX:]`.
++- Prefer explicit message sends over dot-syntax property access, and explicit index
++  loops over fast enumeration, where portability is in doubt.
++- range-v3 does not compile under the ObjC++ frontend — keep it out of `.mm`
++  translation units (guard includes; keep `.mm` files lean on engine headers).
++- CoreText on 10.6 comes via `<ApplicationServices/ApplicationServices.h>`, not the
++  standalone `<CoreText/CoreText.h>` umbrella. Several 10.7+ symbols
++  (`NSFontWeight*`, ARC-style CoreText helpers) are absent on 10.6.
++
++These constraints are exercised by the existing `src/text_shaper/coretext_locator.mm`
++plus the reference patches captured from the MacPorts port; note those patches were
++made to fix *compilation*, and were never run, so their runtime behavior (font-weight
++mapping, removed fallback-cascade logic) must be re-derived, not trusted.
++
++## Build order
++
++1. **[done, pending a real build]** Apply the vtpty Darwin patch; add a CMake path that
++   builds the engine libraries without Qt and confirm the C++23 engine compiles clean on
++   the GCC 16 toolchain, using a no-op stub `RenderTarget`. See `CMake integration`
++   below.
++2. Implement `CGRenderTarget` and verify it in isolation with a headless render-probe:
++   feed a `vtbackend::Terminal` a canned string, render one frame, dump the composited
++   framebuffer to PNG for visual inspection — no window needed.
++3. Build the AppKit window + session + PTY wiring for a real interactive terminal.
++
++Robustness is prioritized over speed-to-demo. The x86 macOS machines (10.15, Sonoma)
++are a testing convenience; the primary target is 10.6 PowerPC.
++
++## CMake integration
++
++- A new option `CONTOUR_FRONTEND_MACOS` (default `OFF`) selects the native frontend. When
++  `ON` it requires an Apple target and forces `CONTOUR_FRONTEND_GUI` `OFF` — the two
++  frontends are mutually exclusive.
++- `src/contour` (the Qt6 frontend) is entered only when `CONTOUR_FRONTEND_GUI` is `ON`;
++  it calls `find_package(Qt6 … REQUIRED)` the moment its `CMakeLists.txt` is parsed, so
++  descending into it unconditionally is what made the libs-only build require Qt (the
++  MacPorts port's "GUI-less target does not work" note, upstream issue #1780). Gating the
++  `add_subdirectory` fixes that.
++- The `-fexperimental-library` flag previously added on every Apple build is a Clang/libc++
++  flag; it is now applied only under Clang/AppleClang, since this port builds with
++  GCC + libstdc++.
++- New sources live in `src/contour_macos/`: `StubRenderTarget.h` (a no-op implementation
++  of all three interfaces), `smoke_main.cpp` (constructs a `Renderer` + stub and runs one
++  setup pass, no window/PTY), and `CMakeLists.txt` (an `INTERFACE` library `contour_macos`
++  linking the engine libs, plus the `contour_macos_smoke` executable).
++
++Configure and build the current milestone with:
++
++```
++cmake -S . -B build -DCONTOUR_FRONTEND_MACOS=ON -DCONTOUR_TESTING=OFF
++cmake --build build --target contour_macos_smoke
++```
++
++The dependency graph pulled in here is the engine's own (freetype, harfbuzz, fontconfig,
++yaml-cpp, range-v3, ms-gsl, boxed-cpp, reflection-cpp, libunicode) plus CoreText — no Qt.
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+new file mode 100644
+index 00000000..cab014a0
+--- /dev/null
++++ b/src/contour_macos/CMakeLists.txt
+@@ -0,0 +1,27 @@
++# Native macOS (AppKit + CoreGraphics) frontend — no Qt.
++#
++# At this stage the target set is intentionally minimal: a header-only stub RenderTarget
++# and a smoke-test executable that links the whole engine stack without a window, to
++# confirm the C++23 engine builds and links on the macOS/GCC toolchain. The real
++# CoreGraphics RenderTarget, AppKit shell, and session layer land here later.
++
++set(_header_files
++    StubRenderTarget.h
++)
++
++source_group(Headers FILES ${_header_files})
++
++# Interface library carrying the frontend's headers and public include path. It grows
++# real translation units (the CoreGraphics backend, the AppKit view, the session) as
++# they are written.
++add_library(contour_macos INTERFACE)
++target_sources(contour_macos INTERFACE ${_header_files})
++target_include_directories(contour_macos INTERFACE ${PROJECT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src)
++target_link_libraries(contour_macos INTERFACE vtrasterizer vtbackend vtmux text_shaper crispy::core)
++
++# Engine build smoke test.
++add_executable(contour_macos_smoke smoke_main.cpp)
++target_link_libraries(contour_macos_smoke PRIVATE contour_macos)
++if(NOT WIN32)
++    target_compile_options(contour_macos_smoke PRIVATE -Wno-c2y-extensions)
++endif()
+diff --git a/src/contour_macos/StubRenderTarget.h b/src/contour_macos/StubRenderTarget.h
+new file mode 100644
+index 00000000..f7f38f4b
+--- /dev/null
++++ b/src/contour_macos/StubRenderTarget.h
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <vtrasterizer/ImageTextureBackend.h>
++#include <vtrasterizer/RenderTarget.h>
++#include <vtrasterizer/TextureAtlas.h>
++
++#include <vector>
++
++namespace contour_macos
++{
++
++/// No-op RenderTarget used to bring up and smoke-test the engine build before the real
++/// CoreGraphics backend exists. It satisfies the full RenderTarget / AtlasBackend /
++/// ImageTextureBackend contract, records nothing, and draws nothing.
++class StubRenderTarget final:
++    public vtrasterizer::RenderTarget,
++    public vtrasterizer::atlas::AtlasBackend,
++    public vtrasterizer::atlas::ImageTextureBackend
++{
++  public:
++    using ImageSize = vtrasterizer::ImageSize;
++    using PageMargin = vtrasterizer::PageMargin;
++
++    explicit StubRenderTarget(ImageSize size) noexcept: _size { size } {}
++
++    // vtrasterizer::RenderTarget
++    void setRenderSize(ImageSize size) override { _size = size; }
++    [[nodiscard]] ImageSize renderSize() const noexcept override { return _size; }
++    void setMargin(PageMargin margin) override { _margin = margin; }
++    vtrasterizer::atlas::AtlasBackend& textureScheduler() override { return *this; }
++    vtrasterizer::atlas::ImageTextureBackend& imageScheduler() override { return *this; }
++    void renderRectangle(int, int, Width, Height, RGBAColor) override {}
++    void scheduleScreenshot(ScreenshotCallback) override {}
++    void setScissorRect(int, int, int, int) override {}
++    void clearScissorRect() override {}
++    void execute(std::chrono::steady_clock::time_point) override {}
++    void clearCache() override {}
++    std::optional<vtrasterizer::AtlasTextureScreenshot> readAtlas() override { return std::nullopt; }
++    void inspect(std::ostream&) const override {}
++
++    // vtrasterizer::atlas::AtlasBackend
++    [[nodiscard]] ImageSize atlasSize() const noexcept override { return _atlasSize; }
++    void configureAtlas(vtrasterizer::atlas::ConfigureAtlas atlas) override { _atlasSize = atlas.size; }
++    void uploadTile(vtrasterizer::atlas::UploadTile) override {}
++    void renderTile(vtrasterizer::atlas::RenderTile) override {}
++
++    // vtrasterizer::atlas::ImageTextureBackend
++    void createImageTexture(vtrasterizer::atlas::CreateImageTexture) override {}
++    void destroyImageTexture(vtrasterizer::atlas::DestroyImageTexture) override {}
++    void renderImageQuad(vtrasterizer::atlas::RenderImageQuad) override {}
++    void renderImageGap(vtrasterizer::atlas::RenderImageGap) override {}
++    [[nodiscard]] std::vector<vtrasterizer::atlas::ImageTextureId> takeFailedImageTextures() override
++    {
++        return {};
++    }
++
++  private:
++    ImageSize _size;
++    ImageSize _atlasSize {};
++    PageMargin _margin {};
++};
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/smoke_main.cpp b/src/contour_macos/smoke_main.cpp
+new file mode 100644
+index 00000000..84eb4d43
+--- /dev/null
++++ b/src/contour_macos/smoke_main.cpp
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// Engine build smoke test. Constructs a vtrasterizer::Renderer against the no-op
++// StubRenderTarget and drives one setup pass. It links the whole engine stack
++// (vtrasterizer -> vtbackend -> text_shaper -> crispy) without Qt and without a
++// window, so a clean run proves the C++23 engine builds and links on the target
++// toolchain before any CoreGraphics or AppKit code exists.
++
++#include <contour_macos/StubRenderTarget.h>
++
++#include <vtrasterizer/Decorator.h>
++#include <vtrasterizer/FontDescriptions.h>
++#include <vtrasterizer/Renderer.h>
++
++#include <vtbackend/ColorPalette.h>
++#include <vtbackend/primitives.h>
++
++#include <crispy/StrongLRUHashtable.h>
++
++#include <cstdio>
++
++int main()
++{
++    using namespace vtbackend;
++    using namespace vtrasterizer;
++
++    auto const pageSize = PageSize { LineCount { 24 }, ColumnCount { 80 } };
++    auto const colorPalette = ColorPalette {};
++    auto const fonts = FontDescriptions {};
++
++    auto renderer = Renderer { pageSize,
++                               fonts,
++                               colorPalette,
++                               crispy::strong_hashtable_size { 4096 },
++                               crispy::lru_capacity { 4000 },
++                               /* atlasDirectMapping */ true,
++                               Decorator::Underline,
++                               Decorator::CurlyUnderline };
++
++    auto target = contour_macos::StubRenderTarget { ImageSize { Width { 800 }, Height { 480 } } };
++    renderer.setRenderTarget(target);
++    (void) renderer.applyStagedReconfigDuringSetup();
++
++    std::puts("contour_macos engine smoke test: renderer constructed and target attached OK");
++    return 0;
++}
+-- 
+2.43.0
+

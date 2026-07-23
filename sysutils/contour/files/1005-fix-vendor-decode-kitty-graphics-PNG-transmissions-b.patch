@@ -1,0 +1,86 @@
+From 8a627d5c73af7ff9599fab9875db2007deb705e2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 16:33:33 +0000
+Subject: [PATCH 05/10] fix(vendor): decode kitty graphics PNG transmissions
+ before storing
+
+processKittyGraphics() (upstream code) accepted f=100 (PNG) transmissions and
+stored the still-compressed PNG bytes directly via ImagePool::create(),
+tagged with whatever pixel size the wire supplied -- which validateKittyTransmission()
+correctly does NOT require for PNG (the file states its own size), so senders that
+omit s=/v= for a PNG transmission (e.g. chafa --format=kitty on a .jpg/.png) leave
+the stored Image at 0x0. The rasterizer trusts Image::size() literally and reads
+width*height*4 bytes as raw RGBA from a buffer that is actually compressed PNG data,
+producing a plausible-looking sliver of decoded-as-raw noise for the first row or so
+before the degenerate geometry cuts it off -- reproduced with
+`chafa --format=kitty` on a JPEG cover image (works fine via --format=iterm/sixel,
+which both go through decodePng() already).
+
+Fix: when command.format is Png, decode via decodePng() (the same helper
+renderITerm2InlineImage()/uploadImage(name, ...) already use for their own PNG
+paths) before calling imagePool().create(), so the stored Image always holds real
+RGBA pixels at their real decoded dimensions, never raw compressed bytes.
+
+Verified separately (not a Screen.cpp bug): mpv --vo=kitty's "text leaking onto the
+screen" symptom is a known upstream mpv issue (OSD/status-text writes racing with
+image-escape-sequence writes, unsynchronized on mpv's side -- see
+https://github.com/ismail-yilmaz/Bobcat/issues/64), reproduced on multiple other
+terminals (xterm, wezterm, Bobcat) with mpv's sixel VO and confirmed by the user to
+also affect its kitty VO here; `mpv --vo=kitty --really-quiet` works around it.
+Not a contour defect; a raw byte-level PTY capture of mpv's kitty output was
+verified byte-for-byte well-formed (clean APC framing, valid base64, correct
+m=1/m=0 chunking, all 800 chunks/14 frames reassemble cleanly against a faithful
+simulation of Screen.cpp's exact reassembly logic) before ruling this out.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/vtbackend/Screen.cpp | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/vtbackend/Screen.cpp b/src/vtbackend/Screen.cpp
+index 30934813..bd7157fc 100644
+--- a/src/vtbackend/Screen.cpp
++++ b/src/vtbackend/Screen.cpp
+@@ -5590,7 +5590,7 @@ void Screen::processKittyGraphics(std::string_view body)
+         }
+         return ImageFormat::RGBA;
+     }();
+-    auto const pixelSize =
++    auto pixelSize =
+         ImageSize { Width::cast_from(command.pixelWidth), Height::cast_from(command.pixelHeight) };
+ 
+     if (format != ImageFormat::PNG)
+@@ -5606,7 +5606,28 @@ void Screen::processKittyGraphics(std::string_view body)
+         }
+     }
+ 
+-    auto image = _terminal->imagePool().create(format, pixelSize, std::move(pixmap));
++    // PNG transmissions (f=100) carry no reliable s=/v=: the file states its own size, and senders
++    // (e.g. chafa) routinely omit the wire dimensions entirely, leaving pixelSize at 0x0. The renderer
++    // downstream trusts Image::size() literally, so storing the still-compressed PNG bytes under that
++    // wrong size makes it read PNG bytes as if they were raw RGBA pixels -- decode here first, exactly
++    // as renderITerm2InlineImage/uploadImage(name, ...) already do for their own PNG paths, so the
++    // stored Image always holds real RGBA pixels at their real decoded size.
++    auto storedFormat = format;
++    if (format == ImageFormat::PNG)
++    {
++        auto decodedSize = pixelSize;
++        auto decodedData = decodePng(pixmap, decodedSize);
++        if (!decodedData)
++        {
++            replyKittyGraphics(command, "EINVAL:could not decode image");
++            return;
++        }
++        pixmap = std::move(*decodedData);
++        pixelSize = decodedSize;
++        storedFormat = ImageFormat::RGBA;
++    }
++
++    auto image = _terminal->imagePool().create(storedFormat, pixelSize, std::move(pixmap));
+     if (!image)
+     {
+         replyKittyGraphics(command, "EINVAL:could not decode image");
+-- 
+2.43.0
+

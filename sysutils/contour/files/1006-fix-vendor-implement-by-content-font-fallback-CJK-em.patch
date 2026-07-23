@@ -1,0 +1,121 @@
+From 1aba69e6fbe3224df3c109fcc8ccc7f25be0f686 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 17:27:34 +0000
+Subject: [PATCH 06/10] fix(vendor): implement by-content font fallback
+ (CJK/emoji missing from primary font)
+
+coretext_locator::resolve(codepoints) -- whose entire purpose, per its name and
+call site (open_shaper.cpp's resolveByCoverage()), is "find a font that covers
+these specific codepoints" -- was a stub returning an empty list, unconditionally.
+Combined with locate() only ever returning the primary font (no fallback chain;
+see the earlier vendor fix restoring 10.6 family/traits-dict correctness), this
+port had NO working font-fallback mechanism at all: any codepoint missing from
+the primary font -- CJK, emoji, anything outside it, even mixed into otherwise-
+Latin text -- fell through to the shaper's replacement glyph
+(open_shaper.cpp's replaceMissingGlyphs()).
+
+Implements resolve() via CTFontCreateForString, CoreText's per-content font-
+substitution primitive: builds a CFString from the UTF-32 codepoints (via
+kCFStringEncodingUTF32, which handles the surrogate-pair/astral-plane
+conversion CoreFoundation's own way rather than hand-rolling it), asks
+CoreText what font covers them, and resolves that font's file path via the
+same copyFontFilePath() helper locate() already uses.
+
+Deliberately NOT implemented via upstream's approach (populating locate()'s
+static cascade list from CTFontCopyDefaultCascadeListForLanguages): that
+function is 10.8+ only and does not exist on the primary PPC 10.6 target at
+all. It would also be a strictly weaker fix even where it did compile --
+open_shaper.cpp's own resolveByCoverage() docstring notes a family/traits-
+ordered cascade can bury the only CJK-capable face arbitrarily far down the
+chain (observed: 83rd of 201 on a real system), past the walk-limit
+(fontFallbackLimit, default 16) ever worth paying for, whereas asking about
+the content directly finds it in one query regardless of chain position.
+CTFontCreateForString has existed since CoreText's 10.5 debut, confirmed via
+Apple's current documentation (macOS 10.5+) before relying on it, after two
+API availability mistakes earlier in this same investigation:
+CTFontCopyDefaultCascadeListForLanguages (10.8+) and kCTFontUIFontSystem
+(10.8+, hence anchoring resolve()'s CTFontCreateForString call on a plain
+CTFontCreateWithName(Helvetica) instead of a system-UI-font accessor).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/text_shaper/coretext_locator.mm | 62 ++++++++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/src/text_shaper/coretext_locator.mm b/src/text_shaper/coretext_locator.mm
+index 258023a9..5f38bb91 100644
+--- a/src/text_shaper/coretext_locator.mm
++++ b/src/text_shaper/coretext_locator.mm
+@@ -237,8 +237,66 @@ namespace text
+         return output;
+     }
+ 
+-    font_source_list coretext_locator::resolve(gsl::span<const char32_t> /*codepoints*/)
++    // Finds a font that covers @p codepoints, via CoreText's own by-content cascading
++    // (CTFontCreateForString), rather than our locate()'s by-family/traits cascade (see the note above
++    // the call site in open_shaper.cpp: a CJK-capable face can sort arbitrarily far down a
++    // family/traits-ordered chain -- past any walk-limit worth paying for -- while asking about the
++    // content directly finds it in one query, independent of that ordering).
++    //
++    // 10.6-safe: CTFontCreateForString has existed since CoreText's introduction in 10.5. (The
++    // newer CTFontCopyDefaultCascadeListForLanguages, used by locate()'s cascade-list scan on
++    // upstream, is 10.8+ only and is NOT an option on the primary PPC target -- do not reach for it
++    // here.) See docs/coretext-106-lessons for the class of 10.6 CoreText gotchas this file already
++    // works around.
++    font_source_list coretext_locator::resolve(gsl::span<const char32_t> codepoints)
+     {
+-        return {};
++        if (codepoints.empty())
++            return {};
++
++        font_source_list result;
++
++        NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++
++        CFStringRef text = CFStringCreateWithBytes(kCFAllocatorDefault,
++                                                    reinterpret_cast<UInt8 const*>(codepoints.data()),
++                                                    static_cast<CFIndex>(codepoints.size() * sizeof(char32_t)),
++                                                    kCFStringEncodingUTF32,
++                                                    false);
++        if (!text)
++        {
++            locatorLog()("coretext: could not build a CFString from {} codepoint(s) to resolve.",
++                        codepoints.size());
++            [pool drain];
++            return {};
++        }
++
++        // CTFontCreateForString consults ITS argument's own cascade list, not a global one, so the
++        // anchor font matters. resolve() is not given the document's primary font/description (see
++        // font_locator.h -- the interface is shared with every platform locator, not ours to widen for
++        // a 10.6-only need), so anchor on Helvetica: present on every Mac OS X release including
++        // 10.5/10.6, and CTFontCreateWithName is the same primitive locate()/ctFontPath() already use
++        // elsewhere in this file -- no new, unverified API surface. Only the SUBSTITUTE's face is what
++        // we actually want; getOrCreateKeyForFont() at the call site re-opens it at the caller's real
++        // size/weight regardless of what size is asked for here.
++        CTFontRef anchor = CTFontCreateWithName(CFSTR("Helvetica"), 12.0, NULL);
++        if (anchor)
++        {
++            CFRange const range = CFRangeMake(0, CFStringGetLength(text));
++            CTFontRef substitute = CTFontCreateForString(anchor, text, range);
++            if (substitute)
++            {
++                char path[PATH_MAX];
++                if (copyFontFilePath(substitute, path, sizeof(path)))
++                    result.emplace_back(font_path { path });
++                else
++                    locatorLog()("coretext: could not resolve a file path for the by-content substitute font.");
++                CFRelease(substitute);
++            }
++            CFRelease(anchor);
++        }
++
++        CFRelease(text);
++        [pool drain];
++        return result;
+     }
+ }
+-- 
+2.43.0
+

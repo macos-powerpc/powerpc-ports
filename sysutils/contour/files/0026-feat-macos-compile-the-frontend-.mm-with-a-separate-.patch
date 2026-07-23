@@ -1,0 +1,157 @@
+From 75e2787d431b63f2163d423308ae968bfcf083f5 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 13:43:43 +0000
+Subject: [PATCH 26/67] feat(macos): compile the frontend .mm with a separate
+ compiler (gcc-4.2 path)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Experiment 1 established that modern gcc miscompiles our ObjC++ regardless of C++
+standard (gnu++98 crashed identically to C++11) — it is the compiler, and Apple's
+gcc-4.2 is the known-good one. But CMake uses one compiler per language and
+text_shaper already enabled OBJCXX with the modern compiler, so swapping
+CMAKE_OBJCXX_COMPILER later is a no-op.
+
+When CONTOUR_MACOS_OBJCXX_COMPILER is set (e.g. /usr/bin/g++-4.2), compile
+TerminalView.mm/main.mm via a custom command invoking that compiler directly and
+link the resulting objects into `contour`. The opaque SessionBridge means these
+.mm depend on no C++23 engine code (only plain structs/pointers cross the
+boundary), so gcc-4.2 objects link with the modern C++23 engine libraries. The
+custom command passes only what Apple's native 10.6 compiler needs (arch,
+version-min, sysroot, -std, our -I src) — no legacysupport, no /opt/local
+includes, no -D_GLIBCXX_USE_CXX11_ABI=0. When the knob is empty the default
+modern-OBJCXX path is used unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt | 102 +++++++++++++++++++++----------
+ 1 file changed, 70 insertions(+), 32 deletions(-)
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index bbee6339..78037dd3 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -48,48 +48,86 @@ target_compile_options(contour_macos_render_probe PRIVATE ${_contour_macos_warn_
+ # The interactive app: AppKit window + view + input (Objective-C++). APPLE-only.
+ if(APPLE)
+     # Modern GCC miscompiles Objective-C++ that talks to Apple's ObjC runtime: AppKit
+-    # messaging our classes crashes (nil class in prepareForMethodLookup / objc_msgSendSuper),
+-    # the same failure FLTK/mplayer/blackomega hit with modern GCC (fltk/fltk#1286). The known
+-    # working combination is Apple's gcc-4.2 at C++98. The opaque SessionBridge makes the .mm
+-    # files depend on no C++23 engine code (only plain structs/pointers cross the boundary), so
+-    # we can compile them differently from the C++23 engine. Two independently-selectable knobs:
++    # messaging our classes crashes the runtime while realizing the class (nil class in
++    # prepareForMethodLookup), the same failure FLTK/mplayer/blackomega hit with modern GCC
++    # (fltk/fltk#1286). Established here: it is the COMPILER, not the C++ standard — modern gcc
++    # at gnu++98 crashes identically to modern gcc at C++11. The known-good combination is
++    # Apple's gcc-4.2. Clang is not an option (no PowerPC support).
+     #
+-    #   CONTOUR_MACOS_OBJCXX_COMPILER  -- path to a compiler for the .mm files (e.g.
+-    #                                     /usr/bin/g++-4.2). Empty = use the default (modern gcc).
+-    #   CONTOUR_MACOS_OBJCXX_STD        -- C++ standard for the .mm files (default gnu++98).
+-    #
+-    # Experiment order: (1) modern gcc + gnu++98; (2) if still broken, gcc-4.2 + gnu++98.
++    # CMake uses one compiler per language, and text_shaper already enabled OBJCXX with the
++    # modern compiler, so we cannot just swap CMAKE_OBJCXX_COMPILER. Instead, when a separate
++    # frontend ObjC++ compiler is given, compile the two frontend .mm files with a custom
++    # command invoking it directly and link the resulting objects into `contour`. The opaque
++    # SessionBridge means those .mm files depend on no C++23 engine code (only plain
++    # structs/pointers cross the boundary), so gcc-4.2 objects link cleanly with the modern
++    # C++23 engine libraries.
+     set(CONTOUR_MACOS_OBJCXX_COMPILER "" CACHE STRING
+-        "Compiler for the macOS ObjC++ frontend sources (empty = default). e.g. /usr/bin/g++-4.2")
++        "Separate compiler for the frontend ObjC++ .mm files (e.g. /usr/bin/g++-4.2). \
++Empty = use the modern default OBJCXX compiler.")
+     set(CONTOUR_MACOS_OBJCXX_STD "gnu++98" CACHE STRING
+-        "C++ standard for the macOS ObjC++ frontend sources.")
++        "C++ standard for the frontend ObjC++ .mm files.")
++
++    set(_app_headers TerminalView.h SessionBridge.h)
++    set(_app_mm
++        "${CMAKE_CURRENT_SOURCE_DIR}/TerminalView.mm"
++        "${CMAKE_CURRENT_SOURCE_DIR}/main.mm"
++    )
+ 
+     if(CONTOUR_MACOS_OBJCXX_COMPILER)
+-        set(CMAKE_OBJCXX_COMPILER "${CONTOUR_MACOS_OBJCXX_COMPILER}")
++        # --- Custom-compile the .mm files with the separate (gcc-4.2) compiler. ---
++        # gcc-4.2 is Apple's native 10.6 compiler, so it needs NONE of the modern-gcc
++        # scaffolding: no -isystem .../LegacySupport, no -I/opt/local/include, and NOT
++        # -D_GLIBCXX_USE_CXX11_ABI=0 (a modern-libstdc++ toggle gcc-4.2 does not recognize).
++        # Just the SDK plus our own src for SessionBridge.h. Mirror arch / deployment target /
++        # sysroot from the CMake configuration.
++        set(_fe_flags "")
++        foreach(_a IN LISTS CMAKE_OSX_ARCHITECTURES)
++            list(APPEND _fe_flags -arch ${_a})
++        endforeach()
++        if(CMAKE_OSX_DEPLOYMENT_TARGET)
++            list(APPEND _fe_flags "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++        endif()
++        if(CMAKE_OSX_SYSROOT)
++            list(APPEND _fe_flags -isysroot "${CMAKE_OSX_SYSROOT}")
++        endif()
++
++        set(_app_objs "")
++        foreach(_mm IN LISTS _app_mm)
++            get_filename_component(_name "${_mm}" NAME_WE)
++            set(_obj "${CMAKE_CURRENT_BINARY_DIR}/${_name}.frontend.o")
++            add_custom_command(
++                OUTPUT "${_obj}"
++                COMMAND "${CONTOUR_MACOS_OBJCXX_COMPILER}"
++                        -x objective-c++
++                        -std=${CONTOUR_MACOS_OBJCXX_STD}
++                        ${_fe_flags}
++                        -O2 -DNDEBUG
++                        -I"${PROJECT_SOURCE_DIR}/src"
++                        -I"${CMAKE_SOURCE_DIR}/src"
++                        -c "${_mm}"
++                        -o "${_obj}"
++                DEPENDS "${_mm}" ${_app_headers}
++                COMMENT "Compiling frontend ObjC++ ${_name}.mm with ${CONTOUR_MACOS_OBJCXX_COMPILER}"
++                VERBATIM)
++            list(APPEND _app_objs "${_obj}")
++        endforeach()
++        set_source_files_properties(${_app_objs} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
++        add_executable(contour ${_app_objs} ${_app_headers})
++        set_target_properties(contour PROPERTIES LINKER_LANGUAGE CXX)
++    else()
++        # --- Default path: compile the .mm as OBJCXX with the modern compiler. ---
++        enable_language(OBJCXX)
++        add_executable(contour ${_app_mm} ${_app_headers})
++        # Build the .mm at the lower C++ standard; disable CMake's own -std injection so it
++        # does not emit a competing flag from the global CMAKE_OBJCXX_STANDARD.
++        set_target_properties(contour PROPERTIES OBJCXX_STANDARD_REQUIRED OFF)
++        target_compile_options(contour
++            PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-std=${CONTOUR_MACOS_OBJCXX_STD}>)
+     endif()
+-    enable_language(OBJCXX)
+ 
+-    set(_app_sources
+-        TerminalView.mm
+-        main.mm
+-    )
+-    set(_app_headers
+-        TerminalView.h
+-    )
+-    add_executable(contour ${_app_sources} ${_app_headers})
+     target_link_libraries(contour PRIVATE contour_macos)
+     target_compile_options(contour PRIVATE ${_contour_macos_warn_opts})
+ 
+-    # This target's .mm files build at a lower C++ standard than the C++23 engine. Turn off
+-    # CMake's own standard-flag injection for the target (so it does not emit a competing
+-    # -std from the global CMAKE_OBJCXX_STANDARD=23) and set the exact -std ourselves. Doing
+-    # it via a flag rather than the OBJCXX_STANDARD property also works with gcc-4.2, which
+-    # predates CMake's OBJCXX_STANDARD handling.
+-    set_target_properties(contour PROPERTIES
+-        OBJCXX_STANDARD ""
+-        OBJCXX_STANDARD_REQUIRED OFF)
+-    target_compile_options(contour PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-std=${CONTOUR_MACOS_OBJCXX_STD}>)
+-
+     # CoreGraphics is not a standalone linkable framework on 10.6 (like CoreText); its
+     # symbols come via ApplicationServices. Link ApplicationServices, not CoreGraphics.
+     target_link_libraries(contour PRIVATE
+-- 
+2.43.0
+

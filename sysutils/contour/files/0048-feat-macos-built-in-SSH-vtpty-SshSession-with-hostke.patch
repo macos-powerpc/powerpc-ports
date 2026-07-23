@@ -1,0 +1,441 @@
+From 6c76f2d87bdf4dce563519d732b5f068d3cb3eea Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 23:16:01 +0000
+Subject: [PATCH 48/67] feat(macos): built-in SSH (vtpty::SshSession) with
+ hostkey prompt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Open an SSH session instead of a local shell with CONTOUR_SSH=user@host[:port]
+(like the CONTOUR_RENDER/CONTOUR_THEME selectors). When the destination is
+empty the session spawns the local shell exactly as before.
+
+- makePty() builds a vtpty::SshSession from an SshOptions (host/port/username,
+  optional key + known_hosts paths defaulting to ~/.ssh) instead of a
+  Process, gated on VTPTY_LIBSSH2 (the user's Portfile adds libssh2; without
+  it the build falls back to the local shell). The engine's SshSession handles
+  auth: ssh-agent first, then key (with password prompt), then password.
+- Host-key verification: libssh2 checks known_hosts itself; on an unknown or
+  changed key the session calls back to the frontend, which shows an NSAlert
+  with the fingerprint and returns the user's choice. The callback runs on the
+  SSH connection thread and marshals to the main thread with waitUntilDone:YES,
+  blocking that thread for the answer — the synchronous semantics the verify
+  callback needs, with no engine lock held at connect time.
+- Threaded through the opaque bridge as a BridgeSshConfig plus a
+  verifySshHostkey callback, so the .mm layer stays engine-free.
+
+Isolated from the selection/render paths: only the PTY choice changes.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/SessionBridge.cpp   | 27 +++++++-
+ src/contour_macos/SessionBridge.h     | 19 +++++-
+ src/contour_macos/TerminalSession.cpp | 47 +++++++++++++-
+ src/contour_macos/TerminalSession.h   | 18 +++++-
+ src/contour_macos/TerminalView.h      |  4 +-
+ src/contour_macos/TerminalView.mm     | 93 ++++++++++++++++++++++++++-
+ src/contour_macos/main.mm             |  7 +-
+ 7 files changed, 204 insertions(+), 11 deletions(-)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index a34cd1fd..9f5cc817 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -72,7 +72,8 @@ TerminalSession* bridge_create(int widthPx,
+                                BridgeFontConfig const& font,
+                                BridgeCallbacks const& cb,
+                                int renderMode,
+-                               char const* themeName)
++                               char const* themeName,
++                               BridgeSshConfig const& ssh)
+ {
+     auto fonts = vtrasterizer::FontDescriptions {};
+     fonts.dpi = text::DPI { font.dpiX, font.dpiY };
+@@ -114,15 +115,35 @@ TerminalSession* bridge_create(int widthPx,
+         };
+     if (cb.onClosed)
+         callbacks.onClosed = [userData, fn = cb.onClosed]() { fn(userData); };
++    if (cb.verifySshHostkey)
++        callbacks.verifySshHostkey =
++            [userData, fn = cb.verifySshHostkey](std::string host, int port, std::string fp) -> bool {
++            return fn(userData, host.c_str(), port, fp.c_str()) != 0;
++        };
+ 
+     auto const backend = renderMode == BridgeRender_OpenGL ? TerminalSession::RenderBackend::OpenGL
+                                                            : TerminalSession::RenderBackend::CPU;
+ 
+     auto const palette = paletteFor(themeByName(themeName ? themeName : "dark"));
+ 
++    auto sshOptions = TerminalSession::SshOptions {};
++    if (ssh.host && ssh.host[0] != '\0')
++    {
++        sshOptions.host = ssh.host;
++        sshOptions.port = ssh.port;
++        sshOptions.username = ssh.username ? ssh.username : "";
++        sshOptions.privateKeyFile = ssh.privateKeyFile ? ssh.privateKeyFile : "";
++        sshOptions.knownHostsFile = ssh.knownHostsFile ? ssh.knownHostsFile : "";
++    }
++
+     auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
+-    return new TerminalSession(
+-        pageSize, std::move(fonts), surfaceSize, std::move(callbacks), backend, palette);
++    return new TerminalSession(pageSize,
++                               std::move(fonts),
++                               surfaceSize,
++                               std::move(callbacks),
++                               backend,
++                               palette,
++                               std::move(sshOptions));
+ }
+ 
+ void bridge_destroy(TerminalSession* session)
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 6c5c237b..9fee7f4b 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -39,6 +39,10 @@ struct BridgeCallbacks
+     /// Returns a freshly malloc()'d UTF-8 C string the bridge will free(), or null.
+     char* (*readClipboard)(void* userData);
+     void (*onClosed)(void* userData);
++    /// Asks the host to verify an unknown/changed SSH host key. Called synchronously from the SSH
++    /// connection thread; the host must present the fingerprint to the user (on the main thread) and
++    /// return 1 to accept (and remember) the key, 0 to reject. Null = reject all unknown keys.
++    int (*verifySshHostkey)(void* userData, char const* host, int port, char const* fingerprint);
+ };
+ 
+ /// Font configuration passed across the boundary as primitives.
+@@ -50,6 +54,18 @@ struct BridgeFontConfig
+     int dpiY;
+ };
+ 
++/// SSH connection request. When host is non-null and non-empty the session connects over SSH instead
++/// of spawning a local shell; empty/null host = local shell (the default). Key/known-hosts paths may
++/// be null to use the standard ~/.ssh locations.
++struct BridgeSshConfig
++{
++    char const* host;           ///< hostname; null/empty = local shell
++    int port;                   ///< 0 = default (22)
++    char const* username;       ///< null/empty = current user
++    char const* privateKeyFile; ///< null = ~/.ssh/id_* (agent/default)
++    char const* knownHostsFile; ///< null = ~/.ssh/known_hosts
++};
++
+ /// Render backend selector. CPU composites into an RGBA8 buffer the view blits as a CGImage;
+ /// OpenGL draws into the view's GL context. Values match TerminalSession::RenderBackend.
+ enum BridgeRenderMode
+@@ -66,7 +82,8 @@ TerminalSession* bridge_create(int widthPx,
+                                BridgeFontConfig const& font,
+                                BridgeCallbacks const& callbacks,
+                                int renderMode,
+-                               char const* themeName);
++                               char const* themeName,
++                               BridgeSshConfig const& ssh);
+ 
+ /// Returns the render backend the session was created with (a BridgeRenderMode value). The view
+ /// uses this to choose its presentation path (CGImage blit vs GL context present).
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 632de470..eb2f17c2 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <vtpty/Process.h>
+ #include <vtpty/Pty.h>
++#include <vtpty/SshSession.h>
+ 
+ #include <vtrasterizer/Decorator.h>
+ 
+@@ -46,7 +47,7 @@ namespace
+         return settings;
+     }
+ 
+-    [[nodiscard]] std::unique_ptr<vtpty::Pty> makePty(vtbackend::PageSize pageSize)
++    [[nodiscard]] std::unique_ptr<vtpty::Pty> makeLocalPty(vtbackend::PageSize pageSize)
+     {
+         auto const shell = vtpty::Process::loginShell(false).front();
+         auto exe = vtpty::Process::ExecInfo {};
+@@ -56,6 +57,42 @@ namespace
+         return std::make_unique<vtpty::Process>(exe, vtpty::createPty(pageSize, std::nullopt), false);
+     }
+ 
++    [[nodiscard]] std::unique_ptr<vtpty::Pty> makePty(
++        vtbackend::PageSize pageSize,
++        TerminalSession::SshOptions const& ssh,
++        std::function<bool(std::string, int, std::string)> const& verifyHostkey)
++    {
++        if (ssh.host.empty())
++            return makeLocalPty(pageSize);
++
++#if defined(VTPTY_LIBSSH2)
++        auto const home = vtpty::Process::homeDirectory();
++        auto config = vtpty::SshHostConfig {};
++        config.hostname = ssh.host;
++        config.port = ssh.port > 0 ? ssh.port : 22;
++        config.username = ssh.username;
++        config.privateKeyFile = ssh.privateKeyFile;
++        config.knownHostsFile =
++            !ssh.knownHostsFile.empty() ? ssh.knownHostsFile : (home / ".ssh" / "known_hosts").string();
++        config.env = vtpty::SshHostConfig::Environment { { "TERM", "xterm-256color" } };
++
++        // libssh2 verifies known hosts against the file itself; the callback fires only for an
++        // unknown/changed key. Present the fingerprint to the user and accept or reject.
++        auto onHostkey = [verifyHostkey](vtpty::SshHostkeyVerificationRequest const& request,
++                                         vtpty::SshHostkeyVerificationResponseCallback const& respond) {
++            bool const accepted =
++                verifyHostkey
++                    ? verifyHostkey(request.hostname, request.port, request.hostkeyHash.toString())
++                    : false;
++            respond(accepted);
++        };
++        return std::make_unique<vtpty::SshSession>(config, onHostkey);
++#else
++        (void) verifyHostkey;
++        return makeLocalPty(pageSize);
++#endif
++    }
++
+     [[nodiscard]] uint32_t widthOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.width)); }
+     [[nodiscard]] uint32_t heightOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.height)); }
+ 
+@@ -120,7 +157,8 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+                                  ImageSize surfaceSize,
+                                  Callbacks callbacks,
+                                  RenderBackend backend,
+-                                 vtbackend::ColorPalette colorPalette):
++                                 vtbackend::ColorPalette colorPalette,
++                                 SshOptions ssh):
+     _callbacks { std::move(callbacks) },
+     _pageSize { pageSize },
+     _surfaceSize { surfaceSize },
+@@ -163,7 +201,10 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _pageSize = derivePageSize(surfaceSize);
+ 
+     _terminal = std::make_unique<vtbackend::Terminal>(
+-        *this, makePty(_pageSize), makeSettings(_pageSize), steady_clock::now());
++        *this,
++        makePty(_pageSize, ssh, _callbacks.verifySshHostkey),
++        makeSettings(_pageSize),
++        steady_clock::now());
+ 
+     // Apply the theme palette to the terminal too (the renderer got it via its ctor). setColorPalette
+     // updates the live palette; also make it the default so a palette-reset (RIS/DECSTR) returns here.
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+index 0855bd7a..e829ea91 100644
+--- a/src/contour_macos/TerminalSession.h
++++ b/src/contour_macos/TerminalSession.h
+@@ -40,6 +40,21 @@ class TerminalSession: public vtbackend::Terminal::Events
+         std::function<void(std::string)> copyToClipboard;    ///< write selection to clipboard
+         std::function<std::string()> readClipboard;          ///< read clipboard (OSC 52)
+         std::function<void()> onClosed;                      ///< shell exited / pty closed
++        /// Verify an unknown SSH host key: (host, port, fingerprint) -> accept. Called from the SSH
++        /// connection thread; the host must prompt on the main thread and block for the answer.
++        std::function<bool(std::string, int, std::string)> verifySshHostkey;
++    };
++
++    /// Optional SSH connection. When host is non-empty the session connects over SSH (vtpty::
++    /// SshSession) instead of spawning a local shell. Empty paths fall back to the standard ~/.ssh
++    /// locations.
++    struct SshOptions
++    {
++        std::string host;           ///< empty = local shell
++        int port = 22;
++        std::string username;       ///< empty = current user
++        std::string privateKeyFile; ///< empty = default/agent
++        std::string knownHostsFile; ///< empty = ~/.ssh/known_hosts
+     };
+ 
+     /// Which render backend the session drives. CPU composites into an RGBA8 buffer the view
+@@ -56,7 +71,8 @@ class TerminalSession: public vtbackend::Terminal::Events
+                     ImageSize surfaceSize,
+                     Callbacks callbacks,
+                     RenderBackend backend = RenderBackend::CPU,
+-                    vtbackend::ColorPalette colorPalette = vtbackend::ColorPalette {});
++                    vtbackend::ColorPalette colorPalette = vtbackend::ColorPalette {},
++                    SshOptions ssh = SshOptions {});
+     ~TerminalSession() override;
+ 
+     /// Spawns the shell and starts the read/parse thread.
+diff --git a/src/contour_macos/TerminalView.h b/src/contour_macos/TerminalView.h
+index a8dbb860..3f9c9c29 100644
+--- a/src/contour_macos/TerminalView.h
++++ b/src/contour_macos/TerminalView.h
+@@ -23,11 +23,13 @@
+ // Creates the session (spawning a shell) sized to the given frame, using the given render backend
+ // (a BridgeRenderMode value: 0 = CPU, 1 = OpenGL) and color theme ("dark"/"light"). Returns nil on
+ // failure.
++// sshDestination is "user@host[:port]" to open an SSH session, or nil/empty for a local shell.
+ - (id)initWithFrame:(NSRect)frame
+          fontFamily:(NSString*)fontFamily
+            fontSize:(double)fontSize
+          renderMode:(int)renderMode
+-              theme:(NSString*)theme;
++              theme:(NSString*)theme
++     sshDestination:(NSString*)sshDestination;
+ 
+ // Requests a repaint on the main thread (safe to call from any thread).
+ - (void)requestRedraw;
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index 661c7407..05cbc222 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -111,12 +111,51 @@ void cbOnClosed(void* userData)
+ 
+ } // namespace
+ 
++// Carries an SSH host-key verification prompt across the thread hop: the SSH connection thread fills
++// host/port/fingerprint, runs the alert on the main thread synchronously (waitUntilDone:YES), and
++// reads back `accepted`.
++@interface SshHostkeyPrompt: NSObject
++{
++@public
++    NSString* host;
++    int port;
++    NSString* fingerprint;
++    BOOL accepted;
++}
++@end
++
++@implementation SshHostkeyPrompt
++@end
++
++namespace
++{
++
++int cbVerifySshHostkey(void* userData, char const* host, int port, char const* fingerprint)
++{
++    (void) userData;
++    SshHostkeyPrompt* prompt = [[SshHostkeyPrompt alloc] init];
++    prompt->host = host ? [NSString stringWithUTF8String:host] : @"";
++    prompt->port = port;
++    prompt->fingerprint = fingerprint ? [NSString stringWithUTF8String:fingerprint] : @"";
++    prompt->accepted = NO;
++    // Run the modal alert on the main thread and block this (SSH) thread until the user answers.
++    [(TerminalView*) userData performSelectorOnMainThread:@selector(mainThreadVerifyHostkey:)
++                                               withObject:prompt
++                                            waitUntilDone:YES];
++    BOOL const accepted = prompt->accepted;
++    [prompt release];
++    return accepted ? 1 : 0;
++}
++
++} // namespace
++
+ @interface TerminalView ()
+ - (void)mainThreadRedraw;
+ - (void)mainThreadSetTitle:(NSString*)title;
+ - (void)mainThreadBell;
+ - (void)mainThreadCopyToClipboard:(NSString*)text;
+ - (void)mainThreadClose;
++- (void)mainThreadVerifyHostkey:(SshHostkeyPrompt*)prompt;
+ - (void)createGLContext;
+ - (void)drawFrameCPU;
+ - (void)drawFrameGL;
+@@ -137,6 +176,7 @@ void cbOnClosed(void* userData)
+            fontSize:(double)fontSize
+          renderMode:(int)renderMode
+               theme:(NSString*)theme
++     sshDestination:(NSString*)sshDestination
+ {
+     self = [super initWithFrame:frame];
+     if (!self)
+@@ -160,6 +200,37 @@ void cbOnClosed(void* userData)
+     callbacks.copyToClipboard = cbCopyToClipboard;
+     callbacks.readClipboard = cbReadClipboard;
+     callbacks.onClosed = cbOnClosed;
++    callbacks.verifySshHostkey = cbVerifySshHostkey;
++
++    // Parse "user@host[:port]" into a BridgeSshConfig. Empty destination => local shell.
++    contour_macos::BridgeSshConfig ssh;
++    ssh.host = NULL;
++    ssh.port = 0;
++    ssh.username = NULL;
++    ssh.privateKeyFile = NULL;
++    ssh.knownHostsFile = NULL;
++    NSString* sshUser = nil;
++    NSString* sshHost = nil;
++    if ([sshDestination length])
++    {
++        NSString* rest = sshDestination;
++        NSRange const at = [rest rangeOfString:@"@"];
++        if (at.location != NSNotFound)
++        {
++            sshUser = [rest substringToIndex:at.location];
++            rest = [rest substringFromIndex:at.location + 1];
++        }
++        NSRange const colon = [rest rangeOfString:@":"];
++        if (colon.location != NSNotFound)
++        {
++            ssh.port = [[rest substringFromIndex:colon.location + 1] intValue];
++            rest = [rest substringToIndex:colon.location];
++        }
++        sshHost = rest;
++        ssh.host = [sshHost UTF8String];
++        if ([sshUser length])
++            ssh.username = [sshUser UTF8String];
++    }
+ 
+     // Under the GL backend the context must be current BEFORE the session is created: the session
+     // constructor configures the renderer's texture atlas, which calls glGenTextures/glTexImage2D
+@@ -188,7 +259,8 @@ void cbOnClosed(void* userData)
+                                             font,
+                                             callbacks,
+                                             renderMode,
+-                                            [theme UTF8String]);
++                                            [theme UTF8String],
++                                            ssh);
+     if (!_session)
+     {
+         [self release];
+@@ -322,6 +394,25 @@ void cbOnClosed(void* userData)
+     [[self window] close];
+ }
+ 
++- (void)mainThreadVerifyHostkey:(SshHostkeyPrompt*)prompt
++{
++    NSString* message =
++        [NSString stringWithFormat:@"The authenticity of host '%@' (port %d) can't be established.\n\n"
++                                   @"Key fingerprint:\n%@\n\nDo you want to continue connecting?",
++                                   prompt->host,
++                                   prompt->port,
++                                   prompt->fingerprint];
++    NSAlert* alert = [[NSAlert alloc] init];
++    [alert setMessageText:@"SSH Host Key Verification"];
++    [alert setInformativeText:message];
++    [alert addButtonWithTitle:@"Connect"];
++    [alert addButtonWithTitle:@"Cancel"];
++    [alert setAlertStyle:NSWarningAlertStyle];
++    NSInteger const response = [alert runModal];
++    [alert release];
++    prompt->accepted = (response == NSAlertFirstButtonReturn) ? YES : NO;
++}
++
+ // Turns a working-directory string — either a plain path or an OSC-7 "file://host/path" URL — into a
+ // short window title: the last path component, with $HOME collapsed to "~". Falls back to the whole
+ // string if it has no components. Returns nil for empty input.
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index 792126c2..e5cc92bc 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -45,11 +45,16 @@
+     char const* themeEnv = getenv("CONTOUR_THEME");
+     NSString* theme = (themeEnv && strcmp(themeEnv, "light") == 0) ? @"light" : @"dark";
+ 
++    // SSH destination: CONTOUR_SSH=user@host[:port] opens an SSH session instead of a local shell.
++    char const* sshEnv = getenv("CONTOUR_SSH");
++    NSString* sshDestination = (sshEnv && sshEnv[0] != '\0') ? [NSString stringWithUTF8String:sshEnv] : nil;
++
+     TerminalView* view = [[TerminalView alloc] initWithFrame:frame
+                                                   fontFamily:@"Menlo"
+                                                     fontSize:14.0
+                                                   renderMode:renderMode
+-                                                       theme:theme];
++                                                       theme:theme
++                                              sshDestination:sshDestination];
+     if (view)
+     {
+         [window setContentView:view];
+-- 
+2.43.0
+

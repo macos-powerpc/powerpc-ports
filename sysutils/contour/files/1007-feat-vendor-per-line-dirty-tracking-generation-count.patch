@@ -1,0 +1,383 @@
+From f81d736a2ecd7a034b62ad7737b1a313c11a5f97 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 19:04:05 +0000
+Subject: [PATCH 07/10] feat(vendor): per-line dirty-tracking generation
+ counter
+
+The engine had NO way to tell a frontend which lines changed between two
+frames: RenderBuffer is a flat, fully-rebuilt-every-frame cell/line list,
+and Terminal::fillRenderBufferInternal() always recomposites the entire
+visible page regardless of how little text actually changed. On a CPU
+compositing backend (this port's default), a full-window recomposite +
+reblit on every keystroke becomes perceptible once the page is large
+enough -- symptom: typing feels laggy specifically in full screen (a much
+bigger page than a normal window), back to normal on exiting it. Old
+iTerm2 (same CPU/CoreGraphics era) does not have this problem because it
+tracks dirty regions and only repaints what changed.
+
+Adds a minimal, purely additive engine primitive to make that possible:
+
+- LineSoA gains a `generation` counter (starts at 1), bumped by every
+  function in LineSoA.h/SoAClusterWriter.h that mutates a line's content
+  (initializeLineSoA, initializeBlankLineSoA, resizeLineSoA, clearRange,
+  resetLine, copyColumns, moveColumns, appendCodepointToCluster,
+  writeCellToSoA, fillWideCharContinuation, writeAsciiToSoA).
+- BasicCellProxy<false> (the mutable CellProxy specialization used by
+  Screen::writeText's whole per-character hot path) bumps it in its OWN
+  destructor rather than in each of its ~15 individual setters
+  (write/reset/setCharacter/setForegroundColor/.../setImageFragment):
+  CellProxy holds a pointer into LineSoA, not a back-reference to the
+  owning Line, so there is no single choke point below the proxy itself:
+  every setter would need its own bump, and missing even one silently
+  breaks dirty-tracking (a line that changed reads as unchanged -- stale
+  content stuck on screen, a correctness bug, not just a missed
+  optimization). A proxy existing at all means its caller intended to
+  write through it (useCellAt's own name says so), so bumping
+  unconditionally on destruction catches every real mutation by
+  construction. The cost of the alternative failure mode -- an
+  occasional false-positive "dirty" line that did not really change,
+  e.g. a mutable proxy constructed but only read from -- is a lost
+  redraw-skip opportunity, never incorrect output. ConstCellProxy
+  (read-only, used by search/history-matching) does not bump: the
+  destructor is `if constexpr` gated on the proxy being mutable.
+- Line::generation() exposes the counter.
+- RenderBuffer gains `lineGenerations` (std::vector<uint64_t>, indexed by
+  screen row), populated by the new Terminal::captureLineGenerations(),
+  which mirrors Grid::render()'s own row-range math exactly (scrollOffset
+  + extraLines-for-smooth-scrolling + page size) so row N's generation
+  corresponds to the exact same grid line Grid::render() just built
+  RenderCells/RenderLines for.
+
+This commit changes NO rendering behavor -- RenderBuffer.cells/lines/
+cursor and every existing render path are untouched; lineGenerations is
+new, optional-to-use data a frontend can ignore. The actual redraw-skip
+logic (comparing this frame's lineGenerations against last frame's,
+scoped invalidation via setNeedsDisplayInRect:/blit only the changed
+rows) is frontend work, landing separately on the `frontend` branch --
+this commit only makes it POSSIBLE.
+
+A resize/scroll/reflow changes what row N even means (the row-index-to-
+grid-line mapping shifts), which is why RenderBuffer.h's doc comment
+requires a frontend to discard its last-frame snapshot whenever
+pageSize()/scrollOffset() change rather than diffing blindly across
+such a boundary -- a real correctness hazard the frontend, not this
+commit, is responsible for handling.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/vtbackend/CellProxy.h          | 20 ++++++++++++++++++++
+ src/vtbackend/Line.h               |  5 +++++
+ src/vtbackend/LineSoA.cpp          | 20 ++++++++++++++++++++
+ src/vtbackend/LineSoA.h            |  9 +++++++++
+ src/vtbackend/RenderBuffer.h       | 14 ++++++++++++++
+ src/vtbackend/SoAClusterWriter.cpp |  3 +++
+ src/vtbackend/SoAClusterWriter.h   |  5 +++++
+ src/vtbackend/Terminal.cpp         | 26 ++++++++++++++++++++++++++
+ src/vtbackend/Terminal.h           |  9 +++++++++
+ 9 files changed, 111 insertions(+)
+
+diff --git a/src/vtbackend/CellProxy.h b/src/vtbackend/CellProxy.h
+index 2044afa3..2517513b 100644
+--- a/src/vtbackend/CellProxy.h
++++ b/src/vtbackend/CellProxy.h
+@@ -48,6 +48,26 @@ class BasicCellProxy
+         assert(!line.codepoints.empty());
+     }
+ 
++    BasicCellProxy(BasicCellProxy const&) noexcept = default;
++    BasicCellProxy(BasicCellProxy&&) noexcept = default;
++    BasicCellProxy& operator=(BasicCellProxy const&) noexcept = default;
++    BasicCellProxy& operator=(BasicCellProxy&&) noexcept = default;
++
++    /// Bumps the owning line's generation counter for the MUTABLE specialization only: every
++    /// `useCellAt()` call returns a proxy that exists so its caller can write through it (the
++    /// class's own name says so), so treating "a mutable proxy was destroyed" as "the cell may
++    /// have changed" catches every write path -- individual setters (write/reset/setCharacter/...),
++    /// LineSoA free functions called through them, everything -- without auditing each one, at the
++    /// cost of occasionally over-invalidating a line nothing actually changed on (e.g. useCellAt()
++    /// called only to read). That false-positive is a lost redraw-skip opportunity, never a
++    /// correctness bug, which is the right side to err on for dirty-tracking: the reverse mistake
++    /// (a missed bump on some overlooked mutation) would silently freeze stale content on screen.
++    ~BasicCellProxy() noexcept
++    {
++        if constexpr (!IsConst)
++            ++_line->generation;
++    }
++
+     /// Implicit conversion from mutable proxy to const proxy.
+     operator BasicCellProxy<true>() const noexcept
+         requires(!IsConst)
+diff --git a/src/vtbackend/Line.h b/src/vtbackend/Line.h
+index 19c88f9e..72a466d9 100644
+--- a/src/vtbackend/Line.h
++++ b/src/vtbackend/Line.h
+@@ -183,6 +183,11 @@ class Line
+ 
+     [[nodiscard]] ColumnCount size() const noexcept { return _columns; }
+ 
++    /// Monotonically increasing counter, bumped on every content change (see LineSoA::generation).
++    /// A frontend compares this against the value it saw last frame to skip recompositing lines
++    /// that provably did not change, instead of redrawing the whole page every frame.
++    [[nodiscard]] uint64_t generation() const noexcept { return _storage.generation; }
++
+     void resize(ColumnCount count)
+     {
+         if (isBlank())
+diff --git a/src/vtbackend/LineSoA.cpp b/src/vtbackend/LineSoA.cpp
+index 77a913f8..f873a1c4 100644
+--- a/src/vtbackend/LineSoA.cpp
++++ b/src/vtbackend/LineSoA.cpp
+@@ -33,6 +33,7 @@ void initializeLineSoA(LineSoA& line, ColumnCount cols, GraphicsAttributes const
+     line.usedColumns = {};
+     line.trivial = true;
+     line.fillAttrs = fillAttrs;
++    ++line.generation;
+ }
+ 
+ void initializeBlankLineSoA(LineSoA& line, GraphicsAttributes const& fillAttrs) noexcept
+@@ -56,6 +57,7 @@ void initializeBlankLineSoA(LineSoA& line, GraphicsAttributes const& fillAttrs)
+     line.usedColumns = {};
+     line.trivial = true;
+     line.fillAttrs = fillAttrs;
++    ++line.generation;
+ }
+ 
+ void resizeLineSoA(LineSoA& line, ColumnCount newCols, GraphicsAttributes const& fillAttrs)
+@@ -83,6 +85,8 @@ void resizeLineSoA(LineSoA& line, ColumnCount newCols, GraphicsAttributes const&
+     // When growing, new cells get fillAttrs. If existing cells had different SGR, no longer trivial.
+     if (n > oldSize && line.trivial && oldSize > 0 && fillAttrs != line.sgr[0])
+         line.trivial = false;
++
++    ++line.generation;
+ }
+ 
+ void clearRange(LineSoA& line, size_t from, size_t count, GraphicsAttributes const& attrs)
+@@ -114,6 +118,8 @@ void clearRange(LineSoA& line, size_t from, size_t count, GraphicsAttributes con
+     // Partial clear may break SGR uniformity.
+     if (from != 0 || count != line.codepoints.size())
+         line.trivial = false;
++
++    ++line.generation;
+ }
+ 
+ void resetLine(LineSoA& line, ColumnCount cols, GraphicsAttributes const& fillAttrs)
+@@ -147,6 +153,12 @@ void resetLine(LineSoA& line, ColumnCount cols, GraphicsAttributes const& fillAt
+     line.usedColumns = {};
+     line.trivial = true;
+     line.fillAttrs = fillAttrs;
++
++    // (canSkipFill's fast path does not go through clearRange, so this function bumps its own
++    // generation regardless of which branch ran; the non-fast-path branch's clearRange() bump is
++    // therefore redundant with this one for that path, which is harmless -- one extra integer
++    // increment, not a correctness concern.)
++    ++line.generation;
+ }
+ 
+ void copyColumns(LineSoA const& src, size_t srcCol, LineSoA& dst, size_t dstCol, size_t count)
+@@ -208,6 +220,7 @@ void copyColumns(LineSoA const& src, size_t srcCol, LineSoA& dst, size_t dstCol,
+ 
+     // Copied SGR data may break uniformity on the destination line.
+     dst.trivial = false;
++    ++dst.generation;
+ }
+ 
+ void moveColumns(LineSoA& line, size_t srcCol, size_t dstCol, size_t count)
+@@ -234,6 +247,9 @@ void moveColumns(LineSoA& line, size_t srcCol, size_t dstCol, size_t count)
+     // Callers must handle cluster pool entries if source cells have extras.
+     // For insert/delete operations, the cluster pool entries remain valid
+     // because the pool indices move with the clusterPoolIndex array.
++
++    if (count > 0)
++        ++line.generation;
+ }
+ 
+ size_t trimBlankRight(LineSoA const& line, size_t cols)
+@@ -332,7 +348,10 @@ int appendCodepointToCluster(LineSoA& line, size_t col, char32_t codepoint, Clus
+     // Under FirstCodepoint the codepoint still joins the cluster -- it is part of the text, and must
+     // round-trip through a copy -- but it may not change how many columns the cluster occupies.
+     if (policy == ClusterWidthPolicy::FirstCodepoint)
++    {
++        ++line.generation;
+         return 0;
++    }
+ 
+     // A cluster always occupies at least one column. grapheme_cluster_width answers 0 for a cluster
+     // made only of zero-width codepoints -- a lone combining mark, ZWSP, a bare ZWJ -- and the base
+@@ -343,6 +362,7 @@ int appendCodepointToCluster(LineSoA& line, size_t col, char32_t codepoint, Clus
+         std::max(1u, unicode::grapheme_cluster_width(std::u32string_view(buffer.data(), count)));
+     line.widths[col] = static_cast<uint8_t>(newWidth);
+ 
++    ++line.generation;
+     return static_cast<int>(newWidth) - static_cast<int>(oldWidth);
+ }
+ 
+diff --git a/src/vtbackend/LineSoA.h b/src/vtbackend/LineSoA.h
+index 03b0d974..252a6d77 100644
+--- a/src/vtbackend/LineSoA.h
++++ b/src/vtbackend/LineSoA.h
+@@ -124,6 +124,15 @@ struct LineSoA
+     /// Used by writeAsciiToSoA and resetLine to skip redundant fill operations
+     /// when the line is being rewritten with the same default attributes.
+     GraphicsAttributes fillAttrs {};
++
++    /// Bumped by every function in this header/SoAClusterWriter.h that mutates this line's
++    /// content, and by every BasicCellProxy<false> (mutable CellProxy) destructor -- i.e. on
++    /// every real content change, from any call site, without each call site needing to know
++    /// about it. A frontend compares this against the value it saw last frame (per line) to
++    /// skip recompositing/reblitting lines that provably did not change, instead of redrawing
++    /// the whole page on every keystroke. Starts at 1, never 0, so a default-constructed
++    /// RenderLine::generation (0) never spuriously compares equal to a real line.
++    uint64_t generation = 1;
+ };
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/vtbackend/RenderBuffer.h b/src/vtbackend/RenderBuffer.h
+index fc3aee6c..af06c001 100644
+--- a/src/vtbackend/RenderBuffer.h
++++ b/src/vtbackend/RenderBuffer.h
+@@ -109,11 +109,25 @@ struct RenderBuffer
+     std::optional<RenderCursor> cursor {};
+     uint64_t frameID {};
+ 
++    /// Per-screen-line snapshot of vtbackend::Line::generation(), indexed by screen row (0 = top of
++    /// the visible page), captured the same frame as cells/lines above. A frontend that wants to
++    /// avoid recompositing/reblitting unchanged rows compares this against the value it stored for
++    /// the SAME row last frame; a row whose generation is unchanged had no content mutation between
++    /// the two frames (see LineSoA::generation for what counts as a mutation). Always populated --
++    /// the cost is one uint64_t copy per screen row (not per cell), negligible next to building
++    /// cells/lines above; a frontend that has no use for it (e.g. one that always recomposites the
++    /// whole frame anyway) simply never reads it. A resize/scroll/reflow invalidates row INDICES
++    /// (row 5 last frame is not necessarily the same content as row 5 this frame), so a frontend
++    /// must discard its own last-frame snapshot whenever pageSize() or scrollOffset() changed, not
++    /// just diff blindly.
++    std::vector<uint64_t> lineGenerations {};
++
+     void clear()
+     {
+         cells.clear();
+         lines.clear();
+         cursor.reset();
++        lineGenerations.clear();
+     }
+ };
+ 
+diff --git a/src/vtbackend/SoAClusterWriter.cpp b/src/vtbackend/SoAClusterWriter.cpp
+index cf183b95..8acad38c 100644
+--- a/src/vtbackend/SoAClusterWriter.cpp
++++ b/src/vtbackend/SoAClusterWriter.cpp
+@@ -77,6 +77,9 @@ namespace
+             }
+         }
+ 
++        if (count > 0)
++            ++line.generation;
++
+         return count;
+     }
+ 
+diff --git a/src/vtbackend/SoAClusterWriter.h b/src/vtbackend/SoAClusterWriter.h
+index 0915f260..009630ab 100644
+--- a/src/vtbackend/SoAClusterWriter.h
++++ b/src/vtbackend/SoAClusterWriter.h
+@@ -80,6 +80,8 @@ inline void writeCellToSoA(LineSoA& line,
+             line.trivial = false;
+         }
+     }
++
++    ++line.generation;
+ }
+ 
+ /// Fill wide-char continuation cells following a wide character.
+@@ -107,6 +109,9 @@ inline void fillWideCharContinuation(LineSoA& line,
+     // Continuation cells always have WideCharContinuation flag, which differs from the head cell's SGR.
+     if (line.trivial && count > 0)
+         line.trivial = false;
++
++    if (count > 0)
++        ++line.generation;
+ }
+ 
+ } // namespace vtbackend
+diff --git a/src/vtbackend/Terminal.cpp b/src/vtbackend/Terminal.cpp
+index a8d924fe..62763409 100644
+--- a/src/vtbackend/Terminal.cpp
++++ b/src/vtbackend/Terminal.cpp
+@@ -602,6 +602,7 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+     auto& displayedScreen = pageAt(_displayedPage);
+ 
+     if (_displayedPage == PageIndex(0))
++    {
+         _lastRenderPassHints = displayedScreen.render(RenderBufferBuilder { *this,
+                                                                             displayedScreen,
+                                                                             output,
+@@ -615,7 +616,10 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+                                                       _viewport.scrollOffset(),
+                                                       highlightSearchMatches,
+                                                       smoothScrollExtra);
++        captureLineGenerations(output, displayedScreen, _viewport.scrollOffset(), smoothScrollExtra);
++    }
+     else
++    {
+         _lastRenderPassHints = displayedScreen.render(RenderBufferBuilder { *this,
+                                                                             displayedScreen,
+                                                                             output,
+@@ -628,6 +632,8 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+                                                                             includeSelection },
+                                                       _viewport.scrollOffset(),
+                                                       highlightSearchMatches);
++        captureLineGenerations(output, displayedScreen, _viewport.scrollOffset(), LineCount(0));
++    }
+ 
+     // Save the baseLine used for the main screen before the bottom status line shifts it.
+     auto const mainScreenLine = baseLine;
+@@ -643,6 +649,26 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+     applyScreenTransitionBlending(output);
+ }
+ 
++void Terminal::captureLineGenerations(RenderBuffer& output,
++                                      Screen const& displayedScreen,
++                                      ScrollOffset scrollOffset,
++                                      LineCount extraLines) const
++{
++    // Mirrors Grid::render()'s own row range exactly (Grid.h): the scrolled-into-history start
++    // offset, the same extraLines widening for smooth scrolling, and the same page-size-driven
++    // row count -- so row N here is the SAME grid line Grid::render() just built RenderCells/
++    // RenderLines for.
++    auto const& grid = displayedScreen.grid();
++    auto const availableAbove = *grid.historyLineCount() - *scrollOffset;
++    auto const extraOffset = std::min(*extraLines, std::max(0, availableAbove));
++    auto const rowCount = *pageSize().lines + extraOffset;
++
++    output.lineGenerations.resize(static_cast<size_t>(rowCount));
++    auto i = -*scrollOffset - extraOffset;
++    for (auto row = size_t { 0 }; row < static_cast<size_t>(rowCount); ++row, ++i)
++        output.lineGenerations[row] = grid.lineAt(LineOffset(i)).generation();
++}
++
+ void Terminal::updateCursorMotionAnimation(RenderBuffer& output)
+ {
+     if (!output.cursor.has_value())
+diff --git a/src/vtbackend/Terminal.h b/src/vtbackend/Terminal.h
+index 05576b30..09344b19 100644
+--- a/src/vtbackend/Terminal.h
++++ b/src/vtbackend/Terminal.h
+@@ -1885,6 +1885,15 @@ class Terminal
+     void mainLoop();
+     void fillRenderBufferInternal(RenderBuffer& output, bool includeSelection);
+     LineCount fillRenderBufferStatusLine(RenderBuffer& output, bool includeSelection, LineOffset base);
++
++    /// Snapshots each visible screen row's Line::generation() into output.lineGenerations, indexed
++    /// the same way Grid::render() walks rows (accounting for scrollOffset and extraLines), so a
++    /// frontend can diff row N this frame against row N last frame to skip recompositing/reblitting
++    /// unchanged rows. Purely additive bookkeeping -- does not affect cells/lines/cursor.
++    void captureLineGenerations(RenderBuffer& output,
++                                Screen const& displayedScreen,
++                                ScrollOffset scrollOffset,
++                                LineCount extraLines) const;
+     void updateIndicatorStatusLine();
+     void updateCursorVisibilityState() const noexcept;
+     void updateHoveringHyperlinkState();
+-- 
+2.43.0
+

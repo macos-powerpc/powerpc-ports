@@ -1,0 +1,427 @@
+From 3da21dc66a23ec21ed136065e623b4a40a6ec212 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 22:44:26 +0000
+Subject: [PATCH 46/67] feat(macos): color themes (dark + light)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add built-in dark and light color themes, selectable with CONTOUR_THEME=
+dark|light (default dark), like the CONTOUR_RENDER backend selector.
+
+- Themes.{h,cpp}: a small, data-driven theme table. Dark is the engine's
+  default ColorPalette; Light is dark-on-near-white with the ANSI white/
+  bright-white/bright-black entries and the selection wash retuned so text
+  stays legible on a light background.
+- TerminalSession takes a ColorPalette and applies it to the renderer (glyph
+  colors + BackgroundRenderer default), the terminal (SGR resolution and the
+  reset-to-default palette), and the render backend's clear color.
+- The renderer only paints cells whose background differs from the default,
+  so the surface must be pre-cleared to the theme background. The CPU blit
+  treats the buffer as opaque (kCGImageAlphaNoneSkipLast), so beginFrame now
+  fills an opaque default-background color instead of transparent (which
+  rendered as opaque black — fine for the near-black dark theme, wrong for
+  light). GLRenderTarget's clear color is set the same way.
+
+Isolated from the mouse/selection path: no input code is touched.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt           |  2 +
+ src/contour_macos/PixelBuffer.h            | 14 ++++++
+ src/contour_macos/SessionBridge.cpp        |  8 +++-
+ src/contour_macos/SessionBridge.h          |  8 ++--
+ src/contour_macos/SoftwareRenderTarget.cpp |  2 +-
+ src/contour_macos/SoftwareRenderTarget.h   | 16 +++++++
+ src/contour_macos/TerminalSession.cpp      | 18 ++++++-
+ src/contour_macos/TerminalSession.h        |  3 +-
+ src/contour_macos/TerminalView.h           |  6 ++-
+ src/contour_macos/TerminalView.mm          |  4 +-
+ src/contour_macos/Themes.cpp               | 55 ++++++++++++++++++++++
+ src/contour_macos/Themes.h                 | 25 ++++++++++
+ src/contour_macos/main.mm                  |  8 +++-
+ 13 files changed, 156 insertions(+), 13 deletions(-)
+ create mode 100644 src/contour_macos/Themes.cpp
+ create mode 100644 src/contour_macos/Themes.h
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index b952e5cd..42f32758 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -12,12 +12,14 @@ set(_header_files
+     SoftwareRenderTarget.h
+     StubRenderTarget.h
+     TerminalSession.h
++    Themes.h
+ )
+ 
+ set(_source_files
+     SessionBridge.cpp
+     SoftwareRenderTarget.cpp
+     TerminalSession.cpp
++    Themes.cpp
+ )
+ 
+ # The GL 2.0 backend is pure C++ (it only calls gl*; it assumes a context is current) and needs
+diff --git a/src/contour_macos/PixelBuffer.h b/src/contour_macos/PixelBuffer.h
+index 37e41ee0..81412d64 100644
+--- a/src/contour_macos/PixelBuffer.h
++++ b/src/contour_macos/PixelBuffer.h
+@@ -47,6 +47,20 @@ class PixelBuffer
+ 
+     void fillTransparent() noexcept { std::fill(_data.begin(), _data.end(), uint8_t { 0 }); }
+ 
++    /// Fills every pixel with an opaque (r, g, b). Used to establish the terminal's default
++    /// background before the renderer composites cells over it (the renderer only paints cells
++    /// whose background differs from the default, so the default must come from here).
++    void fillOpaque(uint8_t r, uint8_t g, uint8_t b) noexcept
++    {
++        for (size_t i = 0; i + 3 < _data.size(); i += 4)
++        {
++            _data[i + 0] = r;
++            _data[i + 1] = g;
++            _data[i + 2] = b;
++            _data[i + 3] = 255;
++        }
++    }
++
+     /// Pointer to the first byte (R) of pixel (x, y). No bounds checking.
+     [[nodiscard]] uint8_t* pixel(uint32_t x, uint32_t y) noexcept
+     {
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index 11f8265f..a34cd1fd 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -4,6 +4,7 @@
+ // freely include the engine headers that use `id` as an identifier.
+ 
+ #include <contour_macos/SessionBridge.h>
++#include <contour_macos/Themes.h>
+ #include <contour_macos/TerminalSession.h>
+ 
+ #include <vtbackend/InputGenerator.h>
+@@ -70,7 +71,8 @@ TerminalSession* bridge_create(int widthPx,
+                                int heightPx,
+                                BridgeFontConfig const& font,
+                                BridgeCallbacks const& cb,
+-                               int renderMode)
++                               int renderMode,
++                               char const* themeName)
+ {
+     auto fonts = vtrasterizer::FontDescriptions {};
+     fonts.dpi = text::DPI { font.dpiX, font.dpiY };
+@@ -116,9 +118,11 @@ TerminalSession* bridge_create(int widthPx,
+     auto const backend = renderMode == BridgeRender_OpenGL ? TerminalSession::RenderBackend::OpenGL
+                                                            : TerminalSession::RenderBackend::CPU;
+ 
++    auto const palette = paletteFor(themeByName(themeName ? themeName : "dark"));
++
+     auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
+     return new TerminalSession(
+-        pageSize, std::move(fonts), surfaceSize, std::move(callbacks), backend);
++        pageSize, std::move(fonts), surfaceSize, std::move(callbacks), backend, palette);
+ }
+ 
+ void bridge_destroy(TerminalSession* session)
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 4ba29acc..6c5c237b 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -58,13 +58,15 @@ enum BridgeRenderMode
+     BridgeRender_OpenGL = 1,
+ };
+ 
+-/// Creates a session sized to (widthPx, heightPx) using the given render backend. The shell's
+-/// read loop is NOT started yet — call bridge_start(). Returns nullptr on failure.
++/// Creates a session sized to (widthPx, heightPx) using the given render backend and color theme.
++/// themeName is "dark" or "light" (case-insensitive; anything else = dark). The shell's read loop
++/// is NOT started yet — call bridge_start(). Returns nullptr on failure.
+ TerminalSession* bridge_create(int widthPx,
+                                int heightPx,
+                                BridgeFontConfig const& font,
+                                BridgeCallbacks const& callbacks,
+-                               int renderMode);
++                               int renderMode,
++                               char const* themeName);
+ 
+ /// Returns the render backend the session was created with (a BridgeRenderMode value). The view
+ /// uses this to choose its presentation path (CGImage blit vs GL context present).
+diff --git a/src/contour_macos/SoftwareRenderTarget.cpp b/src/contour_macos/SoftwareRenderTarget.cpp
+index d197c2e8..cbfc8a5c 100644
+--- a/src/contour_macos/SoftwareRenderTarget.cpp
++++ b/src/contour_macos/SoftwareRenderTarget.cpp
+@@ -66,7 +66,7 @@ SoftwareRenderTarget::SoftwareRenderTarget(ImageSize size):
+ 
+ void SoftwareRenderTarget::beginFrame()
+ {
+-    _output.fillTransparent();
++    _output.fillOpaque(_bgR, _bgG, _bgB);
+     _rects.clear();
+     _imagesBelowText.clear();
+     _textTiles.clear();
+diff --git a/src/contour_macos/SoftwareRenderTarget.h b/src/contour_macos/SoftwareRenderTarget.h
+index 2e40e35a..6d58dedb 100644
+--- a/src/contour_macos/SoftwareRenderTarget.h
++++ b/src/contour_macos/SoftwareRenderTarget.h
+@@ -48,6 +48,16 @@ class SoftwareRenderTarget final:
+     /// When enabled, logs each renderTile() call (target position/size, selector) to stderr.
+     void setDebugTiles(bool on) noexcept { _debugTiles = on; }
+ 
++    /// Sets the color beginFrame() clears the surface to — the terminal's default background. The
++    /// renderer only paints cells whose background differs from the default, so this establishes the
++    /// base color; and the blit treats the buffer as opaque, so it must be an opaque RGB.
++    void setDefaultBackground(uint8_t r, uint8_t g, uint8_t b) noexcept
++    {
++        _bgR = r;
++        _bgG = g;
++        _bgB = b;
++    }
++
+     // --- vtrasterizer::RenderTarget ---
+     void setRenderSize(ImageSize size) override;
+     [[nodiscard]] ImageSize renderSize() const noexcept override { return _renderSize; }
+@@ -151,6 +161,12 @@ class SoftwareRenderTarget final:
+     std::optional<ScreenshotCallback> _pendingScreenshot;
+ 
+     bool _debugTiles = false;
++
++    // Default background the surface is cleared to each frame (the terminal's default bg color).
++    // Defaults to the engine's dark-theme background so behaviour is unchanged when unset.
++    uint8_t _bgR = 0x1a;
++    uint8_t _bgG = 0x17;
++    uint8_t _bgB = 0x16;
+ };
+ 
+ } // namespace contour_macos
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 1cae9d83..93d112d2 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -56,14 +56,15 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+                                  vtrasterizer::FontDescriptions fontDescriptions,
+                                  ImageSize surfaceSize,
+                                  Callbacks callbacks,
+-                                 RenderBackend backend):
++                                 RenderBackend backend,
++                                 vtbackend::ColorPalette colorPalette):
+     _callbacks { std::move(callbacks) },
+     _pageSize { pageSize },
+     _surfaceSize { surfaceSize },
+     _backend { backend },
+     _renderer { pageSize,
+                 std::move(fontDescriptions),
+-                vtbackend::ColorPalette {},
++                colorPalette,
+                 crispy::strong_hashtable_size { 4096 },
+                 crispy::lru_capacity { 4000 },
+                 /* atlasDirectMapping */ true,
+@@ -72,15 +73,23 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+ {
+     // Build the chosen backend and keep a typed alias for backend-specific access. The renderer
+     // is handed the abstract RenderTarget and never learns which concrete backend it drives.
++    auto const bg = colorPalette.defaultBackground;
+     if (_backend == RenderBackend::OpenGL)
+     {
+         auto gl = std::make_unique<GLRenderTarget>(surfaceSize);
++        // The renderer paints only cells whose background differs from the default, so the backend
++        // must clear to the theme's default background to establish it.
++        gl->setClearColor(static_cast<float>(bg.red) / 255.f,
++                          static_cast<float>(bg.green) / 255.f,
++                          static_cast<float>(bg.blue) / 255.f,
++                          1.0f);
+         _gl = gl.get();
+         _renderTarget = std::move(gl);
+     }
+     else
+     {
+         auto sw = std::make_unique<SoftwareRenderTarget>(surfaceSize);
++        sw->setDefaultBackground(bg.red, bg.green, bg.blue);
+         _software = sw.get();
+         _renderTarget = std::move(sw);
+     }
+@@ -93,6 +102,11 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _terminal = std::make_unique<vtbackend::Terminal>(
+         *this, makePty(_pageSize), makeSettings(_pageSize), steady_clock::now());
+ 
++    // Apply the theme palette to the terminal too (the renderer got it via its ctor). setColorPalette
++    // updates the live palette; also make it the default so a palette-reset (RIS/DECSTR) returns here.
++    _terminal->setColorPalette(colorPalette);
++    _terminal->resetColorPalette(colorPalette);
++
+     // setWordDelimiters() is what actually assigns the selection helper's `wordDelimited`
+     // std::function; without calling it, mouse selection invokes an empty std::function and
+     // throws std::bad_function_call. Seed with the usual terminal word-boundary set.
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+index 562c32fb..0855bd7a 100644
+--- a/src/contour_macos/TerminalSession.h
++++ b/src/contour_macos/TerminalSession.h
+@@ -55,7 +55,8 @@ class TerminalSession: public vtbackend::Terminal::Events
+                     vtrasterizer::FontDescriptions fontDescriptions,
+                     ImageSize surfaceSize,
+                     Callbacks callbacks,
+-                    RenderBackend backend = RenderBackend::CPU);
++                    RenderBackend backend = RenderBackend::CPU,
++                    vtbackend::ColorPalette colorPalette = vtbackend::ColorPalette {});
+     ~TerminalSession() override;
+ 
+     /// Spawns the shell and starts the read/parse thread.
+diff --git a/src/contour_macos/TerminalView.h b/src/contour_macos/TerminalView.h
+index fe0479bf..a8dbb860 100644
+--- a/src/contour_macos/TerminalView.h
++++ b/src/contour_macos/TerminalView.h
+@@ -21,11 +21,13 @@
+ }
+ 
+ // Creates the session (spawning a shell) sized to the given frame, using the given render backend
+-// (a BridgeRenderMode value: 0 = CPU, 1 = OpenGL). Returns nil on failure.
++// (a BridgeRenderMode value: 0 = CPU, 1 = OpenGL) and color theme ("dark"/"light"). Returns nil on
++// failure.
+ - (id)initWithFrame:(NSRect)frame
+          fontFamily:(NSString*)fontFamily
+            fontSize:(double)fontSize
+-         renderMode:(int)renderMode;
++         renderMode:(int)renderMode
++              theme:(NSString*)theme;
+ 
+ // Requests a repaint on the main thread (safe to call from any thread).
+ - (void)requestRedraw;
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index 0cd09323..661c7407 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -136,6 +136,7 @@ void cbOnClosed(void* userData)
+          fontFamily:(NSString*)fontFamily
+            fontSize:(double)fontSize
+          renderMode:(int)renderMode
++              theme:(NSString*)theme
+ {
+     self = [super initWithFrame:frame];
+     if (!self)
+@@ -186,7 +187,8 @@ void cbOnClosed(void* userData)
+                                             static_cast<int>(frame.size.height),
+                                             font,
+                                             callbacks,
+-                                            renderMode);
++                                            renderMode,
++                                            [theme UTF8String]);
+     if (!_session)
+     {
+         [self release];
+diff --git a/src/contour_macos/Themes.cpp b/src/contour_macos/Themes.cpp
+new file mode 100644
+index 00000000..591153ab
+--- /dev/null
++++ b/src/contour_macos/Themes.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <contour_macos/Themes.h>
++
++#include <algorithm>
++#include <cctype>
++#include <string>
++
++using vtbackend::ColorPalette;
++using vtbackend::RGBColor;
++
++namespace contour_macos
++{
++
++Theme themeByName(std::string_view name) noexcept
++{
++    std::string lower(name);
++    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++    });
++    if (lower == "light")
++        return Theme::Light;
++    return Theme::Dark;
++}
++
++ColorPalette paletteFor(Theme theme)
++{
++    // The engine's default ColorPalette is already a dark theme (light-grey fg on near-black bg),
++    // so Dark is just the default.
++    ColorPalette palette {};
++    if (theme == Theme::Dark)
++        return palette;
++
++    // Light theme: dark text on a near-white background. The 16 ANSI colors are kept (they are
++    // tuned to read on either background), but the standard-white/standard-black entries are
++    // darkened/lightened so "white" text is not invisible on white and "bright black" stays legible.
++    palette.defaultForeground = 0x1a1a1a_rgb;
++    palette.defaultBackground = 0xf5f5f5_rgb;
++    palette.defaultForegroundBright = 0x000000_rgb;
++    palette.defaultForegroundDimmed = 0x606060_rgb;
++
++    // ANSI white (index 7) and bright-white (15) would be near-invisible on a light background;
++    // pull them toward grey so a program that prints in "white" is still readable.
++    palette.palette[7] = 0x5a5a5a_rgb;  // normal white -> mid grey
++    palette.palette[15] = 0x2a2a2a_rgb; // bright white -> dark grey
++    // Bright-black (index 8) is used as a subtle grey; on light bg lighten it slightly.
++    palette.palette[8] = 0x8a8a8a_rgb;
++
++    // Selection: a light-blue wash reads better than the dark-theme blue on a white background.
++    palette.selection.background = 0x99c0ff_rgb;
++    palette.selection.backgroundAlpha = 0.5f;
++
++    return palette;
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/Themes.h b/src/contour_macos/Themes.h
+new file mode 100644
+index 00000000..327ac391
+--- /dev/null
++++ b/src/contour_macos/Themes.h
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <vtbackend/ColorPalette.h>
++
++#include <string_view>
++
++namespace contour_macos
++{
++
++/// Built-in color themes. Dark is the engine default; Light is a legible-on-white variant.
++/// Kept small and data-driven: adding a theme is adding a case to themeByName() + a builder.
++enum class Theme
++{
++    Dark,
++    Light,
++};
++
++/// Resolves a theme name ("dark"/"light", case-insensitive) to a Theme, defaulting to Dark.
++[[nodiscard]] Theme themeByName(std::string_view name) noexcept;
++
++/// Returns the color palette for a theme.
++[[nodiscard]] vtbackend::ColorPalette paletteFor(Theme theme);
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index d743ba6c..792126c2 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -40,10 +40,16 @@
+     if (renderEnv && (strcmp(renderEnv, "gl") == 0 || strcmp(renderEnv, "opengl") == 0))
+         renderMode = 1; // BridgeRender_OpenGL
+ 
++    // Color theme selector: CONTOUR_THEME=light selects the light theme, anything else (or unset)
++    // the dark theme. Like CONTOUR_RENDER, a single env var suffices until the preferences UI exists.
++    char const* themeEnv = getenv("CONTOUR_THEME");
++    NSString* theme = (themeEnv && strcmp(themeEnv, "light") == 0) ? @"light" : @"dark";
++
+     TerminalView* view = [[TerminalView alloc] initWithFrame:frame
+                                                   fontFamily:@"Menlo"
+                                                     fontSize:14.0
+-                                                  renderMode:renderMode];
++                                                  renderMode:renderMode
++                                                       theme:theme];
+     if (view)
+     {
+         [window setContentView:view];
+-- 
+2.43.0
+

@@ -1,0 +1,780 @@
+From 5e92216d824ff59d32ee82e18c55ada901efcf21 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 11:48:46 +0000
+Subject: [PATCH 19/67] fix(macos): isolate engine behind an opaque bridge so
+ ObjC++ compiles on GCC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The engine headers cannot be included from an Objective-C++ translation unit:
+vtbackend uses `id` as an ordinary identifier (Functions.h operator id_type()
+returning id(), VTType/Charset `switch (id)`), which collides with the `id`
+keyword under the ObjC++ frontend; gcc16's own <chrono> format header also fails
+there. Both were pulled in transitively by TerminalView.mm including
+TerminalSession.h -> Terminal.h.
+
+Introduce SessionBridge.{h,cpp}: a thin, engine-free ABI (opaque
+TerminalSession* handle + plain functions taking primitives) that the .mm files
+call. SessionBridge.cpp is compiled as ordinary C++ and is the only place that
+includes engine headers; TerminalView.mm/main.mm now include ONLY SessionBridge.h
++ TerminalView.h + AppKit — verified engine-header-free. Also: declare
+ContourAppDelegate <NSApplicationDelegate>, cast the CGBitmapInfo enum-or to
+uint32_t, and route object deletion through bridge_destroy() (GCC's ObjC++ parser
+mis-reads `delete [self session]` as array-delete).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt    |   2 +
+ src/contour_macos/SessionBridge.cpp | 190 +++++++++++++++++++
+ src/contour_macos/SessionBridge.h   | 116 +++++++++++
+ src/contour_macos/TerminalView.mm   | 285 ++++++++++++++--------------
+ src/contour_macos/main.mm           |   2 +-
+ 5 files changed, 450 insertions(+), 145 deletions(-)
+ create mode 100644 src/contour_macos/SessionBridge.cpp
+ create mode 100644 src/contour_macos/SessionBridge.h
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 111f31b6..c70b21f7 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -7,12 +7,14 @@
+ 
+ set(_header_files
+     PixelBuffer.h
++    SessionBridge.h
+     SoftwareRenderTarget.h
+     StubRenderTarget.h
+     TerminalSession.h
+ )
+ 
+ set(_source_files
++    SessionBridge.cpp
+     SoftwareRenderTarget.cpp
+     TerminalSession.cpp
+ )
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+new file mode 100644
+index 00000000..0488c1e7
+--- /dev/null
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: Apache-2.0
++//
++// Engine side of the AppKit bridge. Compiled as ordinary C++ (never ObjC++), so it may
++// freely include the engine headers that use `id` as an identifier.
++
++#include <contour_macos/SessionBridge.h>
++#include <contour_macos/TerminalSession.h>
++
++#include <vtbackend/InputGenerator.h>
++#include <vtbackend/Terminal.h>
++#include <vtrasterizer/FontDescriptions.h>
++
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++namespace contour_macos
++{
++
++namespace
++{
++    vtbackend::KeyboardModifiers toKeyboardModifiers(uint32_t bits)
++    {
++        vtbackend::Modifiers mods {};
++        if (bits & BridgeMod_Shift)
++            mods.enable(vtbackend::Modifier::Shift);
++        if (bits & BridgeMod_Alt)
++            mods.enable(vtbackend::Modifier::Alt);
++        if (bits & BridgeMod_Control)
++            mods.enable(vtbackend::Modifier::Control);
++        if (bits & BridgeMod_Super)
++            mods.enable(vtbackend::Modifier::Super);
++        return vtbackend::KeyboardModifiers { mods };
++    }
++
++    bool toEngineKey(int bridgeKey, vtbackend::Key& out)
++    {
++        switch (bridgeKey)
++        {
++            case BridgeKey_Up: out = vtbackend::Key::UpArrow; return true;
++            case BridgeKey_Down: out = vtbackend::Key::DownArrow; return true;
++            case BridgeKey_Left: out = vtbackend::Key::LeftArrow; return true;
++            case BridgeKey_Right: out = vtbackend::Key::RightArrow; return true;
++            case BridgeKey_Home: out = vtbackend::Key::Home; return true;
++            case BridgeKey_End: out = vtbackend::Key::End; return true;
++            case BridgeKey_PageUp: out = vtbackend::Key::PageUp; return true;
++            case BridgeKey_PageDown: out = vtbackend::Key::PageDown; return true;
++            case BridgeKey_Insert: out = vtbackend::Key::Insert; return true;
++            case BridgeKey_Delete: out = vtbackend::Key::Delete; return true;
++            case BridgeKey_F1: out = vtbackend::Key::F1; return true;
++            case BridgeKey_F2: out = vtbackend::Key::F2; return true;
++            case BridgeKey_F3: out = vtbackend::Key::F3; return true;
++            case BridgeKey_F4: out = vtbackend::Key::F4; return true;
++            case BridgeKey_F5: out = vtbackend::Key::F5; return true;
++            case BridgeKey_F6: out = vtbackend::Key::F6; return true;
++            case BridgeKey_F7: out = vtbackend::Key::F7; return true;
++            case BridgeKey_F8: out = vtbackend::Key::F8; return true;
++            case BridgeKey_F9: out = vtbackend::Key::F9; return true;
++            case BridgeKey_F10: out = vtbackend::Key::F10; return true;
++            case BridgeKey_F11: out = vtbackend::Key::F11; return true;
++            case BridgeKey_F12: out = vtbackend::Key::F12; return true;
++            default: return false;
++        }
++    }
++} // namespace
++
++TerminalSession* bridge_create(int widthPx,
++                               int heightPx,
++                               BridgeFontConfig const& font,
++                               BridgeCallbacks const& cb)
++{
++    auto fonts = vtrasterizer::FontDescriptions {};
++    fonts.dpi = text::DPI { font.dpiX, font.dpiY };
++    fonts.size = text::font_size { font.sizePt };
++    std::string const family = font.family ? font.family : "Menlo";
++    for (text::font_description* fd: { &fonts.regular, &fonts.bold, &fonts.italic, &fonts.boldItalic })
++    {
++        fd->familyName = family;
++        fd->spacing = text::font_spacing::mono;
++    }
++    fonts.bold.weight = text::font_weight::bold;
++    fonts.italic.slant = text::font_slant::italic;
++    fonts.boldItalic.weight = text::font_weight::bold;
++    fonts.boldItalic.slant = text::font_slant::italic;
++
++    auto const surfaceSize = ImageSize { vtbackend::Width::cast_from(widthPx),
++                                         vtbackend::Height::cast_from(heightPx) };
++
++    TerminalSession::Callbacks callbacks;
++    auto const userData = cb.userData;
++    if (cb.requestRedraw)
++        callbacks.requestRedraw = [userData, fn = cb.requestRedraw]() { fn(userData); };
++    if (cb.setTitle)
++        callbacks.setTitle = [userData, fn = cb.setTitle](std::string title) { fn(userData, title.c_str()); };
++    if (cb.bell)
++        callbacks.bell = [userData, fn = cb.bell]() { fn(userData); };
++    if (cb.copyToClipboard)
++        callbacks.copyToClipboard = [userData, fn = cb.copyToClipboard](std::string data) {
++            fn(userData, data.c_str());
++        };
++    if (cb.readClipboard)
++        callbacks.readClipboard = [userData, fn = cb.readClipboard]() -> std::string {
++            char* s = fn(userData);
++            if (!s)
++                return std::string {};
++            std::string result(s);
++            std::free(s);
++            return result;
++        };
++    if (cb.onClosed)
++        callbacks.onClosed = [userData, fn = cb.onClosed]() { fn(userData); };
++
++    auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
++    return new TerminalSession(pageSize, std::move(fonts), surfaceSize, std::move(callbacks));
++}
++
++void bridge_destroy(TerminalSession* session)
++{
++    delete session;
++}
++
++void bridge_start(TerminalSession* session)
++{
++    session->start();
++}
++
++void bridge_render_frame(TerminalSession* session)
++{
++    session->renderFrame();
++}
++
++uint8_t const* bridge_output_buffer(TerminalSession* session, int* outWidth, int* outHeight)
++{
++    auto const& buffer = session->renderTarget().outputBuffer();
++    if (outWidth)
++        *outWidth = static_cast<int>(buffer.width());
++    if (outHeight)
++        *outHeight = static_cast<int>(buffer.height());
++    return buffer.data();
++}
++
++void bridge_resize(TerminalSession* session, int widthPx, int heightPx)
++{
++    session->resize(
++        ImageSize { vtbackend::Width::cast_from(widthPx), vtbackend::Height::cast_from(heightPx) });
++}
++
++void bridge_send_key(TerminalSession* session, int bridgeKey, uint32_t modifiers)
++{
++    vtbackend::Key key {};
++    if (!toEngineKey(bridgeKey, key))
++        return;
++    session->terminal().sendKeyEvent(key,
++                                     toKeyboardModifiers(modifiers),
++                                     vtbackend::KeyboardEventType::Press,
++                                     std::chrono::steady_clock::now());
++}
++
++void bridge_send_char(TerminalSession* session, uint32_t codepoint, uint32_t modifiers)
++{
++    session->terminal().sendCharEvent(static_cast<char32_t>(codepoint),
++                                      codepoint,
++                                      toKeyboardModifiers(modifiers),
++                                      vtbackend::KeyboardEventType::Press,
++                                      std::chrono::steady_clock::now());
++}
++
++void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifiers)
++{
++    session->terminal().sendMousePressEvent(toKeyboardModifiers(modifiers).chord,
++                                            vtbackend::MouseButton::Left,
++                                            vtbackend::PixelCoordinate { { x }, { y } },
++                                            false);
++}
++
++void bridge_mouse_release(TerminalSession* session, int x, int y, uint32_t modifiers)
++{
++    session->terminal().sendMouseReleaseEvent(toKeyboardModifiers(modifiers).chord,
++                                              vtbackend::MouseButton::Left,
++                                              vtbackend::PixelCoordinate { { x }, { y } },
++                                              false);
++}
++
++void bridge_focus_in(TerminalSession* session)
++{
++    session->terminal().sendFocusInEvent();
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+new file mode 100644
+index 00000000..81adb92e
+--- /dev/null
++++ b/src/contour_macos/SessionBridge.h
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++// Thin, engine-free bridge between the AppKit Objective-C++ layer and the C++ engine.
++//
++// The contour engine headers cannot be included from an Objective-C++ (.mm) translation
++// unit: the engine uses `id` as an ordinary identifier, which collides with the `id`
++// keyword under the ObjC++ frontend. So the .mm files include ONLY this header (plus
++// AppKit/Foundation) and talk to the engine through the opaque handle and plain functions
++// below. The implementation (SessionBridge.cpp) is compiled as ordinary C++ and is the only
++// place that includes engine + session headers.
++
++#include <cstddef>
++#include <cstdint>
++
++namespace contour_macos
++{
++
++class TerminalSession; // opaque to the .mm side
++
++/// Host callbacks, invoked from the engine's parser thread. Each receives the opaque
++/// `userData` the bridge was created with (the TerminalView). Implementations must marshal
++/// any UI work onto the main thread themselves.
++struct BridgeCallbacks
++{
++    void* userData = nullptr;
++    void (*requestRedraw)(void* userData) = nullptr;
++    void (*setTitle)(void* userData, char const* utf8Title) = nullptr;
++    void (*bell)(void* userData) = nullptr;
++    void (*copyToClipboard)(void* userData, char const* utf8Data) = nullptr;
++    /// Returns a freshly malloc()'d UTF-8 C string the bridge will free(), or nullptr.
++    char* (*readClipboard)(void* userData) = nullptr;
++    void (*onClosed)(void* userData) = nullptr;
++};
++
++/// Font configuration passed across the boundary as primitives.
++struct BridgeFontConfig
++{
++    char const* family = "Menlo";
++    double sizePt = 14.0;
++    int dpiX = 96;
++    int dpiY = 96;
++};
++
++/// Creates a session sized to (widthPx, heightPx) and spawns the shell's read loop is NOT
++/// started yet — call bridge_start(). Returns nullptr on failure.
++TerminalSession* bridge_create(int widthPx,
++                               int heightPx,
++                               BridgeFontConfig const& font,
++                               BridgeCallbacks const& callbacks);
++
++void bridge_destroy(TerminalSession* session);
++
++/// Spawns the shell and starts the parser thread.
++void bridge_start(TerminalSession* session);
++
++/// Renders one frame into the internal buffer. Call on the main thread (from -drawRect:).
++void bridge_render_frame(TerminalSession* session);
++
++/// Returns a pointer to the current RGBA8, top-left-origin frame buffer, and its dimensions.
++/// The pointer is valid until the next bridge_render_frame()/bridge_resize() call.
++uint8_t const* bridge_output_buffer(TerminalSession* session, int* outWidth, int* outHeight);
++
++/// Resizes the render surface (and re-derives the page size). Call on the main thread.
++void bridge_resize(TerminalSession* session, int widthPx, int heightPx);
++
++// --- input (all coordinates in view pixels, top-left origin) ---
++
++/// Modifier bitmask matching the engine's Modifier enum: Shift=1 Alt=2 Control=4 Super=8.
++enum BridgeModifier : uint32_t
++{
++    BridgeMod_Shift = 1,
++    BridgeMod_Alt = 2,
++    BridgeMod_Control = 4,
++    BridgeMod_Super = 8,
++};
++
++/// Special (non-text) keys, matching a subset of vtbackend::Key.
++enum BridgeKey : int
++{
++    BridgeKey_None = 0,
++    BridgeKey_Up,
++    BridgeKey_Down,
++    BridgeKey_Left,
++    BridgeKey_Right,
++    BridgeKey_Home,
++    BridgeKey_End,
++    BridgeKey_PageUp,
++    BridgeKey_PageDown,
++    BridgeKey_Insert,
++    BridgeKey_Delete,
++    BridgeKey_F1,
++    BridgeKey_F2,
++    BridgeKey_F3,
++    BridgeKey_F4,
++    BridgeKey_F5,
++    BridgeKey_F6,
++    BridgeKey_F7,
++    BridgeKey_F8,
++    BridgeKey_F9,
++    BridgeKey_F10,
++    BridgeKey_F11,
++    BridgeKey_F12,
++};
++
++/// Sends a non-text key press (arrows, function keys, etc.).
++void bridge_send_key(TerminalSession* session, int bridgeKey, uint32_t modifiers);
++
++/// Sends a text codepoint (a printable character).
++void bridge_send_char(TerminalSession* session, uint32_t codepoint, uint32_t modifiers);
++
++void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifiers);
++void bridge_mouse_release(TerminalSession* session, int x, int y, uint32_t modifiers);
++void bridge_focus_in(TerminalSession* session);
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index c4ea403b..9a137849 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -1,77 +1,121 @@
+ // SPDX-License-Identifier: Apache-2.0
+-#import <contour_macos/TerminalView.h>
+-
+-#include <contour_macos/TerminalSession.h>
++//
++// Objective-C++ view. Includes ONLY the engine-free SessionBridge.h (plus AppKit): the
++// engine headers use `id` as an identifier and cannot be parsed by the ObjC++ frontend.
+ 
+-#include <vtbackend/InputGenerator.h>
+-#include <vtrasterizer/FontDescriptions.h>
++#import <contour_macos/TerminalView.h>
+ 
+-#import <ApplicationServices/ApplicationServices.h>
++#include <contour_macos/SessionBridge.h>
+ 
+-#include <chrono>
+-#include <string>
+-
+-// Private helpers, declared so the C++ callbacks can target them via
+-// performSelectorOnMainThread: (no ObjC blocks — mainline GCC does not support them).
+-@interface TerminalView ()
+-- (void)mainThreadRedraw;
+-- (void)mainThreadSetTitle:(NSString*)title;
+-- (void)mainThreadBell;
+-- (void)mainThreadCopyToClipboard:(NSString*)text;
+-- (void)mainThreadClose;
+-@end
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace
+ {
+ 
+ using contour_macos::TerminalSession;
+ 
+-vtbackend::KeyboardModifiers keyboardModifiers(NSUInteger flags)
++uint32_t bridgeModifiers(NSUInteger flags)
+ {
+-    vtbackend::Modifiers mods {};
++    uint32_t mods = 0;
+     if (flags & NSShiftKeyMask)
+-        mods.enable(vtbackend::Modifier::Shift);
++        mods |= contour_macos::BridgeMod_Shift;
+     if (flags & NSControlKeyMask)
+-        mods.enable(vtbackend::Modifier::Control);
++        mods |= contour_macos::BridgeMod_Control;
+     if (flags & NSAlternateKeyMask)
+-        mods.enable(vtbackend::Modifier::Alt);
++        mods |= contour_macos::BridgeMod_Alt;
+     if (flags & NSCommandKeyMask)
+-        mods.enable(vtbackend::Modifier::Super);
+-    return vtbackend::KeyboardModifiers { mods };
++        mods |= contour_macos::BridgeMod_Super;
++    return mods;
+ }
+ 
+-bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
++int bridgeSpecialKey(unichar ch)
+ {
+     switch (ch)
+     {
+-        case NSUpArrowFunctionKey: outKey = vtbackend::Key::UpArrow; return true;
+-        case NSDownArrowFunctionKey: outKey = vtbackend::Key::DownArrow; return true;
+-        case NSLeftArrowFunctionKey: outKey = vtbackend::Key::LeftArrow; return true;
+-        case NSRightArrowFunctionKey: outKey = vtbackend::Key::RightArrow; return true;
+-        case NSHomeFunctionKey: outKey = vtbackend::Key::Home; return true;
+-        case NSEndFunctionKey: outKey = vtbackend::Key::End; return true;
+-        case NSPageUpFunctionKey: outKey = vtbackend::Key::PageUp; return true;
+-        case NSPageDownFunctionKey: outKey = vtbackend::Key::PageDown; return true;
+-        case NSDeleteFunctionKey: outKey = vtbackend::Key::Delete; return true;
+-        case NSInsertFunctionKey: outKey = vtbackend::Key::Insert; return true;
+-        case NSF1FunctionKey: outKey = vtbackend::Key::F1; return true;
+-        case NSF2FunctionKey: outKey = vtbackend::Key::F2; return true;
+-        case NSF3FunctionKey: outKey = vtbackend::Key::F3; return true;
+-        case NSF4FunctionKey: outKey = vtbackend::Key::F4; return true;
+-        case NSF5FunctionKey: outKey = vtbackend::Key::F5; return true;
+-        case NSF6FunctionKey: outKey = vtbackend::Key::F6; return true;
+-        case NSF7FunctionKey: outKey = vtbackend::Key::F7; return true;
+-        case NSF8FunctionKey: outKey = vtbackend::Key::F8; return true;
+-        case NSF9FunctionKey: outKey = vtbackend::Key::F9; return true;
+-        case NSF10FunctionKey: outKey = vtbackend::Key::F10; return true;
+-        case NSF11FunctionKey: outKey = vtbackend::Key::F11; return true;
+-        case NSF12FunctionKey: outKey = vtbackend::Key::F12; return true;
+-        default: return false;
++        case NSUpArrowFunctionKey: return contour_macos::BridgeKey_Up;
++        case NSDownArrowFunctionKey: return contour_macos::BridgeKey_Down;
++        case NSLeftArrowFunctionKey: return contour_macos::BridgeKey_Left;
++        case NSRightArrowFunctionKey: return contour_macos::BridgeKey_Right;
++        case NSHomeFunctionKey: return contour_macos::BridgeKey_Home;
++        case NSEndFunctionKey: return contour_macos::BridgeKey_End;
++        case NSPageUpFunctionKey: return contour_macos::BridgeKey_PageUp;
++        case NSPageDownFunctionKey: return contour_macos::BridgeKey_PageDown;
++        case NSDeleteFunctionKey: return contour_macos::BridgeKey_Delete;
++        case NSInsertFunctionKey: return contour_macos::BridgeKey_Insert;
++        case NSF1FunctionKey: return contour_macos::BridgeKey_F1;
++        case NSF2FunctionKey: return contour_macos::BridgeKey_F2;
++        case NSF3FunctionKey: return contour_macos::BridgeKey_F3;
++        case NSF4FunctionKey: return contour_macos::BridgeKey_F4;
++        case NSF5FunctionKey: return contour_macos::BridgeKey_F5;
++        case NSF6FunctionKey: return contour_macos::BridgeKey_F6;
++        case NSF7FunctionKey: return contour_macos::BridgeKey_F7;
++        case NSF8FunctionKey: return contour_macos::BridgeKey_F8;
++        case NSF9FunctionKey: return contour_macos::BridgeKey_F9;
++        case NSF10FunctionKey: return contour_macos::BridgeKey_F10;
++        case NSF11FunctionKey: return contour_macos::BridgeKey_F11;
++        case NSF12FunctionKey: return contour_macos::BridgeKey_F12;
++        default: return contour_macos::BridgeKey_None;
+     }
+ }
+ 
++// --- bridge callback trampolines (fire on the parser thread; marshal to main) ---
++
++void cbRequestRedraw(void* userData)
++{
++    TerminalView* view = (TerminalView*) userData;
++    [view performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
++}
++
++void cbSetTitle(void* userData, char const* utf8)
++{
++    TerminalView* view = (TerminalView*) userData;
++    NSString* t = [[NSString alloc] initWithUTF8String:utf8];
++    [view performSelectorOnMainThread:@selector(mainThreadSetTitle:) withObject:t waitUntilDone:NO];
++    [t release];
++}
++
++void cbBell(void* userData)
++{
++    TerminalView* view = (TerminalView*) userData;
++    [view performSelectorOnMainThread:@selector(mainThreadBell) withObject:nil waitUntilDone:NO];
++}
++
++void cbCopyToClipboard(void* userData, char const* utf8)
++{
++    TerminalView* view = (TerminalView*) userData;
++    NSString* s = [[NSString alloc] initWithUTF8String:utf8];
++    [view performSelectorOnMainThread:@selector(mainThreadCopyToClipboard:) withObject:s waitUntilDone:NO];
++    [s release];
++}
++
++char* cbReadClipboard(void* userData)
++{
++    (void) userData;
++    NSPasteboard* pb = [NSPasteboard generalPasteboard];
++    NSString* s = [pb stringForType:NSPasteboardTypeString];
++    if (!s)
++        return nullptr;
++    char const* utf8 = [s UTF8String];
++    return utf8 ? strdup(utf8) : nullptr;
++}
++
++void cbOnClosed(void* userData)
++{
++    TerminalView* view = (TerminalView*) userData;
++    [view performSelectorOnMainThread:@selector(mainThreadClose) withObject:nil waitUntilDone:NO];
++}
++
+ } // namespace
+ 
++@interface TerminalView ()
++- (void)mainThreadRedraw;
++- (void)mainThreadSetTitle:(NSString*)title;
++- (void)mainThreadBell;
++- (void)mainThreadCopyToClipboard:(NSString*)text;
++- (void)mainThreadClose;
++@end
++
+ @implementation TerminalView
+ 
+ - (TerminalSession*)session
+@@ -85,65 +129,37 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     if (!self)
+         return nil;
+ 
+-    auto fonts = vtrasterizer::FontDescriptions {};
+-    fonts.dpi = text::DPI { 96, 96 };
+-    fonts.size = text::font_size { fontSize };
+-    char const* family = [fontFamily UTF8String];
+-    for (text::font_description* fd: { &fonts.regular, &fonts.bold, &fonts.italic, &fonts.boldItalic })
++    contour_macos::BridgeFontConfig font;
++    font.family = [fontFamily UTF8String];
++    font.sizePt = fontSize;
++    font.dpiX = 96;
++    font.dpiY = 96;
++
++    contour_macos::BridgeCallbacks callbacks;
++    callbacks.userData = self;
++    callbacks.requestRedraw = cbRequestRedraw;
++    callbacks.setTitle = cbSetTitle;
++    callbacks.bell = cbBell;
++    callbacks.copyToClipboard = cbCopyToClipboard;
++    callbacks.readClipboard = cbReadClipboard;
++    callbacks.onClosed = cbOnClosed;
++
++    _session = contour_macos::bridge_create(
++        static_cast<int>(frame.size.width), static_cast<int>(frame.size.height), font, callbacks);
++    if (!_session)
+     {
+-        fd->familyName = family;
+-        fd->spacing = text::font_spacing::mono;
++        [self release];
++        return nil;
+     }
+-    fonts.bold.weight = text::font_weight::bold;
+-    fonts.italic.slant = text::font_slant::italic;
+-    fonts.boldItalic.weight = text::font_weight::bold;
+-    fonts.boldItalic.slant = text::font_slant::italic;
+-
+-    auto const surfaceSize = contour_macos::ImageSize {
+-        vtbackend::Width::cast_from(static_cast<int>(frame.size.width)),
+-        vtbackend::Height::cast_from(static_cast<int>(frame.size.height))
+-    };
+-
+-    // C++ callbacks fire on the parser thread; each marshals to the main thread with
+-    // performSelectorOnMainThread: (block-free). `view` is not retained: the view owns the
+-    // session and outlives it.
+-    TerminalView* view = self;
+-    contour_macos::TerminalSession::Callbacks callbacks;
+-    callbacks.requestRedraw = [view]() {
+-        [view performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
+-    };
+-    callbacks.setTitle = [view](std::string title) {
+-        NSString* t = [[NSString alloc] initWithUTF8String:title.c_str()];
+-        [view performSelectorOnMainThread:@selector(mainThreadSetTitle:) withObject:t waitUntilDone:NO];
+-        [t release]; // performSelector retains the argument for the duration of the call
+-    };
+-    callbacks.bell = [view]() {
+-        [view performSelectorOnMainThread:@selector(mainThreadBell) withObject:nil waitUntilDone:NO];
+-    };
+-    callbacks.copyToClipboard = [view](std::string data) {
+-        NSString* s = [[NSString alloc] initWithUTF8String:data.c_str()];
+-        [view performSelectorOnMainThread:@selector(mainThreadCopyToClipboard:) withObject:s waitUntilDone:NO];
+-        [s release];
+-    };
+-    callbacks.readClipboard = []() -> std::string {
+-        NSPasteboard* pb = [NSPasteboard generalPasteboard];
+-        NSString* s = [pb stringForType:NSPasteboardTypeString];
+-        return s ? std::string([s UTF8String]) : std::string {};
+-    };
+-    callbacks.onClosed = [view]() {
+-        [view performSelectorOnMainThread:@selector(mainThreadClose) withObject:nil waitUntilDone:NO];
+-    };
+-
+-    auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
+-    _session = new contour_macos::TerminalSession(pageSize, std::move(fonts), surfaceSize, std::move(callbacks));
+-    [self session]->start();
++    contour_macos::bridge_start([self session]);
+ 
+     return self;
+ }
+ 
+ - (void)dealloc
+ {
+-    delete [self session];
++    TerminalSession* s = [self session];
++    contour_macos::bridge_destroy(s);
+     _session = nullptr;
+     [super dealloc];
+ }
+@@ -197,25 +213,20 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     if (!session)
+         return;
+ 
+-    session->renderFrame();
+-    contour_macos::PixelBuffer const& buffer = session->renderTarget().outputBuffer();
+-    if (buffer.empty())
++    contour_macos::bridge_render_frame(session);
++    int w = 0;
++    int h = 0;
++    uint8_t const* bytes = contour_macos::bridge_output_buffer(session, &w, &h);
++    if (!bytes || w <= 0 || h <= 0)
+         return;
+ 
+-    size_t const w = buffer.width();
+-    size_t const h = buffer.height();
+-
+-    // The compositor produces straight (non-premultiplied) RGBA over a transparent surface.
+-    // The terminal frame is effectively opaque (backgrounds fill every cell), so treat the
+-    // alpha channel as skipped rather than premultiplied to avoid a premultiply mismatch.
++    // Straight (non-premultiplied) RGBA; the terminal frame is effectively opaque so the
++    // alpha channel is treated as skipped rather than premultiplied.
++    uint32_t const bitmapInfo =
++        (uint32_t) kCGImageAlphaNoneSkipLast | (uint32_t) kCGBitmapByteOrderDefault;
+     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+-    CGContextRef bmp = CGBitmapContextCreate(const_cast<uint8_t*>(buffer.data()),
+-                                             w,
+-                                             h,
+-                                             8,
+-                                             w * 4,
+-                                             cs,
+-                                             kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault);
++    CGContextRef bmp = CGBitmapContextCreate(
++        const_cast<uint8_t*>(bytes), (size_t) w, (size_t) h, 8, (size_t) w * 4, cs, bitmapInfo);
+     if (bmp)
+     {
+         CGImageRef image = CGBitmapContextCreateImage(bmp);
+@@ -236,9 +247,8 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     TerminalSession* session = [self session];
+     if (session)
+     {
+-        session->resize(contour_macos::ImageSize {
+-            vtbackend::Width::cast_from(static_cast<int>(newSize.width)),
+-            vtbackend::Height::cast_from(static_cast<int>(newSize.height)) });
++        contour_macos::bridge_resize(
++            session, static_cast<int>(newSize.width), static_cast<int>(newSize.height));
+         [self setNeedsDisplay:YES];
+     }
+ }
+@@ -251,17 +261,15 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     if (!session)
+         return;
+ 
+-    auto const now = std::chrono::steady_clock::now();
+-    auto const mods = keyboardModifiers([event modifierFlags]);
++    uint32_t const mods = bridgeModifiers([event modifierFlags]);
+     NSString* ignoringMods = [event charactersIgnoringModifiers];
+ 
+     if ([ignoringMods length] == 1)
+     {
+-        unichar ch = [ignoringMods characterAtIndex:0];
+-        vtbackend::Key specialKey {};
+-        if (mapSpecialKey(ch, specialKey))
++        int special = bridgeSpecialKey([ignoringMods characterAtIndex:0]);
++        if (special != contour_macos::BridgeKey_None)
+         {
+-            session->terminal().sendKeyEvent(specialKey, mods, vtbackend::KeyboardEventType::Press, now);
++            contour_macos::bridge_send_key(session, special, mods);
+             return;
+         }
+     }
+@@ -269,20 +277,7 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     NSString* text = [event characters];
+     NSUInteger n = [text length];
+     for (NSUInteger i = 0; i < n; ++i)
+-    {
+-        unichar ch = [text characterAtIndex:i];
+-        session->terminal().sendCharEvent(static_cast<char32_t>(ch),
+-                                          static_cast<uint32_t>(ch),
+-                                          mods,
+-                                          vtbackend::KeyboardEventType::Press,
+-                                          now);
+-    }
+-}
+-
+-- (vtbackend::PixelCoordinate)pixelAt:(NSEvent*)event
+-{
+-    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+-    return vtbackend::PixelCoordinate { { static_cast<int>(p.x) }, { static_cast<int>(p.y) } };
++        contour_macos::bridge_send_char(session, (uint32_t) [text characterAtIndex:i], mods);
+ }
+ 
+ - (void)mouseDown:(NSEvent*)event
+@@ -290,8 +285,9 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     TerminalSession* session = [self session];
+     if (!session)
+         return;
+-    vtbackend::Modifiers mods = keyboardModifiers([event modifierFlags]).chord;
+-    session->terminal().sendMousePressEvent(mods, vtbackend::MouseButton::Left, [self pixelAt:event], false);
++    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
++    contour_macos::bridge_mouse_press(
++        session, (int) p.x, (int) p.y, bridgeModifiers([event modifierFlags]));
+     [self setNeedsDisplay:YES];
+ }
+ 
+@@ -300,8 +296,9 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+     TerminalSession* session = [self session];
+     if (!session)
+         return;
+-    vtbackend::Modifiers mods = keyboardModifiers([event modifierFlags]).chord;
+-    session->terminal().sendMouseReleaseEvent(mods, vtbackend::MouseButton::Left, [self pixelAt:event], false);
++    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
++    contour_macos::bridge_mouse_release(
++        session, (int) p.x, (int) p.y, bridgeModifiers([event modifierFlags]));
+     [self setNeedsDisplay:YES];
+ }
+ 
+@@ -309,7 +306,7 @@ bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
+ {
+     TerminalSession* session = [self session];
+     if (session)
+-        session->terminal().sendFocusInEvent();
++        contour_macos::bridge_focus_in(session);
+     return [super becomeFirstResponder];
+ }
+ 
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index 39ac6885..c6cde8b7 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -5,7 +5,7 @@
+ 
+ // Minimal application delegate: creates one window with a TerminalView, and quits when the
+ // last window closes.
+-@interface ContourAppDelegate: NSObject
++@interface ContourAppDelegate: NSObject <NSApplicationDelegate>
+ {
+ @private
+     NSWindow* _window;
+-- 
+2.43.0
+

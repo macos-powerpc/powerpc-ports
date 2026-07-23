@@ -1,0 +1,854 @@
+From c2dc9214d923b28aa6c5e82f5fb5cc79402cc495 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 11:18:13 +0000
+Subject: [PATCH 17/67] =?UTF-8?q?feat(macos):=20interactive=20AppKit=20fro?=
+ =?UTF-8?q?ntend=20=E2=80=94=20session,=20view,=20app=20(task=205)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First draft of the native interactive terminal: an NSWindow + NSView driving
+the render loop and a real PTY-backed shell, with no Qt.
+
+- TerminalSession.{h,cpp}: pure-C++ engine wiring (no AppKit), implements
+  vtbackend::Terminal::Events. Owns the Terminal, Renderer and
+  SoftwareRenderTarget, spawns the login shell over a UnixPty via vtpty::Process,
+  and runs the blocking read/parse loop on its own thread. Host callbacks
+  (redraw/title/bell/clipboard/closed) fire on the parser thread; the view
+  marshals them to the main thread. Derives page size from the surface + cell
+  size; resize() re-derives and calls Terminal::resizeScreen.
+
+- TerminalView.{h,mm}: NSView (Objective-C++, no ARC). -drawRect: renders one
+  frame and blits the RGBA8 output buffer as a CGImage. keyDown maps special
+  keys to Key::* / sends text via sendCharEvent; mouse press/release wired.
+  Main-thread hops use performSelectorOnMainThread: (NOT ObjC blocks — mainline
+  GCC does not support ^{} blocks), and the code avoids @{}/@[]/@() literal sugar,
+  so it compiles with GCC's ObjC frontend, not only clang.
+
+- main.mm: NSApplication + delegate + window bootstrap, manual retain/release,
+  explicit NSAutoreleasePool.
+
+- CMake: build the `contour` app on APPLE (OBJCXX), linking contour_macos and the
+  AppKit/Foundation/ApplicationServices/CoreGraphics frameworks. No name clash
+  with the Qt `contour` target: src/contour is only entered when the Qt GUI is on,
+  which CONTOUR_FRONTEND_MACOS forces off.
+
+Not yet built on the target toolchain. Known risks to verify on gcc-mp-16:
+ObjC++ translation units include heavy C++23 engine headers (Terminal/Renderer/
+FontDescriptions) — the range-v3/ObjC++ `id` collision is gone on master (std
+<ranges>), but the whole chain compiling under GCC ObjC++ is unverified.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt      |  31 ++-
+ src/contour_macos/TerminalSession.cpp | 201 ++++++++++++++++
+ src/contour_macos/TerminalSession.h   |  96 ++++++++
+ src/contour_macos/TerminalView.h      |  24 ++
+ src/contour_macos/TerminalView.mm     | 316 ++++++++++++++++++++++++++
+ src/contour_macos/main.mm             |  71 ++++++
+ 6 files changed, 738 insertions(+), 1 deletion(-)
+ create mode 100644 src/contour_macos/TerminalSession.cpp
+ create mode 100644 src/contour_macos/TerminalSession.h
+ create mode 100644 src/contour_macos/TerminalView.h
+ create mode 100644 src/contour_macos/TerminalView.mm
+ create mode 100644 src/contour_macos/main.mm
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 3fe6da26..111f31b6 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -9,10 +9,12 @@ set(_header_files
+     PixelBuffer.h
+     SoftwareRenderTarget.h
+     StubRenderTarget.h
++    TerminalSession.h
+ )
+ 
+ set(_source_files
+     SoftwareRenderTarget.cpp
++    TerminalSession.cpp
+ )
+ 
+ source_group(Headers FILES ${_header_files})
+@@ -28,7 +30,7 @@ endif()
+ 
+ add_library(contour_macos STATIC ${_source_files} ${_header_files})
+ target_include_directories(contour_macos PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src)
+-target_link_libraries(contour_macos PUBLIC vtrasterizer vtbackend vtmux text_shaper crispy::core)
++target_link_libraries(contour_macos PUBLIC vtrasterizer vtbackend vtmux text_shaper vtpty crispy::core)
+ target_compile_options(contour_macos PRIVATE ${_contour_macos_warn_opts})
+ 
+ # Engine build smoke test (constructs Renderer + a no-op target; no window/PTY).
+@@ -40,3 +42,30 @@ target_compile_options(contour_macos_smoke PRIVATE ${_contour_macos_warn_opts})
+ add_executable(contour_macos_render_probe render_probe.cpp)
+ target_link_libraries(contour_macos_render_probe PRIVATE contour_macos)
+ target_compile_options(contour_macos_render_probe PRIVATE ${_contour_macos_warn_opts})
++
++# The interactive app: AppKit window + view + input (Objective-C++). APPLE-only.
++if(APPLE)
++    enable_language(OBJCXX)
++    set(_app_sources
++        TerminalView.mm
++        main.mm
++    )
++    set(_app_headers
++        TerminalView.h
++    )
++    add_executable(contour ${_app_sources} ${_app_headers})
++    target_link_libraries(contour PRIVATE contour_macos)
++    target_compile_options(contour PRIVATE ${_contour_macos_warn_opts})
++    # ObjC++ sources need to compile as Objective-C++; .mm is auto-detected, but set the
++    # standard to match the engine (C++23) for the C++ portions they include.
++    set_target_properties(contour PROPERTIES
++        CXX_STANDARD 23
++        OBJCXX_STANDARD 23
++    )
++    target_link_libraries(contour PRIVATE
++        "-framework AppKit"
++        "-framework Foundation"
++        "-framework ApplicationServices"
++        "-framework CoreGraphics"
++    )
++endif()
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+new file mode 100644
+index 00000000..bfc7e8af
+--- /dev/null
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <contour_macos/TerminalSession.h>
++
++#include <vtbackend/Settings.h>
++
++#include <vtpty/Process.h>
++#include <vtpty/Pty.h>
++
++#include <vtrasterizer/Decorator.h>
++
++#include <chrono>
++#include <utility>
++
++using namespace std::chrono;
++
++namespace contour_macos
++{
++
++namespace
++{
++    constexpr int PageMarginPx = 2;
++
++    [[nodiscard]] vtbackend::Settings makeSettings(vtbackend::PageSize pageSize)
++    {
++        auto settings = vtbackend::Settings {};
++        settings.pageSize = pageSize;
++        settings.maxHistoryLineCount = vtbackend::LineCount(1000);
++        settings.ptyReadBufferSize = 16384;
++        settings.goodImageProtocol = true;
++        settings.allowClipboardRead = true;
++        return settings;
++    }
++
++    [[nodiscard]] std::unique_ptr<vtpty::Pty> makePty(vtbackend::PageSize pageSize)
++    {
++        auto const shell = vtpty::Process::loginShell(false).front();
++        auto exe = vtpty::Process::ExecInfo {};
++        exe.program = shell;
++        exe.workingDirectory = vtpty::Process::homeDirectory();
++        exe.env = vtpty::Process::Environment { { "TERM", "xterm-256color" } };
++        return std::make_unique<vtpty::Process>(exe, vtpty::createPty(pageSize, std::nullopt), false);
++    }
++
++    [[nodiscard]] uint32_t widthOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.width)); }
++    [[nodiscard]] uint32_t heightOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.height)); }
++} // namespace
++
++TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
++                                 vtrasterizer::FontDescriptions fontDescriptions,
++                                 ImageSize surfaceSize,
++                                 Callbacks callbacks):
++    _callbacks { std::move(callbacks) },
++    _pageSize { pageSize },
++    _surfaceSize { surfaceSize },
++    _renderTarget { surfaceSize },
++    _renderer { pageSize,
++                std::move(fontDescriptions),
++                vtbackend::ColorPalette {},
++                crispy::strong_hashtable_size { 4096 },
++                crispy::lru_capacity { 4000 },
++                /* atlasDirectMapping */ true,
++                vtrasterizer::Decorator::Underline,
++                vtrasterizer::Decorator::CurlyUnderline }
++{
++    _renderer.setRenderTarget(_renderTarget);
++    (void) _renderer.applyStagedReconfigDuringSetup();
++
++    _pageSize = derivePageSize(surfaceSize);
++
++    _terminal = std::make_unique<vtbackend::Terminal>(
++        *this, makePty(_pageSize), makeSettings(_pageSize), steady_clock::now());
++
++    _renderTarget.setRenderSize(surfaceSize);
++    _renderer.applyResize(
++        surfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
++}
++
++TerminalSession::~TerminalSession()
++{
++    terminate();
++}
++
++vtbackend::PageSize TerminalSession::derivePageSize(ImageSize surfaceSize) const
++{
++    auto const cell = _renderer.gridMetrics().cellSize;
++    auto const cw = std::max(1u, static_cast<uint32_t>(unbox(cell.width)));
++    auto const ch = std::max(1u, static_cast<uint32_t>(unbox(cell.height)));
++    auto const usableW = widthOf(surfaceSize) > 2 * PageMarginPx ? widthOf(surfaceSize) - 2 * PageMarginPx : 0;
++    auto const usableH =
++        heightOf(surfaceSize) > 2 * PageMarginPx ? heightOf(surfaceSize) - 2 * PageMarginPx : 0;
++    auto const columns = std::max(1u, usableW / cw);
++    auto const lines = std::max(1u, usableH / ch);
++    return vtbackend::PageSize { vtbackend::LineCount(static_cast<int>(lines)),
++                                 vtbackend::ColumnCount(static_cast<int>(columns)) };
++}
++
++void TerminalSession::start()
++{
++    if (_started)
++        return;
++    _started = true;
++    _terminal->device().start();
++    _readThread = std::make_unique<std::thread>([this] { mainLoop(); });
++}
++
++void TerminalSession::mainLoop()
++{
++    while (!_terminating.load(std::memory_order_relaxed))
++    {
++        if (!_terminal->processInputOnce())
++            break;
++    }
++}
++
++void TerminalSession::terminate()
++{
++    if (_terminating.exchange(true))
++        return;
++    if (_terminal)
++    {
++        _terminal->device().wakeupReader(); // unblock a pending processInputOnce() read
++        _terminal->device().close();
++    }
++    if (_readThread && _readThread->joinable())
++        _readThread->join();
++    _readThread.reset();
++}
++
++void TerminalSession::renderFrame()
++{
++    _renderTarget.beginFrame();
++    _terminal->tick(steady_clock::now());
++    (void) _renderer.render(*_terminal, /* pressureHint */ false);
++}
++
++void TerminalSession::resize(ImageSize newSurfaceSize)
++{
++    if (newSurfaceSize == _surfaceSize)
++        return;
++    _surfaceSize = newSurfaceSize;
++    _renderTarget.setRenderSize(newSurfaceSize);
++    _pageSize = derivePageSize(newSurfaceSize);
++    _renderer.applyResize(
++        newSurfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
++    _terminal->resizeScreen(_pageSize, newSurfaceSize);
++}
++
++// --- Events (parser thread) ---
++
++void TerminalSession::screenUpdated()
++{
++    if (_callbacks.requestRedraw)
++        _callbacks.requestRedraw();
++}
++
++void TerminalSession::renderBufferUpdated()
++{
++    if (_callbacks.requestRedraw)
++        _callbacks.requestRedraw();
++}
++
++void TerminalSession::bell()
++{
++    if (_callbacks.bell)
++        _callbacks.bell();
++}
++
++void TerminalSession::setWindowTitle(std::string_view title)
++{
++    if (_callbacks.setTitle)
++        _callbacks.setTitle(std::string(title));
++}
++
++void TerminalSession::copyToClipboard(std::string_view data)
++{
++    if (_callbacks.copyToClipboard)
++        _callbacks.copyToClipboard(std::string(data));
++}
++
++std::string TerminalSession::getClipboard()
++{
++    return _callbacks.readClipboard ? _callbacks.readClipboard() : std::string {};
++}
++
++void TerminalSession::onClosed()
++{
++    if (_callbacks.onClosed)
++        _callbacks.onClosed();
++}
++
++void TerminalSession::requestWindowResize(vtbackend::LineCount, vtbackend::ColumnCount)
++{
++    // Window resize requested by the application (XTWINOPS); ignored for now.
++}
++
++void TerminalSession::requestWindowResize(vtbackend::Width, vtbackend::Height)
++{
++    // Window resize requested by the application (XTWINOPS); ignored for now.
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+new file mode 100644
+index 00000000..de306073
+--- /dev/null
++++ b/src/contour_macos/TerminalSession.h
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <contour_macos/SoftwareRenderTarget.h>
++
++#include <vtbackend/Terminal.h>
++#include <vtrasterizer/FontDescriptions.h>
++#include <vtrasterizer/Renderer.h>
++
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++
++namespace contour_macos
++{
++
++/// Engine wiring for one terminal, with no AppKit/CoreGraphics dependency.
++///
++/// Owns the vtbackend::Terminal, the vtrasterizer::Renderer, and the SoftwareRenderTarget,
++/// spawns the PTY + shell, and runs the blocking read/parse loop on its own thread. It
++/// implements vtbackend::Terminal::Events; the AppKit view installs callbacks (repaint,
++/// title, bell, clipboard) that the session invokes — always marshalled to the main thread
++/// by the host, since Events fire on the parser thread.
++///
++/// This mirrors what contour's Qt TerminalSession does, minus every Qt dependency.
++class TerminalSession: public vtbackend::Terminal::Events
++{
++  public:
++    /// Host hooks. All are invoked from the parser thread; the host is responsible for
++    /// dispatching UI work to the main thread.
++    struct Callbacks
++    {
++        std::function<void()> requestRedraw;                 ///< screen content changed
++        std::function<void(std::string)> setTitle;           ///< window title changed
++        std::function<void()> bell;                          ///< audible/visual bell
++        std::function<void(std::string)> copyToClipboard;    ///< write selection to clipboard
++        std::function<std::string()> readClipboard;          ///< read clipboard (OSC 52)
++        std::function<void()> onClosed;                      ///< shell exited / pty closed
++    };
++
++    TerminalSession(vtbackend::PageSize pageSize,
++                    vtrasterizer::FontDescriptions fontDescriptions,
++                    ImageSize surfaceSize,
++                    Callbacks callbacks);
++    ~TerminalSession() override;
++
++    /// Spawns the shell and starts the read/parse thread.
++    void start();
++
++    /// Stops the read loop and joins the thread. Idempotent.
++    void terminate();
++
++    [[nodiscard]] vtbackend::Terminal& terminal() noexcept { return *_terminal; }
++    [[nodiscard]] vtrasterizer::Renderer& renderer() noexcept { return _renderer; }
++    [[nodiscard]] SoftwareRenderTarget& renderTarget() noexcept { return _renderTarget; }
++
++    /// Renders one frame into the render target's output buffer. Call on the main thread
++    /// (e.g. from -drawRect:). Clears, ticks, renders.
++    void renderFrame();
++
++    /// Resizes the render surface and re-derives the page size from the cell size.
++    /// Call on the main thread when the view's pixel size changes.
++    void resize(ImageSize newSurfaceSize);
++
++    // --- vtbackend::Terminal::Events (fire on the parser thread) ---
++    void screenUpdated() override;
++    void renderBufferUpdated() override;
++    void bell() override;
++    void setWindowTitle(std::string_view title) override;
++    void copyToClipboard(std::string_view data) override;
++    std::string getClipboard() override;
++    void onClosed() override;
++    void requestWindowResize(vtbackend::LineCount, vtbackend::ColumnCount) override;
++    void requestWindowResize(vtbackend::Width, vtbackend::Height) override;
++    void openDocument(std::string_view /*fileOrUrl*/) override {}
++
++  private:
++    void mainLoop();
++    [[nodiscard]] vtbackend::PageSize derivePageSize(ImageSize surfaceSize) const;
++
++    Callbacks _callbacks;
++    vtbackend::PageSize _pageSize;
++    ImageSize _surfaceSize;
++
++    SoftwareRenderTarget _renderTarget;
++    vtrasterizer::Renderer _renderer;
++    std::unique_ptr<vtbackend::Terminal> _terminal;
++
++    std::unique_ptr<std::thread> _readThread;
++    std::atomic<bool> _terminating { false };
++    bool _started = false;
++};
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/TerminalView.h b/src/contour_macos/TerminalView.h
+new file mode 100644
+index 00000000..14de23c1
+--- /dev/null
++++ b/src/contour_macos/TerminalView.h
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#import <AppKit/AppKit.h>
++
++// An NSView that hosts one terminal session. It drives the render loop in -drawRect:
++// (blitting the session's RGBA8 output buffer as a CGImage), translates NSEvents into
++// engine input, and marshals the session's parser-thread callbacks onto the main thread.
++//
++// Written in manual-retain-release Objective-C++ (no ARC), so it compiles with GCC's
++// ObjC frontend as well as clang.
++@interface TerminalView: NSView
++{
++@private
++    void* _session; // contour_macos::TerminalSession* (owned)
++}
++
++// Creates the session (spawning a shell) sized to the given frame. Returns nil on failure.
++- (id)initWithFrame:(NSRect)frame fontFamily:(NSString*)fontFamily fontSize:(double)fontSize;
++
++// Requests a repaint on the main thread (safe to call from any thread).
++- (void)requestRedraw;
++
++@end
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+new file mode 100644
+index 00000000..c4ea403b
+--- /dev/null
++++ b/src/contour_macos/TerminalView.mm
+@@ -0,0 +1,316 @@
++// SPDX-License-Identifier: Apache-2.0
++#import <contour_macos/TerminalView.h>
++
++#include <contour_macos/TerminalSession.h>
++
++#include <vtbackend/InputGenerator.h>
++#include <vtrasterizer/FontDescriptions.h>
++
++#import <ApplicationServices/ApplicationServices.h>
++
++#include <chrono>
++#include <string>
++
++// Private helpers, declared so the C++ callbacks can target them via
++// performSelectorOnMainThread: (no ObjC blocks — mainline GCC does not support them).
++@interface TerminalView ()
++- (void)mainThreadRedraw;
++- (void)mainThreadSetTitle:(NSString*)title;
++- (void)mainThreadBell;
++- (void)mainThreadCopyToClipboard:(NSString*)text;
++- (void)mainThreadClose;
++@end
++
++namespace
++{
++
++using contour_macos::TerminalSession;
++
++vtbackend::KeyboardModifiers keyboardModifiers(NSUInteger flags)
++{
++    vtbackend::Modifiers mods {};
++    if (flags & NSShiftKeyMask)
++        mods.enable(vtbackend::Modifier::Shift);
++    if (flags & NSControlKeyMask)
++        mods.enable(vtbackend::Modifier::Control);
++    if (flags & NSAlternateKeyMask)
++        mods.enable(vtbackend::Modifier::Alt);
++    if (flags & NSCommandKeyMask)
++        mods.enable(vtbackend::Modifier::Super);
++    return vtbackend::KeyboardModifiers { mods };
++}
++
++bool mapSpecialKey(unichar ch, vtbackend::Key& outKey)
++{
++    switch (ch)
++    {
++        case NSUpArrowFunctionKey: outKey = vtbackend::Key::UpArrow; return true;
++        case NSDownArrowFunctionKey: outKey = vtbackend::Key::DownArrow; return true;
++        case NSLeftArrowFunctionKey: outKey = vtbackend::Key::LeftArrow; return true;
++        case NSRightArrowFunctionKey: outKey = vtbackend::Key::RightArrow; return true;
++        case NSHomeFunctionKey: outKey = vtbackend::Key::Home; return true;
++        case NSEndFunctionKey: outKey = vtbackend::Key::End; return true;
++        case NSPageUpFunctionKey: outKey = vtbackend::Key::PageUp; return true;
++        case NSPageDownFunctionKey: outKey = vtbackend::Key::PageDown; return true;
++        case NSDeleteFunctionKey: outKey = vtbackend::Key::Delete; return true;
++        case NSInsertFunctionKey: outKey = vtbackend::Key::Insert; return true;
++        case NSF1FunctionKey: outKey = vtbackend::Key::F1; return true;
++        case NSF2FunctionKey: outKey = vtbackend::Key::F2; return true;
++        case NSF3FunctionKey: outKey = vtbackend::Key::F3; return true;
++        case NSF4FunctionKey: outKey = vtbackend::Key::F4; return true;
++        case NSF5FunctionKey: outKey = vtbackend::Key::F5; return true;
++        case NSF6FunctionKey: outKey = vtbackend::Key::F6; return true;
++        case NSF7FunctionKey: outKey = vtbackend::Key::F7; return true;
++        case NSF8FunctionKey: outKey = vtbackend::Key::F8; return true;
++        case NSF9FunctionKey: outKey = vtbackend::Key::F9; return true;
++        case NSF10FunctionKey: outKey = vtbackend::Key::F10; return true;
++        case NSF11FunctionKey: outKey = vtbackend::Key::F11; return true;
++        case NSF12FunctionKey: outKey = vtbackend::Key::F12; return true;
++        default: return false;
++    }
++}
++
++} // namespace
++
++@implementation TerminalView
++
++- (TerminalSession*)session
++{
++    return static_cast<TerminalSession*>(_session);
++}
++
++- (id)initWithFrame:(NSRect)frame fontFamily:(NSString*)fontFamily fontSize:(double)fontSize
++{
++    self = [super initWithFrame:frame];
++    if (!self)
++        return nil;
++
++    auto fonts = vtrasterizer::FontDescriptions {};
++    fonts.dpi = text::DPI { 96, 96 };
++    fonts.size = text::font_size { fontSize };
++    char const* family = [fontFamily UTF8String];
++    for (text::font_description* fd: { &fonts.regular, &fonts.bold, &fonts.italic, &fonts.boldItalic })
++    {
++        fd->familyName = family;
++        fd->spacing = text::font_spacing::mono;
++    }
++    fonts.bold.weight = text::font_weight::bold;
++    fonts.italic.slant = text::font_slant::italic;
++    fonts.boldItalic.weight = text::font_weight::bold;
++    fonts.boldItalic.slant = text::font_slant::italic;
++
++    auto const surfaceSize = contour_macos::ImageSize {
++        vtbackend::Width::cast_from(static_cast<int>(frame.size.width)),
++        vtbackend::Height::cast_from(static_cast<int>(frame.size.height))
++    };
++
++    // C++ callbacks fire on the parser thread; each marshals to the main thread with
++    // performSelectorOnMainThread: (block-free). `view` is not retained: the view owns the
++    // session and outlives it.
++    TerminalView* view = self;
++    contour_macos::TerminalSession::Callbacks callbacks;
++    callbacks.requestRedraw = [view]() {
++        [view performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
++    };
++    callbacks.setTitle = [view](std::string title) {
++        NSString* t = [[NSString alloc] initWithUTF8String:title.c_str()];
++        [view performSelectorOnMainThread:@selector(mainThreadSetTitle:) withObject:t waitUntilDone:NO];
++        [t release]; // performSelector retains the argument for the duration of the call
++    };
++    callbacks.bell = [view]() {
++        [view performSelectorOnMainThread:@selector(mainThreadBell) withObject:nil waitUntilDone:NO];
++    };
++    callbacks.copyToClipboard = [view](std::string data) {
++        NSString* s = [[NSString alloc] initWithUTF8String:data.c_str()];
++        [view performSelectorOnMainThread:@selector(mainThreadCopyToClipboard:) withObject:s waitUntilDone:NO];
++        [s release];
++    };
++    callbacks.readClipboard = []() -> std::string {
++        NSPasteboard* pb = [NSPasteboard generalPasteboard];
++        NSString* s = [pb stringForType:NSPasteboardTypeString];
++        return s ? std::string([s UTF8String]) : std::string {};
++    };
++    callbacks.onClosed = [view]() {
++        [view performSelectorOnMainThread:@selector(mainThreadClose) withObject:nil waitUntilDone:NO];
++    };
++
++    auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
++    _session = new contour_macos::TerminalSession(pageSize, std::move(fonts), surfaceSize, std::move(callbacks));
++    [self session]->start();
++
++    return self;
++}
++
++- (void)dealloc
++{
++    delete [self session];
++    _session = nullptr;
++    [super dealloc];
++}
++
++- (BOOL)isFlipped
++{
++    return YES; // top-left origin, matching the render buffer
++}
++
++- (BOOL)acceptsFirstResponder
++{
++    return YES;
++}
++
++- (void)requestRedraw
++{
++    [self performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
++}
++
++- (void)mainThreadRedraw
++{
++    [self setNeedsDisplay:YES];
++}
++
++- (void)mainThreadSetTitle:(NSString*)title
++{
++    [[self window] setTitle:title];
++}
++
++- (void)mainThreadBell
++{
++    NSBeep();
++}
++
++- (void)mainThreadCopyToClipboard:(NSString*)text
++{
++    NSPasteboard* pb = [NSPasteboard generalPasteboard];
++    [pb clearContents];
++    [pb setString:text forType:NSPasteboardTypeString];
++}
++
++- (void)mainThreadClose
++{
++    [[self window] close];
++}
++
++- (void)drawRect:(NSRect)dirtyRect
++{
++    (void) dirtyRect;
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++
++    session->renderFrame();
++    contour_macos::PixelBuffer const& buffer = session->renderTarget().outputBuffer();
++    if (buffer.empty())
++        return;
++
++    size_t const w = buffer.width();
++    size_t const h = buffer.height();
++
++    // The compositor produces straight (non-premultiplied) RGBA over a transparent surface.
++    // The terminal frame is effectively opaque (backgrounds fill every cell), so treat the
++    // alpha channel as skipped rather than premultiplied to avoid a premultiply mismatch.
++    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++    CGContextRef bmp = CGBitmapContextCreate(const_cast<uint8_t*>(buffer.data()),
++                                             w,
++                                             h,
++                                             8,
++                                             w * 4,
++                                             cs,
++                                             kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault);
++    if (bmp)
++    {
++        CGImageRef image = CGBitmapContextCreateImage(bmp);
++        if (image)
++        {
++            CGContextRef view = (CGContextRef) [[NSGraphicsContext currentContext] graphicsPort];
++            CGContextDrawImage(view, CGRectMake(0, 0, w, h), image);
++            CGImageRelease(image);
++        }
++        CGContextRelease(bmp);
++    }
++    CGColorSpaceRelease(cs);
++}
++
++- (void)setFrameSize:(NSSize)newSize
++{
++    [super setFrameSize:newSize];
++    TerminalSession* session = [self session];
++    if (session)
++    {
++        session->resize(contour_macos::ImageSize {
++            vtbackend::Width::cast_from(static_cast<int>(newSize.width)),
++            vtbackend::Height::cast_from(static_cast<int>(newSize.height)) });
++        [self setNeedsDisplay:YES];
++    }
++}
++
++// --- input ---
++
++- (void)keyDown:(NSEvent*)event
++{
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++
++    auto const now = std::chrono::steady_clock::now();
++    auto const mods = keyboardModifiers([event modifierFlags]);
++    NSString* ignoringMods = [event charactersIgnoringModifiers];
++
++    if ([ignoringMods length] == 1)
++    {
++        unichar ch = [ignoringMods characterAtIndex:0];
++        vtbackend::Key specialKey {};
++        if (mapSpecialKey(ch, specialKey))
++        {
++            session->terminal().sendKeyEvent(specialKey, mods, vtbackend::KeyboardEventType::Press, now);
++            return;
++        }
++    }
++
++    NSString* text = [event characters];
++    NSUInteger n = [text length];
++    for (NSUInteger i = 0; i < n; ++i)
++    {
++        unichar ch = [text characterAtIndex:i];
++        session->terminal().sendCharEvent(static_cast<char32_t>(ch),
++                                          static_cast<uint32_t>(ch),
++                                          mods,
++                                          vtbackend::KeyboardEventType::Press,
++                                          now);
++    }
++}
++
++- (vtbackend::PixelCoordinate)pixelAt:(NSEvent*)event
++{
++    NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
++    return vtbackend::PixelCoordinate { { static_cast<int>(p.x) }, { static_cast<int>(p.y) } };
++}
++
++- (void)mouseDown:(NSEvent*)event
++{
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    vtbackend::Modifiers mods = keyboardModifiers([event modifierFlags]).chord;
++    session->terminal().sendMousePressEvent(mods, vtbackend::MouseButton::Left, [self pixelAt:event], false);
++    [self setNeedsDisplay:YES];
++}
++
++- (void)mouseUp:(NSEvent*)event
++{
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++    vtbackend::Modifiers mods = keyboardModifiers([event modifierFlags]).chord;
++    session->terminal().sendMouseReleaseEvent(mods, vtbackend::MouseButton::Left, [self pixelAt:event], false);
++    [self setNeedsDisplay:YES];
++}
++
++- (BOOL)becomeFirstResponder
++{
++    TerminalSession* session = [self session];
++    if (session)
++        session->terminal().sendFocusInEvent();
++    return [super becomeFirstResponder];
++}
++
++@end
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+new file mode 100644
+index 00000000..39ac6885
+--- /dev/null
++++ b/src/contour_macos/main.mm
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: Apache-2.0
++#import <contour_macos/TerminalView.h>
++
++#import <AppKit/AppKit.h>
++
++// Minimal application delegate: creates one window with a TerminalView, and quits when the
++// last window closes.
++@interface ContourAppDelegate: NSObject
++{
++@private
++    NSWindow* _window;
++}
++@end
++
++@implementation ContourAppDelegate
++
++- (void)applicationDidFinishLaunching:(NSNotification*)note
++{
++    (void) note;
++
++    NSRect const frame = NSMakeRect(0, 0, 720, 432);
++    NSUInteger const style = NSTitledWindowMask | NSClosableWindowMask | NSMiniaturizableWindowMask
++                             | NSResizableWindowMask;
++    _window = [[NSWindow alloc] initWithContentRect:frame
++                                          styleMask:style
++                                            backing:NSBackingStoreBuffered
++                                              defer:NO];
++    [_window setTitle:@"contour"];
++
++    TerminalView* view = [[TerminalView alloc] initWithFrame:frame fontFamily:@"Menlo" fontSize:14.0];
++    [_window setContentView:view];
++    [_window makeFirstResponder:view];
++    [view release];
++
++    [_window center];
++    [_window makeKeyAndOrderFront:nil];
++    [NSApp activateIgnoringOtherApps:YES];
++}
++
++- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app
++{
++    (void) app;
++    return YES;
++}
++
++- (void)dealloc
++{
++    [_window release];
++    [super dealloc];
++}
++
++@end
++
++int main(int argc, char const** argv)
++{
++    (void) argc;
++    (void) argv;
++
++    NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    NSApplication* app = [NSApplication sharedApplication];
++    [app setActivationPolicy:NSApplicationActivationPolicyRegular];
++
++    ContourAppDelegate* delegate = [[ContourAppDelegate alloc] init];
++    [app setDelegate:delegate];
++
++    [app run];
++
++    [delegate release];
++    [pool drain];
++    return 0;
++}
+-- 
+2.43.0
+

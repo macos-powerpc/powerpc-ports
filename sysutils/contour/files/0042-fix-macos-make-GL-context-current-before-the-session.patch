@@ -1,0 +1,152 @@
+From 234a97ed44935908df27376ebab057cece879930 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 22:01:02 +0000
+Subject: [PATCH 42/67] fix(macos): make GL context current before the session
+ is built
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CONTOUR_RENDER=gl bus-errored at launch: glGenTextures crashed inside
+GLRenderTarget::configureAtlas. The backtrace showed configureAtlas is
+called from the TerminalSession constructor (Renderer::setRenderTarget ->
+configureTextureAtlas), i.e. from inside bridge_create — long before the
+view had created or made-current any NSOpenGLContext. glGenTextures with
+no current context dereferences a null dispatch table and faults.
+
+The earlier design assumed GL calls happen only at render time, but the
+engine configures (and later uploads to) its texture atlas as part of
+renderer setup and glyph caching. So the context must be current for the
+whole session's GL activity, and must exist BEFORE bridge_create.
+
+Reorder view init: create the GL context and make it current first, then
+bridge_create (atlas setup now runs against a live context), then
+bridge_gl_initialize for the program/VBO. Texture creation needs only a
+context, not a drawable, so setView: (which requires the view to be in a
+window) is deferred to the first drawFrameGL, where flushBuffer needs it.
+If the GL context cannot be created, fall back to the CPU backend rather
+than construct a GL session with no context.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/TerminalView.mm | 66 ++++++++++++++++++++++++-------
+ 1 file changed, 52 insertions(+), 14 deletions(-)
+
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index e6516873..5acc290a 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -117,7 +117,7 @@ void cbOnClosed(void* userData)
+ - (void)mainThreadBell;
+ - (void)mainThreadCopyToClipboard:(NSString*)text;
+ - (void)mainThreadClose;
+-- (void)setupGLContext;
++- (void)createGLContext;
+ - (void)drawFrameCPU;
+ - (void)drawFrameGL;
+ @end
+@@ -157,6 +157,28 @@ void cbOnClosed(void* userData)
+     callbacks.readClipboard = cbReadClipboard;
+     callbacks.onClosed = cbOnClosed;
+ 
++    // Under the GL backend the context must be current BEFORE the session is created: the session
++    // constructor configures the renderer's texture atlas, which calls glGenTextures/glTexImage2D
++    // on the GL backend. Those need a current context (with no context, glGenTextures dereferences a
++    // null dispatch table and bus-errors). Create the context and make it current first; then the
++    // session ctor's atlas setup — and every later glyph upload — runs against a live context. A
++    // drawable is not required for texture creation, only for flushBuffer() at present time, so we
++    // attach the view (setView:) later, once we are in a window.
++    if (renderMode == contour_macos::BridgeRender_OpenGL)
++    {
++        [self createGLContext];
++        if (!_glContext)
++        {
++            // No GL context: fall back to the CPU backend rather than create a GL session with no
++            // context (which would bus-error at atlas setup).
++            NSLog(@"TerminalView: GL unavailable, falling back to CPU renderer");
++            renderMode = contour_macos::BridgeRender_CPU;
++            _renderMode = contour_macos::BridgeRender_CPU;
++        }
++        else
++            [_glContext makeCurrentContext];
++    }
++
+     _session = contour_macos::bridge_create(static_cast<int>(frame.size.width),
+                                             static_cast<int>(frame.size.height),
+                                             font,
+@@ -168,23 +190,27 @@ void cbOnClosed(void* userData)
+         return nil;
+     }
+ 
+-    // The engine may report a different render backend than requested (e.g. a future GL-init
+-    // failure could fall back to CPU); trust the session's actual choice for the present path.
+     _renderMode = contour_macos::bridge_render_mode([self session]);
+-    if (_renderMode == contour_macos::BridgeRender_OpenGL)
+-        [self setupGLContext];
++
++    // With the context current, create the GL program/VBO now (also needs a live context). The atlas
++    // was already configured by bridge_create; the program only has to exist before the first draw.
++    if (_renderMode == contour_macos::BridgeRender_OpenGL && _glContext)
++    {
++        contour_macos::bridge_gl_initialize([self session]);
++        _glInitialized = YES;
++    }
+ 
+     contour_macos::bridge_start([self session]);
+ 
+     return self;
+ }
+ 
+-// Creates a legacy (GL 2.x) pixel format and context and attaches it to this view. We request only
+-// a color buffer + double buffering — no depth/stencil, no core-profile hint — so the format is
+-// satisfiable on the 10.5/10.6 GL 2.0 baseline (PPC included). On failure we leave _glContext nil;
+-// drawRect: then falls back to the CPU present path, which draws nothing useful under a GL session
+-// but does not crash.
+-- (void)setupGLContext
++// Creates a legacy (GL 2.x) pixel format and context. We request only a color buffer + double
++// buffering — no depth/stencil, no core-profile hint — so the format is satisfiable on the 10.5/10.6
++// GL 2.0 baseline (PPC included). Does NOT attach the view yet (setView: needs a window/drawable,
++// which does not exist at init time); attachment happens lazily in drawFrameGL. Leaves _glContext
++// nil on failure.
++- (void)createGLContext
+ {
+     NSOpenGLPixelFormatAttribute attrs[] = {
+         NSOpenGLPFADoubleBuffer,
+@@ -206,7 +232,8 @@ void cbOnClosed(void* userData)
+         NSLog(@"TerminalView: failed to create GL context");
+         return;
+     }
+-    [_glContext setView:self];
++    // NB: no setView: here — the view is not in a window yet, so it would fail. drawFrameGL
++    // attaches the view lazily once there is a drawable.
+ }
+ 
+ - (void)dealloc
+@@ -330,10 +357,21 @@ void cbOnClosed(void* userData)
+     if (!_glContext)
+         return;
+ 
++    // Attach the view to the context the first time we draw with a window/drawable available
++    // (setView: fails before the view is in a window, which is why init did not do it). flushBuffer
++    // needs the drawable; texture setup done earlier did not.
++    if ([_glContext view] != self)
++    {
++        if ([self window])
++            [_glContext setView:self];
++        else
++            return; // no window yet — nothing to present to
++    }
++
+     [_glContext makeCurrentContext];
+ 
+-    // Create the GL program/atlas once the context is current (it cannot be done at session
+-    // construction, which runs before any GL context exists).
++    // The program/VBO were created in init (context was current then). If that somehow did not run,
++    // do it now so we never issue draws without a program.
+     if (!_glInitialized)
+     {
+         contour_macos::bridge_gl_initialize([self session]);
+-- 
+2.43.0
+

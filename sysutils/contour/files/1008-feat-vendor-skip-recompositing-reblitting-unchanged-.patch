@@ -1,0 +1,337 @@
+From 10e5ccded8d847243176069bc518a7a7bdc9a9f9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 21:07:35 +0000
+Subject: [PATCH 08/10] feat(vendor): skip recompositing/reblitting unchanged
+ rows in Renderer
+
+Consumes the per-line generation counters added in f81d736a. Renderer::render()
+gains an opt-in RenderDirtyMode::SkipUnchangedRows (default stays FullFrame,
+so every existing call site is unaffected): the single-pass render path
+diffs each row's RenderBuffer::lineGenerations entry against the previous
+frame's snapshot and filters cells/lines down to only the rows that
+changed, plus whichever row the cursor was on or has moved to (the cursor
+overlay leaves no trace in lineGenerations). lastDirtyRows() exposes which
+rows actually painted so a frontend can scope setNeedsDisplayInRect:/blit
+to just those pixel rows.
+
+RenderBuffer::lineGenerationsBase (paired with Terminal::
+captureLineGenerations()) records the absolute LineOffset lineGenerations[0]
+corresponds to, so isRowDirty() can map a RenderCell/RenderLine's absolute
+position back to an index without re-deriving Grid::render()'s own
+scrollOffset/extraLines math.
+
+A caller opting into SkipUnchangedRows takes on two obligations documented
+on the new members: its RenderTarget must retain unchanged pixels across
+frames (no per-frame full clear), and it must discard its own last-frame
+bookkeeping whenever pageSize()/scrollOffset() change (a resize/scroll
+changes what row N even means). The actual frontend consumer lands
+separately on the `frontend` branch.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/vtbackend/RenderBuffer.h  |  8 ++++
+ src/vtbackend/Terminal.cpp    |  1 +
+ src/vtbackend/Terminal.h      |  7 +--
+ src/vtrasterizer/Renderer.cpp | 81 ++++++++++++++++++++++++++++++++---
+ src/vtrasterizer/Renderer.h   | 71 +++++++++++++++++++++++++++++-
+ 5 files changed, 158 insertions(+), 10 deletions(-)
+
+diff --git a/src/vtbackend/RenderBuffer.h b/src/vtbackend/RenderBuffer.h
+index af06c001..e934feb6 100644
+--- a/src/vtbackend/RenderBuffer.h
++++ b/src/vtbackend/RenderBuffer.h
+@@ -122,12 +122,20 @@ struct RenderBuffer
+     /// just diff blindly.
+     std::vector<uint64_t> lineGenerations {};
+ 
++    /// The LineOffset that lineGenerations[0] corresponds to (matches the starting offset
++    /// Grid::render() itself walks from: -scrollOffset - extraLines). RenderCell::position.line and
++    /// RenderLine::lineOffset are absolute grid LineOffsets, so a consumer maps either to a
++    /// lineGenerations index via `*cellOrLine.position.line - *lineGenerationsBase` rather than
++    /// re-deriving the scrollOffset/extraLines math itself (which only Terminal has access to).
++    LineOffset lineGenerationsBase {};
++
+     void clear()
+     {
+         cells.clear();
+         lines.clear();
+         cursor.reset();
+         lineGenerations.clear();
++        lineGenerationsBase = LineOffset {};
+     }
+ };
+ 
+diff --git a/src/vtbackend/Terminal.cpp b/src/vtbackend/Terminal.cpp
+index 62763409..f5dd8864 100644
+--- a/src/vtbackend/Terminal.cpp
++++ b/src/vtbackend/Terminal.cpp
+@@ -665,6 +665,7 @@ void Terminal::captureLineGenerations(RenderBuffer& output,
+ 
+     output.lineGenerations.resize(static_cast<size_t>(rowCount));
+     auto i = -*scrollOffset - extraOffset;
++    output.lineGenerationsBase = LineOffset(i);
+     for (auto row = size_t { 0 }; row < static_cast<size_t>(rowCount); ++row, ++i)
+         output.lineGenerations[row] = grid.lineAt(LineOffset(i)).generation();
+ }
+diff --git a/src/vtbackend/Terminal.h b/src/vtbackend/Terminal.h
+index 09344b19..c64d8a0b 100644
+--- a/src/vtbackend/Terminal.h
++++ b/src/vtbackend/Terminal.h
+@@ -1887,9 +1887,10 @@ class Terminal
+     LineCount fillRenderBufferStatusLine(RenderBuffer& output, bool includeSelection, LineOffset base);
+ 
+     /// Snapshots each visible screen row's Line::generation() into output.lineGenerations, indexed
+-    /// the same way Grid::render() walks rows (accounting for scrollOffset and extraLines), so a
+-    /// frontend can diff row N this frame against row N last frame to skip recompositing/reblitting
+-    /// unchanged rows. Purely additive bookkeeping -- does not affect cells/lines/cursor.
++    /// the same way Grid::render() walks rows (accounting for scrollOffset and extraLines), and
++    /// records that indexing's starting LineOffset into output.lineGenerationsBase, so a frontend
++    /// can diff row N this frame against row N last frame to skip recompositing/reblitting unchanged
++    /// rows. Purely additive bookkeeping -- does not affect cells/lines/cursor.
+     void captureLineGenerations(RenderBuffer& output,
+                                 Screen const& displayedScreen,
+                                 ScrollOffset scrollOffset,
+diff --git a/src/vtrasterizer/Renderer.cpp b/src/vtrasterizer/Renderer.cpp
+index c37c031a..a421cd76 100644
+--- a/src/vtrasterizer/Renderer.cpp
++++ b/src/vtrasterizer/Renderer.cpp
+@@ -525,11 +525,11 @@ void Renderer::publishFontMetricsAndDescriptions()
+     }
+ }
+ 
+-bool Renderer::render(vtbackend::Terminal& terminal, bool pressure)
++bool Renderer::render(vtbackend::Terminal& terminal, bool pressure, RenderDirtyMode dirtyMode)
+ {
+     try
+     {
+-        return renderImpl(terminal, pressure);
++        return renderImpl(terminal, pressure, dirtyMode);
+     }
+     catch (std::exception const& e)
+     {
+@@ -542,7 +542,7 @@ bool Renderer::render(vtbackend::Terminal& terminal, bool pressure)
+     return false;
+ }
+ 
+-bool Renderer::renderImpl(vtbackend::Terminal& terminal, bool pressure)
++bool Renderer::renderImpl(vtbackend::Terminal& terminal, bool pressure, RenderDirtyMode dirtyMode)
+ {
+     // Hold _applyMutex across the whole frame: this both applies any staged reconfiguration and then
+     // renders from _gridMetrics / the texture atlas. Holding it for the full duration makes a GUI-thread
+@@ -620,16 +620,63 @@ bool Renderer::renderImpl(vtbackend::Terminal& terminal, bool pressure)
+ 
+     auto const primaryPressure = pressure && terminal.isPrimaryScreen();
+ 
++    _lastDirtyRows.clear();
++
+     if (smoothPixelOffset == 0)
+     {
+         // --- Single-pass rendering: no smooth scroll offset, no scissor needed ---
+         setSmoothScrollOffset(0);
++        // Populated only for RenderDirtyMode::SkipUnchangedRows: backing storage for the filtered
++        // spans passed to renderCells()/renderLines() below (declared here so it outlives the
++        // renderPass() lambda call that reads the spans).
++        auto filteredCells = std::vector<vtbackend::RenderCell> {};
++        auto filteredLines = std::vector<vtbackend::RenderLine> {};
+         renderPass(primaryPressure, [&] {
+             vtbackend::RenderBufferRef const renderBuffer = terminal.renderBuffer();
+             cursorOpt = renderBuffer.get().cursor;
+-            renderCells(std::span(renderBuffer.get().cells));
+-            renderLines(std::span(renderBuffer.get().lines));
++            if (dirtyMode != RenderDirtyMode::SkipUnchangedRows)
++            {
++                renderCells(std::span(renderBuffer.get().cells));
++                renderLines(std::span(renderBuffer.get().lines));
++                return;
++            }
++
++            // The previous frame's cursor row must always redraw even if its generation is
++            // unchanged: the cursor overlay (cell-color inversion or a dedicated shape, drawn
++            // separately below) left no trace in lineGenerations, so skipping it would leave a
++            // stale cursor glyph on screen once the cursor moves away from that row.
++            auto const previousCursorLine = _previousCursorPosition
++                                                ? std::optional { _previousCursorPosition->line }
++                                                : std::nullopt;
++            auto const currentCursorLine =
++                cursorOpt ? std::optional { cursorOpt->position.line } : std::nullopt;
++            // Rows are visited in ascending LineOffset order (cells/lines are each sorted by
++            // position, per findCellPartitionPoint()'s contract), so recording a row only when it
++            // differs from the last one recorded de-duplicates without a set.
++            auto const rowIsDirty = [&](vtbackend::LineOffset line) {
++                if (!(line == previousCursorLine || line == currentCursorLine || isRowDirty(renderBuffer.get(), line)))
++                    return false;
++                if (_lastDirtyRows.empty() || _lastDirtyRows.back() != line)
++                    _lastDirtyRows.push_back(line);
++                return true;
++            };
++
++            filteredCells.clear();
++            for (auto const& cell: renderBuffer.get().cells)
++                if (rowIsDirty(cell.position.line))
++                    filteredCells.push_back(cell);
++
++            filteredLines.clear();
++            for (auto const& line: renderBuffer.get().lines)
++                if (rowIsDirty(line.lineOffset))
++                    filteredLines.push_back(line);
++
++            renderCells(std::span(filteredCells));
++            renderLines(std::span(filteredLines));
++
++            updateDirtyTrackingSnapshot(renderBuffer.get());
+         });
++        _previousCursorPosition = cursorOpt.transform([](auto const& c) { return c.position; });
+     }
+     else
+     {
+@@ -784,6 +831,30 @@ void Renderer::renderLines(std::span<vtbackend::RenderLine const> lines)
+     }
+ }
+ 
++bool Renderer::isRowDirty(vtbackend::RenderBuffer const& buffer, vtbackend::LineOffset lineOffset) const
++{
++    if (!_havePreviousLineGenerations)
++        return true;
++
++    auto const currentIndex = *lineOffset - *buffer.lineGenerationsBase;
++    if (currentIndex < 0 || static_cast<size_t>(currentIndex) >= buffer.lineGenerations.size())
++        return true; // Out of the current snapshot's bounds; cannot claim knowledge, so redraw.
++
++    auto const previousIndex = *lineOffset - *_previousLineGenerationsBase;
++    if (previousIndex < 0 || static_cast<size_t>(previousIndex) >= _previousLineGenerations.size())
++        return true; // This grid line was not part of the previous frame's visible page at all.
++
++    return buffer.lineGenerations[static_cast<size_t>(currentIndex)]
++           != _previousLineGenerations[static_cast<size_t>(previousIndex)];
++}
++
++void Renderer::updateDirtyTrackingSnapshot(vtbackend::RenderBuffer const& buffer)
++{
++    _previousLineGenerations = buffer.lineGenerations;
++    _previousLineGenerationsBase = buffer.lineGenerationsBase;
++    _havePreviousLineGenerations = true;
++}
++
+ size_t Renderer::findCellPartitionPoint(std::vector<vtbackend::RenderCell> const& cells,
+                                         vtbackend::LineCount statusLineBoundary)
+ {
+diff --git a/src/vtrasterizer/Renderer.h b/src/vtrasterizer/Renderer.h
+index 958332d4..bf7c56db 100644
+--- a/src/vtrasterizer/Renderer.h
++++ b/src/vtrasterizer/Renderer.h
+@@ -43,6 +43,21 @@ struct RenderCursor
+     }
+ };
+ 
++/// Controls whether Renderer::render() may skip re-emitting draw commands for screen rows whose
++/// content provably did not change since the previous call (see vtbackend::RenderBuffer::
++/// lineGenerations). Opt-in: a caller whose RenderTarget does not preserve unchanged pixels across
++/// frames (e.g. one that clears its surface every frame) must keep FullFrame, or unchanged rows
++/// will render as blank.
++enum class RenderDirtyMode
++{
++    /// Emit commands for every visible cell/line every frame, as if no dirty-tracking existed.
++    FullFrame,
++    /// Skip cells/lines whose row generation is unchanged from the previous render() call. The
++    /// caller's RenderTarget must retain previously-drawn pixels for skipped rows (no per-frame
++    /// full-surface clear), or their content will not appear.
++    SkipUnchangedRows,
++};
++
+ /**
+  * Renders a terminal's screen to the current OpenGL context.
+  */
+@@ -232,13 +247,32 @@ class Renderer
+      *                       CPU intensive but allow to render fast.
+      *                       The user shall not notice that, because this frame
+      *                       is known already to be updated right after again.
++     * @param dirtyMode      FullFrame (default) renders every visible cell/line, matching prior
++     *                       behavior exactly. SkipUnchangedRows additionally skips rows whose
++     *                       content did not change since the previous render() call; only use this
++     *                       when the RenderTarget in use retains unchanged pixels across frames.
+      *
+      * @return true if a font reconfiguration was applied during this frame and the display must
+      *         re-derive its geometry against the new cell size (see applyPendingReconfig()). The flag is
+      *         consumed here, under _applyMutex, so it cannot also be consumed concurrently by a GUI-thread
+      *         applyStagedReconfigDuringSetup().
+      */
+-    [[nodiscard]] bool render(vtbackend::Terminal& terminal, bool pressureHint);
++    [[nodiscard]] bool render(vtbackend::Terminal& terminal,
++                              bool pressureHint,
++                              RenderDirtyMode dirtyMode = RenderDirtyMode::FullFrame);
++
++    /// The screen rows (grid-absolute LineOffset, main display only) the most recent render() call
++    /// actually (re)painted, when it was called with RenderDirtyMode::SkipUnchangedRows. A caller
++    /// whose RenderTarget does not clear its surface on its own must erase exactly these rows to the
++    /// default background before render()'s painted commands are composited (renderCell() does not
++    /// emit a background rect for a default-background cell, since the old full-frame-clear model
++    /// made that redundant), and may restrict its presentation (e.g. a CGContextDrawImage blit or
++    /// setNeedsDisplayInRect:) to the pixel rows these cover. Empty and meaningless after a
++    /// RenderDirtyMode::FullFrame call (everything was repainted; treat as "all rows").
++    [[nodiscard]] std::vector<vtbackend::LineOffset> const& lastDirtyRows() const noexcept
++    {
++        return _lastDirtyRows;
++    }
+ 
+     /// Synchronously applies any staged font/geometry reconfiguration.
+     ///
+@@ -300,7 +334,7 @@ class Renderer
+ 
+   private:
+     /// Internal implementation of render(), wrapped in a try/catch for graceful degradation.
+-    [[nodiscard]] bool renderImpl(vtbackend::Terminal& terminal, bool pressure);
++    [[nodiscard]] bool renderImpl(vtbackend::Terminal& terminal, bool pressure, RenderDirtyMode dirtyMode);
+ 
+     void configureTextureAtlas();
+ 
+@@ -320,6 +354,18 @@ class Renderer
+     /// @param lines  Contiguous sub-range of RenderLine entries to render.
+     void renderLines(std::span<vtbackend::RenderLine const> lines);
+ 
++    /// Returns whether the row @p lineOffset belongs to, per @p buffer's lineGenerations/
++    /// lineGenerationsBase, changed since the previous render() call's snapshot (_previousLine
++    /// Generations/_previousLineGenerationsBase). A row outside either snapshot's bounds, or a
++    /// mismatched previous snapshot (see updateDirtyTrackingSnapshot()), is conservatively dirty.
++    [[nodiscard]] bool isRowDirty(vtbackend::RenderBuffer const& buffer,
++                                  vtbackend::LineOffset lineOffset) const;
++
++    /// Replaces the stored previous-frame generation snapshot with @p buffer's, for the next
++    /// render() call's isRowDirty() comparisons. Called once per frame, after rendering, only when
++    /// dirty-tracking is in use.
++    void updateDirtyTrackingSnapshot(vtbackend::RenderBuffer const& buffer);
++
+     void executeImageDiscards();
+ 
+     crispy::strong_hashtable_size _atlasHashtableSlotCount;
+@@ -423,6 +469,27 @@ class Renderer
+     /// UI resize. nullopt until the first frame seeds it.
+     std::optional<vtbackend::PageSize> _lastObservedTotalPageSize;
+ 
++    /// Dirty-row tracking (RenderDirtyMode::SkipUnchangedRows only), render-thread-only.
++    ///
++    /// The previous render() call's vtbackend::RenderBuffer::lineGenerations/lineGenerationsBase,
++    /// used by isRowDirty() to decide which rows the current frame may skip. Empty/false until the
++    /// first SkipUnchangedRows frame seeds it, and deliberately NOT reset when FullFrame frames
++    /// happen in between: a caller may alternate modes (e.g. always-FullFrame on resize), and a
++    /// stale-but-still-row-comparable snapshot is exactly as valid as a fresh one — isRowDirty()
++    /// only trusts it when the row is actually in bounds.
++    std::vector<uint64_t> _previousLineGenerations;
++    vtbackend::LineOffset _previousLineGenerationsBase {};
++    bool _havePreviousLineGenerations = false;
++
++    /// The previous frame's cursor position (single-pass path only), so its row can always be
++    /// forced dirty even when its line generation alone would say otherwise (the cursor overlay
++    /// itself is not part of a Line's tracked content).
++    std::optional<vtbackend::CellLocation> _previousCursorPosition;
++
++    /// Rows the most recent SkipUnchangedRows render() call painted; see lastDirtyRows(). Cleared at
++    /// the start of every render() call, populated only when dirtyMode == SkipUnchangedRows.
++    std::vector<vtbackend::LineOffset> _lastDirtyRows;
++
+     /// Ensures a PendingReconfig exists and returns it. Caller must hold _reconfigMutex.
+     PendingReconfig& ensurePendingLocked()
+     {
+-- 
+2.43.0
+

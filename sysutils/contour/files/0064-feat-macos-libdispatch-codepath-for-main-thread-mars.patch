@@ -1,0 +1,307 @@
+From ca6b977128d04f7c8c547bf4c9260c2012fcc412 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 13:06:38 +0000
+Subject: [PATCH 64/67] feat(macos): libdispatch codepath for main-thread
+ marshaling (opt-in)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a compile-time alternative to performSelectorOnMainThread: for the
+parser/SSH-thread -> main-thread callback hops in TerminalView.mm (redraw,
+title, bell, clipboard, close, cwd-change, SSH hostkey prompt), gated by a
+new CMake option CONTOUR_USE_LIBDISPATCH (default OFF — performSelectorOnMainThread:
+stays the default, longer-proven path).
+
+- callOnMainThread / callOnMainThreadSync wrap dispatch_async_f / dispatch_sync_f
+  (libdispatch's function-pointer form, available on 10.6+) when the flag is on,
+  or performSelectorOnMainThread:waitUntilDone: (NO/YES) otherwise. No Blocks
+  syntax anywhere — Apple's gcc-4.2 can compile blocks, but the modern-gcc OBJCXX
+  path (the other frontend compiler this port supports) may lack a Blocks
+  runtime, so this avoids depending on blocks at all.
+- dispatch_async_f does not retain its context, unlike performSelectorOnMainThread:,
+  so the async path's context struct explicitly retains target+argument and
+  releases them after the call runs.
+- CONTOUR_USE_LIBDISPATCH is threaded into both frontend compile paths (the
+  gcc-4.2 custom-compile command and the modern-OBJCXX default) as a -D define;
+  no new link dependency (libdispatch ships in libSystem on 10.6+).
+
+Confined entirely to src/contour_macos/ (our GUI frontend); no engine changes.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ docs/macos-port.md                |  20 ++++--
+ src/contour_macos/CMakeLists.txt  |  23 ++++++
+ src/contour_macos/TerminalView.mm | 112 ++++++++++++++++++++++++++----
+ 3 files changed, 138 insertions(+), 17 deletions(-)
+
+diff --git a/docs/macos-port.md b/docs/macos-port.md
+index dd44e7e7..bae1880e 100644
+--- a/docs/macos-port.md
++++ b/docs/macos-port.md
+@@ -153,11 +153,21 @@ Three logical roles, collapsed from Qt's four to three here:
+ 
+ The one cross-thread seam to replace is upstream's `postToObject`
+ (`QMetaObject::invokeMethod(..., Qt::QueuedConnection)`): every backend→GUI hop
+-(schedule-redraw, title change, resize request, …) goes through it. It is replaced by
+-a single function that enqueues onto the main run loop —
+-`dispatch_async(dispatch_get_main_queue(), ^{ … })` (libdispatch, available on 10.6+),
+-or `CFRunLoopPerformBlock` + `CFRunLoopWakeUp`. Dispatched blocks must re-check object
+-liveness (window/session still alive) before touching them, as the Qt lambdas do.
++(schedule-redraw, title change, resize request, bell, clipboard, close, SSH hostkey
++prompt, …) goes through it. `TerminalView.mm` implements two interchangeable
++marshaling paths, selected at compile time by `CONTOUR_USE_LIBDISPATCH` (CMake option,
++default OFF):
++- **Default**: `performSelectorOnMainThread:withObject:waitUntilDone:` (NO for
++  fire-and-forget calls, YES for the synchronous SSH hostkey prompt). The longer-proven
++  path on this port.
++- **`CONTOUR_USE_LIBDISPATCH=ON`**: `dispatch_async_f`/`dispatch_sync_f` (libdispatch,
++  available on 10.6+) via `callOnMainThread`/`callOnMainThreadSync`. Deliberately the
++  function-pointer form, not `dispatch_async`/blocks — Apple's gcc-4.2 (the frontend's
++  known-good ObjC++ compiler, see the CMakeLists.txt note by the same name) can compile
++  blocks, but this port avoids them everywhere to not depend on that; the modern-gcc
++  OBJCXX path may not have a Blocks runtime available at all. The dispatched context
++  explicitly retains/releases its target+argument (dispatch_async_f does not retain
++  anything itself, unlike performSelectorOnMainThread:).
+ 
+ Cross-thread render safety is preserved by continuing to use
+ `refreshRenderBuffer()` + `renderBuffer()` (double buffer + RAII front-buffer lock)
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 6b74c09c..e2a62704 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -94,6 +94,17 @@ Empty = use the modern default OBJCXX compiler.")
+     set(CONTOUR_MACOS_OBJCXX_STD "gnu++98" CACHE STRING
+         "C++ standard for the frontend ObjC++ .mm files.")
+ 
++    # Marshals parser/SSH-thread -> main-thread callbacks (redraw, title, bell, clipboard,
++    # close, hostkey prompt) in TerminalView.mm via libdispatch (dispatch_async_f/
++    # dispatch_sync_f — the function-pointer form, no Blocks runtime required) instead of
++    # performSelectorOnMainThread:. libdispatch ships in libSystem on 10.6+, so this needs no
++    # extra link flags, only the define below (read by TerminalView.mm's #if
++    # CONTOUR_USE_LIBDISPATCH). Off by default: performSelectorOnMainThread: is the
++    # longer-proven path on this port; opt in once the libdispatch path has been exercised.
++    option(CONTOUR_USE_LIBDISPATCH
++        "Use libdispatch (dispatch_async_f/dispatch_sync_f) instead of performSelectorOnMainThread: \
++for the frontend's parser/SSH-thread -> main-thread callback marshaling." OFF)
++
+     set(_app_headers TerminalView.h SessionBridge.h)
+     set(_app_mm
+         "${CMAKE_CURRENT_SOURCE_DIR}/TerminalView.mm"
+@@ -123,6 +134,12 @@ Empty = use the modern default OBJCXX compiler.")
+         # quotes, which the compiler then treats as part of the directory name.
+         set(_fe_includes -I "${PROJECT_SOURCE_DIR}/src")
+ 
++        if(CONTOUR_USE_LIBDISPATCH)
++            set(_fe_defines -D CONTOUR_USE_LIBDISPATCH=1)
++        else()
++            set(_fe_defines -D CONTOUR_USE_LIBDISPATCH=0)
++        endif()
++
+         set(_app_objs "")
+         foreach(_mm IN LISTS _app_mm)
+             get_filename_component(_name "${_mm}" NAME_WE)
+@@ -134,6 +151,7 @@ Empty = use the modern default OBJCXX compiler.")
+                         -std=${CONTOUR_MACOS_OBJCXX_STD}
+                         ${_fe_flags}
+                         -O2 -DNDEBUG
++                        ${_fe_defines}
+                         ${_fe_includes}
+                         -c "${_mm}"
+                         -o "${_obj}"
+@@ -154,6 +172,11 @@ Empty = use the modern default OBJCXX compiler.")
+         set_target_properties(contour PROPERTIES OBJCXX_STANDARD_REQUIRED OFF)
+         target_compile_options(contour
+             PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-std=${CONTOUR_MACOS_OBJCXX_STD}>)
++        if(CONTOUR_USE_LIBDISPATCH)
++            target_compile_definitions(contour PRIVATE CONTOUR_USE_LIBDISPATCH=1)
++        else()
++            target_compile_definitions(contour PRIVATE CONTOUR_USE_LIBDISPATCH=0)
++        endif()
+     endif()
+ 
+     target_link_libraries(contour PRIVATE contour_macos)
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index c82a1acd..e9e8a065 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -13,11 +13,103 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#if CONTOUR_USE_LIBDISPATCH
++// libdispatch is present on 10.6+, but the *block* syntax it's normally used with needs a
++// Blocks runtime this frontend cannot assume (gcc-4.2 builds it under gnu++98). Use the
++// function-pointer form (dispatch_async_f/dispatch_sync_f) instead: no blocks anywhere.
++#include <dispatch/dispatch.h>
++#endif
++
+ namespace
+ {
+ 
+ using contour_macos::TerminalSession;
+ 
++#if CONTOUR_USE_LIBDISPATCH
++
++// Context for a fire-and-forget main-thread hop: retains `target` for the dispatched call's
++// lifetime (dispatch_async_f does not retain anything itself, unlike performSelectorOnMainThread:,
++// which implicitly retains its target/argument until the call runs) and carries one optional
++// argument, released after the call.
++struct MainThreadCallContext
++{
++    id target;
++    SEL selector;
++    id argument;
++};
++
++void runMainThreadCall(void* rawContext)
++{
++    MainThreadCallContext* context = static_cast<MainThreadCallContext*>(rawContext);
++    [context->target performSelector:context->selector withObject:context->argument];
++    [context->argument release];
++    [context->target release];
++    delete context;
++}
++
++// Async equivalent of [target performSelectorOnMainThread:selector withObject:argument
++// waitUntilDone:NO], via dispatch_async_f (no Blocks runtime required). `argument` may be nil.
++void dispatchToMainThread(id target, SEL selector, id argument)
++{
++    MainThreadCallContext* context = new MainThreadCallContext;
++    context->target = [target retain];
++    context->selector = selector;
++    context->argument = [argument retain];
++    dispatch_async_f(dispatch_get_main_queue(), context, runMainThreadCall);
++}
++
++// Context for a blocking main-thread hop: no retain needed (the calling thread blocks until
++// the call returns, so `target`/`argument` are kept alive by the caller's own stack frame).
++struct MainThreadSyncCallContext
++{
++    id target;
++    SEL selector;
++    id argument;
++};
++
++void runMainThreadSyncCall(void* rawContext)
++{
++    MainThreadSyncCallContext* context = static_cast<MainThreadSyncCallContext*>(rawContext);
++    [context->target performSelector:context->selector withObject:context->argument];
++}
++
++// Blocking equivalent of [target performSelectorOnMainThread:selector withObject:argument
++// waitUntilDone:YES], via dispatch_sync_f.
++void dispatchToMainThreadSync(id target, SEL selector, id argument)
++{
++    MainThreadSyncCallContext context;
++    context.target = target;
++    context.selector = selector;
++    context.argument = argument;
++    dispatch_sync_f(dispatch_get_main_queue(), &context, runMainThreadSyncCall);
++}
++
++#endif // CONTOUR_USE_LIBDISPATCH
++
++// Fire-and-forget hop from the parser/SSH thread to the main thread. Two implementations
++// selected at compile time by CONTOUR_USE_LIBDISPATCH: libdispatch's dispatch_async_f, or the
++// always-available performSelectorOnMainThread: fallback (identical observable behavior —
++// asynchronous, retains target+argument for the call's duration).
++void callOnMainThread(id target, SEL selector, id argument)
++{
++#if CONTOUR_USE_LIBDISPATCH
++    dispatchToMainThread(target, selector, argument);
++#else
++    [target performSelectorOnMainThread:selector withObject:argument waitUntilDone:NO];
++#endif
++}
++
++// Blocking hop from the parser/SSH thread to the main thread; returns once the call has run.
++// Used only for the SSH host-key prompt, which must complete before the caller can proceed.
++void callOnMainThreadSync(id target, SEL selector, id argument)
++{
++#if CONTOUR_USE_LIBDISPATCH
++    dispatchToMainThreadSync(target, selector, argument);
++#else
++    [target performSelectorOnMainThread:selector withObject:argument waitUntilDone:YES];
++#endif
++}
++
+ uint32_t bridgeModifiers(NSUInteger flags)
+ {
+     uint32_t mods = 0;
+@@ -67,28 +159,28 @@ int bridgeSpecialKey(unichar ch)
+ void cbRequestRedraw(void* userData)
+ {
+     TerminalView* view = (TerminalView*) userData;
+-    [view performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
++    callOnMainThread(view, @selector(mainThreadRedraw), nil);
+ }
+ 
+ void cbSetTitle(void* userData, char const* utf8)
+ {
+     TerminalView* view = (TerminalView*) userData;
+     NSString* t = [[NSString alloc] initWithUTF8String:utf8];
+-    [view performSelectorOnMainThread:@selector(mainThreadSetTitle:) withObject:t waitUntilDone:NO];
++    callOnMainThread(view, @selector(mainThreadSetTitle:), t);
+     [t release];
+ }
+ 
+ void cbBell(void* userData)
+ {
+     TerminalView* view = (TerminalView*) userData;
+-    [view performSelectorOnMainThread:@selector(mainThreadBell) withObject:nil waitUntilDone:NO];
++    callOnMainThread(view, @selector(mainThreadBell), nil);
+ }
+ 
+ void cbCopyToClipboard(void* userData, char const* utf8)
+ {
+     TerminalView* view = (TerminalView*) userData;
+     NSString* s = [[NSString alloc] initWithUTF8String:utf8];
+-    [view performSelectorOnMainThread:@selector(mainThreadCopyToClipboard:) withObject:s waitUntilDone:NO];
++    callOnMainThread(view, @selector(mainThreadCopyToClipboard:), s);
+     [s release];
+ }
+ 
+@@ -106,16 +198,14 @@ char* cbReadClipboard(void* userData)
+ void cbOnClosed(void* userData)
+ {
+     TerminalView* view = (TerminalView*) userData;
+-    [view performSelectorOnMainThread:@selector(mainThreadClose) withObject:nil waitUntilDone:NO];
++    callOnMainThread(view, @selector(mainThreadClose), nil);
+ }
+ 
+ void cbWorkingDirectoryChanged(void* userData, char const* utf8Cwd)
+ {
+     (void) utf8Cwd; // the view re-reads the cwd from the session on the main thread
+     TerminalView* view = (TerminalView*) userData;
+-    [view performSelectorOnMainThread:@selector(updateTitleFromWorkingDirectory)
+-                           withObject:nil
+-                        waitUntilDone:NO];
++    callOnMainThread(view, @selector(updateTitleFromWorkingDirectory), nil);
+ }
+ 
+ } // namespace
+@@ -148,9 +238,7 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+     prompt->fingerprint = fingerprint ? [NSString stringWithUTF8String:fingerprint] : @"";
+     prompt->accepted = NO;
+     // Run the modal alert on the main thread and block this (SSH) thread until the user answers.
+-    [(TerminalView*) userData performSelectorOnMainThread:@selector(mainThreadVerifyHostkey:)
+-                                               withObject:prompt
+-                                            waitUntilDone:YES];
++    callOnMainThreadSync((TerminalView*) userData, @selector(mainThreadVerifyHostkey:), prompt);
+     BOOL const accepted = prompt->accepted;
+     [prompt release];
+     return accepted ? 1 : 0;
+@@ -364,7 +452,7 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+ 
+ - (void)requestRedraw
+ {
+-    [self performSelectorOnMainThread:@selector(mainThreadRedraw) withObject:nil waitUntilDone:NO];
++    callOnMainThread(self, @selector(mainThreadRedraw), nil);
+ }
+ 
+ - (void)mainThreadRedraw
+-- 
+2.43.0
+

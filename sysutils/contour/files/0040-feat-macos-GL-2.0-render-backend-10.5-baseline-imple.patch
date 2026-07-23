@@ -1,0 +1,894 @@
+From 53dc9e68402ab1f036d21997d5959c7971529dff Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 20:06:12 +0000
+Subject: [PATCH 40/67] =?UTF-8?q?feat(macos):=20GL=202.0=20render=20backen?=
+ =?UTF-8?q?d=20(10.5=20baseline)=20=E2=80=94=20implementation=20only?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add GLRenderTarget, a second RenderTarget implementation alongside the CPU
+SoftwareRenderTarget. It implements the same three interfaces (RenderTarget,
+AtlasBackend, ImageTextureBackend) and reproduces the CPU backend's
+semantics: straight-alpha src-over blending, per-selector glyph tint
+(coverage in the red channel), nearest+clamp sampling, and the same z-order
+(background rects, below-text images, text tiles, above-text images).
+
+It is pure C++ with no AppKit/Cocoa type — it only calls gl* and assumes a
+context is current on the calling thread — so it compiles with the modern
+engine compiler and links with the C++23 engine exactly like the CPU
+backend. Vertex data goes through a client VBO (GL 1.5); a single GLSL 1.20
+program with a selector uniform draws solid fills, glyph tiles and image
+quads. All textures are normalized to RGBA8 on upload so sampling is
+identical regardless of source format.
+
+Everything stays within guaranteed GL 2.0 core (glActiveTexture 1.3,
+glBlendFuncSeparate 1.4, VBOs 1.5, shaders 2.0; no VAOs, no FBOs), so it
+builds against the 10.5 SDK — the safe PPC baseline. A CONTOUR_GL_BASELINE_105
+compile flag (default ON) is the documented seam for a future 10.6-rich
+codepath; it currently gates no behavior because both paths are byte-for-byte
+identical, and the header says so plainly.
+
+This commit is the backend in isolation: it is built into the contour_macos
+library (APPLE-only, linking -framework OpenGL) but is NOT yet selected by the
+session or driven by the view, so the working CPU frontend is unchanged. The
+NSOpenGLView render path and the backend selector land in a separate commit.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt     |  22 +
+ src/contour_macos/GLBaseline.h       |  36 ++
+ src/contour_macos/GLRenderTarget.cpp | 587 +++++++++++++++++++++++++++
+ src/contour_macos/GLRenderTarget.h   | 155 +++++++
+ 4 files changed, 800 insertions(+)
+ create mode 100644 src/contour_macos/GLBaseline.h
+ create mode 100644 src/contour_macos/GLRenderTarget.cpp
+ create mode 100644 src/contour_macos/GLRenderTarget.h
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 6fe7abc1..b952e5cd 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -6,6 +6,7 @@
+ # so it can be built and verified on any platform.
+ 
+ set(_header_files
++    GLBaseline.h
+     PixelBuffer.h
+     SessionBridge.h
+     SoftwareRenderTarget.h
+@@ -19,6 +20,14 @@ set(_source_files
+     TerminalSession.cpp
+ )
+ 
++# The GL 2.0 backend is pure C++ (it only calls gl*; it assumes a context is current) and needs
++# the OpenGL framework, which exists only on APPLE. Compile it into the library there; off-Apple
++# the CPU backend is the only one and this file is skipped.
++if(APPLE)
++    list(APPEND _header_files GLRenderTarget.h)
++    list(APPEND _source_files GLRenderTarget.cpp)
++endif()
++
+ source_group(Headers FILES ${_header_files})
+ source_group(Sources FILES ${_source_files})
+ 
+@@ -35,6 +44,19 @@ target_include_directories(contour_macos PUBLIC ${PROJECT_SOURCE_DIR}/src ${CMAK
+ target_link_libraries(contour_macos PUBLIC vtrasterizer vtbackend vtmux text_shaper vtpty crispy::core)
+ target_compile_options(contour_macos PRIVATE ${_contour_macos_warn_opts})
+ 
++# GLRenderTarget calls into the OpenGL framework. Default to the conservative 10.5 GL 2.0 baseline
++# (CONTOUR_GL_BASELINE_105=1) — the guaranteed-safe floor on PPC. Set CONTOUR_GL_BASELINE_105=OFF
++# to opt into the richer 10.6 GL path once it exists.
++if(APPLE)
++    option(CONTOUR_GL_BASELINE_105 "Build the GL backend against the conservative 10.5 GL 2.0 baseline" ON)
++    target_link_libraries(contour_macos PUBLIC "-framework OpenGL")
++    if(CONTOUR_GL_BASELINE_105)
++        target_compile_definitions(contour_macos PUBLIC CONTOUR_GL_BASELINE_105=1)
++    else()
++        target_compile_definitions(contour_macos PUBLIC CONTOUR_GL_BASELINE_105=0)
++    endif()
++endif()
++
+ # Engine build smoke test (constructs Renderer + a no-op target; no window/PTY).
+ add_executable(contour_macos_smoke smoke_main.cpp)
+ target_link_libraries(contour_macos_smoke PRIVATE contour_macos)
+diff --git a/src/contour_macos/GLBaseline.h b/src/contour_macos/GLBaseline.h
+new file mode 100644
+index 00000000..d58fd314
+--- /dev/null
++++ b/src/contour_macos/GLBaseline.h
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++// GL baseline selection for the OpenGL render backend.
++//
++// The OpenGL framework shipped with PPC macOS is not uniform: a 10.6 PPC machine may expose a GL
++// stack closer to the 10.5 feature set than an x86 10.6 machine does. We therefore do NOT key GL
++// capabilities off the macOS version macros (which are an unreliable proxy for what the GL driver
++// actually supports); the baseline is a compile-time choice instead.
++//
++// CONTOUR_GL_BASELINE_105 (default: 1) selects the conservative path that builds against the 10.5
++// SDK and uses only the guaranteed GL 2.0 core plus legacy pixel formats — the safe baseline for
++// PPC. Define it to 0 to opt into the slightly richer 10.6 path (e.g. GL_RED single-channel
++// textures instead of GL_LUMINANCE) when the target's GL framework is known to support it.
++//
++// Both paths stay within GL 2.0/2.1 core: client-side VBOs (GL 1.5), no VAOs, no FBOs, shader
++// pipeline only. GL versions below 2.0 are not supported by either path.
++//
++// STATUS: the backend currently normalizes every texture to RGBA8 and uses only guaranteed GL 2.0
++// core, so the 10.5 and 10.6 paths are byte-for-byte identical and this flag does not yet change
++// any behavior — it exists as the documented seam so a future 10.6-rich codepath (native
++// single-channel glyph atlas via GL_RED to halve atlas upload bandwidth, optional FBO atlas
++// readback) can land behind CONTOUR_GL_BASELINE_105 == 0 without touching the 10.5 path. The 10.5
++// baseline is the guaranteed-safe floor on PPC; keep it the default. See the "10.6-rich GL" task.
++
++#if !defined(CONTOUR_GL_BASELINE_105)
++    #define CONTOUR_GL_BASELINE_105 1
++#endif
++
++namespace contour_macos::glbaseline
++{
++
++/// True when compiled for the conservative 10.5 GL baseline (legacy single-channel formats).
++inline constexpr bool is105Baseline = (CONTOUR_GL_BASELINE_105 != 0);
++
++} // namespace contour_macos::glbaseline
+diff --git a/src/contour_macos/GLRenderTarget.cpp b/src/contour_macos/GLRenderTarget.cpp
+new file mode 100644
+index 00000000..f4a518e5
+--- /dev/null
++++ b/src/contour_macos/GLRenderTarget.cpp
+@@ -0,0 +1,587 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <contour_macos/GLRenderTarget.h>
++
++#include <contour_macos/GLBaseline.h>
++
++// Legacy (compatibility-profile) OpenGL. On the 10.5/10.6 SDK <OpenGL/gl.h> declares the GL 2.0
++// core — shaders, VBOs, glActiveTexture (1.3), glBlendFuncSeparate (1.4) — and <OpenGL/glext.h>
++// carries any remaining tokens. We deliberately stay within GL 2.0 core so the same code builds on
++// the 10.5 SDK (the safe PPC baseline) and runs on 10.6. Nothing here needs a 3.0+ core profile.
++#include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
++
++#include <cstdio>
++#include <cstring>
++#include <ostream>
++#include <vector>
++
++using vtrasterizer::atlas::ConfigureAtlas;
++using vtrasterizer::atlas::CreateImageTexture;
++using vtrasterizer::atlas::DestroyImageTexture;
++using vtrasterizer::atlas::Format;
++using vtrasterizer::atlas::ImageTextureId;
++using vtrasterizer::atlas::RenderImageGap;
++using vtrasterizer::atlas::RenderImageQuad;
++using vtrasterizer::atlas::RenderTile;
++using vtrasterizer::atlas::UploadTile;
++
++namespace contour_macos
++{
++
++namespace
++{
++    [[nodiscard]] uint32_t widthOf(GLRenderTarget::ImageSize s) noexcept
++    {
++        return static_cast<uint32_t>(unbox(s.width));
++    }
++    [[nodiscard]] uint32_t heightOf(GLRenderTarget::ImageSize s) noexcept
++    {
++        return static_cast<uint32_t>(unbox(s.height));
++    }
++
++    // GLSL 1.20 (OpenGL 2.0). A single program draws every quad: solid fills, glyph tiles and
++    // image quads. The selector uniform picks how the sampled texel becomes the output color,
++    // matching text.frag and SoftwareRenderTarget exactly.
++    char const* kVertexShader = "#version 120\n"
++                                "uniform mat4 uProjection;\n"
++                                "attribute vec2 aPosition;\n"
++                                "attribute vec2 aTexCoord;\n"
++                                "varying vec2 vTexCoord;\n"
++                                "void main() {\n"
++                                "    vTexCoord = aTexCoord;\n"
++                                "    gl_Position = uProjection * vec4(aPosition, 0.0, 1.0);\n"
++                                "}\n";
++
++    // Selector 2 = solid fill (no texture sample); 0 = glyph coverage in red channel tinted by
++    // uTint; 1 = image texel verbatim. Straight-alpha output; src-over blending is set by the
++    // fixed-function blend state, so the shader emits straight (non-premultiplied) RGBA.
++    char const* kFragmentShader = "#version 120\n"
++                                  "uniform sampler2D uSampler;\n"
++                                  "uniform int uSelector;\n"
++                                  "uniform vec4 uTint;\n"
++                                  "varying vec2 vTexCoord;\n"
++                                  "void main() {\n"
++                                  "    if (uSelector == 2) {\n"
++                                  "        gl_FragColor = uTint;\n"
++                                  "    } else if (uSelector == 1) {\n"
++                                  "        gl_FragColor = texture2D(uSampler, vTexCoord);\n"
++                                  "    } else {\n"
++                                  "        float coverage = texture2D(uSampler, vTexCoord).r;\n"
++                                  "        gl_FragColor = vec4(uTint.rgb, coverage * uTint.a);\n"
++                                  "    }\n"
++                                  "}\n";
++
++    constexpr uint32_t SelectorSolid = 2;
++
++    [[nodiscard]] unsigned compileShader(GLenum type, char const* src)
++    {
++        unsigned const shader = glCreateShader(type);
++        glShaderSource(shader, 1, &src, nullptr);
++        glCompileShader(shader);
++        GLint ok = GL_FALSE;
++        glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++        if (ok != GL_TRUE)
++        {
++            char log[1024] = { 0 };
++            glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
++            std::fprintf(stderr, "GLRenderTarget: shader compile failed: %s\n", log);
++            glDeleteShader(shader);
++            return 0;
++        }
++        return shader;
++    }
++} // namespace
++
++GLRenderTarget::GLRenderTarget(ImageSize size): _renderSize { size } {}
++
++GLRenderTarget::~GLRenderTarget()
++{
++    teardownGL();
++}
++
++void GLRenderTarget::setClearColor(float r, float g, float b, float a) noexcept
++{
++    _clearR = r;
++    _clearG = g;
++    _clearB = b;
++    _clearA = a;
++}
++
++void GLRenderTarget::initializeGL()
++{
++    if (_program)
++        return;
++
++    unsigned const vs = compileShader(GL_VERTEX_SHADER, kVertexShader);
++    unsigned const fs = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
++    if (!vs || !fs)
++        return;
++
++    _program = glCreateProgram();
++    glAttachShader(_program, vs);
++    glAttachShader(_program, fs);
++    glBindAttribLocation(_program, 0, "aPosition");
++    glBindAttribLocation(_program, 1, "aTexCoord");
++    glLinkProgram(_program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++
++    GLint linked = GL_FALSE;
++    glGetProgramiv(_program, GL_LINK_STATUS, &linked);
++    if (linked != GL_TRUE)
++    {
++        char log[1024] = { 0 };
++        glGetProgramInfoLog(_program, sizeof(log), nullptr, log);
++        std::fprintf(stderr, "GLRenderTarget: program link failed: %s\n", log);
++        glDeleteProgram(_program);
++        _program = 0;
++        return;
++    }
++
++    _uProjection = glGetUniformLocation(_program, "uProjection");
++    _uSelector = glGetUniformLocation(_program, "uSelector");
++    _uTint = glGetUniformLocation(_program, "uTint");
++    _uSampler = glGetUniformLocation(_program, "uSampler");
++    _aPosition = 0;
++    _aTexCoord = 1;
++
++    glGenBuffers(1, &_vbo);
++}
++
++void GLRenderTarget::teardownGL()
++{
++    for (auto const& [id, tex]: _imageTextures)
++        glDeleteTextures(1, &tex);
++    _imageTextures.clear();
++    if (_atlasTexture)
++    {
++        glDeleteTextures(1, &_atlasTexture);
++        _atlasTexture = 0;
++    }
++    if (_vbo)
++    {
++        glDeleteBuffers(1, &_vbo);
++        _vbo = 0;
++    }
++    if (_program)
++    {
++        glDeleteProgram(_program);
++        _program = 0;
++    }
++}
++
++void GLRenderTarget::setRenderSize(ImageSize size)
++{
++    _renderSize = size;
++    glViewport(0, 0, static_cast<GLsizei>(widthOf(size)), static_cast<GLsizei>(heightOf(size)));
++}
++
++void GLRenderTarget::beginFrame()
++{
++    glViewport(
++        0, 0, static_cast<GLsizei>(widthOf(_renderSize)), static_cast<GLsizei>(heightOf(_renderSize)));
++    glClearColor(_clearR, _clearG, _clearB, _clearA);
++    glClear(GL_COLOR_BUFFER_BIT);
++}
++
++std::optional<GLRenderTarget::ClipRect> GLRenderTarget::currentClip() const noexcept
++{
++    return _scissorBottomLeft;
++}
++
++void GLRenderTarget::renderRectangle(int x, int y, Width width, Height height, RGBAColor color)
++{
++    Quad q;
++    q.x = static_cast<float>(x);
++    q.y = static_cast<float>(y);
++    q.w = static_cast<float>(unbox(width));
++    q.h = static_cast<float>(unbox(height));
++    q.r = static_cast<float>(color.red()) / 255.f;
++    q.g = static_cast<float>(color.green()) / 255.f;
++    q.b = static_cast<float>(color.blue()) / 255.f;
++    q.a = static_cast<float>(color.alpha()) / 255.f;
++    q.solid = true;
++    q.clip = currentClip();
++    _rects.push_back(q);
++}
++
++void GLRenderTarget::configureAtlas(ConfigureAtlas atlas)
++{
++    _atlasSize = atlas.size;
++    if (!_atlasTexture)
++        glGenTextures(1, &_atlasTexture);
++    glBindTexture(GL_TEXTURE_2D, _atlasTexture);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    // Allocate an empty RGBA8 atlas; tiles arrive via uploadTile as glTexSubImage2D.
++    glTexImage2D(GL_TEXTURE_2D,
++                 0,
++                 GL_RGBA,
++                 static_cast<GLsizei>(widthOf(_atlasSize)),
++                 static_cast<GLsizei>(heightOf(_atlasSize)),
++                 0,
++                 GL_RGBA,
++                 GL_UNSIGNED_BYTE,
++                 nullptr);
++}
++
++void GLRenderTarget::uploadTile(UploadTile tile)
++{
++    auto const tw = widthOf(tile.bitmapSize);
++    auto const th = heightOf(tile.bitmapSize);
++    if (tw == 0 || th == 0 || !_atlasTexture)
++        return;
++
++    // Convert the source tile to RGBA8 CPU-side (Red -> (c,0,0,255); RGB -> (r,g,b,255); RGBA
++    // verbatim), matching SoftwareRenderTarget, then upload a single tight RGBA sub-image. This
++    // keeps the atlas a single RGBA texture and lets the fragment shader read glyph coverage from
++    // the red channel exactly as the CPU backend does.
++    auto const channels = static_cast<uint32_t>(tile.bitmapFormat);
++    std::vector<uint8_t> rgba(static_cast<size_t>(tw) * th * 4, 0);
++    for (uint32_t row = 0; row < th; ++row)
++    {
++        uint8_t const* srcRow = tile.bitmap.data() + static_cast<size_t>(row) * tw * channels;
++        uint8_t* dstRow = rgba.data() + static_cast<size_t>(row) * tw * 4;
++        for (uint32_t col = 0; col < tw; ++col)
++        {
++            uint8_t const* s = srcRow + static_cast<size_t>(col) * channels;
++            uint8_t* d = dstRow + static_cast<size_t>(col) * 4;
++            switch (tile.bitmapFormat)
++            {
++                case Format::Red:
++                    d[0] = s[0];
++                    d[1] = 0;
++                    d[2] = 0;
++                    d[3] = 255;
++                    break;
++                case Format::RGB:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = 255;
++                    break;
++                case Format::RGBA:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = s[3];
++                    break;
++            }
++        }
++    }
++
++    glBindTexture(GL_TEXTURE_2D, _atlasTexture);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glTexSubImage2D(GL_TEXTURE_2D,
++                    0,
++                    static_cast<GLint>(tile.location.x.value),
++                    static_cast<GLint>(tile.location.y.value),
++                    static_cast<GLsizei>(tw),
++                    static_cast<GLsizei>(th),
++                    GL_RGBA,
++                    GL_UNSIGNED_BYTE,
++                    rgba.data());
++}
++
++void GLRenderTarget::renderTile(RenderTile tile)
++{
++    Quad q;
++    q.x = static_cast<float>(tile.x.value);
++    q.y = static_cast<float>(tile.y.value);
++    q.w = static_cast<float>(widthOf(tile.targetSize));
++    q.h = static_cast<float>(heightOf(tile.targetSize));
++    q.u0 = tile.normalizedLocation.x;
++    q.v0 = tile.normalizedLocation.y;
++    q.u1 = tile.normalizedLocation.x + tile.normalizedLocation.width;
++    q.v1 = tile.normalizedLocation.y + tile.normalizedLocation.height;
++    q.r = tile.color[0];
++    q.g = tile.color[1];
++    q.b = tile.color[2];
++    q.a = tile.color[3];
++    // Selector 1 (image) samples verbatim; anything else is glyph coverage tinted by color.
++    q.selector = tile.fragmentShaderSelector == 1 ? SelectorImage : SelectorGlyphAlpha;
++    q.texture = _atlasTexture;
++    q.clip = currentClip();
++    _textTiles.push_back(q);
++}
++
++void GLRenderTarget::createImageTexture(CreateImageTexture param)
++{
++    auto const w = widthOf(param.size);
++    auto const h = heightOf(param.size);
++    if (w == 0 || h == 0)
++    {
++        _failedImageTextures.push_back(param.id);
++        return;
++    }
++
++    unsigned tex = 0;
++    glGenTextures(1, &tex);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++
++    // Widen the source to RGBA8 on the CPU and always upload GL_RGBA. This keeps a single, identical
++    // sampling path on both GL baselines: a single-channel source uploaded as GL_LUMINANCE (10.5) and
++    // as GL_RED (10.6) would sample differently ((L,L,L,1) vs (R,0,0,1)), so the image selector — which
++    // reads the texel verbatim — would disagree between baselines. Widening here removes that divergence
++    // entirely and matches SoftwareRenderTarget's RGBA image storage. Single-channel images are rare
++    // (images are RGB/RGBA); the copy cost only applies to them, and RGB widening is one alpha byte.
++    auto const channels = static_cast<uint32_t>(param.format);
++    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 0);
++    for (uint32_t row = 0; row < h; ++row)
++    {
++        uint8_t const* srcRow = param.data.data() + static_cast<size_t>(row) * w * channels;
++        uint8_t* dstRow = rgba.data() + static_cast<size_t>(row) * w * 4;
++        for (uint32_t col = 0; col < w; ++col)
++        {
++            uint8_t const* s = srcRow + static_cast<size_t>(col) * channels;
++            uint8_t* d = dstRow + static_cast<size_t>(col) * 4;
++            switch (param.format)
++            {
++                case Format::Red:
++                    d[0] = s[0];
++                    d[1] = s[0];
++                    d[2] = s[0];
++                    d[3] = 255;
++                    break;
++                case Format::RGB:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = 255;
++                    break;
++                case Format::RGBA:
++                    d[0] = s[0];
++                    d[1] = s[1];
++                    d[2] = s[2];
++                    d[3] = s[3];
++                    break;
++            }
++        }
++    }
++    glTexImage2D(GL_TEXTURE_2D,
++                 0,
++                 GL_RGBA,
++                 static_cast<GLsizei>(w),
++                 static_cast<GLsizei>(h),
++                 0,
++                 GL_RGBA,
++                 GL_UNSIGNED_BYTE,
++                 rgba.data());
++    _imageTextures[param.id.value] = tex;
++}
++
++void GLRenderTarget::destroyImageTexture(DestroyImageTexture param)
++{
++    auto const it = _imageTextures.find(param.id.value);
++    if (it == _imageTextures.end())
++        return;
++    glDeleteTextures(1, &it->second);
++    _imageTextures.erase(it);
++}
++
++void GLRenderTarget::renderImageQuad(RenderImageQuad param)
++{
++    auto const it = _imageTextures.find(param.texture.value);
++    if (it == _imageTextures.end())
++        return;
++
++    Quad q;
++    q.x = static_cast<float>(param.x);
++    q.y = static_cast<float>(param.y);
++    q.w = static_cast<float>(widthOf(param.targetSize));
++    q.h = static_cast<float>(heightOf(param.targetSize));
++    q.u0 = param.source.x;
++    q.v0 = param.source.y;
++    q.u1 = param.source.x + param.source.width;
++    q.v1 = param.source.y + param.source.height;
++    q.r = param.color[0];
++    q.g = param.color[1];
++    q.b = param.color[2];
++    q.a = param.color[3];
++    q.selector = SelectorImage;
++    q.texture = it->second;
++    q.clip = currentClip();
++    (param.aboveText ? _imagesAboveText : _imagesBelowText).push_back(q);
++}
++
++void GLRenderTarget::renderImageGap(RenderImageGap param)
++{
++    Quad q;
++    q.x = static_cast<float>(param.x);
++    q.y = static_cast<float>(param.y);
++    q.w = static_cast<float>(widthOf(param.size));
++    q.h = static_cast<float>(heightOf(param.size));
++    q.r = static_cast<float>(param.color.red()) / 255.f;
++    q.g = static_cast<float>(param.color.green()) / 255.f;
++    q.b = static_cast<float>(param.color.blue()) / 255.f;
++    q.a = static_cast<float>(param.color.alpha()) / 255.f;
++    q.solid = true;
++    q.clip = currentClip();
++    (param.aboveText ? _imagesAboveText : _imagesBelowText).push_back(q);
++}
++
++std::vector<ImageTextureId> GLRenderTarget::takeFailedImageTextures()
++{
++    return std::move(_failedImageTextures);
++}
++
++void GLRenderTarget::setScissorRect(int x, int y, int width, int height)
++{
++    // The engine issues scissor rects in bottom-left device pixels, which is what glScissor wants.
++    _scissorBottomLeft = ClipRect { x, y, width, height };
++}
++
++void GLRenderTarget::clearScissorRect()
++{
++    _scissorBottomLeft.reset();
++}
++
++void GLRenderTarget::drawQuad(Quad const& q)
++{
++    if (q.clip.has_value())
++    {
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(q.clip->x, q.clip->y, q.clip->width, q.clip->height);
++    }
++    else
++        glDisable(GL_SCISSOR_TEST);
++
++    glUniform1i(_uSelector, static_cast<GLint>(q.solid ? SelectorSolid : q.selector));
++    glUniform4f(_uTint, q.r, q.g, q.b, q.a);
++
++    if (!q.solid)
++    {
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, q.texture);
++        glUniform1i(_uSampler, 0);
++    }
++
++    // Two triangles, top-left origin (matches the projection below). Interleaved x,y,u,v.
++    float const x0 = q.x, y0 = q.y, x1 = q.x + q.w, y1 = q.y + q.h;
++    float const verts[] = {
++        x0, y0, q.u0, q.v0, x1, y0, q.u1, q.v0, x1, y1, q.u1, q.v1,
++        x0, y0, q.u0, q.v0, x1, y1, q.u1, q.v1, x0, y1, q.u0, q.v1,
++    };
++
++    glBindBuffer(GL_ARRAY_BUFFER, _vbo);
++    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
++    glEnableVertexAttribArray(static_cast<GLuint>(_aPosition));
++    glEnableVertexAttribArray(static_cast<GLuint>(_aTexCoord));
++    glVertexAttribPointer(
++        static_cast<GLuint>(_aPosition), 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*) 0);
++    glVertexAttribPointer(static_cast<GLuint>(_aTexCoord),
++                          2,
++                          GL_FLOAT,
++                          GL_FALSE,
++                          4 * sizeof(float),
++                          (void*) (2 * sizeof(float)));
++    glDrawArrays(GL_TRIANGLES, 0, 6);
++}
++
++void GLRenderTarget::emitQuads(std::vector<Quad> const& quads)
++{
++    for (auto const& q: quads)
++        drawQuad(q);
++}
++
++void GLRenderTarget::execute(std::chrono::steady_clock::time_point /*now*/)
++{
++    if (!_program)
++    {
++        _rects.clear();
++        _imagesBelowText.clear();
++        _textTiles.clear();
++        _imagesAboveText.clear();
++        return;
++    }
++
++    glUseProgram(_program);
++
++    // Straight-alpha src-over: out.rgb = s.rgb*s.a + d.rgb*(1-s.a); out.a = s.a + d.a*(1-s.a).
++    glEnable(GL_BLEND);
++    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++
++    // Orthographic projection with a top-left origin: x in [0,w] -> [-1,1], y in [0,h] -> [1,-1].
++    auto const w = static_cast<float>(widthOf(_renderSize));
++    auto const h = static_cast<float>(heightOf(_renderSize));
++    float const sx = w > 0 ? 2.f / w : 0.f;
++    float const sy = h > 0 ? 2.f / h : 0.f;
++    // Column-major mat4 (OpenGL convention).
++    float const proj[16] = {
++        sx, 0.f, 0.f, 0.f, 0.f, -sy, 0.f, 0.f, 0.f, 0.f, -1.f, 0.f, -1.f, 1.f, 0.f, 1.f,
++    };
++    glUniformMatrix4fv(_uProjection, 1, GL_FALSE, proj);
++
++    // z-order: background rects -> below-text images -> text -> above-text images.
++    emitQuads(_rects);
++    emitQuads(_imagesBelowText);
++    emitQuads(_textTiles);
++    emitQuads(_imagesAboveText);
++
++    glDisable(GL_SCISSOR_TEST);
++
++    _rects.clear();
++    _imagesBelowText.clear();
++    _textTiles.clear();
++    _imagesAboveText.clear();
++
++    if (_pendingScreenshot)
++    {
++        // Read the framebuffer back as RGBA8, top-left origin (flip rows from GL bottom-left).
++        auto const pw = widthOf(_renderSize);
++        auto const ph = heightOf(_renderSize);
++        std::vector<uint8_t> pixels(static_cast<size_t>(pw) * ph * 4, 0);
++        glPixelStorei(GL_PACK_ALIGNMENT, 1);
++        glReadPixels(0,
++                     0,
++                     static_cast<GLsizei>(pw),
++                     static_cast<GLsizei>(ph),
++                     GL_RGBA,
++                     GL_UNSIGNED_BYTE,
++                     pixels.data());
++        std::vector<uint8_t> flipped(pixels.size());
++        for (uint32_t row = 0; row < ph; ++row)
++            std::memcpy(flipped.data() + static_cast<size_t>(row) * pw * 4,
++                        pixels.data() + static_cast<size_t>(ph - 1 - row) * pw * 4,
++                        static_cast<size_t>(pw) * 4);
++        auto cb = std::move(*_pendingScreenshot);
++        _pendingScreenshot.reset();
++        cb(flipped, _renderSize);
++    }
++}
++
++void GLRenderTarget::scheduleScreenshot(ScreenshotCallback callback)
++{
++    _pendingScreenshot = std::move(callback);
++}
++
++void GLRenderTarget::clearCache()
++{
++    for (auto const& [id, tex]: _imageTextures)
++        glDeleteTextures(1, &tex);
++    _imageTextures.clear();
++    _failedImageTextures.clear();
++}
++
++std::optional<vtrasterizer::AtlasTextureScreenshot> GLRenderTarget::readAtlas()
++{
++    // Not used by the live frontend (the CPU backend serves the atlas-inspection path); GL atlas
++    // readback would require binding it to an FBO. Return empty rather than pretend.
++    return std::nullopt;
++}
++
++void GLRenderTarget::inspect(std::ostream& output) const
++{
++    output << "GLRenderTarget: renderSize=" << widthOf(_renderSize) << "x" << heightOf(_renderSize)
++           << ", atlas=" << widthOf(_atlasSize) << "x" << heightOf(_atlasSize)
++           << ", imageTextures=" << _imageTextures.size() << '\n';
++}
++
++} // namespace contour_macos
+diff --git a/src/contour_macos/GLRenderTarget.h b/src/contour_macos/GLRenderTarget.h
+new file mode 100644
+index 00000000..5a8bb501
+--- /dev/null
++++ b/src/contour_macos/GLRenderTarget.h
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <vtrasterizer/ImageTextureBackend.h>
++#include <vtrasterizer/RenderTarget.h>
++#include <vtrasterizer/TextureAtlas.h>
++
++#include <cstdint>
++#include <optional>
++#include <unordered_map>
++#include <vector>
++
++namespace contour_macos
++{
++
++/// OpenGL 2.0 (GLSL 1.20) implementation of the contour render backend.
++///
++/// Implements the same three interfaces as SoftwareRenderTarget — RenderTarget, AtlasBackend and
++/// ImageTextureBackend — but instead of compositing into a CPU buffer it batches textured/solid
++/// quads and issues them with OpenGL 2.0 in execute(). It reproduces the CPU backend's semantics:
++/// straight-alpha src-over blending, per-selector glyph tint, nearest+clamp sampling, and the same
++/// z-order (background rects, below-text images, text tiles, above-text images).
++///
++/// This class is deliberately free of any AppKit/Cocoa type. It assumes a compatible GL context is
++/// current on the calling thread (the NSOpenGLView makes its context current before render()); it
++/// only calls into the gl* API. That keeps it compilable by the modern engine compiler and linkable
++/// with the C++23 engine, exactly like SoftwareRenderTarget, and makes it a drop-in sibling behind
++/// the RenderTarget seam — selecting it changes nothing in the engine or the CPU path.
++class GLRenderTarget final:
++    public vtrasterizer::RenderTarget,
++    public vtrasterizer::atlas::AtlasBackend,
++    public vtrasterizer::atlas::ImageTextureBackend
++{
++  public:
++    using ImageSize = vtrasterizer::ImageSize;
++    using PageMargin = vtrasterizer::PageMargin;
++
++    explicit GLRenderTarget(ImageSize size);
++    ~GLRenderTarget() override;
++
++    /// Creates the GL program, VBO and atlas texture. Must be called with the GL context current,
++    /// after the context exists but before the first frame. Separated from the constructor because
++    /// the owning view creates the context and makes it current only once its NSOpenGLView is set up.
++    void initializeGL();
++
++    /// Releases all GL objects. Must be called with the context current (e.g. from the view's
++    /// teardown). Idempotent.
++    void teardownGL();
++
++    /// Clears the framebuffer for a new frame. Call with the context current before driving
++    /// vtrasterizer::Renderer::render(); mirrors SoftwareRenderTarget::beginFrame().
++    void beginFrame();
++
++    /// The background clear color (straight RGBA, 0..1). Defaults to opaque black.
++    void setClearColor(float r, float g, float b, float a) noexcept;
++
++    // --- vtrasterizer::RenderTarget ---
++    void setRenderSize(ImageSize size) override;
++    [[nodiscard]] ImageSize renderSize() const noexcept override { return _renderSize; }
++    void setMargin(PageMargin /*margin*/) override {} // baked into vertex coords upstream; no-op
++    vtrasterizer::atlas::AtlasBackend& textureScheduler() override { return *this; }
++    vtrasterizer::atlas::ImageTextureBackend& imageScheduler() override { return *this; }
++    void renderRectangle(int x, int y, Width width, Height height, RGBAColor color) override;
++    void scheduleScreenshot(ScreenshotCallback callback) override;
++    void setScissorRect(int x, int y, int width, int height) override;
++    void clearScissorRect() override;
++    void execute(std::chrono::steady_clock::time_point now) override;
++    void clearCache() override;
++    std::optional<vtrasterizer::AtlasTextureScreenshot> readAtlas() override;
++    void inspect(std::ostream& output) const override;
++
++    // --- vtrasterizer::atlas::AtlasBackend ---
++    [[nodiscard]] ImageSize atlasSize() const noexcept override { return _atlasSize; }
++    void configureAtlas(vtrasterizer::atlas::ConfigureAtlas atlas) override;
++    void uploadTile(vtrasterizer::atlas::UploadTile tile) override;
++    void renderTile(vtrasterizer::atlas::RenderTile tile) override;
++
++    // --- vtrasterizer::atlas::ImageTextureBackend ---
++    void createImageTexture(vtrasterizer::atlas::CreateImageTexture param) override;
++    void destroyImageTexture(vtrasterizer::atlas::DestroyImageTexture param) override;
++    void renderImageQuad(vtrasterizer::atlas::RenderImageQuad param) override;
++    void renderImageGap(vtrasterizer::atlas::RenderImageGap param) override;
++    [[nodiscard]] std::vector<vtrasterizer::atlas::ImageTextureId> takeFailedImageTextures() override;
++
++  private:
++    /// A scissor rectangle in bottom-left GL device pixels (as glScissor wants), or nullopt.
++    struct ClipRect
++    {
++        int x = 0;
++        int y = 0;
++        int width = 0;
++        int height = 0;
++    };
++
++    /// Fragment selectors, matching text.frag / SoftwareRenderTarget: 0 = glyph coverage (red
++    /// channel) tinted by color; 1 = image texture sampled verbatim (tint ignored).
++    enum Selector : uint32_t
++    {
++        SelectorGlyphAlpha = 0,
++        SelectorImage = 1,
++    };
++
++    /// One batched quad: a target rect, source UVs, a tint, a selector and which texture to sample.
++    /// texture 0 means "the atlas"; otherwise it is an image texture id.
++    struct Quad
++    {
++        float x = 0, y = 0, w = 0, h = 0;      // target rect, top-left origin, item pixels
++        float u0 = 0, v0 = 0, u1 = 0, v1 = 0;  // source UVs (normalized); unused for solid fills
++        float r = 0, g = 0, b = 0, a = 0;      // tint / solid color
++        uint32_t selector = SelectorGlyphAlpha;
++        uint32_t texture = 0;                  // 0 = atlas; else image-texture GL name
++        bool solid = false;                    // solid color fill (no texture sample)
++        std::optional<ClipRect> clip {};
++    };
++
++    void emitQuads(std::vector<Quad> const& quads);
++    void drawQuad(Quad const& q);
++    [[nodiscard]] std::optional<ClipRect> currentClip() const noexcept;
++
++    // Geometry
++    ImageSize _renderSize;
++
++    // GL objects (0 = not created)
++    unsigned _program = 0;
++    unsigned _vbo = 0;
++    unsigned _atlasTexture = 0;
++    ImageSize _atlasSize {};
++
++    // Uniform / attribute locations
++    int _uProjection = -1;
++    int _uSelector = -1;
++    int _uTint = -1;
++    int _uSampler = -1;
++    int _aPosition = -1;
++    int _aTexCoord = -1;
++
++    // Image textures keyed by ImageTextureId::value -> GL texture name
++    std::unordered_map<uint32_t, unsigned> _imageTextures;
++    std::vector<vtrasterizer::atlas::ImageTextureId> _failedImageTextures;
++
++    // Active scissor (bottom-left device pixels), as issued.
++    std::optional<ClipRect> _scissorBottomLeft;
++
++    // Per-frame accumulators, drawn in z-order then cleared.
++    std::vector<Quad> _rects;
++    std::vector<Quad> _imagesBelowText;
++    std::vector<Quad> _textTiles;
++    std::vector<Quad> _imagesAboveText;
++
++    std::optional<ScreenshotCallback> _pendingScreenshot;
++
++    float _clearR = 0.f, _clearG = 0.f, _clearB = 0.f, _clearA = 1.f;
++};
++
++} // namespace contour_macos
+-- 
+2.43.0
+

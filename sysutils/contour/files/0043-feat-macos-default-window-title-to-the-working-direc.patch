@@ -1,0 +1,181 @@
+From 8ef982b1016bc1b9fccab41d0249ca1ceb6b9d28 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 22:16:18 +0000
+Subject: [PATCH 43/67] feat(macos): default window title to the working
+ directory
+
+The window title was hardcoded to "contour", so with several windows open
+the Window menu and titlebars were indistinguishable. Give each window a
+meaningful default derived from its working directory (the shell's OSC-0/2
+title still overrides it while the shell drives).
+
+- Seed the engine's working directory in the session ctor from the shell's
+  spawn directory: the engine otherwise only learns the CWD from OSC 7,
+  which shells emit after their first prompt, so it is empty at startup.
+- Expose it via bridge_working_directory().
+- The view sets the window title from the CWD when it is placed in a window
+  (viewDidMoveToWindow) and whenever an OSC title is cleared. The title is
+  the last path component, with $HOME shown as "~"; an OSC-7 "file://host/
+  path" URL is reduced to its path first.
+
+Non-shell-title configs now show e.g. "~" or the project directory instead
+of "contour" everywhere. Shells that set an OSC title are unaffected.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/SessionBridge.cpp   |  8 ++++
+ src/contour_macos/SessionBridge.h     |  5 +++
+ src/contour_macos/TerminalSession.cpp |  5 +++
+ src/contour_macos/TerminalView.mm     | 56 +++++++++++++++++++++++++++
+ src/contour_macos/main.mm             |  2 +
+ 5 files changed, 76 insertions(+)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index d2caf6a2..6d37c3bb 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -132,6 +132,14 @@ int bridge_render_mode(TerminalSession* session)
+                                                                               : BridgeRender_CPU;
+ }
+ 
++char* bridge_working_directory(TerminalSession* session)
++{
++    std::string cwd = session->terminal().currentWorkingDirectory();
++    if (cwd.empty())
++        return nullptr;
++    return strdup(cwd.c_str());
++}
++
+ void bridge_gl_initialize(TerminalSession* session)
+ {
+     if (GLRenderTarget* gl = session->glTarget())
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 7e9f3497..4ba29acc 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -70,6 +70,11 @@ TerminalSession* bridge_create(int widthPx,
+ /// uses this to choose its presentation path (CGImage blit vs GL context present).
+ int bridge_render_mode(TerminalSession* session);
+ 
++/// Returns the session's current working directory as a freshly malloc()'d UTF-8 C string (caller
++/// frees), or null if unknown. Tracks OSC 7 updates from the shell; before the shell reports one it
++/// reflects the directory the shell was spawned in. Used to seed a meaningful initial window title.
++char* bridge_working_directory(TerminalSession* session);
++
+ /// GL lifecycle. Call with the view's GL context current: bridge_gl_initialize() once after the
+ /// context exists (creates the program/atlas), bridge_gl_teardown() before the context is torn
+ /// down. No-ops under the CPU backend.
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 4b88158f..1cae9d83 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -99,6 +99,11 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _terminal->setWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?│");
+     _terminal->setExtendedWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?");
+ 
++    // The engine only learns the working directory from OSC 7 (which shells emit after their first
++    // prompt), so it is empty at startup. Seed it with the directory the shell was spawned in so the
++    // window has a meaningful title immediately; OSC 7 updates take over once the shell reports one.
++    _terminal->setCurrentWorkingDirectory(vtpty::Process::homeDirectory().string());
++
+     _renderTarget->setRenderSize(surfaceSize);
+     _renderer.applyResize(
+         surfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index 5acc290a..a7d65689 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -120,6 +120,8 @@ void cbOnClosed(void* userData)
+ - (void)createGLContext;
+ - (void)drawFrameCPU;
+ - (void)drawFrameGL;
++- (NSString*)titleFromWorkingDirectory:(NSString*)cwd;
++- (void)updateTitleFromWorkingDirectory;
+ @end
+ 
+ @implementation TerminalView
+@@ -278,6 +280,13 @@ void cbOnClosed(void* userData)
+ 
+ - (void)mainThreadSetTitle:(NSString*)title
+ {
++    // An empty OSC title (e.g. the shell clearing it) should not blank the titlebar — fall back to
++    // the working-directory title instead.
++    if (![title length])
++    {
++        [self updateTitleFromWorkingDirectory];
++        return;
++    }
+     [[self window] setTitle:title];
+ }
+ 
+@@ -298,6 +307,53 @@ void cbOnClosed(void* userData)
+     [[self window] close];
+ }
+ 
++// Turns a working-directory string — either a plain path or an OSC-7 "file://host/path" URL — into a
++// short window title: the last path component, with $HOME collapsed to "~". Falls back to the whole
++// string if it has no components. Returns nil for empty input.
++- (NSString*)titleFromWorkingDirectory:(NSString*)cwd
++{
++    if (![cwd length])
++        return nil;
++
++    NSString* path = cwd;
++    NSRange const scheme = [path rangeOfString:@"://"];
++    if (scheme.location != NSNotFound)
++    {
++        // Strip "file://host" — keep from the first '/' after the authority.
++        NSString* rest = [path substringFromIndex:scheme.location + scheme.length];
++        NSRange const slash = [rest rangeOfString:@"/"];
++        path = slash.location != NSNotFound ? [rest substringFromIndex:slash.location] : rest;
++    }
++
++    NSString* home = NSHomeDirectory();
++    if ([home length] && [path isEqualToString:home])
++        return @"~";
++    NSString* last = [path lastPathComponent];
++    return [last length] ? last : path;
++}
++
++// Sets the window title from the session's current working directory. Used for the initial title and
++// as the fallback; shell OSC-0/2 titles (via mainThreadSetTitle:) override it while the shell drives.
++- (void)updateTitleFromWorkingDirectory
++{
++    if (!_session || ![self window])
++        return;
++    char* cwd = contour_macos::bridge_working_directory([self session]);
++    NSString* cwdStr = cwd ? [NSString stringWithUTF8String:cwd] : nil;
++    if (cwd)
++        free(cwd);
++    NSString* title = [self titleFromWorkingDirectory:cwdStr];
++    [[self window] setTitle:(title ? title : @"contour")];
++}
++
++- (void)viewDidMoveToWindow
++{
++    [super viewDidMoveToWindow];
++    // Give the window a meaningful initial title as soon as it is placed. The shell's OSC title (if
++    // any) supersedes this once it arrives.
++    [self updateTitleFromWorkingDirectory];
++}
++
+ - (void)drawRect:(NSRect)dirtyRect
+ {
+     (void) dirtyRect;
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index bfc81f44..d743ba6c 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -27,6 +27,8 @@
+                                                    styleMask:style
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO];
++    // The initial title is set by the view from the working directory once it is placed in the
++    // window (viewDidMoveToWindow); this is just a placeholder for the brief moment before that.
+     [window setTitle:@"contour"];
+     [window setReleasedWhenClosed:YES];
+ 
+-- 
+2.43.0
+

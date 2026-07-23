@@ -1,0 +1,141 @@
+From 43b20f0695673a4d10f1a74aef22833eb98d1ca7 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 14:01:55 +0000
+Subject: [PATCH 47/67] =?UTF-8?q?feat(macos):=20iTerm2=20inline=20images?=
+ =?UTF-8?q?=20=E2=80=94=20frontend=20PNG=20decoder?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Inject a PNG decoder built on ImageIO/CoreGraphics (ApplicationServices on
+10.6) into the terminal. The engine's PNG path (both GIP and iTerm2) needs
+a decoder; the Qt frontend supplies one via QImage, here we use the native
+codec — no new dependency. Without it PNG payloads were silently dropped.
+Link -framework ApplicationServices into contour_macos (the library now
+uses ImageIO/CoreGraphics), so the probe/smoke targets link too.
+
+Split from the original commit 89139d1d4 (upstream-history split into
+vendor/frontend layers, 2026-07-21): the engine-side OSC 1337 File= handler
+(Screen::iTerm2File, Functions.h registration) is a vendor-layer change.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/contour_macos/CMakeLists.txt      |  5 +-
+ src/contour_macos/TerminalSession.cpp | 67 +++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 42f32758..77331047 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -51,7 +51,10 @@ target_compile_options(contour_macos PRIVATE ${_contour_macos_warn_opts})
+ # to opt into the richer 10.6 GL path once it exists.
+ if(APPLE)
+     option(CONTOUR_GL_BASELINE_105 "Build the GL backend against the conservative 10.5 GL 2.0 baseline" ON)
+-    target_link_libraries(contour_macos PUBLIC "-framework OpenGL")
++    # GLRenderTarget uses OpenGL; TerminalSession uses ImageIO/CoreGraphics (via ApplicationServices,
++    # as on 10.6) to decode inline PNG images. Link both into the library so the probe/smoke targets
++    # that depend only on contour_macos link too.
++    target_link_libraries(contour_macos PUBLIC "-framework OpenGL" "-framework ApplicationServices")
+     if(CONTOUR_GL_BASELINE_105)
+         target_compile_definitions(contour_macos PUBLIC CONTOUR_GL_BASELINE_105=1)
+     else()
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 93d112d2..632de470 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -8,9 +8,17 @@
+ 
+ #include <vtrasterizer/Decorator.h>
+ 
++// ImageIO + CoreGraphics (via ApplicationServices on 10.6) for decoding inline PNG images. This is
++// a C API, so it is usable from this ordinary-C++ translation unit (no ObjC needed).
++#include <ApplicationServices/ApplicationServices.h>
++
+ #include <algorithm>
+ #include <chrono>
++#include <cstdint>
++#include <optional>
++#include <span>
+ #include <utility>
++#include <vector>
+ 
+ using namespace std::chrono;
+ 
+@@ -50,6 +58,61 @@ namespace
+ 
+     [[nodiscard]] uint32_t widthOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.width)); }
+     [[nodiscard]] uint32_t heightOf(ImageSize s) noexcept { return static_cast<uint32_t>(unbox(s.height)); }
++
++    /// Decodes a PNG (or any format ImageIO recognizes) into tightly-packed straight-alpha RGBA8,
++    /// using ImageIO/CoreGraphics. This is the decoder the engine's PNG image path (GIP, iTerm2 OSC
++    /// 1337) calls; without it those protocols cannot show PNG payloads. The Qt frontend uses QImage
++    /// for the same purpose — here we use the platform-native codec, which needs no extra dependency.
++    [[nodiscard]] std::optional<vtbackend::Image::Data> decodePngViaImageIO(
++        vtbackend::ImageFormat format, std::span<uint8_t const> data, vtbackend::ImageSize& size)
++    {
++        if (format != vtbackend::ImageFormat::PNG)
++            return std::nullopt;
++
++        CFDataRef cfData = CFDataCreateWithBytesNoCopy(
++            nullptr, data.data(), static_cast<CFIndex>(data.size()), kCFAllocatorNull);
++        if (!cfData)
++            return std::nullopt;
++
++        CGImageSourceRef source = CGImageSourceCreateWithData(cfData, nullptr);
++        CGImageRef image = source ? CGImageSourceCreateImageAtIndex(source, 0, nullptr) : nullptr;
++
++        std::optional<vtbackend::Image::Data> result;
++        if (image)
++        {
++            auto const w = static_cast<size_t>(CGImageGetWidth(image));
++            auto const h = static_cast<size_t>(CGImageGetHeight(image));
++            if (w != 0 && h != 0)
++            {
++                // Draw into a known RGBA8, straight-alpha, top-left-origin buffer regardless of the
++                // source's color space / bit depth / orientation.
++                vtbackend::Image::Data pixels(w * h * 4, 0);
++                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++                CGContextRef ctx = CGBitmapContextCreate(pixels.data(),
++                                                         w,
++                                                         h,
++                                                         8,
++                                                         w * 4,
++                                                         cs,
++                                                         kCGImageAlphaPremultipliedLast
++                                                             | kCGBitmapByteOrderDefault);
++                if (ctx)
++                {
++                    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat) w, (CGFloat) h), image);
++                    CGContextRelease(ctx);
++                    size = vtbackend::ImageSize { vtbackend::Width::cast_from(w),
++                                                  vtbackend::Height::cast_from(h) };
++                    result = std::move(pixels);
++                }
++                CGColorSpaceRelease(cs);
++            }
++            CGImageRelease(image);
++        }
++        if (source)
++            CFRelease(source);
++        CFRelease(cfData);
++        return result;
++    }
+ } // namespace
+ 
+ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+@@ -107,6 +170,10 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _terminal->setColorPalette(colorPalette);
+     _terminal->resetColorPalette(colorPalette);
+ 
++    // Inject the PNG decoder the engine's image protocols (GIP, iTerm2 OSC 1337) call; without it
++    // decodePng() no-ops and PNG inline images are silently dropped.
++    _terminal->setImageDecoder(&decodePngViaImageIO);
++
+     // setWordDelimiters() is what actually assigns the selection helper's `wordDelimited`
+     // std::function; without calling it, mouse selection invokes an empty std::function and
+     // throws std::bad_function_call. Seed with the usual terminal word-boundary set.
+-- 
+2.43.0
+

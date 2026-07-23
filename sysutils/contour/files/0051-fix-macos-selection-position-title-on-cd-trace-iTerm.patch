@@ -1,0 +1,153 @@
+From 7c342a89864e751a10d0642527eba3aaead74f14 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 14:02:22 +0000
+Subject: [PATCH 51/67] fix(macos): selection position, title on cd; trace
+ iTerm2
+
+Split from the original commit f4db6966b (upstream-history split into
+vendor/frontend layers, 2026-07-21): this half covers the frontend-side
+selection/title/tracing fixes (SessionBridge, TerminalSession, TerminalView).
+The accompanying Screen.cpp change is a vendor-layer edit.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ src/contour_macos/SessionBridge.cpp   | 23 ++++++++++++++++++-----
+ src/contour_macos/SessionBridge.h     |  3 +++
+ src/contour_macos/TerminalSession.cpp | 15 +++++++++++++++
+ src/contour_macos/TerminalSession.h   |  2 ++
+ src/contour_macos/TerminalView.mm     | 10 ++++++++++
+ 5 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index 9f5cc817..6ed50a94 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -115,6 +115,9 @@ TerminalSession* bridge_create(int widthPx,
+         };
+     if (cb.onClosed)
+         callbacks.onClosed = [userData, fn = cb.onClosed]() { fn(userData); };
++    if (cb.workingDirectoryChanged)
++        callbacks.workingDirectoryChanged =
++            [userData, fn = cb.workingDirectoryChanged](std::string cwd) { fn(userData, cwd.c_str()); };
+     if (cb.verifySshHostkey)
+         callbacks.verifySshHostkey =
+             [userData, fn = cb.verifySshHostkey](std::string host, int port, std::string fp) -> bool {
+@@ -250,11 +253,21 @@ void bridge_send_char(TerminalSession* session, uint32_t codepoint, uint32_t mod
+ 
+ void bridge_mouse_press(TerminalSession* session, int x, int y, uint32_t modifiers)
+ {
+-    session->terminal().tick(std::chrono::steady_clock::now());
+-    session->terminal().sendMousePressEvent(toKeyboardModifiers(modifiers).chord,
+-                                            vtbackend::MouseButton::Left,
+-                                            vtbackend::PixelCoordinate { { x }, { y } },
+-                                            false);
++    auto& terminal = session->terminal();
++    auto const chord = toKeyboardModifiers(modifiers).chord;
++    auto const pixel = vtbackend::PixelCoordinate { { x }, { y } };
++
++    terminal.tick(std::chrono::steady_clock::now());
++
++    // handleMouseSelection() reads the click position from _currentMousePosition, which the engine
++    // updates ONLY on a mouse-move. The Qt frontend tracks hover so it is always current; we only
++    // send moves while dragging, so on a plain click it was stale — the press anchored the selection
++    // at the wrong cell (double-click landed on the wrong word entirely). Send a move to the click
++    // position first so the press sees the right cell. This does not disturb double/triple-click: the
++    // engine resets its speed-click counter only when the position CHANGES, and the repeated clicks of
++    // a multi-click land on the same cell.
++    terminal.sendMouseMoveEvent(chord, session->pixelToCell(x, y), pixel, false);
++    terminal.sendMousePressEvent(chord, vtbackend::MouseButton::Left, pixel, false);
+ }
+ 
+ void bridge_mouse_move(TerminalSession* session, int x, int y, uint32_t modifiers)
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 9fee7f4b..e3c34fde 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -39,6 +39,9 @@ struct BridgeCallbacks
+     /// Returns a freshly malloc()'d UTF-8 C string the bridge will free(), or null.
+     char* (*readClipboard)(void* userData);
+     void (*onClosed)(void* userData);
++    /// The working directory changed (shell emitted OSC 7). utf8Cwd is a plain path or a
++    /// "file://host/path" URL. Used to refresh the window title.
++    void (*workingDirectoryChanged)(void* userData, char const* utf8Cwd);
+     /// Asks the host to verify an unknown/changed SSH host key. Called synchronously from the SSH
+     /// connection thread; the host must present the fingerprint to the user (on the main thread) and
+     /// return 1 to accept (and remember) the key, 0 to reject. Null = reject all unknown keys.
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 55dd9ce6..d990bd8d 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -359,6 +359,21 @@ void TerminalSession::resize(ImageSize newSurfaceSize)
+ 
+ void TerminalSession::screenUpdated()
+ {
++    // If the shell reported a new working directory (OSC 7) since the last update, tell the host so
++    // it can refresh the window title. Shells that emit OSC 7 on each prompt (zsh on macOS by
++    // default; bash with the right PROMPT_COMMAND) get a live cwd-tracking title; shells that never
++    // emit it keep the initial title, which is the best we can do without shell integration. This
++    // runs on the parser thread; the host marshals the title update to the main thread.
++    if (_callbacks.workingDirectoryChanged)
++    {
++        std::string const& cwd = _terminal->currentWorkingDirectory();
++        if (cwd != _lastWorkingDirectory)
++        {
++            _lastWorkingDirectory = cwd;
++            _callbacks.workingDirectoryChanged(cwd);
++        }
++    }
++
+     if (_callbacks.requestRedraw)
+         _callbacks.requestRedraw();
+ }
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+index 1b07d74a..5a0339db 100644
+--- a/src/contour_macos/TerminalSession.h
++++ b/src/contour_macos/TerminalSession.h
+@@ -40,6 +40,7 @@ class TerminalSession: public vtbackend::Terminal::Events
+         std::function<void(std::string)> copyToClipboard;    ///< write selection to clipboard
+         std::function<std::string()> readClipboard;          ///< read clipboard (OSC 52)
+         std::function<void()> onClosed;                      ///< shell exited / pty closed
++        std::function<void(std::string)> workingDirectoryChanged; ///< cwd changed (OSC 7)
+         /// Verify an unknown SSH host key: (host, port, fingerprint) -> accept. Called from the SSH
+         /// connection thread; the host must prompt on the main thread and block for the answer.
+         std::function<bool(std::string, int, std::string)> verifySshHostkey;
+@@ -141,6 +142,7 @@ class TerminalSession: public vtbackend::Terminal::Events
+     std::unique_ptr<std::thread> _readThread;
+     std::atomic<bool> _terminating { false };
+     bool _started = false;
++    std::string _lastWorkingDirectory; ///< last cwd seen, to detect OSC 7 changes
+ };
+ 
+ } // namespace contour_macos
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index 05cbc222..b291cfc6 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -109,6 +109,15 @@ void cbOnClosed(void* userData)
+     [view performSelectorOnMainThread:@selector(mainThreadClose) withObject:nil waitUntilDone:NO];
+ }
+ 
++void cbWorkingDirectoryChanged(void* userData, char const* utf8Cwd)
++{
++    (void) utf8Cwd; // the view re-reads the cwd from the session on the main thread
++    TerminalView* view = (TerminalView*) userData;
++    [view performSelectorOnMainThread:@selector(updateTitleFromWorkingDirectory)
++                           withObject:nil
++                        waitUntilDone:NO];
++}
++
+ } // namespace
+ 
+ // Carries an SSH host-key verification prompt across the thread hop: the SSH connection thread fills
+@@ -200,6 +209,7 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+     callbacks.copyToClipboard = cbCopyToClipboard;
+     callbacks.readClipboard = cbReadClipboard;
+     callbacks.onClosed = cbOnClosed;
++    callbacks.workingDirectoryChanged = cbWorkingDirectoryChanged;
+     callbacks.verifySshHostkey = cbVerifySshHostkey;
+ 
+     // Parse "user@host[:port]" into a BridgeSshConfig. Empty destination => local shell.
+-- 
+2.43.0
+

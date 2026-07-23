@@ -1,0 +1,588 @@
+From b81934e0b95e9e6421cd76ab4fbbe44a85211383 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 20:18:58 +0000
+Subject: [PATCH 41/67] feat(macos): select GL backend at runtime + NSOpenGL
+ present path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wire the GL backend (added standalone in the previous commit) into the
+session and view so it is actually selectable, without disturbing the CPU
+path.
+
+Session: TerminalSession now takes a RenderBackend (CPU default) and holds
+the target as unique_ptr<vtrasterizer::RenderTarget>, with typed non-owning
+aliases (softwareTarget()/glTarget()) for backend-specific access. The
+renderer is handed the abstract RenderTarget and never learns which concrete
+backend it drives. renderFrame() dispatches beginFrame() through the typed
+alias; the destructor detaches the render target from the renderer before it
+is freed.
+
+Bridge: bridge_create() takes a render mode; bridge_render_mode() reports the
+session's actual backend; bridge_gl_initialize()/bridge_gl_teardown() drive
+the GL program/atlas lifecycle (called by the view with its context current).
+bridge_output_buffer() returns null under GL (no CPU buffer exists), which
+routes the view to its GL present path. The bridge header stays engine-free
+and C++98-clean, so the gcc-4.2 .mm layer is unchanged in how it includes.
+
+View: TerminalView keeps being a plain NSView. Under the CPU backend it blits
+the RGBA8 buffer as a CGImage exactly as before (that code is untouched, just
+moved into drawFrameCPU). Under the GL backend it hosts an NSOpenGLContext
+attached to the view, makes it current around bridge_render_frame(), creates
+the GL program/atlas lazily on the first frame (the only point a context is
+current), and flushBuffer()s to present; setFrameSize: calls [ctx update] and
+dealloc tears GL down with the context current before the session dies. The
+NSOpenGL* API is AppKit, so no GL headers leak into the .mm — the opaque
+bridge boundary and the mixed-compiler build are preserved.
+
+The backend is chosen by CONTOUR_RENDER=gl|cpu (default cpu) in main.mm, so
+GL can be exercised without a rebuild until the preferences UI exists. Under
+the default (CPU) nothing changes.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/SessionBridge.cpp   |  40 ++++++++-
+ src/contour_macos/SessionBridge.h     |  25 +++++-
+ src/contour_macos/TerminalSession.cpp |  39 +++++++--
+ src/contour_macos/TerminalSession.h   |  32 ++++++-
+ src/contour_macos/TerminalView.h      |  21 +++--
+ src/contour_macos/TerminalView.mm     | 120 ++++++++++++++++++++++----
+ src/contour_macos/main.mm             |  17 +++-
+ 7 files changed, 255 insertions(+), 39 deletions(-)
+
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index 559a2ddd..d2caf6a2 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -69,7 +69,8 @@ namespace
+ TerminalSession* bridge_create(int widthPx,
+                                int heightPx,
+                                BridgeFontConfig const& font,
+-                               BridgeCallbacks const& cb)
++                               BridgeCallbacks const& cb,
++                               int renderMode)
+ {
+     auto fonts = vtrasterizer::FontDescriptions {};
+     fonts.dpi = text::DPI { font.dpiX, font.dpiY };
+@@ -112,8 +113,12 @@ TerminalSession* bridge_create(int widthPx,
+     if (cb.onClosed)
+         callbacks.onClosed = [userData, fn = cb.onClosed]() { fn(userData); };
+ 
++    auto const backend = renderMode == BridgeRender_OpenGL ? TerminalSession::RenderBackend::OpenGL
++                                                           : TerminalSession::RenderBackend::CPU;
++
+     auto const pageSize = vtbackend::PageSize { vtbackend::LineCount(24), vtbackend::ColumnCount(80) };
+-    return new TerminalSession(pageSize, std::move(fonts), surfaceSize, std::move(callbacks));
++    return new TerminalSession(
++        pageSize, std::move(fonts), surfaceSize, std::move(callbacks), backend);
+ }
+ 
+ void bridge_destroy(TerminalSession* session)
+@@ -121,6 +126,24 @@ void bridge_destroy(TerminalSession* session)
+     delete session;
+ }
+ 
++int bridge_render_mode(TerminalSession* session)
++{
++    return session->renderBackend() == TerminalSession::RenderBackend::OpenGL ? BridgeRender_OpenGL
++                                                                              : BridgeRender_CPU;
++}
++
++void bridge_gl_initialize(TerminalSession* session)
++{
++    if (GLRenderTarget* gl = session->glTarget())
++        gl->initializeGL();
++}
++
++void bridge_gl_teardown(TerminalSession* session)
++{
++    if (GLRenderTarget* gl = session->glTarget())
++        gl->teardownGL();
++}
++
+ void bridge_start(TerminalSession* session)
+ {
+     session->start();
+@@ -138,7 +161,18 @@ int bridge_render_frame(TerminalSession* session)
+ 
+ uint8_t const* bridge_output_buffer(TerminalSession* session, int* outWidth, int* outHeight)
+ {
+-    auto const& buffer = session->renderTarget().outputBuffer();
++    // Only the CPU backend produces a readable RGBA8 buffer. Under the GL backend there is none
++    // (the frame lives in the GL framebuffer); return null so the view uses its GL present path.
++    SoftwareRenderTarget* const sw = session->softwareTarget();
++    if (!sw)
++    {
++        if (outWidth)
++            *outWidth = 0;
++        if (outHeight)
++            *outHeight = 0;
++        return NULL;
++    }
++    auto const& buffer = sw->outputBuffer();
+     if (outWidth)
+         *outWidth = static_cast<int>(buffer.width());
+     if (outHeight)
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 329b7d2e..7e9f3497 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -50,12 +50,31 @@ struct BridgeFontConfig
+     int dpiY;
+ };
+ 
+-/// Creates a session sized to (widthPx, heightPx) and spawns the shell's read loop is NOT
+-/// started yet — call bridge_start(). Returns nullptr on failure.
++/// Render backend selector. CPU composites into an RGBA8 buffer the view blits as a CGImage;
++/// OpenGL draws into the view's GL context. Values match TerminalSession::RenderBackend.
++enum BridgeRenderMode
++{
++    BridgeRender_CPU = 0,
++    BridgeRender_OpenGL = 1,
++};
++
++/// Creates a session sized to (widthPx, heightPx) using the given render backend. The shell's
++/// read loop is NOT started yet — call bridge_start(). Returns nullptr on failure.
+ TerminalSession* bridge_create(int widthPx,
+                                int heightPx,
+                                BridgeFontConfig const& font,
+-                               BridgeCallbacks const& callbacks);
++                               BridgeCallbacks const& callbacks,
++                               int renderMode);
++
++/// Returns the render backend the session was created with (a BridgeRenderMode value). The view
++/// uses this to choose its presentation path (CGImage blit vs GL context present).
++int bridge_render_mode(TerminalSession* session);
++
++/// GL lifecycle. Call with the view's GL context current: bridge_gl_initialize() once after the
++/// context exists (creates the program/atlas), bridge_gl_teardown() before the context is torn
++/// down. No-ops under the CPU backend.
++void bridge_gl_initialize(TerminalSession* session);
++void bridge_gl_teardown(TerminalSession* session);
+ 
+ void bridge_destroy(TerminalSession* session);
+ 
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 1769e55c..4b88158f 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -55,11 +55,12 @@ namespace
+ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+                                  vtrasterizer::FontDescriptions fontDescriptions,
+                                  ImageSize surfaceSize,
+-                                 Callbacks callbacks):
++                                 Callbacks callbacks,
++                                 RenderBackend backend):
+     _callbacks { std::move(callbacks) },
+     _pageSize { pageSize },
+     _surfaceSize { surfaceSize },
+-    _renderTarget { surfaceSize },
++    _backend { backend },
+     _renderer { pageSize,
+                 std::move(fontDescriptions),
+                 vtbackend::ColorPalette {},
+@@ -69,7 +70,22 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+                 vtrasterizer::Decorator::Underline,
+                 vtrasterizer::Decorator::CurlyUnderline }
+ {
+-    _renderer.setRenderTarget(_renderTarget);
++    // Build the chosen backend and keep a typed alias for backend-specific access. The renderer
++    // is handed the abstract RenderTarget and never learns which concrete backend it drives.
++    if (_backend == RenderBackend::OpenGL)
++    {
++        auto gl = std::make_unique<GLRenderTarget>(surfaceSize);
++        _gl = gl.get();
++        _renderTarget = std::move(gl);
++    }
++    else
++    {
++        auto sw = std::make_unique<SoftwareRenderTarget>(surfaceSize);
++        _software = sw.get();
++        _renderTarget = std::move(sw);
++    }
++
++    _renderer.setRenderTarget(*_renderTarget);
+     (void) _renderer.applyStagedReconfigDuringSetup();
+ 
+     _pageSize = derivePageSize(surfaceSize);
+@@ -83,7 +99,7 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     _terminal->setWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?│");
+     _terminal->setExtendedWordDelimiters(" /\\()\"'-.,:;<>~!@#$%^&*|+=[]{}~?");
+ 
+-    _renderTarget.setRenderSize(surfaceSize);
++    _renderTarget->setRenderSize(surfaceSize);
+     _renderer.applyResize(
+         surfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
+ 
+@@ -100,6 +116,11 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+ TerminalSession::~TerminalSession()
+ {
+     terminate();
++    // The renderer holds a raw reference to the render target; drop it before the target unique_ptr
++    // is destroyed so no dangling reference outlives the backend. (Declared-member order already
++    // destroys _renderer before _renderTarget, but detaching explicitly keeps this correct if the
++    // layout ever changes and mirrors the documented Renderer teardown contract.)
++    _renderer.detachRenderTarget();
+ }
+ 
+ vtbackend::PageSize TerminalSession::derivePageSize(ImageSize surfaceSize) const
+@@ -181,7 +202,13 @@ void TerminalSession::terminate()
+ 
+ void TerminalSession::renderFrame()
+ {
+-    _renderTarget.beginFrame();
++    // beginFrame() clears the surface for a new frame; it is a concrete-backend method (not on the
++    // abstract RenderTarget), so dispatch through the typed alias. For GL this requires the view's
++    // context to already be current (the view makes it current before calling us).
++    if (_software)
++        _software->beginFrame();
++    else if (_gl)
++        _gl->beginFrame();
+     _terminal->tick(steady_clock::now());
+     (void) _renderer.render(*_terminal, /* pressureHint */ false);
+ }
+@@ -191,7 +218,7 @@ void TerminalSession::resize(ImageSize newSurfaceSize)
+     if (newSurfaceSize == _surfaceSize)
+         return;
+     _surfaceSize = newSurfaceSize;
+-    _renderTarget.setRenderSize(newSurfaceSize);
++    _renderTarget->setRenderSize(newSurfaceSize);
+     _pageSize = derivePageSize(newSurfaceSize);
+     _renderer.applyResize(
+         newSurfaceSize, _pageSize, vtrasterizer::PageMargin { PageMarginPx, PageMarginPx, PageMarginPx });
+diff --git a/src/contour_macos/TerminalSession.h b/src/contour_macos/TerminalSession.h
+index 3087ab5c..562c32fb 100644
+--- a/src/contour_macos/TerminalSession.h
++++ b/src/contour_macos/TerminalSession.h
+@@ -1,10 +1,12 @@
+ // SPDX-License-Identifier: Apache-2.0
+ #pragma once
+ 
++#include <contour_macos/GLRenderTarget.h>
+ #include <contour_macos/SoftwareRenderTarget.h>
+ 
+ #include <vtbackend/Terminal.h>
+ #include <vtrasterizer/FontDescriptions.h>
++#include <vtrasterizer/RenderTarget.h>
+ #include <vtrasterizer/Renderer.h>
+ 
+ #include <functional>
+@@ -40,10 +42,20 @@ class TerminalSession: public vtbackend::Terminal::Events
+         std::function<void()> onClosed;                      ///< shell exited / pty closed
+     };
+ 
++    /// Which render backend the session drives. CPU composites into an RGBA8 buffer the view
++    /// blits as a CGImage; OpenGL draws into the view's GL context. The choice is fixed at
++    /// construction; the view sets up its presentation path to match renderBackend().
++    enum class RenderBackend
++    {
++        CPU,
++        OpenGL,
++    };
++
+     TerminalSession(vtbackend::PageSize pageSize,
+                     vtrasterizer::FontDescriptions fontDescriptions,
+                     ImageSize surfaceSize,
+-                    Callbacks callbacks);
++                    Callbacks callbacks,
++                    RenderBackend backend = RenderBackend::CPU);
+     ~TerminalSession() override;
+ 
+     /// Spawns the shell and starts the read/parse thread.
+@@ -54,7 +66,16 @@ class TerminalSession: public vtbackend::Terminal::Events
+ 
+     [[nodiscard]] vtbackend::Terminal& terminal() noexcept { return *_terminal; }
+     [[nodiscard]] vtrasterizer::Renderer& renderer() noexcept { return _renderer; }
+-    [[nodiscard]] SoftwareRenderTarget& renderTarget() noexcept { return _renderTarget; }
++
++    [[nodiscard]] RenderBackend renderBackend() const noexcept { return _backend; }
++
++    /// The CPU backend, or nullptr when the OpenGL backend is active. Callers that read the RGBA8
++    /// output buffer (the CGImage blit path) must go through this.
++    [[nodiscard]] SoftwareRenderTarget* softwareTarget() noexcept { return _software; }
++
++    /// The OpenGL backend, or nullptr when the CPU backend is active. The view drives its GL
++    /// lifecycle (initializeGL/teardownGL) with the context current.
++    [[nodiscard]] GLRenderTarget* glTarget() noexcept { return _gl; }
+ 
+     /// Maps a view pixel coordinate (top-left origin) to a grid cell location.
+     [[nodiscard]] vtbackend::CellLocation pixelToCell(int x, int y) const;
+@@ -87,7 +108,12 @@ class TerminalSession: public vtbackend::Terminal::Events
+     vtbackend::PageSize _pageSize;
+     ImageSize _surfaceSize;
+ 
+-    SoftwareRenderTarget _renderTarget;
++    RenderBackend _backend;
++    // Exactly one of these owns the target; _renderTarget is the base view the renderer is given,
++    // and _software / _gl are typed aliases into it (non-owning) for backend-specific access.
++    std::unique_ptr<vtrasterizer::RenderTarget> _renderTarget;
++    SoftwareRenderTarget* _software = nullptr;
++    GLRenderTarget* _gl = nullptr;
+     vtrasterizer::Renderer _renderer;
+     std::unique_ptr<vtbackend::Terminal> _terminal;
+ 
+diff --git a/src/contour_macos/TerminalView.h b/src/contour_macos/TerminalView.h
+index 14de23c1..fe0479bf 100644
+--- a/src/contour_macos/TerminalView.h
++++ b/src/contour_macos/TerminalView.h
+@@ -3,20 +3,29 @@
+ 
+ #import <AppKit/AppKit.h>
+ 
+-// An NSView that hosts one terminal session. It drives the render loop in -drawRect:
+-// (blitting the session's RGBA8 output buffer as a CGImage), translates NSEvents into
+-// engine input, and marshals the session's parser-thread callbacks onto the main thread.
++// An NSView that hosts one terminal session. It drives the render loop in -drawRect:, translates
++// NSEvents into engine input, and marshals the session's parser-thread callbacks onto the main
++// thread. It presents the frame one of two ways depending on the session's render backend: the CPU
++// backend's RGBA8 buffer is blitted as a CGImage; the OpenGL backend draws into an NSOpenGLContext
++// attached to this view, which is then flushed.
+ //
+ // Written in manual-retain-release Objective-C++ (no ARC), so it compiles with GCC's
+ // ObjC frontend as well as clang.
+ @interface TerminalView: NSView
+ {
+ @private
+-    void* _session; // contour_macos::TerminalSession* (owned)
++    void* _session;        // contour_macos::TerminalSession* (owned)
++    NSOpenGLContext* _glContext; // non-nil only under the OpenGL backend
++    int _renderMode;       // BridgeRenderMode, cached from the session
++    BOOL _glInitialized;   // GL program/atlas created (once the context is current)
+ }
+ 
+-// Creates the session (spawning a shell) sized to the given frame. Returns nil on failure.
+-- (id)initWithFrame:(NSRect)frame fontFamily:(NSString*)fontFamily fontSize:(double)fontSize;
++// Creates the session (spawning a shell) sized to the given frame, using the given render backend
++// (a BridgeRenderMode value: 0 = CPU, 1 = OpenGL). Returns nil on failure.
++- (id)initWithFrame:(NSRect)frame
++         fontFamily:(NSString*)fontFamily
++           fontSize:(double)fontSize
++         renderMode:(int)renderMode;
+ 
+ // Requests a repaint on the main thread (safe to call from any thread).
+ - (void)requestRedraw;
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index 39e36208..e6516873 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -117,6 +117,9 @@ void cbOnClosed(void* userData)
+ - (void)mainThreadBell;
+ - (void)mainThreadCopyToClipboard:(NSString*)text;
+ - (void)mainThreadClose;
++- (void)setupGLContext;
++- (void)drawFrameCPU;
++- (void)drawFrameGL;
+ @end
+ 
+ @implementation TerminalView
+@@ -126,12 +129,19 @@ void cbOnClosed(void* userData)
+     return static_cast<TerminalSession*>(_session);
+ }
+ 
+-- (id)initWithFrame:(NSRect)frame fontFamily:(NSString*)fontFamily fontSize:(double)fontSize
++- (id)initWithFrame:(NSRect)frame
++         fontFamily:(NSString*)fontFamily
++           fontSize:(double)fontSize
++         renderMode:(int)renderMode
+ {
+     self = [super initWithFrame:frame];
+     if (!self)
+         return nil;
+ 
++    _glContext = nil;
++    _glInitialized = NO;
++    _renderMode = renderMode;
++
+     contour_macos::BridgeFontConfig font;
+     font.family = [fontFamily UTF8String];
+     font.sizePt = fontSize;
+@@ -147,21 +157,73 @@ void cbOnClosed(void* userData)
+     callbacks.readClipboard = cbReadClipboard;
+     callbacks.onClosed = cbOnClosed;
+ 
+-    _session = contour_macos::bridge_create(
+-        static_cast<int>(frame.size.width), static_cast<int>(frame.size.height), font, callbacks);
++    _session = contour_macos::bridge_create(static_cast<int>(frame.size.width),
++                                            static_cast<int>(frame.size.height),
++                                            font,
++                                            callbacks,
++                                            renderMode);
+     if (!_session)
+     {
+         [self release];
+         return nil;
+     }
++
++    // The engine may report a different render backend than requested (e.g. a future GL-init
++    // failure could fall back to CPU); trust the session's actual choice for the present path.
++    _renderMode = contour_macos::bridge_render_mode([self session]);
++    if (_renderMode == contour_macos::BridgeRender_OpenGL)
++        [self setupGLContext];
++
+     contour_macos::bridge_start([self session]);
+ 
+     return self;
+ }
+ 
++// Creates a legacy (GL 2.x) pixel format and context and attaches it to this view. We request only
++// a color buffer + double buffering — no depth/stencil, no core-profile hint — so the format is
++// satisfiable on the 10.5/10.6 GL 2.0 baseline (PPC included). On failure we leave _glContext nil;
++// drawRect: then falls back to the CPU present path, which draws nothing useful under a GL session
++// but does not crash.
++- (void)setupGLContext
++{
++    NSOpenGLPixelFormatAttribute attrs[] = {
++        NSOpenGLPFADoubleBuffer,
++        NSOpenGLPFAColorSize, 24,
++        NSOpenGLPFAAlphaSize, 8,
++        NSOpenGLPFAAccelerated,
++        0,
++    };
++    NSOpenGLPixelFormat* pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
++    if (!pf)
++    {
++        NSLog(@"TerminalView: no suitable GL pixel format; GL backend unavailable");
++        return;
++    }
++    _glContext = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:nil];
++    [pf release];
++    if (!_glContext)
++    {
++        NSLog(@"TerminalView: failed to create GL context");
++        return;
++    }
++    [_glContext setView:self];
++}
++
+ - (void)dealloc
+ {
+     TerminalSession* s = [self session];
++    if (_glContext)
++    {
++        // Release GL objects with the context current, while the session (and its GL target) is
++        // still alive, then drop the context.
++        [_glContext makeCurrentContext];
++        if (s)
++            contour_macos::bridge_gl_teardown(s);
++        [NSOpenGLContext clearCurrentContext];
++        [_glContext clearDrawable];
++        [_glContext release];
++        _glContext = nil;
++    }
+     contour_macos::bridge_destroy(s);
+     _session = NULL;
+     [super dealloc];
+@@ -212,22 +274,20 @@ void cbOnClosed(void* userData)
+ - (void)drawRect:(NSRect)dirtyRect
+ {
+     (void) dirtyRect;
+-    TerminalSession* session = [self session];
+-    if (!session)
++    if (!_session)
+         return;
++    if (_renderMode == contour_macos::BridgeRender_OpenGL)
++        [self drawFrameGL];
++    else
++        [self drawFrameCPU];
++}
+ 
+-    int const nextMs = contour_macos::bridge_render_frame(session);
+-    if (nextMs >= 0)
+-    {
+-        // A time-based effect (cursor/cell blink, cursor-motion animation) needs another
+-        // frame; schedule one so it completes instead of freezing mid-flight.
+-        [NSObject cancelPreviousPerformRequestsWithTarget:self
+-                                                 selector:@selector(mainThreadRedraw)
+-                                                   object:nil];
+-        [self performSelector:@selector(mainThreadRedraw)
+-                   withObject:nil
+-                   afterDelay:(double) nextMs / 1000.0];
+-    }
++// CPU present: render into the RGBA8 buffer and blit it as a CGImage.
++- (void)drawFrameCPU
++{
++    TerminalSession* session = [self session];
++
++    (void) contour_macos::bridge_render_frame(session);
+ 
+     int w = 0;
+     int h = 0;
+@@ -263,12 +323,38 @@ void cbOnClosed(void* userData)
+     CGColorSpaceRelease(cs);
+ }
+ 
++// GL present: render into the view's GL context, then flush (swap) it. The backend draws directly
++// into the framebuffer, so there is no CPU buffer to blit.
++- (void)drawFrameGL
++{
++    if (!_glContext)
++        return;
++
++    [_glContext makeCurrentContext];
++
++    // Create the GL program/atlas once the context is current (it cannot be done at session
++    // construction, which runs before any GL context exists).
++    if (!_glInitialized)
++    {
++        contour_macos::bridge_gl_initialize([self session]);
++        _glInitialized = YES;
++    }
++
++    (void) contour_macos::bridge_render_frame([self session]);
++
++    [_glContext flushBuffer];
++}
++
+ - (void)setFrameSize:(NSSize)newSize
+ {
+     [super setFrameSize:newSize];
+     TerminalSession* session = [self session];
+     if (session)
+     {
++        // The GL context tracks the view; tell it the drawable changed size so its backing store
++        // and the next glViewport match the new bounds.
++        if (_glContext)
++            [_glContext update];
+         contour_macos::bridge_resize(
+             session, static_cast<int>(newSize.width), static_cast<int>(newSize.height));
+         [self setNeedsDisplay:YES];
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index e1fa6586..bfc81f44 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -7,6 +7,10 @@
+ 
+ #import <AppKit/AppKit.h>
+ 
++// getenv / strcmp for the render-backend env selector.
++#include <stdlib.h>
++#include <string.h>
++
+ // Application delegate: owns the terminal windows and the menu bar, quits on last-window-close.
+ @interface ContourAppDelegate: NSObject <NSApplicationDelegate>
+ - (void)newWindow:(id)sender;
+@@ -26,7 +30,18 @@
+     [window setTitle:@"contour"];
+     [window setReleasedWhenClosed:YES];
+ 
+-    TerminalView* view = [[TerminalView alloc] initWithFrame:frame fontFamily:@"Menlo" fontSize:14.0];
++    // Render backend selector: CONTOUR_RENDER=gl selects the OpenGL backend, anything else (or
++    // unset) the CPU backend. A single env var is enough until the preferences UI exists; it lets
++    // the GL path be exercised without a rebuild. BridgeRender_CPU/_OpenGL are 0/1.
++    int renderMode = 0; // BridgeRender_CPU
++    char const* renderEnv = getenv("CONTOUR_RENDER");
++    if (renderEnv && (strcmp(renderEnv, "gl") == 0 || strcmp(renderEnv, "opengl") == 0))
++        renderMode = 1; // BridgeRender_OpenGL
++
++    TerminalView* view = [[TerminalView alloc] initWithFrame:frame
++                                                  fontFamily:@"Menlo"
++                                                    fontSize:14.0
++                                                  renderMode:renderMode];
+     if (view)
+     {
+         [window setContentView:view];
+-- 
+2.43.0
+

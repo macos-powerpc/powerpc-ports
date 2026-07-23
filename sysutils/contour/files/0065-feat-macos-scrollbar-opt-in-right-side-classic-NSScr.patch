@@ -1,0 +1,413 @@
+From 7df21896ec7dc394e304ddf405b15f886026a21e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 16:56:55 +0000
+Subject: [PATCH 65/67] feat(macos): scrollbar (opt-in, right-side, classic
+ NSScroller)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a vertical scrollbar for the scrollback, wired to the same
+vtbackend::Viewport primitives wheel-scroll already uses. Off by default
+(matches the Qt frontend's profiles.scrollbar.position default of Hidden);
+opt in via `defaults write org.contourterminal.Contour scrollbar -bool true`
+or CONTOUR_SCROLLBAR=1.
+
+Layout: researched how mlterm's Cocoa frontend (the closest architectural
+analog — custom-compositing view, not cell-based text layout) handles this
+before designing our own: it adds its terminal view and a bare NSScroller as
+sibling subviews of the window's contentView, never NSScrollView/documentView
+(our "content" is a fixed-size composited page plus a separate scrollback
+ring buffer, not a literal tall view to scroll within — the same reasoning
+applies to us as to mlterm). Followed the same shape: when scrollbar is on,
+main.mm makes a plain NSView the window's contentView, holding a narrowed
+TerminalView (left) and the NSScroller (right, attachScroller:) as siblings.
+TerminalView's internal coordinate math (mouse events, GL viewport, CPU
+blit) needed zero changes — it already only reasons about its own frame.
+
+Bridge additions (SessionBridge.h/.cpp): bridge_scroll_info (scrollOffset /
+historyLineCount / pageLineCount, for the scroller's knob position and
+proportion), bridge_scroll_to (absolute positioning, for drag/track-click),
+bridge_is_alternate_screen (hides the scrollbar while vim/less/etc. are
+active, matching the Qt frontend's hide_in_alt_screen default — the
+alternate screen has no scrollback of its own).
+
+TerminalView.mm: syncScroller (called each drawRect:) reflects engine state
+into the scroller, with a floor on knobProportion (0.05) for very long
+scrollback, matching the Qt frontend's 0.1 floor in spirit. scrollerAction:
+handles all NSScroller hit-parts (knob drag, track click, line/page
+steppers) via the bridge. _scrollerTracking suppresses syncScroller during
+an active drag so it does not fight the gesture with whatever the render
+thread computes mid-frame. 10.6 uses NSScroller's classic always-visible
+style everywhere (no runtime overlay-style branch for modern macOS) — one
+code path, and consistent with this port's 10.6-first priority.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ docs/macos-roadmap.md               |   5 +-
+ src/contour_macos/SessionBridge.cpp |  28 +++++++
+ src/contour_macos/SessionBridge.h   |  18 +++++
+ src/contour_macos/TerminalView.h    |  13 ++-
+ src/contour_macos/TerminalView.mm   | 121 ++++++++++++++++++++++++++++
+ src/contour_macos/main.mm           |  39 ++++++++-
+ 6 files changed, 218 insertions(+), 6 deletions(-)
+
+diff --git a/docs/macos-roadmap.md b/docs/macos-roadmap.md
+index 66703a4f..24cdf38b 100644
+--- a/docs/macos-roadmap.md
++++ b/docs/macos-roadmap.md
+@@ -97,8 +97,9 @@ Config exposes the image path + opacity (fits the preferences window, item 2).
+ 
+ These are cheap because the engine already implements the behavior; only frontend wiring or
+ a palette/flag is needed:
+-- **Scrollback + scroll input** — wheel/trackpad scroll maps to the engine's viewport scroll;
+-  optional scrollbar. (Engine has full history + viewport.)
++- **Scrollback + scroll input** — wheel/trackpad scroll maps to the engine's viewport scroll.
++  Scrollbar: done (opt-in, `CONTOUR_SCROLLBAR=1` / `defaults write org.contourterminal.Contour
++  scrollbar -bool true`; classic NSScroller, right side, auto-hides on the alternate screen).
+ - **Mouse selection → copy** — drag-select already routes through the mouse events; verify
+   selection rendering and that Copy grabs it. (Selection API is in the engine.)
+ - **Bell** — already wired to `NSBeep`; add a visual-bell option later.
+diff --git a/src/contour_macos/SessionBridge.cpp b/src/contour_macos/SessionBridge.cpp
+index bbbfc577..80d6f5cb 100644
+--- a/src/contour_macos/SessionBridge.cpp
++++ b/src/contour_macos/SessionBridge.cpp
+@@ -11,6 +11,7 @@
+ #include <vtbackend/Terminal.h>
+ #include <vtrasterizer/FontDescriptions.h>
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+@@ -313,6 +314,33 @@ bool bridge_scroll(TerminalSession* session, int lines)
+                      : vp.scrollDown(vtbackend::LineCount(-lines));
+ }
+ 
++void bridge_scroll_info(TerminalSession* session,
++                        int* outScrollOffset,
++                        int* outHistoryLineCount,
++                        int* outPageLineCount)
++{
++    auto& terminal = session->terminal();
++    if (outScrollOffset)
++        *outScrollOffset = unbox(terminal.viewport().scrollOffset());
++    if (outHistoryLineCount)
++        *outHistoryLineCount = unbox(terminal.primaryScreen().historyLineCount());
++    if (outPageLineCount)
++        *outPageLineCount = unbox(terminal.pageSize().lines);
++}
++
++bool bridge_scroll_to(TerminalSession* session, int scrollOffset)
++{
++    auto& terminal = session->terminal();
++    auto const maxOffset = unbox(terminal.primaryScreen().historyLineCount());
++    auto const clamped = std::clamp(scrollOffset, 0, maxOffset);
++    return terminal.viewport().scrollTo(vtbackend::ScrollOffset(clamped));
++}
++
++bool bridge_is_alternate_screen(TerminalSession* session)
++{
++    return session->terminal().isAlternateScreen();
++}
++
+ char* bridge_copy_selection(TerminalSession* session)
+ {
+     std::string const text = session->terminal().extractSelectionText();
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index f5a85562..ea345bca 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -176,6 +176,24 @@ void bridge_focus_in(TerminalSession* session);
+ /// negative = toward newer/bottom). Returns true if the viewport moved.
+ bool bridge_scroll(TerminalSession* session, int lines);
+ 
++/// Reports the viewport state a scrollbar needs. outScrollOffset is lines scrolled back from the
++/// bottom (0 = at the bottom / most recent); outHistoryLineCount is the total scrollback line
++/// count (the maximum outScrollOffset can reach); outPageLineCount is the number of lines the
++/// page displays at once. All three are >= 0.
++void bridge_scroll_info(TerminalSession* session,
++                        int* outScrollOffset,
++                        int* outHistoryLineCount,
++                        int* outPageLineCount);
++
++/// Scrolls the viewport to an absolute offset (lines back from the bottom, matching
++/// bridge_scroll_info's outScrollOffset; clamped to [0, historyLineCount]). Returns true if the
++/// viewport moved. Used by scrollbar thumb drag / track click.
++bool bridge_scroll_to(TerminalSession* session, int scrollOffset);
++
++/// True while the alternate screen (a full-screen app such as vim/less) is active, which has no
++/// scrollback of its own. A scrollbar should hide itself while this is true.
++bool bridge_is_alternate_screen(TerminalSession* session);
++
+ // --- edit operations (for the Edit menu) ---
+ 
+ /// Returns the currently selected text as a freshly malloc()'d UTF-8 C string (caller frees),
+diff --git a/src/contour_macos/TerminalView.h b/src/contour_macos/TerminalView.h
+index fcfced9d..74e02d76 100644
+--- a/src/contour_macos/TerminalView.h
++++ b/src/contour_macos/TerminalView.h
+@@ -21,23 +21,34 @@
+     BOOL _fullScreen;      // in traditional (borderless) full-screen
+     NSRect _savedWindowFrame;    // window frame to restore on exit
+     NSUInteger _savedStyleMask;  // window style mask to restore on exit
++    NSScroller* _scroller;  // non-nil only when the scrollbar is enabled (see initWithFrame:...)
++    BOOL _scrollerTracking; // YES while the user is dragging the scroller's knob
+ }
+ 
+ // Creates the session (spawning a shell) sized to the given frame, using the given render backend
+ // (a BridgeRenderMode value: 0 = CPU, 1 = OpenGL) and color theme ("dark"/"light"). Returns nil on
+ // failure.
+ // sshDestination is "user@host[:port]" to open an SSH session, or nil/empty for a local shell.
++// showsScrollbar adds a vertical NSScroller docked to the right edge (classic, always-visible
++// style; hidden automatically while the alternate screen -- e.g. vim/less -- is active).
+ - (id)initWithFrame:(NSRect)frame
+          fontFamily:(NSString*)fontFamily
+            fontSize:(double)fontSize
+          renderMode:(int)renderMode
+               theme:(NSString*)theme
+      sshDestination:(NSString*)sshDestination
+-              shell:(NSString*)shell;
++              shell:(NSString*)shell
++      showsScrollbar:(BOOL)showsScrollbar;
+ 
+ // Requests a repaint on the main thread (safe to call from any thread).
+ - (void)requestRedraw;
+ 
++// Creates the scrollbar (an NSScroller docked to the right edge of container's bounds, tracking
++// this view's height) and adds it to container, a sibling view of this one (NOT a subview of this
++// view) sized to the full window content area. Only valid when this view was created with
++// showsScrollbar:YES. Safe to call at most once.
++- (void)attachScroller:(NSView*)container;
++
+ // Toggles traditional (borderless-window) full screen. Menu action (View > Toggle Full Screen).
+ - (void)toggleTraditionalFullScreen:(id)sender;
+ 
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index e9e8a065..f1a0aa93 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -13,6 +13,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include <algorithm>
++
+ #if CONTOUR_USE_LIBDISPATCH
+ // libdispatch is present on 10.6+, but the *block* syntax it's normally used with needs a
+ // Blocks runtime this frontend cannot assume (gcc-4.2 builds it under gnu++98). Use the
+@@ -256,6 +258,8 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+ - (void)createGLContext;
+ - (void)drawFrameCPU;
+ - (void)drawFrameGL;
++- (void)syncScroller;
++- (void)scrollerAction:(NSScroller*)sender;
+ - (NSString*)titleFromWorkingDirectory:(NSString*)cwd;
+ - (void)updateTitleFromWorkingDirectory;
+ - (void)setWindowTitle:(NSString*)title;
+@@ -275,6 +279,7 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+               theme:(NSString*)theme
+      sshDestination:(NSString*)sshDestination
+               shell:(NSString*)shell
++      showsScrollbar:(BOOL)showsScrollbar
+ {
+     self = [super initWithFrame:frame];
+     if (!self)
+@@ -283,6 +288,8 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+     _glContext = nil;
+     _glInitialized = NO;
+     _renderMode = renderMode;
++    _scroller = nil;
++    _scrollerTracking = NO;
+ 
+     contour_macos::BridgeFontConfig font;
+     font.family = [fontFamily UTF8String];
+@@ -423,6 +430,15 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+ - (void)dealloc
+ {
+     TerminalSession* s = [self session];
++    if (_scroller)
++    {
++        // _scroller is owned by the container view's subviews array, not by us (see
++        // attachScroller:) -- do not release it, only stop it from calling back into an object
++        // that is about to go away.
++        [_scroller setTarget:nil];
++        [_scroller setAction:NULL];
++        _scroller = nil;
++    }
+     if (_glContext)
+     {
+         // Release GL objects with the context current, while the session (and its GL target) is
+@@ -576,6 +592,111 @@ int cbVerifySshHostkey(void* userData, char const* host, int port, char const* f
+         [self drawFrameGL];
+     else
+         [self drawFrameCPU];
++    [self syncScroller];
++}
++
++// Reflects the engine's current viewport into the scroller's knob position/proportion, and hides
++// the scroller while the alternate screen (vim/less/etc.) is active -- it has no scrollback of its
++// own, matching the Qt frontend's hide_in_alt_screen default. A no-op when there is no scroller
++// (showsScrollbar:NO) or while the user is actively dragging its knob (driving the engine, not the
++// other way around, avoids fighting the drag with the frame we are mid-render of).
++- (void)syncScroller
++{
++    if (!_scroller || _scrollerTracking)
++        return;
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++
++    BOOL const altScreen = contour_macos::bridge_is_alternate_screen(session);
++    [_scroller setHidden:altScreen];
++    if (altScreen)
++        return;
++
++    int scrollOffset = 0, historyLineCount = 0, pageLineCount = 0;
++    contour_macos::bridge_scroll_info(session, &scrollOffset, &historyLineCount, &pageLineCount);
++
++    int const totalLineCount = historyLineCount + pageLineCount;
++    if (totalLineCount <= 0 || pageLineCount <= 0)
++    {
++        [_scroller setEnabled:NO];
++        return;
++    }
++
++    // knobProportion is the fraction of the track the knob occupies (page / total); position is
++    // the fraction scrolled from the TOP (0.0), whereas our scrollOffset counts lines back from the
++    // BOTTOM (0 = newest) -- invert it. NSScroller floors knobProportion near zero to an unusable
++    // sliver for very long scrollback, so clamp it to a minimum, matching the Qt frontend's 0.1.
++    float const knobProportion =
++        (float) std::max(0.05, (double) pageLineCount / (double) totalLineCount);
++    float const position =
++        historyLineCount > 0 ? 1.0f - (float) scrollOffset / (float) historyLineCount : 1.0f;
++
++    [_scroller setEnabled:YES];
++    [_scroller setDoubleValue:position];
++    [_scroller setKnobProportion:knobProportion];
++}
++
++// NSScroller target/action: fires for every hit-part (knob drag, track click, line/page
++// stepper arrows if present). hitPart tells us which; translate each into an engine scroll.
++- (void)scrollerAction:(NSScroller*)sender
++{
++    TerminalSession* session = [self session];
++    if (!session)
++        return;
++
++    int scrollOffset = 0, historyLineCount = 0, pageLineCount = 0;
++    contour_macos::bridge_scroll_info(session, &scrollOffset, &historyLineCount, &pageLineCount);
++
++    switch ([sender hitPart])
++    {
++        case NSScrollerKnob:
++        case NSScrollerKnobSlot:
++        {
++            // Dragging: [sender doubleValue] is the new position fraction, top-to-bottom; invert
++            // to a scrollOffset (lines back from the bottom) the same way syncScroller computes it
++            // the other way. _scrollerTracking suppresses syncScroller fighting the drag with
++            // whatever the render thread computes mid-gesture.
++            _scrollerTracking = YES;
++            int const target =
++                historyLineCount - (int) ([sender doubleValue] * (double) historyLineCount);
++            contour_macos::bridge_scroll_to(session, target);
++            [self setNeedsDisplay:YES];
++            break;
++        }
++        case NSScrollerDecrementLine: contour_macos::bridge_scroll(session, 1); [self setNeedsDisplay:YES]; break;
++        case NSScrollerIncrementLine: contour_macos::bridge_scroll(session, -1); [self setNeedsDisplay:YES]; break;
++        case NSScrollerDecrementPage:
++            contour_macos::bridge_scroll(session, std::max(1, pageLineCount));
++            [self setNeedsDisplay:YES];
++            break;
++        case NSScrollerIncrementPage:
++            contour_macos::bridge_scroll(session, -std::max(1, pageLineCount));
++            [self setNeedsDisplay:YES];
++            break;
++        default: break;
++    }
++
++    // A mouseUp ends the drag gesture; NSScroller does not tell us that directly, but hitPart is
++    // NSScrollerNoPart once the mouse is released, which is when tracking should resume following
++    // the engine's own viewport again.
++    if ([sender hitPart] == NSScrollerNoPart)
++        _scrollerTracking = NO;
++}
++
++- (void)attachScroller:(NSView*)container
++{
++    if (_scroller)
++        return;
++    CGFloat const width = [NSScroller scrollerWidth];
++    NSRect const frame = NSMakeRect(container.bounds.size.width - width, 0, width, container.bounds.size.height);
++    _scroller = [[NSScroller alloc] initWithFrame:frame];
++    [_scroller setEnabled:YES];
++    [_scroller setTarget:self];
++    [_scroller setAction:@selector(scrollerAction:)];
++    [_scroller setAutoresizingMask:NSViewMinXMargin | NSViewHeightSizable];
++    [container addSubview:_scroller];
++    [_scroller release]; // container's subviews array now owns it
+ }
+ 
+ // CPU present: render into the RGBA8 buffer and blit it as a CGImage.
+diff --git a/src/contour_macos/main.mm b/src/contour_macos/main.mm
+index 696ed66f..3a97e569 100644
+--- a/src/contour_macos/main.mm
++++ b/src/contour_macos/main.mm
+@@ -86,16 +86,49 @@
+     // set defaults "shell" or leave it for the login shell.)
+     NSString* shell = [defaults stringForKey:@"shell"];
+ 
+-    TerminalView* view = [[TerminalView alloc] initWithFrame:frame
++    // Scrollbar: env CONTOUR_SCROLLBAR, else defaults "scrollbar" (bool), else off (matches the
++    // Qt frontend's default of Hidden — opt-in, not on by default).
++    char const* scrollbarEnv = getenv("CONTOUR_SCROLLBAR");
++    BOOL showsScrollbar;
++    if (scrollbarEnv)
++    {
++        NSString* value = [[NSString stringWithUTF8String:scrollbarEnv] lowercaseString];
++        showsScrollbar = ![value isEqualToString:@"0"] && ![value isEqualToString:@"off"]
++                          && ![value isEqualToString:@"false"];
++    }
++    else
++        showsScrollbar = [defaults boolForKey:@"scrollbar"];
++
++    // With a scrollbar, the window's actual content host is a plain NSView holding TerminalView
++    // (narrowed to leave room on the right) and the NSScroller as sibling subviews -- the same
++    // structure mlterm's Cocoa frontend uses (MLTermView + NSScroller both added to the window's
++    // contentView, never an NSScrollView/documentView: our "content" is a fixed-size composited
++    // page plus a separate scrollback ring buffer, not a literal tall view to scroll within).
++    CGFloat const scrollerWidth = showsScrollbar ? [NSScroller scrollerWidth] : 0;
++    NSRect const termFrame =
++        NSMakeRect(0, 0, frame.size.width - scrollerWidth, frame.size.height);
++    TerminalView* view = [[TerminalView alloc] initWithFrame:termFrame
+                                                   fontFamily:fontFamily
+                                                     fontSize:fontSize
+                                                   renderMode:renderMode
+                                                        theme:theme
+                                               sshDestination:sshDestination
+-                                                       shell:shell];
++                                                       shell:shell
++                                              showsScrollbar:showsScrollbar];
+     if (view)
+     {
+-        [window setContentView:view];
++        if (showsScrollbar)
++        {
++            NSView* container = [[NSView alloc] initWithFrame:frame];
++            [view setFrameOrigin:NSMakePoint(0, 0)];
++            [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
++            [container addSubview:view];
++            [view attachScroller:container];
++            [window setContentView:container];
++            [container release];
++        }
++        else
++            [window setContentView:view];
+         [view release];
+     }
+     [window center];
+-- 
+2.43.0
+

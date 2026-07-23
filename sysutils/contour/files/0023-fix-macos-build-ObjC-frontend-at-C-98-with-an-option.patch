@@ -1,0 +1,212 @@
+From f50f9bc8fd5cc7629552540319d907e4cdad00ff Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 19 Jul 2026 12:50:23 +0000
+Subject: [PATCH 23/67] fix(macos): build ObjC++ frontend at C++98, with an
+ optional gcc-4.2 override
+
+Replaces the -fnext-runtime guess. The launch crash (nil class in
+prepareForMethodLookup / objc_msgSendSuper from -[NSWindow makeFirstResponder:])
+is the known modern-gcc Objective-C++ miscompile (fltk/fltk#1286, mplayer,
+blackomega). The established-good combination for such code is Apple gcc-4.2 at
+C++98; what is NOT yet established is whether modern gcc at C++98 also avoids it.
+
+The opaque SessionBridge means the .mm files depend on no C++23 engine code (only
+plain structs/pointers cross the boundary), so they can be compiled independently
+of the C++23 engine. Add two cache knobs on the `contour` target:
+  CONTOUR_MACOS_OBJCXX_COMPILER -- compiler for the .mm files (e.g. /usr/bin/g++-4.2);
+                                   empty = default (modern gcc).
+  CONTOUR_MACOS_OBJCXX_STD       -- C++ standard for the .mm files (default gnu++98).
+Experiment order: (1) modern gcc + gnu++98; (2) gcc-4.2 + gnu++98.
+
+Make SessionBridge.h and both .mm files strictly C++98-clean: no nullptr (-> NULL),
+no in-class member initializers, no enum-with-fixed-base, and C headers
+(<stdint.h>/<stddef.h>/<string.h>) rather than the C++ wrappers so an old compiler
+(gcc-4.2) can parse them. The C++23 engine is untouched.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AeG2jwYMX5gdvvtUnx3PJa
+---
+ src/contour_macos/CMakeLists.txt  | 38 ++++++++++++++++++++--------
+ src/contour_macos/SessionBridge.h | 42 ++++++++++++++++++-------------
+ src/contour_macos/TerminalView.mm | 11 ++++----
+ 3 files changed, 58 insertions(+), 33 deletions(-)
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index 40bd6489..8930f864 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -47,7 +47,28 @@ target_compile_options(contour_macos_render_probe PRIVATE ${_contour_macos_warn_
+ 
+ # The interactive app: AppKit window + view + input (Objective-C++). APPLE-only.
+ if(APPLE)
++    # Modern GCC miscompiles Objective-C++ that talks to Apple's ObjC runtime: AppKit
++    # messaging our classes crashes (nil class in prepareForMethodLookup / objc_msgSendSuper),
++    # the same failure FLTK/mplayer/blackomega hit with modern GCC (fltk/fltk#1286). The known
++    # working combination is Apple's gcc-4.2 at C++98. The opaque SessionBridge makes the .mm
++    # files depend on no C++23 engine code (only plain structs/pointers cross the boundary), so
++    # we can compile them differently from the C++23 engine. Two independently-selectable knobs:
++    #
++    #   CONTOUR_MACOS_OBJCXX_COMPILER  -- path to a compiler for the .mm files (e.g.
++    #                                     /usr/bin/g++-4.2). Empty = use the default (modern gcc).
++    #   CONTOUR_MACOS_OBJCXX_STD        -- C++ standard for the .mm files (default gnu++98).
++    #
++    # Experiment order: (1) modern gcc + gnu++98; (2) if still broken, gcc-4.2 + gnu++98.
++    set(CONTOUR_MACOS_OBJCXX_COMPILER "" CACHE STRING
++        "Compiler for the macOS ObjC++ frontend sources (empty = default). e.g. /usr/bin/g++-4.2")
++    set(CONTOUR_MACOS_OBJCXX_STD "gnu++98" CACHE STRING
++        "C++ standard for the macOS ObjC++ frontend sources.")
++
++    if(CONTOUR_MACOS_OBJCXX_COMPILER)
++        set(CMAKE_OBJCXX_COMPILER "${CONTOUR_MACOS_OBJCXX_COMPILER}")
++    endif()
+     enable_language(OBJCXX)
++
+     set(_app_sources
+         TerminalView.mm
+         main.mm
+@@ -58,17 +79,12 @@ if(APPLE)
+     add_executable(contour ${_app_sources} ${_app_headers})
+     target_link_libraries(contour PRIVATE contour_macos)
+     target_compile_options(contour PRIVATE ${_contour_macos_warn_opts})
+-    # GCC defaults to the GNU Objective-C runtime, but macOS AppKit uses Apple's NeXT
+-    # runtime. Without this, AppKit messaging our classes finds a mismatched class
+-    # structure and crashes in the ObjC runtime (nil class in prepareForMethodLookup).
+-    # Emit NeXT-runtime ObjC so our classes interoperate with the system frameworks.
+-    target_compile_options(contour PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fnext-runtime>)
+-    # ObjC++ sources need to compile as Objective-C++; .mm is auto-detected, but set the
+-    # standard to match the engine (C++23) for the C++ portions they include.
+-    set_target_properties(contour PROPERTIES
+-        CXX_STANDARD 23
+-        OBJCXX_STANDARD 23
+-    )
++
++    # Force the ObjC++ standard explicitly (works even with gcc-4.2, which predates CMake's
++    # OBJCXX_STANDARD handling), and leave the target's plain C++ standard unset (no C++ TUs).
++    set_source_files_properties(${_app_sources} PROPERTIES
++        COMPILE_OPTIONS "-std=${CONTOUR_MACOS_OBJCXX_STD}")
++
+     # CoreGraphics is not a standalone linkable framework on 10.6 (like CoreText); its
+     # symbols come via ApplicationServices. Link ApplicationServices, not CoreGraphics.
+     target_link_libraries(contour PRIVATE
+diff --git a/src/contour_macos/SessionBridge.h b/src/contour_macos/SessionBridge.h
+index 81adb92e..8ba63be8 100644
+--- a/src/contour_macos/SessionBridge.h
++++ b/src/contour_macos/SessionBridge.h
+@@ -10,36 +10,44 @@
+ // below. The implementation (SessionBridge.cpp) is compiled as ordinary C++ and is the only
+ // place that includes engine + session headers.
+ 
+-#include <cstddef>
+-#include <cstdint>
++// C headers (not <cstddef>/<cstdint>): this header is included by the .mm files, which may be
++// compiled by an old compiler (gcc-4.2) where the C++ <c...> wrappers are unreliable. The C
++// headers put uint32_t/uint8_t/size_t in the global namespace, which is what this header uses.
++#include <stddef.h>
++#include <stdint.h>
+ 
+ namespace contour_macos
+ {
+ 
+ class TerminalSession; // opaque to the .mm side
+ 
++// NB: this header is included by the ObjC++ (.mm) files, which are compiled at -std=gnu++98
++// to avoid a modern-GCC Objective-C++ miscompile (see the app CMakeLists). It must therefore
++// stay strictly C++98-clean: no in-class member initializers, no enum-with-fixed-base, no
++// nullptr. The C++23 SessionBridge.cpp includes it too, where C++98 is a valid subset.
++
+ /// Host callbacks, invoked from the engine's parser thread. Each receives the opaque
+ /// `userData` the bridge was created with (the TerminalView). Implementations must marshal
+-/// any UI work onto the main thread themselves.
++/// any UI work onto the main thread themselves. Zero-initialize before use.
+ struct BridgeCallbacks
+ {
+-    void* userData = nullptr;
+-    void (*requestRedraw)(void* userData) = nullptr;
+-    void (*setTitle)(void* userData, char const* utf8Title) = nullptr;
+-    void (*bell)(void* userData) = nullptr;
+-    void (*copyToClipboard)(void* userData, char const* utf8Data) = nullptr;
+-    /// Returns a freshly malloc()'d UTF-8 C string the bridge will free(), or nullptr.
+-    char* (*readClipboard)(void* userData) = nullptr;
+-    void (*onClosed)(void* userData) = nullptr;
++    void* userData;
++    void (*requestRedraw)(void* userData);
++    void (*setTitle)(void* userData, char const* utf8Title);
++    void (*bell)(void* userData);
++    void (*copyToClipboard)(void* userData, char const* utf8Data);
++    /// Returns a freshly malloc()'d UTF-8 C string the bridge will free(), or null.
++    char* (*readClipboard)(void* userData);
++    void (*onClosed)(void* userData);
+ };
+ 
+ /// Font configuration passed across the boundary as primitives.
+ struct BridgeFontConfig
+ {
+-    char const* family = "Menlo";
+-    double sizePt = 14.0;
+-    int dpiX = 96;
+-    int dpiY = 96;
++    char const* family;
++    double sizePt;
++    int dpiX;
++    int dpiY;
+ };
+ 
+ /// Creates a session sized to (widthPx, heightPx) and spawns the shell's read loop is NOT
+@@ -67,7 +75,7 @@ void bridge_resize(TerminalSession* session, int widthPx, int heightPx);
+ // --- input (all coordinates in view pixels, top-left origin) ---
+ 
+ /// Modifier bitmask matching the engine's Modifier enum: Shift=1 Alt=2 Control=4 Super=8.
+-enum BridgeModifier : uint32_t
++enum BridgeModifier
+ {
+     BridgeMod_Shift = 1,
+     BridgeMod_Alt = 2,
+@@ -76,7 +84,7 @@ enum BridgeModifier : uint32_t
+ };
+ 
+ /// Special (non-text) keys, matching a subset of vtbackend::Key.
+-enum BridgeKey : int
++enum BridgeKey
+ {
+     BridgeKey_None = 0,
+     BridgeKey_Up,
+diff --git a/src/contour_macos/TerminalView.mm b/src/contour_macos/TerminalView.mm
+index e0bcbd05..a32ac2f2 100644
+--- a/src/contour_macos/TerminalView.mm
++++ b/src/contour_macos/TerminalView.mm
+@@ -9,8 +9,9 @@
+ 
+ #include <contour_macos/SessionBridge.h>
+ 
+-#include <cstdlib>
+-#include <cstring>
++// C headers (the .mm may be built by gcc-4.2 under gnu++98): strdup lives in <string.h>.
++#include <stdlib.h>
++#include <string.h>
+ 
+ namespace
+ {
+@@ -97,9 +98,9 @@ char* cbReadClipboard(void* userData)
+     NSPasteboard* pb = [NSPasteboard generalPasteboard];
+     NSString* s = [pb stringForType:NSPasteboardTypeString];
+     if (!s)
+-        return nullptr;
++        return NULL;
+     char const* utf8 = [s UTF8String];
+-    return utf8 ? strdup(utf8) : nullptr;
++    return utf8 ? strdup(utf8) : NULL;
+ }
+ 
+ void cbOnClosed(void* userData)
+@@ -162,7 +163,7 @@ void cbOnClosed(void* userData)
+ {
+     TerminalSession* s = [self session];
+     contour_macos::bridge_destroy(s);
+-    _session = nullptr;
++    _session = NULL;
+     [super dealloc];
+ }
+ 
+-- 
+2.43.0
+

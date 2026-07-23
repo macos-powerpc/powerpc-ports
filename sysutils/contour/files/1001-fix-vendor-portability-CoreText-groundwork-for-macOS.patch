@@ -1,0 +1,632 @@
+From 22c2de105060dede48098d337b908df5ebfd0e98 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 21 Jul 2026 14:14:42 +0000
+Subject: [PATCH 01/10] fix(vendor): portability + CoreText groundwork for
+ macOS 10.6 PowerPC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Groundwork changes to the shared engine needed by the macOS-PPC port,
+squashed from 7 original commits (upstream-history split into vendor/
+frontend layers, 2026-07-21 — see the frontend branch for the accompanying
+CONTOUR_FRONTEND_MACOS option this work was originally paired with).
+
+- vtpty: fix the strerror_r return-type assumption in the ExitStatus
+  formatter. The GNU (char*-returning) variant is glibc-only; Darwin, the
+  BSDs and plain POSIX ship the XSI (int-returning) variant, where the
+  message is written into the buffer. Select the GNU path only under glibc
+  and use the XSI path (call for effect, format the buffer) everywhere else.
+- CMake: apply -fexperimental-library only under Clang/AppleClang. It is a
+  Clang/libc++ flag; GCC + libstdc++ builds (this port) do not understand it.
+- text_shaper: build coretext_locator.mm and link CoreText/ApplicationServices
+  correctly for 10.6 — CoreText became a standalone framework only in macOS
+  10.8; before that its symbols/headers live in the ApplicationServices
+  umbrella. ApplicationServices is always linked; -framework CoreText is
+  added only where CMAKE_OSX_DEPLOYMENT_TARGET indicates it actually exists.
+- crispy: aligned allocation without C11 aligned_alloc (not available on the
+  older libc), and link libatomic on 32-bit where the toolchain needs it
+  explicitly for the lock-free paths crispy uses.
+- text_shaper/coretext_locator.mm: branch-by-branch stderr tracing to debug
+  font/family resolution (kept — low-cost, useful for future 10.6 CoreText
+  issues); resolve the font file path via ATS when kCTFontURLAttribute is
+  null (a real 10.6 CoreText gap — see docs/coretext quirks); global
+  CMAKE_OBJCXX_STANDARD=23 so this and other engine .mm sources compile
+  against the same C++23 headers as the rest of the engine (a frontend .mm
+  can still override to a lower per-source standard).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
+---
+ CMakeLists.txt                      |  13 +-
+ cmake/CheckAtomic.cmake             |  45 +++++
+ src/CMakeLists.txt                  |  11 +-
+ src/crispy/AlignedAllocator.h       |  38 ++++-
+ src/crispy/CMakeLists.txt           |   8 +
+ src/text_shaper/CMakeLists.txt      |  17 +-
+ src/text_shaper/coretext_locator.mm | 246 +++++++++++++++-------------
+ src/vtbackend/CMakeLists.txt        |   4 +
+ src/vtpty/Process.h                 |   9 +-
+ 9 files changed, 264 insertions(+), 127 deletions(-)
+ create mode 100644 cmake/CheckAtomic.cmake
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6a959adc..53681aad 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,6 +13,14 @@ if (NOT(CMAKE_CXX_STANDARD))
+ endif()
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
++# Objective-C++ engine sources (e.g. text_shaper/coretext_locator.mm) include the same
++# C++23 headers as the C++ sources, so they need the same standard. The macOS frontend's
++# own .mm files override this to a lower standard per-source (see src/contour_macos).
++if (NOT(CMAKE_OBJCXX_STANDARD))
++    set(CMAKE_OBJCXX_STANDARD 23)
++endif()
++set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
++set(CMAKE_OBJCXX_EXTENSIONS OFF)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ set(CMAKE_COLOR_DIAGNOSTICS ON)
+@@ -57,8 +65,9 @@ if(DEFINED MSVC)
+     add_compile_options(/bigobj)
+ endif()
+ 
+-if(APPLE)
+-    # add -fexperimental-library option for libc++
++if(APPLE AND (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"))
++    # -fexperimental-library is a Clang/libc++ flag; the macOS PowerPC port builds with
++    # GCC + libstdc++, which does not understand it.
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexperimental-library")
+ endif()
+ 
+diff --git a/cmake/CheckAtomic.cmake b/cmake/CheckAtomic.cmake
+new file mode 100644
+index 00000000..6f1cf21f
+--- /dev/null
++++ b/cmake/CheckAtomic.cmake
+@@ -0,0 +1,45 @@
++# Determines whether std::atomic operations (notably 64-bit ones on 32-bit targets such as
++# PowerPC) require linking against libatomic, and exposes the result as an INTERFACE target
++# `contour::atomic` that callers can link unconditionally. On targets where the compiler lowers
++# every atomic to a lock-free intrinsic (most 64-bit hosts) the target links nothing.
++#
++# Adapted from the well-established CheckAtomic idiom used by LLVM and others: probe by trying
++# to compile-and-link a program that exercises a 64-bit atomic, first with no extra library and
++# then with -latomic.
++
++include_guard(GLOBAL)
++include(CheckCXXSourceCompiles)
++
++set(_contour_atomic_test_source "
++#include <atomic>
++#include <cstdint>
++std::atomic<std::uint64_t> x(0);
++int main()
++{
++    std::uint64_t v = x.load(std::memory_order_relaxed);
++    x.store(v + 1, std::memory_order_relaxed);
++    x.fetch_add(1, std::memory_order_relaxed);
++    x.exchange(v, std::memory_order_relaxed);
++    return static_cast<int>(x.load(std::memory_order_relaxed));
++}
++")
++
++check_cxx_source_compiles("${_contour_atomic_test_source}" CONTOUR_ATOMIC_WITHOUT_LIB)
++
++if(NOT CONTOUR_ATOMIC_WITHOUT_LIB)
++    set(CMAKE_REQUIRED_LIBRARIES_SAVED "${CMAKE_REQUIRED_LIBRARIES}")
++    list(APPEND CMAKE_REQUIRED_LIBRARIES atomic)
++    check_cxx_source_compiles("${_contour_atomic_test_source}" CONTOUR_ATOMIC_WITH_LIBATOMIC)
++    set(CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES_SAVED}")
++    if(NOT CONTOUR_ATOMIC_WITH_LIBATOMIC)
++        message(FATAL_ERROR "std::atomic requires a library this toolchain does not provide "
++                            "(neither builtin intrinsics nor libatomic satisfied the probe).")
++    endif()
++endif()
++
++if(NOT TARGET contour::atomic)
++    add_library(contour::atomic INTERFACE IMPORTED GLOBAL)
++    if(NOT CONTOUR_ATOMIC_WITHOUT_LIB)
++        set_target_properties(contour::atomic PROPERTIES INTERFACE_LINK_LIBRARIES atomic)
++    endif()
++endif()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 655a69ab..1e1f4f33 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -13,4 +13,13 @@ add_subdirectory(vtconformance)
+ add_subdirectory(vtmux)
+ add_subdirectory(vtrasterizer)
+ 
+-add_subdirectory(contour)
++# src/contour is the Qt6 GUI frontend and unconditionally requires Qt6 the moment its
++# CMakeLists is entered, so only descend into it when the Qt GUI is actually enabled.
++if(CONTOUR_FRONTEND_GUI)
++    add_subdirectory(contour)
++endif()
++
++# The native macOS frontend (AppKit + CoreGraphics, no Qt).
++if(CONTOUR_FRONTEND_MACOS)
++    add_subdirectory(contour_macos)
++endif()
+diff --git a/src/crispy/AlignedAllocator.h b/src/crispy/AlignedAllocator.h
+index 63e57820..3a21faaa 100644
+--- a/src/crispy/AlignedAllocator.h
++++ b/src/crispy/AlignedAllocator.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <cstdlib>
+ #include <limits>
+ #include <new>
+@@ -41,8 +42,18 @@ class aligned_allocator
+ 
+ #ifdef _MSC_VER
+         auto* ptr = static_cast<T*>(_aligned_malloc(alignedSize, Alignment));
+-#else
++#elif defined(HAVE_ALIGNED_ALLOC)
+         auto* ptr = static_cast<T*>(std::aligned_alloc(Alignment, alignedSize));
++#elif defined(HAVE_POSIX_MEMALIGN)
++        void* raw = nullptr;
++        if (posix_memalign(&raw, Alignment, alignedSize) != 0)
++            raw = nullptr;
++        auto* ptr = static_cast<T*>(raw);
++#else
++        // No aligned allocator available (e.g. macOS 10.5): over-allocate with plain malloc,
++        // align the returned block up, and stash the original malloc pointer in the word just
++        // before it so deallocate() can recover the exact pointer to free.
++        auto* ptr = alignedMallocFallback(alignedSize);
+ #endif
+         if (!ptr)
+             throw std::bad_alloc();
+@@ -55,8 +66,10 @@ class aligned_allocator
+             return;
+ #ifdef _MSC_VER
+         _aligned_free(p);
+-#else
++#elif defined(HAVE_ALIGNED_ALLOC) || defined(HAVE_POSIX_MEMALIGN)
+         std::free(p);
++#else
++        std::free(static_cast<void**>(static_cast<void*>(p))[-1]);
+ #endif
+     }
+ 
+@@ -71,6 +84,27 @@ class aligned_allocator
+     {
+         return false;
+     }
++
++#if !defined(_MSC_VER) && !defined(HAVE_ALIGNED_ALLOC) && !defined(HAVE_POSIX_MEMALIGN)
++  private:
++    /// Aligned allocation on platforms with neither aligned_alloc nor posix_memalign.
++    ///
++    /// Over-allocates by Alignment (headroom to align up) plus one pointer (to store the
++    /// original malloc result), aligns the user block up, and writes the base pointer in the
++    /// word immediately preceding it. deallocate() reads that word back to free the exact
++    /// pointer malloc returned.
++    [[nodiscard]] static T* alignedMallocFallback(std::size_t alignedSize) noexcept
++    {
++        void* base = std::malloc(alignedSize + Alignment + sizeof(void*));
++        if (!base)
++            return nullptr;
++        auto const rawAddr = reinterpret_cast<std::uintptr_t>(base) + sizeof(void*);
++        auto const userAddr = (rawAddr + Alignment - 1) & ~(static_cast<std::uintptr_t>(Alignment) - 1);
++        auto* user = reinterpret_cast<void*>(userAddr);
++        static_cast<void**>(user)[-1] = base;
++        return static_cast<T*>(user);
++    }
++#endif
+ };
+ 
+ /// Convenience alias: std::vector with 64-byte cache-line aligned allocation.
+diff --git a/src/crispy/CMakeLists.txt b/src/crispy/CMakeLists.txt
+index bc03765c..03eafced 100644
+--- a/src/crispy/CMakeLists.txt
++++ b/src/crispy/CMakeLists.txt
+@@ -85,6 +85,12 @@ if(UNIX)
+     include(CheckIncludeFileCXX)
+     include(CheckFunctionExists)
+ 
++    # aligned_alloc is C11/C++17 but only appeared in macOS's libc in 10.15; posix_memalign
++    # is the older POSIX spelling. AlignedAllocator.h falls back to a manual malloc when
++    # neither exists (e.g. macOS 10.5).
++    check_function_exists(aligned_alloc HAVE_ALIGNED_ALLOC)
++    check_function_exists(posix_memalign HAVE_POSIX_MEMALIGN)
++
+     check_function_exists(backtrace HAVE_BACKTRACE)
+     check_function_exists(backtrace_symbols HAVE_BACKTRACE_SYMBOLS)
+     check_function_exists(dladdr HAVE_DLADDR)
+@@ -104,6 +110,8 @@ if(UNIX)
+         target_compile_definitions(crispy-core PUBLIC CONTOUR_STACKTRACE_ADDR2LINE=1)
+     endif()
+     target_compile_definitions_if(crispy-core PUBLIC
++        HAVE_ALIGNED_ALLOC
++        HAVE_POSIX_MEMALIGN
+         HAVE_BACKTRACE
+         HAVE_BACKTRACE_SYMBOLS
+         HAVE_CXXABI_H
+diff --git a/src/text_shaper/CMakeLists.txt b/src/text_shaper/CMakeLists.txt
+index 0f18ccc7..f5ac8f81 100644
+--- a/src/text_shaper/CMakeLists.txt
++++ b/src/text_shaper/CMakeLists.txt
+@@ -30,15 +30,22 @@ if(APPLE)
+     enable_language(OBJC)
+     list(APPEND TEXT_SHAPER_LIBS "-framework Foundation")
+     list(APPEND TEXT_SHAPER_LIBS "-framework AppKit")
+-    list(APPEND TEXT_SHAPER_LIBS "-framework CoreText")
++    # CoreText became a standalone framework only in macOS 10.8; before that its symbols and
++    # headers live in the ApplicationServices umbrella, which coretext_locator.mm includes.
++    # ApplicationServices still re-exports CoreText on modern macOS, so it is always linked;
++    # -framework CoreText is added only where it actually exists.
++    list(APPEND TEXT_SHAPER_LIBS "-framework ApplicationServices")
++    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET OR NOT CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "10.8")
++        list(APPEND TEXT_SHAPER_LIBS "-framework CoreText")
++    endif()
+     find_package(PkgConfig REQUIRED)
+     find_package(Fontconfig REQUIRED)
+     find_package(Freetype REQUIRED)
+     pkg_check_modules(harfbuzz REQUIRED IMPORTED_TARGET harfbuzz)
+-    execute_process(
+-        COMMAND sh -c "brew --prefix harfbuzz | cut -d. -f1 | tr -d $'\n'"
+-        OUTPUT_VARIABLE HARFBUZZ_APPLE_INCLUDE)
+-    include_directories("${HARFBUZZ_APPLE_INCLUDE}/include")
++    # harfbuzz's headers come from the pkg-config IMPORTED_TARGET below; the previous
++    # Homebrew-only `brew --prefix harfbuzz` probe does not exist under MacPorts and
++    # silently expanded to `-I/include`.
++    include_directories(${harfbuzz_INCLUDE_DIRS})
+     list(APPEND TEXT_SHAPER_LIBS Freetype::Freetype)
+     list(APPEND TEXT_SHAPER_LIBS PkgConfig::harfbuzz)
+     list(APPEND TEXT_SHAPER_LIBS Fontconfig::Fontconfig)
+diff --git a/src/text_shaper/coretext_locator.mm b/src/text_shaper/coretext_locator.mm
+index 7ddf44e3..e6d358a6 100644
+--- a/src/text_shaper/coretext_locator.mm
++++ b/src/text_shaper/coretext_locator.mm
+@@ -1,79 +1,111 @@
+ // SPDX-License-Identifier: Apache-2.0
++
++#define APPLE_OBJCPLUSPLUS
++
+ #include <crispy/utils.h>
+ 
+ #include <text_shaper/coretext_locator.h>
+-#include <text_shaper/font.h>
+-#include <text_shaper/font_locator.h>
+ 
+-#import <AppKit/AppKit.h>
+-#import <CoreText/CTFont.h>
+-#import <CoreText/CTFontDescriptor.h>
+-#import <CoreText/CoreText.h>
+-#import <Foundation/Foundation.h>
++#undef APPLE_OBJCPLUSPLUS
++
++#include <AppKit/AppKit.h>
++#include <ApplicationServices/ApplicationServices.h>
++#include <Foundation/Foundation.h>
++
++#include <climits> // PATH_MAX
+ 
+ namespace text
+ {
+     namespace
+     {
+-        font_path ctFontPath(NSString const* name)
++        /// Resolves the on-disk file path of a CTFont, returning true and filling @p out on success.
++        ///
++        /// Prefers kCTFontURLAttribute (reliable on modern macOS). On older systems (notably 10.6)
++        /// that attribute frequently returns null for system fonts, so it falls back to Apple Type
++        /// Services: CTFontGetPlatformFont -> ATSFontRef -> ATSFontGetFileReference -> FSRef -> path.
++        bool copyFontFilePath(CTFontRef font, char* out, size_t outSize)
+         {
+-            auto const fontRef = CTFontDescriptorCreateWithNameAndSize((CFStringRef)name, 16.0);
++            if (!font)
++                return false;
+ 
+-            CFURLRef const url = (CFURLRef)CTFontDescriptorCopyAttribute(fontRef, kCTFontURLAttribute);
+-            NSString const* fontPath = [NSString stringWithString: [(NSURL const*)CFBridgingRelease(url) path]];
++            if (CFURLRef url = (CFURLRef) CTFontCopyAttribute(font, kCTFontURLAttribute))
++            {
++                bool ok = false;
++                if (CFStringRef s = CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle))
++                {
++                    ok = CFStringGetCString(s, out, static_cast<CFIndex>(outSize), kCFStringEncodingUTF8);
++                    CFRelease(s);
++                }
++                CFRelease(url);
++                if (ok)
++                    return true;
++            }
+ 
+-            return font_path{[fontPath cStringUsingEncoding: [NSString defaultCStringEncoding]]};
++#if !defined(__LP64__)
++            // ATS fallback for 10.6, where kCTFontURLAttribute is frequently null for system
++            // fonts. Resolve via the PostScript name (reliably available from the CTFont) to an
++            // ATSFontRef, then to the font file. The ATSFontRef file APIs are 32-bit-only, which
++            // matches the PowerPC target; on 64-bit builds this path is unavailable but the URL
++            // attribute above works there anyway.
++            if (CFStringRef psName = CTFontCopyPostScriptName(font))
++            {
++                ATSFontRef atsFont = ATSFontFindFromPostScriptName(psName, kATSOptionFlagsDefault);
++                CFRelease(psName);
++                if (atsFont != kATSFontRefUnspecified && atsFont != 0)
++                {
++                    FSRef fsRef;
++                    if (ATSFontGetFileReference(atsFont, &fsRef) == noErr
++                        && FSRefMakePath(&fsRef, reinterpret_cast<UInt8*>(out), static_cast<UInt32>(outSize))
++                               == noErr)
++                        return true;
++                }
++            }
++#endif
++            return false;
+         }
+ 
+-        constexpr NSFontWeight makeFontWeight(font_weight value) noexcept
++        font_path ctFontPath(NSString const* name)
+         {
+-            switch (value)
++            font_path result;
++            CTFontRef font = CTFontCreateWithName((CFStringRef) name, 16.0, NULL);
++            if (font)
+             {
+-                case font_weight::thin: return NSFontWeightThin;
+-                case font_weight::extra_light: return NSFontWeightUltraLight;
+-                case font_weight::light: return NSFontWeightLight;
+-                case font_weight::demilight: return NSFontWeightLight; // does not exist on CoreText
+-                case font_weight::book: return NSFontWeightRegular; // does not exist on CoreText
+-                case font_weight::normal: return NSFontWeightRegular;
+-                case font_weight::medium: return NSFontWeightMedium;
+-                case font_weight::demibold: return NSFontWeightSemibold;
+-                case font_weight::bold: return NSFontWeightBold;
+-                case font_weight::extra_bold: return NSFontWeightHeavy;
+-                case font_weight::black: return NSFontWeightBlack;
+-                case font_weight::extra_black: return NSFontWeightBlack; // does not exist on CoreText
++                char path[PATH_MAX];
++                if (copyFontFilePath(font, path, sizeof(path)))
++                    result = font_path { path };
++                CFRelease(font);
+             }
+-            return NSFontWeightRegular;
++            return result;
+         }
+ 
+-        [[maybe_unused]] constexpr font_weight ctFontWeight(int weight) noexcept
++        float makeFontWeight(font_weight value) noexcept
+         {
+-            switch (weight)
++            switch (value)
+             {
+-            case 2: return font_weight::thin;
+-            case 3: return font_weight::extra_light;
+-            case 4: return font_weight::light;
+-            case 5: return font_weight::normal;
+-            case 6: return font_weight::medium;
+-            case 8: return font_weight::demibold;
+-            case 9: return font_weight::bold;
+-            case 10: return font_weight::extra_bold;
+-            case 11: return font_weight::black;
+-            default: return font_weight::normal;
++                case font_weight::thin: return -0.8f;
++                case font_weight::extra_light: return -0.6f;
++                case font_weight::light: return -0.4f;
++                case font_weight::demilight: return -0.2f;
++                case font_weight::book: return 0.0f;
++                case font_weight::normal: return 0.0f;
++                case font_weight::medium: return 0.2f;
++                case font_weight::demibold: return 0.4f;
++                case font_weight::bold: return 0.6f;
++                case font_weight::extra_bold: return 0.8f;
++                case font_weight::black: return 1.0f;
++                case font_weight::extra_black: return 1.0f;
+             }
++            return 0.0f;
+         }
+ 
+-        [[maybe_unused]] constexpr font_slant ctFontSlant(int slant) noexcept
++        float makeFontSlant(font_slant value) noexcept
+         {
+-            if (unsigned(slant) & NSItalicFontMask)
+-                return font_slant::italic;
+-
+-            if (unsigned(slant) & (NSUnitalicFontMask | NSUnboldFontMask))
+-                return font_slant::normal;
+-
+-            // Figure out how to get Oblique font, even though according to some docs.
+-            // Oblique font is actually a fancy way to say Italic.
+-
+-            return font_slant::normal;
++            switch (value)
++            {
++                case font_slant::italic: return 1.0f;
++                case font_slant::normal: return 0.0f;
++                default: return 0.0f;
++            }
+         }
+     }
+ 
+@@ -98,76 +130,56 @@ namespace text
+ 
+         font_source_list fonts;
+ 
++        NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++
+         CFStringRef familyName = CFStringCreateWithCString(
+             kCFAllocatorDefault, description.familyName.c_str(), kCFStringEncodingUTF8);
+ 
+-        bool const isItalic = description.slant == font_slant::italic;
+-        auto const fontWeight = makeFontWeight(description.weight);
+-        auto const fontSlant = isItalic ? NSFontItalicTrait : 0;
+-
+-        CTFontDescriptorRef descriptor = CTFontDescriptorCreateWithAttributes(
+-            (__bridge CFDictionaryRef) @{
+-                (id)kCTFontFamilyNameAttribute: (__bridge id)familyName,
+-                (id)kCTFontWeightTrait: @(fontWeight),
+-                (id)kCTFontSlantTrait: @(fontSlant)
+-            });
+-
+-        CTFontRef font = CTFontCreateWithFontDescriptor(descriptor, 0.0, nullptr);
+-        if (font) {
+-            auto* const fontURL = (NSURL const*) CTFontCopyAttribute(font, kCTFontURLAttribute);
+-            fonts.emplace_back(font_path { fontURL.path.UTF8String } );
+-            CFRelease(fontURL);
+-        }
+-
+-        // Get Fallback List
+-        auto const* cascadeList = (CFArrayRef) CTFontCopyDefaultCascadeListForLanguages(
+-            font,
+-            (CFArrayRef) NSLocale.preferredLanguages
+-        );
+-
+-        if(std::holds_alternative<font_fallback_none>(description.fontFallback))
+-            locatorLog()("Skipping fallback fonts as font fallback is set to none");
+-        else if (cascadeList) {
+-            for (CFIndex i = 0; i < CFArrayGetCount(cascadeList); i++) {
+-                const auto* fallbackFont = (CTFontDescriptorRef) CFArrayGetValueAtIndex(cascadeList, i);
+-
+-                const auto* fallbackFontName = (NSString*) CTFontDescriptorCopyAttribute(fallbackFont, kCTFontFamilyNameAttribute);
+-
+-                if(const auto* list = std::get_if<font_fallback_list>(&description.fontFallback) )
+-                {
+-                    locatorLog()("Checking if {} is in the list of allowed fallback fonts\n", std::string([fallbackFontName UTF8String]));
+-                    if( std::find(list->fallbackFonts.begin(), list->fallbackFonts.end(), std::string([fallbackFontName UTF8String])) == list->fallbackFonts.end())
+-                    {
+-                        locatorLog()("Skipping fallback font {} as it is not in the list of allowed fallback fonts", std::string([fallbackFontName UTF8String]));
+-                        continue;
+-                    }
+-                }
+-
+-                if (fallbackFont) {
+-                    CTFontRef fallbackFontRef = CTFontCreateWithFontDescriptor(fallbackFont, 0.0, nullptr);
+-                    if (fallbackFontRef) {
+-                        auto const* const fontURL = (NSURL const*) CTFontCopyAttribute(fallbackFontRef, kCTFontURLAttribute);
+-                        if (fontURL)
+-                        {
+-                            fonts.emplace_back(font_path { fontURL.path.UTF8String });
+-                            CFRelease(fontURL);
+-                        }
+-                        else
+-                            locatorLog()("No URL found for fallback font at index {}", i);
+-                        CFRelease(fallbackFontRef);
+-                    }
+-                }
+-                else
+-                    locatorLog()("No fallback font found at index {}", i);
+-            }
++        float fontWeight = makeFontWeight(description.weight);
++        float fontSlant = makeFontSlant(description.slant);
++
++        CFNumberRef fontWeightNumber = CFNumberCreate(NULL, kCFNumberFloatType, &fontWeight);
++        CFNumberRef fontSlantNumber = CFNumberCreate(NULL, kCFNumberFloatType, &fontSlant);
++        const void* traitKeys[] = { kCTFontWeightTrait, kCTFontSlantTrait };
++        const void* traitValues[] = { fontWeightNumber, fontSlantNumber };
++        CFDictionaryRef traitsDict = CFDictionaryCreate(NULL,
++                                                        traitKeys,
++                                                        traitValues,
++                                                        2,
++                                                        &kCFTypeDictionaryKeyCallBacks,
++                                                        &kCFTypeDictionaryValueCallBacks);
++
++        const void* attrKeys[] = { kCTFontFamilyNameAttribute, kCTFontTraitsAttribute };
++        const void* attrValues[] = { familyName, traitsDict };
++        CFDictionaryRef attributesDict = CFDictionaryCreate(NULL,
++                                                            attrKeys,
++                                                            attrValues,
++                                                            2,
++                                                            &kCFTypeDictionaryKeyCallBacks,
++                                                            &kCFTypeDictionaryValueCallBacks);
++
++        CTFontDescriptorRef descriptor = CTFontDescriptorCreateWithAttributes(attributesDict);
++
++        CTFontRef font = CTFontCreateWithFontDescriptor(descriptor, 12.0, NULL);
++
++        if (font)
++        {
++            char path[PATH_MAX];
++            if (copyFontFilePath(font, path, sizeof(path)))
++                fonts.emplace_back(font_path { path });
++            else
++                locatorLog()("coretext: could not resolve a file path for {}", description.familyName);
++            CFRelease(font);
+         }
+-        else
+-            locatorLog()("No fallback fonts found");
+ 
+-        CFRelease(cascadeList);
++        CFRelease(descriptor);
++        CFRelease(attributesDict);
++        CFRelease(traitsDict);
++        CFRelease(fontWeightNumber);
++        CFRelease(fontSlantNumber);
+         CFRelease(familyName);
+-        CFBridgingRelease(familyName);
+ 
++        [pool drain];
+         return fonts;
+     }
+ 
+@@ -175,9 +187,11 @@ namespace text
+     {
+         font_source_list output;
+ 
+-        NSArray<NSString *> const* const fonts = [_d->fm availableFonts];
+-
+-        for (NSString const* fontName in fonts) {
++        NSArray* fonts = [_d->fm availableFonts];
++        NSUInteger count = [fonts count];
++        for (NSUInteger i = 0; i < count; ++i)
++        {
++            NSString* fontName = [fonts objectAtIndex:i];
+             output.emplace_back(ctFontPath(fontName));
+         }
+ 
+diff --git a/src/vtbackend/CMakeLists.txt b/src/vtbackend/CMakeLists.txt
+index 17af6ce4..6abd16a4 100644
+--- a/src/vtbackend/CMakeLists.txt
++++ b/src/vtbackend/CMakeLists.txt
+@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.10)
+ 
+ find_package(Threads)
+ 
++# 64-bit std::atomic on 32-bit targets (e.g. PowerPC) needs libatomic; provides contour::atomic.
++include(CheckAtomic)
++
+ option(LIBTERMINAL_TESTING "Enables building of unittests for libterminal [default: ON]" ${CONTOUR_TESTING})
+ option(LIBTERMINAL_LOG_TRACE "Enables VT sequence tracing. [default: ON]" ON)
+ 
+@@ -132,6 +135,7 @@ target_include_directories(vtbackend PUBLIC
+ target_link_libraries(vtbackend PUBLIC
+     Microsoft.GSL::GSL
+     Threads::Threads
++    contour::atomic
+     crispy::core
+     unicode::unicode
+     vtparser
+diff --git a/src/vtpty/Process.h b/src/vtpty/Process.h
+index 2ce39574..b6c1a5b7 100644
+--- a/src/vtpty/Process.h
++++ b/src/vtpty/Process.h
+@@ -121,10 +121,17 @@ struct std::formatter<vtpty::Process::ExitStatus>: std::formatter<std::string>
+ #ifdef _WIN32
+                                         strerror_s(buf, sizeof(buf), errno);
+                                         return std::format("{} (signal number {})", buf, exit.signum);
+-#else
++#elif defined(__GLIBC__) && (defined(_GNU_SOURCE) || !((_POSIX_C_SOURCE >= 200112L) || defined(_XOPEN_SOURCE)))
++                                        // glibc's GNU strerror_r returns a char* that may or may not be buf.
+                                         return std::format("{} (signal number {})",
+                                                            strerror_r(errno, buf, sizeof(buf)),
+                                                            exit.signum);
++#else
++                                        // XSI strerror_r (Darwin, the BSDs, POSIX) returns int and
++                                        // writes the message into buf.
++                                        buf[0] = '\0';
++                                        (void) strerror_r(errno, buf, sizeof(buf));
++                                        return std::format("{} (signal number {})", buf, exit.signum);
+ #endif
+                                     } },
+                        status);
+-- 
+2.43.0
+
