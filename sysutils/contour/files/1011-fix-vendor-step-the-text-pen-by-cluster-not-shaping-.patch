@@ -1,0 +1,264 @@
+From ae54e6875350e5233a313541d0cf55739b3f5602 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 25 Jul 2026 19:08:32 +0000
+Subject: [PATCH 11/11] fix(vendor): step the text pen by cluster, not
+ shaping-font advance (ghost math glyphs)
+
+A grid cell holding a covered base plus a codepoint the primary font lacks is one
+cluster, and a cluster is indivisible, so font fallback re-shapes the whole cell
+with a substitute font. That substitute is usually proportional, and HarfBuzz
+returns its advances for a normal side-by-side run -- e.g. ~2 cells for a
+two-codepoint cell, ~3 for a base plus two combining marks. renderTextGroup stepped
+the pen by those per-glyph advances (an exact 2x survives the snap-to-whole-cells
+too), so the cell's later glyphs, and everything after, were drawn a cell or two too
+far right: a "ghost" glyph beside the real one, whose position shifted with the
+surrounding SGR runs (they change which cells share a shaping group). This was the
+math-symbol ghost blob (e.g. after the summation sign) and the dropped/misplaced
+combining marks in mathematical text.
+
+Carry the input cluster on text::glyph_position (open_shaper fills it from
+info[i].cluster; it survives the fallback splice), and step the pen by the cluster:
+every glyph of one cluster shares the cell's column, a combining mark stacks via its
+own HarfBuzz offset, and the column advances only when the cluster does. A shaper
+that does not populate clusters (DirectWrite; never built by this port) is detected
+-- a multi-glyph run whose back cluster is no greater than its front -- and keeps the
+old advance-based stepping, so Windows behaviour is unchanged.
+
+Regression tests: open_shaper.fallback.carries_the_cluster_through_the_splice, and a
+new section in TextRenderer.fallback_run_stays_on_the_cell_grid.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JgBWxn9uoMJzT5vQNqviAA
+---
+ src/text_shaper/open_shaper.cpp        |  1 +
+ src/text_shaper/open_shaper_test.cpp   | 42 +++++++++++++++
+ src/text_shaper/shaper.h               | 10 ++++
+ src/vtrasterizer/TextRenderer.cpp      | 72 ++++++++++++++++++--------
+ src/vtrasterizer/TextRenderer_test.cpp | 17 ++++++
+ 5 files changed, 119 insertions(+), 23 deletions(-)
+
+diff --git a/src/text_shaper/open_shaper.cpp b/src/text_shaper/open_shaper.cpp
+index 12189bc0..933f759b 100644
+--- a/src/text_shaper/open_shaper.cpp
++++ b/src/text_shaper/open_shaper.cpp
+@@ -619,6 +619,7 @@ namespace
+             glyph_position gpos {};
+             gpos.glyph =
+                 glyph_key { .size = fontInfo.size, .font = font, .index = glyph_index { info[i].codepoint } };
++            gpos.cluster = info[i].cluster;
+ #ifdef GLYPH_KEY_DEBUG
+             {
+                 auto const cluster = info[i].cluster;
+diff --git a/src/text_shaper/open_shaper_test.cpp b/src/text_shaper/open_shaper_test.cpp
+index ca8311dc..54a14dfd 100644
+--- a/src/text_shaper/open_shaper_test.cpp
++++ b/src/text_shaper/open_shaper_test.cpp
+@@ -359,6 +359,48 @@ TEST_CASE("open_shaper.fallback.a_combining_mark_travels_with_its_base", "[open_
+     }
+ }
+ 
++TEST_CASE("open_shaper.fallback.carries_the_cluster_through_the_splice", "[open_shaper][fallback]")
++{
++    // The cluster is the glyph's cell, and the renderer steps the pen by it instead of by the shaping
++    // font's advance -- so it must survive font fallback. A covered base and a codepoint the primary
++    // lacks share one cell (cluster 0); a following letter is a second cell (cluster 1). The base+missing
++    // pair is re-shaped whole by a proportional fallback whose advances overshoot the terminal grid, which
++    // is exactly the ghost-glyph case: the pen must not trust those advances, only the cluster.
++    auto env = fallback_env { {
++        { .name = "primary", .monospace = Monospaced, .glyphs = { { U'a', 8 }, { U'b', 8 } } },
++        { .name = "fallback",
++          .monospace = Proportional,
++          .glyphs = { { U'a', 20 }, { Snowman, 20 }, { U'b', 20 } } },
++    } };
++
++    auto const primary = env.key("primary");
++    auto const fallback = env.key("fallback");
++
++    // Cell 0: 'a' + Snowman (Snowman missing from the primary). Cell 1: 'b'.
++    auto clusters = vector<unsigned> { 0, 0, 1 };
++    auto result = shape_result {};
++    env.shaper().shape(primary,
++                       u32string { U'a', Snowman, U'b' },
++                       gsl::span<unsigned> { clusters },
++                       unicode::Script::Latin,
++                       unicode::PresentationStyle::Text,
++                       result);
++    REQUIRE(result.size() == 3);
++
++    // 'a' and Snowman are one cell together in the fallback; 'b' is the next cell in the primary.
++    CHECK(result[0].cluster == 0);
++    CHECK(result[1].cluster == 0);
++    CHECK(result[2].cluster == 1);
++
++    CHECK(result[0].glyph.font == fallback);
++    CHECK(result[1].glyph.font == fallback);
++    CHECK(result[2].glyph.font == primary);
++
++    // The fallback really does report an over-a-cell advance for the base; the renderer must ignore it and
++    // step by the cluster, which is what this test pins the cluster values down for.
++    CHECK(result[0].advance.x > 8);
++}
++
+ TEST_CASE("open_shaper.fallback.respects_the_fallback_limit", "[open_shaper][fallback]")
+ {
+     auto env = fallback_env { {
+diff --git a/src/text_shaper/shaper.h b/src/text_shaper/shaper.h
+index 2732a6bd..b010c34e 100644
+--- a/src/text_shaper/shaper.h
++++ b/src/text_shaper/shaper.h
+@@ -76,6 +76,16 @@ struct glyph_position
+     crispy::point advance;
+ 
+     unicode::PresentationStyle presentation {};
++
++    /// The input cluster this glyph was shaped from, i.e. which grid cell it belongs to.
++    ///
++    /// Carried all the way through font fallback so the renderer can step the pen by whole cells --
++    /// zero for a combining mark sharing its base's cluster, one per cell for ordinary text -- instead
++    /// of accumulating the shaping font's advances. A fallback font asked to shape a whole cell-cluster
++    /// (a covered base plus a codepoint the primary lacked) reports advances for a proportional run,
++    /// which overshoot the terminal grid and draw the next glyph a cell too far; the cluster is the only
++    /// datum that pins each glyph back to its one cell. @see TextRenderer::renderTextGroup.
++    unsigned cluster {};
+ };
+ 
+ using shape_result = std::vector<glyph_position>;
+diff --git a/src/vtrasterizer/TextRenderer.cpp b/src/vtrasterizer/TextRenderer.cpp
+index 43965351..e15ca5f7 100644
+--- a/src/vtrasterizer/TextRenderer.cpp
++++ b/src/vtrasterizer/TextRenderer.cpp
+@@ -636,22 +636,65 @@ void TextRenderer::renderTextGroup(std::u32string_view codepoints,
+         return;
+     }
+ 
++    // The pen steps by the glyph's CLUSTER, not by the shaping font's advance. A cluster is a grid
++    // cell, so every glyph of one cluster shares a single cell-aligned pen base -- a combining mark
++    // draws over its base via its own HarfBuzz offset, and the cell steps forward only when the
++    // cluster does. The shaping font's advance is deliberately ignored for pen stepping: a fallback
++    // font asked to shape a whole cell-cluster (a covered base plus a codepoint the primary lacked)
++    // reports a proportional run's advances -- e.g. ~2 cells for a two-codepoint cell -- which
++    // overshoot the grid and drew the next cell's glyph a cell too far, a "ghost" glyph beside the
++    // real one whose position shifted with the surrounding SGR segmentation. Clusters count cells
++    // appended, monotone non-decreasing within a group, so `cluster - baseCluster` is the cell offset
++    // of every glyph from the group's origin; a ligature that merged N cells leaves an N-wide gap to
++    // the next cluster, which is exactly its width. (TextClusterGrouper's east-asian-width fixme is
++    // orthogonal: clusters count cells, and a wide cell's second column is a separate space cell that
++    // ends the group, so no glyph is ever stepped across it here.)
++    //
++    // A shaper that leaves the cluster field unpopulated opts out: every glyph then reports the group's
++    // base cluster, which a multi-glyph run reveals as a back cluster no greater than the front. Such a
++    // run keeps the legacy advance-based stepping so it is not collapsed onto one cell -- the guard is a
++    // capability check, not a heuristic on the text.
++    auto const baseCluster = glyphPositions.empty() ? 0u : glyphPositions.front().cluster;
++    auto const clustersPopulated =
++        glyphPositions.size() < 2 || glyphPositions.back().cluster > baseCluster;
++
++    // Legacy pen for a shaper that did not fill in clusters (see the capability check above): it steps by
++    // the shaping font's advance, snapped DOWN to whole cells. A bold/fallback face reports an advance a
++    // little over one cell (~1.3), and nearest-rounding would push some to two, producing ragged
++    // "Ke rnel" spacing; a real N-cell glyph reports an exact N-cell multiple, so flooring keeps it at N.
++    // A non-zero advance always steps at least one cell. Unused while clusters are populated.
++    auto legacyPen = pen;
++    auto const stepLegacyPen = [&](text::glyph_position const& gp) noexcept {
++        legacyPen.x += (gp.advance.x == 0 ? 0 : std::max(1, gp.advance.x / std::max(1, cellWidth)))
++                       * cellWidth * advanceScale;
++    };
++
++    // Where this glyph's cell begins: its cluster offset from the group origin when the shaper gave us
++    // clusters, otherwise wherever the accumulated advances have reached.
++    auto const cellPenFor = [&](text::glyph_position const& gp) noexcept {
++        if (!clustersPopulated)
++            return legacyPen;
++        auto cellPen = pen;
++        cellPen.x += static_cast<int>(gp.cluster - baseCluster) * cellWidth * advanceScale;
++        return cellPen;
++    };
++
+     for (auto const& glyphPosition: glyphPositions)
+     {
++        auto const cellPen = cellPenFor(glyphPosition);
++        if (!clustersPopulated)
++            stepLegacyPen(glyphPosition);
++
+         if (auto const* attributes = ensureRasterizedIfDirectMapped(glyphPosition.glyph))
+         {
+             auto const attributesCopy = adjustTileAttributesForLineFlags(lineFlags, *attributes);
+-            auto pen1 = applyGlyphPositionToPen(pen, attributesCopy, glyphPosition);
++            auto pen1 = applyGlyphPositionToPen(cellPen, attributesCopy, glyphPosition);
+             pen1 = adjustPenForLineFlags(lineFlags,
+                                          _gridMetrics,
+                                          unbox<int>(attributes->bitmapSize.height),
+                                          attributes->metadata.y.value,
+                                          pen1);
+             renderRasterizedGlyph(pen1, color, attributesCopy);
+-
+-            // Direct mapping only ever covers printable US-ASCII of the primary font, which occupies
+-            // exactly one cell. The advance is known, so the font is not consulted for it.
+-            pen.x += cellWidth * advanceScale;
+             continue;
+         }
+ 
+@@ -662,7 +705,7 @@ void TextRenderer::renderTextGroup(std::u32string_view codepoints,
+         if (attributes)
+         {
+             auto const attributesCopy = adjustTileAttributesForLineFlags(lineFlags, *attributes);
+-            auto pen1 = applyGlyphPositionToPen(pen, attributesCopy, glyphPosition);
++            auto pen1 = applyGlyphPositionToPen(cellPen, attributesCopy, glyphPosition);
+             pen1 = adjustPenForLineFlags(lineFlags,
+                                          _gridMetrics,
+                                          unbox<int>(attributes->bitmapSize.height),
+@@ -688,23 +731,6 @@ void TextRenderer::renderTextGroup(std::u32string_view codepoints,
+                 sliceKey += unbox(textureAtlas().tileSize().width);
+             }
+         }
+-
+-        // TODO: The font's advance is a stand-in for the datum the pipeline actually has and then drops:
+-        // the glyph's cluster, i.e. which cell it belongs to. Carrying the cluster on glyph_position would
+-        // let the pen step by the exact cell delta -- zero for a combining mark, N for a ligature spanning
+-        // N cells -- with no rounding at all. That awaits TextClusterGrouper's east-asian-width fixme,
+-        // since clusters presently count cells appended rather than columns occupied.
+-        //
+-        // Until then, snap the advance DOWN to whole cells rather than to the nearest: a bold/fallback
+-        // face whose glyphs are not perfectly cell-matched reports an advance a little over one cell
+-        // (e.g. ~1.3), and nearest-rounding pushes some of those to two cells, producing ragged
+-        // "Ke rnel"/"Di splay" spacing. A real N-cell glyph (wide CJK, ligature) reports an advance at
+-        // an exact N-cell multiple, so flooring keeps it at N; only the sub-multiple overshoot of a
+-        // mismatched face is trimmed. A non-zero advance always steps at least one cell.
+-        auto const advCells = glyphPosition.advance.x == 0
+-                                  ? 0
+-                                  : std::max(1, glyphPosition.advance.x / std::max(1, cellWidth));
+-        pen.x += advCells * cellWidth * advanceScale;
+     }
+ }
+ 
+diff --git a/src/vtrasterizer/TextRenderer_test.cpp b/src/vtrasterizer/TextRenderer_test.cpp
+index b3a780f9..f0495ba2 100644
+--- a/src/vtrasterizer/TextRenderer_test.cpp
++++ b/src/vtrasterizer/TextRenderer_test.cpp
+@@ -1496,6 +1496,23 @@ TEST_CASE("TextRenderer.fallback_run_stays_on_the_cell_grid", "[renderer][fallba
+         CHECK(positions[0] == 0);
+         CHECK(positions[1] == 1 * CellWidth);
+     }
++
++    SECTION("a covered base sharing its cell with a missing codepoint does not ghost")
++    {
++        // The ghost-glyph case. One cell holds 'A' (which the primary covers) and the ornament (which it
++        // does not); because a cluster is indivisible, the whole cell is re-shaped by the proportional
++        // fallback, and HarfBuzz reports the pair's combined width (A@7 + ornament@12 = 19px, ~2 cells)
++        // against a one-cell cluster. Stepping the pen by that advance carried the ornament off 'A' and
++        // onto the next cell, drawing a phantom glyph over 'B'. Stepping by the cluster instead keeps both
++        // glyphs of the cell on the cell's own column, so 'B' stands alone in the next one.
++        auto const positions =
++            renderedGlyphPositions(renderer, renderTarget, { std::u32string { U'A', Ornament }, U"B" });
++
++        REQUIRE(positions.size() == 3);
++        CHECK(positions[0] == 0);             // 'A' on cell 0
++        CHECK(positions[1] == 0);             // the ornament shares cell 0, drawn over 'A', not on cell 1
++        CHECK(positions[2] == 1 * CellWidth); // 'B' stands alone on cell 1, with no ghost over it
++    }
+ }
+ 
+ TEST_CASE("TextRenderer.a_scaled_block_draws_one_cell_sized_tile_per_band", "[renderer][textsizing]")
+-- 
+2.43.0
+
