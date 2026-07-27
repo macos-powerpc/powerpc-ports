@@ -1,0 +1,79 @@
+From d332093236e4dde0cda08f224c97af8752b33a50 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 25 Jul 2026 16:44:24 +0000
+Subject: [PATCH 28/30] hir_typeck: find trait-object methods through
+ custom-receiver wrappers
+
+find_method's trait-object case only peeled `&`/`&mut`/`Box` off the
+receiver type, so methods with arbitrary self types called on a wrapped
+trait object - `Pin<&mut dyn Future>.poll()` (self: Pin<&mut Self>) or
+`Arc<dyn Trait>.method()` (self: Arc<Self>) - found no candidates
+("No applicable methods"). Search deeper (borrows and the first type
+param of wrapper structs) for a trait object; a candidate only counts
+when check_method_receiver's extracted `Self` is that trait object
+itself, which also rejects previously-accepted shapes like a
+value-receiver match at the `&dyn` level. MIR cleanup already knows how
+to virtualize such calls (get_unit_ptr walks coerce_unsized fields), so
+this is typecheck-only. Seen with futures-task 0.3.x (blocks xh, so,
+arti) and signal-hook 0.3.17 (blocks fastmod).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GNXc7PddzJE4X1swqbe3Xn
+---
+ src/hir_typeck/helpers.cpp | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 8b12328d..a253f9b4 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -5169,8 +5169,33 @@ bool TraitResolution::find_method(const Span& sp,
+     DEBUG("> Special cases");
+     // 4. If the type is a trait object, search for methods on that trait object
+     // - NOTE: This isnt mutually exclusive with the below set (an inherent impl of `(Trait)` is valid)
+-    if( const auto* ityp = get_inner_type(ty, [](const auto& t){ return t.data().is_TraitObject(); }) )
++    // Custom receivers (`self: Pin<&mut Self>`, `self: Arc<Self>`) mean the trait object can sit
++    // under wrapper structs the plain Borrow/Box peel can't see - search deeper for one. A false
++    // positive here is harmless: the extracted `Self` must be the found trait object itself.
++    struct FindDynInner {
++        static const ::HIR::TypeRef* find(const HMTypeInferrence& ivars, const ::HIR::TypeRef& t) {
++            const auto& ty = ivars.get_type(t);
++            if( ty.data().is_TraitObject() )
++                return &ty;
++            if( ty.data().is_Borrow() )
++                return find(ivars, ty.data().as_Borrow().inner);
++            if( ty.data().is_Path() && ty.data().as_Path().binding.is_Struct() )
++            {
++                if( const auto* pe = ty.data().as_Path().path.m_data.opt_Generic() )
++                {
++                    if( !pe->m_params.m_types.empty() )
++                        return find(ivars, pe->m_params.m_types.front());
++                }
++            }
++            return nullptr;
++        }
++    };
++    const auto* dyn_ityp = get_inner_type(ty, [](const auto& t){ return t.data().is_TraitObject(); });
++    if( !dyn_ityp )
++        dyn_ityp = FindDynInner::find(this->m_ivars, ty);
++    if( dyn_ityp )
+     {
++        const auto* ityp = dyn_ityp;
+         const auto& e = ityp->data().as_TraitObject();
+         const auto& trait = this->m_crate.get_trait_by_path(sp, e.m_trait.m_path.m_path);
+ 
+@@ -5180,7 +5205,10 @@ bool TraitResolution::find_method(const Span& sp,
+         {
+             DEBUG("- Found trait " << final_trait_path << " (trait object)");
+             // - If the receiver is valid, then it's correct (no need to check the type again)
+-            if(const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access))
++            const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access);
++            // The receiver's `Self` must be the trait object itself (rejects e.g. a shared-borrow
++            // receiver on `&Wrapper<dyn Trait>` extracting `Self = Wrapper<dyn Trait>`)
++            if( self_ty_p && *self_ty_p == *ityp )
+             {
+                 if(e.m_trait.m_hrtbs) {
+                     auto pps = e.m_trait.m_hrtbs->make_empty_params(true);
+-- 
+2.43.0
+
