@@ -1,8 +1,53 @@
+From b2170647583461f42dc2d9f201211fcafda2429f Mon Sep 17 00:00:00 2001
+From: Anthony Green <green@moxielogic.com>
+Date: Mon, 27 Jul 2026 20:08:15 -0400
+Subject: [PATCH] powerpc: fix Darwin closure returns broken by #951
+
+PR #951 (840add3b) changed the shared PowerPC closure helper,
+ffi_closure_helper_common, to return a small PPC_LD_* jump-table index
+instead of the ffi_type*, and rewrote aix_closure.S to consume it -- but
+left darwin_closure.S expecting the old ffi_type* and dereferencing it.
+With the helper now returning a small integer, ffi_closure_ASM
+dereferenced e.g. 0 (PPC_LD_NONE, a void return) as a pointer, faulting
+on a load from address 0.  This crashed essentially every closure call
+-- including every gobject-introspection signal handler -- on 32- and
+64-bit PowerPC Darwin (SIGBUS at ffi_closure_ASM, dar=0; issue #1002).
+
+Convert darwin_closure.S to the PPC_LD_* convention, mirroring
+aix_closure.S: drop the ffi_type* dereference, use the returned index
+directly, and reorder the return-value jump table into PPC_LD_* order
+(NONE, R3, R3R4, F32, F64, F128, U8, S8, U16, S16, and on ppc64 U32, S32).
+
+Darwin, unlike AIX, returns small structs by value in registers, which
+the existing assembly handles (Lsmallstruct/Lfour/Lstructend).  The
+helper's return code is a single small integer with no room for
+cif->rtype, which that assembly needs, so for a by-value struct return
+the helper now stashes cif->rtype in the first parameter-save slot (dead
+by return time) and returns a new PPC_LD_STRUCT code; the PPC_LD_STRUCT
+fragment recovers it and drives the unchanged struct machinery.  By-
+reference struct returns still return PPC_LD_NONE.
+
+Based on the approach in a patch by Sergey Fedorov (@barracuda156); the
+jump table here is reordered to the PPC_LD_* layout so that float,
+double, long double, sub-word and 64-bit returns also dispatch correctly.
+
+I have no PowerPC Darwin hardware; the jump-table fragment offsets were
+checked by assembling for powerpc and powerpc64, but runtime
+confirmation on 10.5/10.6 is still needed.
+
+Fixes #1002.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ src/powerpc/darwin_closure.S | 131 +++++++++++++++--------------------
+ src/powerpc/ffi_darwin.c     |  23 ++++++
+ 2 files changed, 79 insertions(+), 75 deletions(-)
+
 diff --git a/src/powerpc/darwin_closure.S b/src/powerpc/darwin_closure.S
-index 3121e6ac..d7b0c24f 100644
+index 3121e6ac2..08cbe4bc1 100644
 --- src/powerpc/darwin_closure.S
 +++ src/powerpc/darwin_closure.S
-@@ -186,17 +186,20 @@ LCFI1:
+@@ -186,19 +186,17 @@ LCFI1:
  	/* Make the call.  */
  	bl	BLCLS_HELP
  
@@ -11,80 +56,148 @@ index 3121e6ac..d7b0c24f 100644
 -	sg	r3,LINKAGE_SIZE(r1)	; ffi_type * result_type
 -	lg	r0,0(r3)		; size => r0
 -	lhz	r3,FFI_TYPE_TYPE(r3)	; type => r3
-+	/* r3 now contains a small PPC_LD_* jump-table index (see the
-+	   PPC_LD_* defines in ffi_darwin.c), not an ffi_type* as older
-+	   versions of this file assumed - ffi_closure_helper_common
-+	   cannot return an ffi_type* and a jump-table index through
-+	   the same slot, so it only ever returns the index. For struct
-+	   returns by value it stashes cif->rtype back into the first
-+	   slot of the incoming gpr save area (PARENT_PARM_BASE), which
-+	   the PPC_LD_STRUCT fragment below recovers.  */
- 
- 	/* The helper will have intercepted structure returns and inserted
- 	   the caller`s destination address for structs returned by ref.  */
- 
+-
+-	/* The helper will have intercepted structure returns and inserted
+-	   the caller`s destination address for structs returned by ref.  */
+-
 -	/* r3 contains the return type  so use it to look up in a table
 -	   so we know how to deal with each type.  */
-+	/* r3 contains the return type index so use it to look up in
-+	   a table so we know how to deal with each type.  */
- 
- 	addi	r5,r1,(SAVE_SIZE-RESULT_BYTES) /* Otherwise, our return is here.  */
+-
+-	addi	r5,r1,(SAVE_SIZE-RESULT_BYTES) /* Otherwise, our return is here.  */
++	/* r3 now holds a small PPC_LD_* jump-table index (see the PPC_LD_*
++	   defines in ffi_darwin.c), not an ffi_type* as this file previously
++	   assumed: ffi_closure_helper_common cannot return both an ffi_type*
++	   and the dispatch index through r3, so it returns the index.  The
++	   helper has already intercepted by-reference struct returns (writing
++	   the result to the caller`s buffer and returning PPC_LD_NONE); for a
++	   by-value struct return it returns PPC_LD_STRUCT and stashes cif->rtype
++	   in the first parameter-save slot, which the PPC_LD_STRUCT fragment
++	   below recovers.  */
++
++	addi	r5,r1,(SAVE_SIZE-RESULT_BYTES) /* Our return value is here.  */
  	bl	Lget_ret_type0_addr	/* Get pointer to Lret_type0 into LR.  */
-@@ -253,7 +256,7 @@ Lret_type4:
+ 	mflr	r4			/* Move to r4.  */
+ 	slwi	r3,r3,4			/* Now multiply return type by 16.  */
+@@ -218,43 +216,60 @@ LFE1:
+ Lget_ret_type0_addr:
+ 	blrl
+ 
+-/* case FFI_TYPE_VOID  */
++/* The fragments below are indexed by the PPC_LD_* return code that
++   ffi_closure_helper_common handed back in r3, so their order must match the
++   PPC_LD_* values in ffi_darwin.c.  Each is exactly 16 bytes (four
++   instructions), except the final PPC_LD_STRUCT fragment.  */
++
++/* case PPC_LD_NONE (void, or a struct returned by reference)  */
+ Lret_type0:
+ 	b	Lfinish
+ 	nop
+ 	nop
+ 	nop
+ 
+-/* case FFI_TYPE_INT  */
++/* case PPC_LD_R3 (one GPR: int, pointer, and on ppc64 also 64-bit ints)  */
+ Lret_type1:
+ 	lg	r3,0(r5)
+ 	b	Lfinish
+ 	nop
+ 	nop
+ 
+-/* case FFI_TYPE_FLOAT  */
++/* case PPC_LD_R3R4 (two GPRs: the 32-bit ABI`s 64-bit integer)  */
+ Lret_type2:
++#if defined(__ppc64__)
++	lg	r3,0(r5)
++	lg	r4,8(r5)
++#else
++	lwz	r3,0(r5)
++	lwz	r4,4(r5)
++#endif
++	b	Lfinish
++	nop
++
++/* case PPC_LD_F32  */
++Lret_type3:
+ 	lfs	f1,0(r5)
+ 	b	Lfinish
+ 	nop
+ 	nop
+ 
+-/* case FFI_TYPE_DOUBLE  */
+-Lret_type3:
++/* case PPC_LD_F64  */
++Lret_type4:
+ 	lfd	f1,0(r5)
+ 	b	Lfinish
+ 	nop
+ 	nop
+ 
+-/* case FFI_TYPE_LONGDOUBLE  */
+-Lret_type4:
++/* case PPC_LD_F128 (128-bit long double: two doubles)  */
++Lret_type5:
+ 	lfd	f1,0(r5)
+ 	lfd	f2,8(r5)
  	b	Lfinish
  	nop
  
 -/* case FFI_TYPE_UINT8  */
+-Lret_type5:
 +/* case PPC_LD_U8  */
- Lret_type5:
++Lret_type6:
  #if defined(__ppc64__)
  	lbz	r3,7(r5)
-@@ -264,7 +267,7 @@ Lret_type5:
+ #else
+@@ -264,8 +279,8 @@ Lret_type5:
  	nop
  	nop
  
 -/* case FFI_TYPE_SINT8  */
+-Lret_type6:
 +/* case PPC_LD_S8  */
- Lret_type6:
++Lret_type7:
  #if defined(__ppc64__)
  	lbz	r3,7(r5)
-@@ -275,7 +278,7 @@ Lret_type6:
+ #else
+@@ -275,8 +290,8 @@ Lret_type6:
  	b	Lfinish
  	nop
  
 -/* case FFI_TYPE_UINT16  */
+-Lret_type7:
 +/* case PPC_LD_U16  */
- Lret_type7:
++Lret_type8:
  #if defined(__ppc64__)
  	lhz	r3,6(r5)
-@@ -286,7 +289,7 @@ Lret_type7:
+ #else
+@@ -286,8 +301,8 @@ Lret_type7:
  	nop
  	nop
  
 -/* case FFI_TYPE_SINT16  */
+-Lret_type8:
 +/* case PPC_LD_S16  */
- Lret_type8:
++Lret_type9:
  #if defined(__ppc64__)
  	lha	r3,6(r5)
-@@ -297,77 +300,54 @@ Lret_type8:
+ #else
+@@ -297,77 +312,43 @@ Lret_type8:
  	nop
  	nop
  
 -/* case FFI_TYPE_UINT32  */
 -Lret_type9:
  #if defined(__ppc64__)
-+/* case PPC_LD_U32 (ppc64 only - m32 aliases PPC_LD_R3)  */
-+Lret_type9:
- 	lwz	r3,4(r5)
+-	lwz	r3,4(r5)
 -#else
 -	lwz	r3,0(r5)
 -#endif
- 	b	Lfinish
- 	nop
- 	nop
- 
+-	b	Lfinish
+-	nop
+-	nop
+-
 -/* case FFI_TYPE_SINT32  */
-+/* case PPC_LD_S32 (ppc64 only - m32 aliases PPC_LD_R3)  */
++/* case PPC_LD_U32 (ppc64 only; the 32-bit ABI aliases U32 to PPC_LD_R3)  */
  Lret_type10:
 -#if defined(__ppc64__)
  	lwz	r3,4(r5)
@@ -94,64 +207,57 @@ index 3121e6ac..d7b0c24f 100644
  	b	Lfinish
  	nop
  	nop
-+#endif
  
 -/* case FFI_TYPE_UINT64  */
--Lret_type11:
-+/* case PPC_LD_STRUCT  */
-+Lret_type_struct:
- #if defined(__ppc64__)
++/* case PPC_LD_S32 (ppc64 only; the 32-bit ABI aliases S32 to PPC_LD_R3)  */
+ Lret_type11:
+-#if defined(__ppc64__)
 -	lg	r3,0(r5)
 -	b	Lfinish
-+	/* Small struct returned by value.  ffi_closure_helper_common
-+	   stashed cif->rtype in the first slot of the incoming gpr
-+	   save area (PARENT_PARM_BASE) since it can't return both that
-+	   and the PPC_LD_* dispatch index through r3.  Recovering it and
-+	   deciding how to load the result takes more than the 4
-+	   instructions available in this slot, so do the minimum here
-+	   and finish the work out-of-line at Lstruct_by_value.  */
-+	lg	r3,0(r5)		; we need at least this...
-+	b	Lstruct_by_value
- 	nop
+-	nop
 -#else
 -	lwz	r3,0(r5)
 -	lwz	r4,4(r5)
--	b	Lfinish
++	lwa	r3,4(r5)
+ 	b	Lfinish
 -#endif
  	nop
 -
 -/* case FFI_TYPE_SINT64  */
 -Lret_type12:
 -#if defined(__ppc64__)
-+#else
- 	lg	r3,0(r5)
- 	b	Lfinish
+-	lg	r3,0(r5)
+-	b	Lfinish
  	nop
 -#else
 -	lwz	r3,0(r5)
 -	lwz	r4,4(r5)
 -	b	Lfinish
--#endif
- 	nop
-+#endif
+ #endif
+-	nop
  
 -/* case FFI_TYPE_STRUCT  */
 -Lret_type13:
- #if defined(__ppc64__)
--	lg	r3,0(r5)		; we need at least this...
-+Lstruct_by_value:
++/* case PPC_LD_STRUCT (a by-value struct return).  This is the final,
++   variable-length fragment, so it need not be padded to 16 bytes.  The helper
++   stashed cif->rtype in the first parameter-save slot (see ffi_darwin.c),
++   because the small dispatch index in r3 left no room for it.  */
++Lret_type_struct:
 +	lg	r6,PARENT_PARM_BASE(r1)	; cif->rtype
-+	sg	r6,LINKAGE_SIZE(r1)	; keep it around, as the old code did
++	sg	r6,LINKAGE_SIZE(r1)	; where the struct code below expects it
 +	lg	r0,0(r6)		; size => r0
+ #if defined(__ppc64__)
+ 	lg	r3,0(r5)		; we need at least this...
  	cmpi	0,r0,4
  	bgt	Lstructend		; not a special small case
  	b	Lsmallstruct		; see if we need more.
--#else
+ #else
 -	cmpwi	0,r0,4
 -	bgt	Lfinish		; not by value
 -	lg	r3,0(r5)
--	b	Lfinish
--#endif
++	lg	r3,0(r5)		; a <=4-byte struct, returned in r3
+ 	b	Lfinish
+ #endif
 -/* case FFI_TYPE_POINTER  */
 -Lret_type14:
 -	lg	r3,0(r5)
@@ -159,37 +265,15 @@ index 3121e6ac..d7b0c24f 100644
 -	nop
 -	nop
  
--#if defined(__ppc64__)
+ #if defined(__ppc64__)
  Lsmallstruct:
 -	beq	Lfour			; continuation of Lret13.
-+	beq	Lfour			; continuation of Lstruct_by_value.
++	beq	Lfour			; continuation of Lret_type_struct.
  	cmpi	0,r0,3
  	beq	Lfinish			; don`t adjust this - can`t be any floats here...
  	srdi	r3,r3,48
-@@ -404,9 +384,9 @@ Lstructend:
- 
- 	/* OK, frustratingly, the process of saving the struct to mem might have
- 	   messed with the FPRs, so we have to re-load them :(.
--	   We`ll use our FPRs space again - calling: 
--	   void darwin64_pass_struct_floats (ffi_type *s, char *src, 
--					     unsigned *nfpr, double **fprs) 
-+	   We`ll use our FPRs space again - calling:
-+	   void darwin64_pass_struct_floats (ffi_type *s, char *src,
-+					     unsigned *nfpr, double **fprs)
- 	   We`ll temporarily pinch the first two slots of the param area for local
- 	   vars used by the routine.  */
- 	xor	r6,r6,r6
-@@ -419,7 +399,7 @@ Lstructend:
- 	lg	r3,LINKAGE_SIZE(r1)		; ffi_type * result_type.
- 	bl	PASS_STR_FLOATS			; get struct floats into FPR save space.
- 	/* See if we used any floats  */
--	lwz	r0,(SAVE_SIZE-RESULT_BYTES)(r1)	
-+	lwz	r0,(SAVE_SIZE-RESULT_BYTES)(r1)
- 	cmpi	0,r0,0
- 	beq	Lstructints			; nope.
- 	/* OK load `em up... */
 diff --git a/src/powerpc/ffi_darwin.c b/src/powerpc/ffi_darwin.c
-index 01e2a437..a58dc8c1 100644
+index 01e2a4370..64449c38e 100644
 --- src/powerpc/ffi_darwin.c
 +++ src/powerpc/ffi_darwin.c
 @@ -60,11 +60,13 @@ struct ffi_aix_trampoline_struct {
@@ -206,22 +290,21 @@ index 01e2a437..a58dc8c1 100644
  #endif
  
  extern void ffi_closure_ASM (void);
-@@ -1260,6 +1262,14 @@ ffi_closure_helper_common (ffi_cif* cif,
+@@ -1260,6 +1262,13 @@ ffi_closure_helper_common (ffi_cif* cif,
    long             i, avn;
    ffi_dblfl *      end_pfr = pfr + NUM_FPR_ARG_REGISTERS;
    unsigned         size_al;
 +  int              struct_ret_by_value = 0;
-+  /* ffi_closure_ASM's jump-table dispatch only has room for a small
-+     integer return code (see PPC_LD_* above), so when the return code
-+     is PPC_LD_STRUCT we hand back cif->rtype here, in the first slot of
-+     the incoming gpr save area (which is otherwise dead by this point),
-+     so the assembly can still special-case small-struct-by-value
-+     returns the way it always has.  */
++  /* When a struct is returned by value, ffi_closure_ASM's jump-table
++     dispatch carries only a small integer return code (see PPC_LD_* above),
++     with no room for cif->rtype.  We hand cif->rtype back in the first
++     parameter-save slot -- which is dead by the time we return -- for the
++     PPC_LD_STRUCT fragment in darwin_closure.S to recover.  */
 +  unsigned long *  pgr0 = pgr;
  #if defined(POWERPC_DARWIN64)
    unsigned 	   fpsused = 0;
  #endif
-@@ -1275,12 +1285,16 @@ ffi_closure_helper_common (ffi_cif* cif,
+@@ -1275,12 +1284,16 @@ ffi_closure_helper_common (ffi_cif* cif,
  	  rvalue = (void *) *pgr;
  	  pgr++;
  	}
@@ -238,12 +321,16 @@ index 01e2a437..a58dc8c1 100644
  #else /* assume we return by ref.  */
        rvalue = (void *) *pgr;
        pgr++;
-@@ -1480,7 +1494,13 @@ ffi_closure_helper_common (ffi_cif* cif,
+@@ -1480,7 +1493,17 @@ ffi_closure_helper_common (ffi_cif* cif,
    switch (cif->rtype->type)
      {
      case FFI_TYPE_VOID:
 +      return PPC_LD_NONE;
      case FFI_TYPE_STRUCT:
++      /* A by-reference struct return needs nothing further here: the result
++	 was written straight to the caller's buffer.  A by-value struct
++	 return is loaded into registers by darwin_closure.S, which needs
++	 cif->rtype -- hand it back in the first parameter-save slot.  */
 +      if (struct_ret_by_value)
 +	{
 +	  *pgr0 = (unsigned long) cif->rtype;
