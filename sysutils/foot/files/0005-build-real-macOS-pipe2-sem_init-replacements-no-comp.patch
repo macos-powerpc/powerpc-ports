@@ -1,0 +1,310 @@
+From 0afdee46583459484004bd79764dd81cd8c333d8 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 27 Jul 2026 14:30:23 +0000
+Subject: [PATCH 5/5] build: real macOS pipe2/sem_init replacements, no compat
+ headers
+
+pipe2() doesn't exist on Darwin -- add a portable static inline
+polyfill to util.h (pipe() + per-fd fcntl(F_SETFL/F_SETFD)), included
+by all five call sites.
+
+sem_init/sem_destroy are deprecated on Darwin, and documented as
+outright unreliable there, not just discouraged. Use libdispatch's
+plain-C semaphore API instead (dispatch_semaphore_create/_wait/
+_signal/dispatch_release, no Objective-C/Blocks, available since the
+first libdispatch release in macOS 10.6): terminal.h now conditions
+its <semaphore.h> include and the render worker start/done fields'
+type on __APPLE__, with render_sem_wait/render_sem_post wrapping
+whichever API is in effect so terminal.c/render.c's call sites don't
+need to branch individually.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01U6fuL1PtRJHhr97gAGyS1h
+---
+ render.c   | 15 ++++++++++-----
+ spawn.c    |  1 +
+ terminal.c | 31 ++++++++++++++++++++++++++-----
+ terminal.h | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ util.h     | 51 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 130 insertions(+), 11 deletions(-)
+
+diff --git a/render.c b/render.c
+index cf5f969a..96cfdf84 100644
+--- a/render.c
++++ b/render.c
+@@ -2197,12 +2197,17 @@ render_worker_thread(void *_ctx)
+     if (pthread_setname_np(pthread_self(), proc_title) < 0)
+         LOG_ERRNO("render worker %d: failed to set process title", my_id);
+ 
++#if defined(__APPLE__)
++    dispatch_semaphore_t *start = &term->render.workers.start;
++    dispatch_semaphore_t *done = &term->render.workers.done;
++#else
+     sem_t *start = &term->render.workers.start;
+     sem_t *done = &term->render.workers.done;
++#endif
+     mtx_t *lock = &term->render.workers.lock;
+ 
+     while (true) {
+-        sem_wait(start);
++        render_sem_wait(start);
+ 
+         struct buffer *buf = term->render.workers.buf;
+ 
+@@ -2236,7 +2241,7 @@ render_worker_thread(void *_ctx)
+ 
+             case -1:
+                 frame_done = true;
+-                sem_post(done);
++                render_sem_post(done);
+                 break;
+ 
+             case -2:
+@@ -3557,7 +3562,7 @@ grid_render(struct terminal *term)
+         mtx_lock(&term->render.workers.lock);
+         term->render.workers.buf = buf;
+         for (size_t i = 0; i < term->render.workers.count; i++)
+-            sem_post(&term->render.workers.start);
++            render_sem_post(&term->render.workers.start);
+ 
+         xassert(tll_length(term->render.workers.queue) == 0);
+     }
+@@ -3587,7 +3592,7 @@ grid_render(struct terminal *term)
+         mtx_unlock(&term->render.workers.lock);
+ 
+         for (size_t i = 0; i < term->render.workers.count; i++)
+-            sem_wait(&term->render.workers.done);
++            render_sem_wait(&term->render.workers.done);
+         term->render.workers.buf = NULL;
+     }
+ 
+@@ -5460,7 +5465,7 @@ render_buffer_release_callback(struct buffer *buf, void *data)
+     mtx_unlock(&term->render.workers.preapplied_damage.lock);
+ 
+     mtx_lock(&term->render.workers.lock);
+-    sem_post(&term->render.workers.start);
++    render_sem_post(&term->render.workers.start);
+     xassert(tll_length(term->render.workers.queue) == 0);
+     tll_push_back(term->render.workers.queue, -3);
+     mtx_unlock(&term->render.workers.lock);
+diff --git a/spawn.c b/spawn.c
+index 17c821b5..c97f4d71 100644
+--- a/spawn.c
++++ b/spawn.c
+@@ -13,6 +13,7 @@
+ #define LOG_ENABLE_DBG 0
+ #include "log.h"
+ #include "debug.h"
++#include "util.h"
+ #include "xmalloc.h"
+ 
+ pid_t
+diff --git a/terminal.c b/terminal.c
+index 9ef5f143..292138cf 100644
+--- a/terminal.c
++++ b/terminal.c
+@@ -705,17 +705,40 @@ fdm_app_id_update_timeout(struct fdm *fdm, int fd, int events, void *data)
+     return true;
+ }
+ 
++static void
++render_worker_sems_destroy(struct terminal *term)
++{
++#if defined(__APPLE__)
++    if (term->render.workers.start != NULL)
++        dispatch_release(term->render.workers.start);
++    if (term->render.workers.done != NULL)
++        dispatch_release(term->render.workers.done);
++#else
++    sem_destroy(&term->render.workers.start);
++    sem_destroy(&term->render.workers.done);
++#endif
++}
++
+ static bool
+ initialize_render_workers(struct terminal *term)
+ {
+     LOG_INFO("using %hu rendering threads", term->render.workers.count);
+ 
++#if defined(__APPLE__)
++    term->render.workers.start = dispatch_semaphore_create(0);
++    term->render.workers.done = dispatch_semaphore_create(0);
++    if (term->render.workers.start == NULL || term->render.workers.done == NULL) {
++        LOG_ERR("failed to instantiate render worker semaphores");
++        return false;
++    }
++#else
+     if (sem_init(&term->render.workers.start, 0, 0) < 0 ||
+         sem_init(&term->render.workers.done, 0, 0) < 0)
+     {
+         LOG_ERRNO("failed to instantiate render worker semaphores");
+         return false;
+     }
++#endif
+ 
+     int err;
+     if ((err = mtx_init(&term->render.workers.lock, mtx_plain)) != thrd_success) {
+@@ -751,8 +774,7 @@ initialize_render_workers(struct terminal *term)
+     return true;
+ 
+ err_sem_destroy:
+-    sem_destroy(&term->render.workers.start);
+-    sem_destroy(&term->render.workers.done);
++    render_worker_sems_destroy(term);
+     return false;
+ }
+ 
+@@ -1859,7 +1881,7 @@ term_destroy(struct terminal *term)
+         }
+ 
+         for (size_t i = 0; i < worker_count; i++) {
+-            sem_post(&term->render.workers.start);
++            render_sem_post(&term->render.workers.start);
+             tll_push_back(term->render.workers.queue, -2);
+         }
+     }
+@@ -1906,8 +1928,7 @@ term_destroy(struct terminal *term)
+     mtx_destroy(&term->render.workers.preapplied_damage.lock);
+     cnd_destroy(&term->render.workers.preapplied_damage.cond);
+     mtx_destroy(&term->render.workers.lock);
+-    sem_destroy(&term->render.workers.start);
+-    sem_destroy(&term->render.workers.done);
++    render_worker_sems_destroy(term);
+     xassert(tll_length(term->render.workers.queue) == 0);
+     tll_free(term->render.workers.queue);
+ 
+diff --git a/terminal.h b/terminal.h
+index 446d5f23..e6a992e3 100644
+--- a/terminal.h
++++ b/terminal.h
+@@ -5,7 +5,43 @@
+ #include <stddef.h>
+ 
+ #include <threads.h>
+-#include <semaphore.h>
++
++#if defined(__APPLE__)
++ /*
++  * Darwin's unnamed POSIX semaphores (sem_init/sem_destroy) are
++  * deprecated, and documented as unreliable, not just discouraged.
++  * Use libdispatch's plain-C semaphore API instead (no Objective-C/
++  * Blocks required; available since the first libdispatch release
++  * in macOS 10.6).
++  */
++ #include <dispatch/dispatch.h>
++
++static inline void
++render_sem_wait(dispatch_semaphore_t *sem)
++{
++    dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER);
++}
++
++static inline void
++render_sem_post(dispatch_semaphore_t *sem)
++{
++    dispatch_semaphore_signal(*sem);
++}
++#else
++ #include <semaphore.h>
++
++static inline void
++render_sem_wait(sem_t *sem)
++{
++    sem_wait(sem);
++}
++
++static inline void
++render_sem_post(sem_t *sem)
++{
++    sem_post(sem);
++}
++#endif
+ 
+ #if defined(FOOT_GRAPHEME_CLUSTERING)
+  #include <utf8proc.h>
+@@ -691,8 +727,13 @@ struct terminal {
+         /* Render threads + synchronization primitives */
+         struct {
+             uint16_t count;
++#if defined(__APPLE__)
++            dispatch_semaphore_t start;
++            dispatch_semaphore_t done;
++#else
+             sem_t start;
+             sem_t done;
++#endif
+             mtx_t lock;
+             tll(int) queue;
+             thrd_t *threads;
+diff --git a/util.h b/util.h
+index 3746e269..45722f39 100644
+--- a/util.h
++++ b/util.h
+@@ -5,6 +5,12 @@
+ #include <string.h>
+ #include <threads.h>
+ 
++#if defined(__APPLE__)
++ #include <errno.h>
++ #include <fcntl.h>
++ #include <unistd.h>
++#endif
++
+ #define ALEN(v) (sizeof(v) / sizeof((v)[0]))
+ #define min(x, y) ((x) < (y) ? (x) : (y))
+ #define max(x, y) ((x) > (y) ? (x) : (y))
+@@ -15,6 +21,51 @@ streq(const char *a, const char *b)
+     return strcmp(a, b) == 0;
+ }
+ 
++#if defined(__APPLE__)
++/*
++ * pipe2() is a Linux/glibc extension (later adopted by *BSD), never
++ * implemented by Darwin on any macOS version. All current call sites
++ * only ever pass O_CLOEXEC and/or O_NONBLOCK.
++ */
++static inline int
++pipe2(int fildes[2], int flags)
++{
++    if (flags & ~(O_CLOEXEC | O_NONBLOCK)) {
++        errno = EINVAL;
++        return -1;
++    }
++
++    if (pipe(fildes) < 0)
++        return -1;
++
++    if (flags & O_NONBLOCK) {
++        for (int i = 0; i < 2; i++) {
++            int f = fcntl(fildes[i], F_GETFL, 0);
++            if (f < 0 || fcntl(fildes[i], F_SETFL, f | O_NONBLOCK) < 0)
++                goto fail;
++        }
++    }
++
++    if (flags & O_CLOEXEC) {
++        for (int i = 0; i < 2; i++) {
++            int f = fcntl(fildes[i], F_GETFD, 0);
++            if (f < 0 || fcntl(fildes[i], F_SETFD, f | FD_CLOEXEC) < 0)
++                goto fail;
++        }
++    }
++
++    return 0;
++
++fail: {
++    int saved_errno = errno;
++    close(fildes[0]);
++    close(fildes[1]);
++    errno = saved_errno;
++    return -1;
++}
++}
++#endif
++
+ static inline const char *
+ thrd_err_as_string(int thrd_err)
+ {
+-- 
+2.43.0
+

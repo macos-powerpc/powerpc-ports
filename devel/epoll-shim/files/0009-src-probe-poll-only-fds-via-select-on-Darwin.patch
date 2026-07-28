@@ -1,0 +1,213 @@
+From 40a18a4d7eca049adaf7679ecf5dffdf21c8e749 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 27 Jul 2026 18:47:21 +0000
+Subject: [PATCH] src: probe poll-only fds via select() on Darwin
+
+Darwin's poll() (up to at least 10.8) does not support tty/pty fds
+and various other character devices: it reports POLLNVAL for a
+valid, open pty master. This defeated the poll-only-fd fallback end
+to end: epollfd_ctx_wait()'s probe saw POLLNVAL and silently removed
+the fd from the interest set (which is correct cleanup for genuinely
+stale fds), so a terminal emulator's ptmx produced no events ever
+after -- foot on 10.6/PPC displayed a window but no shell output,
+and its EPOLL_CTL_DEL at exit failed with ENOENT because the fd had
+long been dropped.
+
+Add compat_poll_select(), a poll() emulation over select() (which
+handles ptys fine, and also works on kqueue fds), and use it as the
+core of compat_ppoll() as well as for the poll-only-fd probes in
+epollfd_ctx.c. Fds >= FD_SETSIZE degrade to the old poll() path.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Kvag8nXEuGz9XJL3WdSxKC
+---
+ src/compat_ppoll.c | 95 +++++++++++++++++++++++++++++++++++++++++++++-
+ src/compat_ppoll.h |  4 ++
+ src/epollfd_ctx.c  | 22 +++++++++--
+ 3 files changed, 117 insertions(+), 4 deletions(-)
+
+diff --git a/src/compat_ppoll.c b/src/compat_ppoll.c
+index 19b0c88..55fdde6 100644
+--- a/src/compat_ppoll.c
++++ b/src/compat_ppoll.c
+@@ -3,8 +3,10 @@
+ #include <sys/types.h>
+ 
+ #include <sys/event.h>
++#include <sys/select.h>
+ 
+ #include <errno.h>
++#include <fcntl.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -12,6 +14,96 @@
+ 
+ #include "wrap.h"
+ 
++/*
++ * poll() on Darwin (up to at least 10.8) does not support tty/pty fds
++ * and various other character devices: it reports POLLNVAL for a
++ * valid, open pty master. select() handles all of them fine, so
++ * emulate poll() over select() here. This is used both as the core of
++ * compat_ppoll() below and by epollfd_ctx.c's poll-only-fd probes --
++ * the POLLNVAL misreport would otherwise get poll-only fds (e.g. a
++ * terminal emulator's ptmx) silently dropped from the interest set.
++ */
++int
++compat_poll_select(struct pollfd fds[], nfds_t nfds, int timeout_ms)
++{
++	fd_set rset, wset, eset;
++	FD_ZERO(&rset);
++	FD_ZERO(&wset);
++	FD_ZERO(&eset);
++
++	int maxfd = -1;
++	for (nfds_t i = 0; i < nfds; ++i) {
++		fds[i].revents = 0;
++		int fd = fds[i].fd;
++		if (fd < 0) {
++			continue;
++		}
++		if (fd >= FD_SETSIZE) {
++			/* Can't select() on this fd; degrade to poll(). */
++			return real_poll(fds, nfds, timeout_ms);
++		}
++		if (fds[i].events & (POLLIN | POLLRDNORM | POLLRDBAND)) {
++			FD_SET(fd, &rset);
++		}
++		if (fds[i].events & (POLLOUT | POLLWRNORM)) {
++			FD_SET(fd, &wset);
++		}
++		if (fds[i].events & POLLPRI) {
++			FD_SET(fd, &eset);
++		}
++		if (fd > maxfd) {
++			maxfd = fd;
++		}
++	}
++
++	struct timeval tv;
++	struct timeval *tvp = NULL;
++	if (timeout_ms >= 0) {
++		tv.tv_sec = timeout_ms / 1000;
++		tv.tv_usec = (timeout_ms % 1000) * 1000;
++		tvp = &tv;
++	}
++
++	int n = select(maxfd + 1, &rset, &wset, &eset, tvp);
++	if (n < 0) {
++		if (errno != EBADF) {
++			return -1;
++		}
++
++		/* Match poll() semantics: report which fds are stale. */
++		int cnt = 0;
++		for (nfds_t i = 0; i < nfds; ++i) {
++			if (fds[i].fd >= 0 &&
++			    real_fcntl(fds[i].fd, F_GETFD) < 0) {
++				fds[i].revents = POLLNVAL;
++				++cnt;
++			}
++		}
++		return cnt;
++	}
++
++	int cnt = 0;
++	for (nfds_t i = 0; i < nfds; ++i) {
++		int fd = fds[i].fd;
++		if (fd < 0) {
++			continue;
++		}
++		if (FD_ISSET(fd, &rset)) {
++			fds[i].revents |= POLLIN;
++		}
++		if (FD_ISSET(fd, &wset)) {
++			fds[i].revents |= POLLOUT;
++		}
++		if (FD_ISSET(fd, &eset)) {
++			fds[i].revents |= POLLPRI;
++		}
++		if (fds[i].revents != 0) {
++			++cnt;
++		}
++	}
++	return cnt;
++}
++
+ static errno_t
+ compat_ppoll_impl(struct pollfd fds[], nfds_t nfds,
+     struct timespec const *restrict timeout, sigset_t const *restrict sigmask,
+@@ -143,7 +235,8 @@ compat_ppoll_impl(struct pollfd fds[], nfds_t nfds,
+ 		(void)pthread_sigmask(SIG_SETMASK, sigmask, &origmask);
+ 	}
+ 
+-	int ready = real_poll(fds2 ? fds2 : fds, nfds + !!(fds2), timeout_ms);
++	int ready = compat_poll_select(fds2 ? fds2 : fds, nfds + !!(fds2),
++	    timeout_ms);
+ 	ec = ready < 0 ? errno : 0;
+ 
+ 	if (sigmask != NULL) {
+diff --git a/src/compat_ppoll.h b/src/compat_ppoll.h
+index 8a8d173..f13c36b 100644
+--- a/src/compat_ppoll.h
++++ b/src/compat_ppoll.h
+@@ -11,4 +11,8 @@ int compat_ppoll(struct pollfd fds[], nfds_t nfds,
+ #define ppoll compat_ppoll
+ #endif
+ 
++/* poll() emulated over select(); see the comment in compat_ppoll.c.
++ * Only built on platforms that build compat_ppoll.c (i.e. Apple). */
++int compat_poll_select(struct pollfd fds[], nfds_t nfds, int timeout_ms);
++
+ #endif
+diff --git a/src/epollfd_ctx.c b/src/epollfd_ctx.c
+index b4c5a05..885091f 100644
+--- a/src/epollfd_ctx.c
++++ b/src/epollfd_ctx.c
+@@ -23,6 +23,21 @@
+ 
+ #include "wrap.h"
+ 
++/*
++ * Darwin's poll() (up to at least 10.8) misreports valid tty/pty and
++ * some other character-device fds as POLLNVAL -- precisely the fds
++ * that end up as NODE_TYPE_POLL here. Probe poll-only fds through the
++ * select()-based emulation instead, so they don't get wrongly dropped
++ * from the interest set by the POLLNVAL cleanup in
++ * epollfd_ctx_wait().
++ */
++#ifdef __APPLE__
++#include "compat_ppoll.h"
++#define poll_only_fds_poll(fds, nfds) compat_poll_select((fds), (nfds), 0)
++#else
++#define poll_only_fds_poll(fds, nfds) real_poll((fds), (nfds), 0)
++#endif
++
+ static RegisteredFDsNode *
+ registered_fds_node_create(int fd)
+ {
+@@ -309,7 +324,8 @@ registered_fds_node_feed_event(RegisteredFDsNode *fd2_node, int kq,
+ 			.events = (short)fd2_node->events,
+ 		};
+ 
+-		revents = real_poll(&pfd, 1, 0) < 0 ? EPOLLERR : pfd.revents;
++		revents = poll_only_fds_poll(&pfd, 1) < 0 ? EPOLLERR :
++		    pfd.revents;
+ 
+ 		fd2_node->revents = revents & POLLNVAL ? 0 : (uint32_t)revents;
+ 		assert(!(fd2_node->revents &
+@@ -1344,8 +1360,8 @@ epollfd_ctx_wait(EpollFDCtx *epollfd, int kq, struct epoll_event *ev, int cnt,
+ 
+ 	epollfd_ctx_fill_pollfds(epollfd, kq, epollfd->pfds);
+ 
+-	int n = real_poll(epollfd->pfds, /**/
+-	    (nfds_t)(1 + epollfd->poll_fds_size), 0);
++	int n = poll_only_fds_poll(epollfd->pfds, /**/
++	    (nfds_t)(1 + epollfd->poll_fds_size));
+ 	if (n < 0) {
+ 		return errno;
+ 	}
+-- 
+2.43.0
+
