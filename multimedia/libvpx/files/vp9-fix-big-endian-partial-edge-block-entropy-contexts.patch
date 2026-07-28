@@ -1,0 +1,85 @@
+Subject: [PATCH] vp9: fix big-endian decode of frames with partial edge blocks
+
+vp9_decode_block_tokens() writes back above/left entropy contexts for
+8x8/16x16/32x32 transform blocks with a native multi-byte store:
+
+    *(uint32_t *)a = ((eob > 0) * 0x01010101) >> ctx_shift_a;
+
+The right-shift is meant to clear the context bytes belonging to
+the part of the transform block that overhangs the frame edge (ctx_shift
+computed by get_ctx_shift()). Storing the shifted value through
+a native-endian pointer makes the cleared bytes land at the END of
+the array only on little-endian hosts. On big-endian hosts the cleared
+bytes land at the START: the in-picture neighbor contexts are zeroed
+and the out-of-picture ones are set.
+
+Any frame whose width or height is not a multiple of the transform
+coverage at the edge (e.g. 1080 = 16.875 * 64) then feeds wrong
+contexts into decode_coefs(), the wrong coefficient probability is
+selected, and the arithmetic decode silently diverges mid-frame.
+Downstream this surfaces as garbage pixels, under/over-consumed
+packets, "Truncated packet" / "Invalid frame marker" errors and
+a "Keyframe / intra-only frame required to reset decoder state" cascade.
+64x64-aligned streams decode bit-exactly, which long masked the bug.
+
+Verified on emulated 32-bit BE PowerPC (qemu-ppc, gcc-13 -O3 pure C)
+and cross-checked against Debian s390x builds: before this change
+a 320x180 VP9 stream diverges after ~29k identical symbol reads and
+fails; after it, all test streams (unaligned and aligned, IVF and
+WebM-origin, with superframes) decode bit-identically to x86_64.
+
+Write the context bytes explicitly instead of shifting through
+a native-endian store.
+
+diff --git a/vp9/decoder/vp9_detokenize.c b/vp9/decoder/vp9_detokenize.c
+index d957dc34e..d5415c74e 100644
+--- a/vp9/decoder/vp9_detokenize.c
++++ b/vp9/decoder/vp9_detokenize.c
+@@ -299,8 +299,16 @@ int vp9_decode_block_tokens(TileWorkerData *twd, int plane, const ScanOrder *sc,
+       ctx += !!*(const uint16_t *)l;
+       eob = decode_coefs(xd, get_plane_type(plane), pd->dqcoeff, tx_size,
+                          dequant, ctx, sc->scan, sc->neighbors, r);
+-      *(uint16_t *)a = ((eob > 0) * 0x0101) >> ctx_shift_a;
+-      *(uint16_t *)l = ((eob > 0) * 0x0101) >> ctx_shift_l;
++      // The (0x0101 >> shift) trick sets the first (2 - shift/8) context
++      // bytes to (eob > 0) and clears the bytes masked out by
++      // get_ctx_shift() for blocks overhanging the frame edge.  Doing it
++      // through a native 16-bit store is little-endian specific: on
++      // big-endian hosts the cleared bytes land on the in-picture side.
++      // Write the bytes explicitly instead.
++      memset(a, 0, 2);
++      memset(a, eob > 0, 2 - (ctx_shift_a >> 3));
++      memset(l, 0, 2);
++      memset(l, eob > 0, 2 - (ctx_shift_l >> 3));
+       break;
+     case TX_16X16:
+       get_ctx_shift(xd, &ctx_shift_a, &ctx_shift_l, x, y, 1 << TX_16X16);
+@@ -308,20 +316,21 @@ int vp9_decode_block_tokens(TileWorkerData *twd, int plane, const ScanOrder *sc,
+       ctx += !!*(const uint32_t *)l;
+       eob = decode_coefs(xd, get_plane_type(plane), pd->dqcoeff, tx_size,
+                          dequant, ctx, sc->scan, sc->neighbors, r);
+-      *(uint32_t *)a = ((eob > 0) * 0x01010101) >> ctx_shift_a;
+-      *(uint32_t *)l = ((eob > 0) * 0x01010101) >> ctx_shift_l;
++      memset(a, 0, 4);
++      memset(a, eob > 0, 4 - (ctx_shift_a >> 3));
++      memset(l, 0, 4);
++      memset(l, eob > 0, 4 - (ctx_shift_l >> 3));
+       break;
+     case TX_32X32:
+       get_ctx_shift(xd, &ctx_shift_a, &ctx_shift_l, x, y, 1 << TX_32X32);
+-      // NOTE: casting to uint64_t here is safe because the default memory
+-      // alignment is at least 8 bytes and the TX_32X32 is aligned on 8 byte
+-      // boundaries.
+       ctx = !!*(const uint64_t *)a;
+       ctx += !!*(const uint64_t *)l;
+       eob = decode_coefs(xd, get_plane_type(plane), pd->dqcoeff, tx_size,
+                          dequant, ctx, sc->scan, sc->neighbors, r);
+-      *(uint64_t *)a = ((eob > 0) * 0x0101010101010101ULL) >> ctx_shift_a;
+-      *(uint64_t *)l = ((eob > 0) * 0x0101010101010101ULL) >> ctx_shift_l;
++      memset(a, 0, 8);
++      memset(a, eob > 0, 8 - (ctx_shift_a >> 3));
++      memset(l, 0, 8);
++      memset(l, eob > 0, 8 - (ctx_shift_l >> 3));
+       break;
+     default:
+       assert(0 && "Invalid transform size.");
