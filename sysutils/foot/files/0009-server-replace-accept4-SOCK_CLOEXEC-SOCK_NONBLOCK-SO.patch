@@ -1,0 +1,145 @@
+From 4fe18e071f84cf8b124390dc9ce4e6ba8806a037 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 27 Jul 2026 15:23:59 +0000
+Subject: [PATCH 9/9] server: replace
+ accept4/SOCK_CLOEXEC/SOCK_NONBLOCK/SO_DOMAIN for Darwin
+
+None of accept4(), SOCK_CLOEXEC, SOCK_NONBLOCK, or SO_DOMAIN exist on
+Darwin (confirmed against Apple's actual socket.h: no CLOEXEC/
+NONBLOCK bits reserved in the SOCK_* namespace, no SO_DOMAIN in the
+SO_* list). Add a shared fd_set_cloexec_nonblock() helper to util.h
+(the same fcntl(F_SETFD,FD_CLOEXEC)+fcntl(F_SETFL,O_NONBLOCK) pattern
+prepare_socket() in this file already uses for its passed-in-fd case)
+and use it after accept()/socket() instead of the atomic flags --
+same portable fallback libuv and tmux both use, with the same
+accepted small race window between fd creation and the fcntl calls.
+
+prepare_socket()'s SO_DOMAIN validation check (confirming a passed-in
+fd's address family) is dropped on Darwin, since there's no
+getsockopt() equivalent; the SO_TYPE == SOCK_STREAM check already
+there provides most of the same protection.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01U6fuL1PtRJHhr97gAGyS1h
+---
+ server.c | 37 +++++++++++++++++++++++++++++++++++++
+ util.h   | 26 +++++++++++++++++++++++---
+ 2 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/server.c b/server.c
+index 25963325..a2239e32 100644
+--- a/server.c
++++ b/server.c
+@@ -446,8 +446,17 @@ fdm_server(struct fdm *fdm, int fd, int events, void *data)
+ 
+     struct sockaddr_un addr;
+     socklen_t addr_size = sizeof(addr);
++#if defined(__APPLE__)
++    int client_fd = accept(
++        server->fd, (struct sockaddr *)&addr, &addr_size);
++    if (client_fd != -1 && !fd_set_cloexec_nonblock(client_fd)) {
++        close(client_fd);
++        client_fd = -1;
++    }
++#else
+     int client_fd = accept4(
+         server->fd, (struct sockaddr *)&addr, &addr_size, SOCK_CLOEXEC | SOCK_NONBLOCK);
++#endif
+ 
+     if (client_fd == -1) {
+         LOG_ERRNO("failed to accept client connection");
+@@ -478,7 +487,15 @@ try_connect(const char *sock_path)
+ {
+     enum connect_status ret = CONNECT_ERR;
+ 
++#if defined(__APPLE__)
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd != -1 && !fd_set_cloexec_nonblock(fd)) {
++        close(fd);
++        fd = -1;
++    }
++#else
+     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++#endif
+     if (fd == -1) {
+         LOG_ERRNO("failed to create UNIX socket");
+         goto err;
+@@ -527,9 +544,21 @@ prepare_socket(int fd)
+         return false;
+     }
+ 
++#if defined(__APPLE__)
++    /*
++     * SO_DOMAIN doesn't exist on Darwin (getsockname() + sa_family
++     * would be a substitute, but adds little here on top of the
++     * SO_TYPE == SOCK_STREAM check below), so this one check is
++     * simply skipped there.
++     */
++    int const socket_options[] = { SO_ACCEPTCONN, SO_TYPE };
++    int const socket_options_values[] = { NON_ZERO_OPT, SOCK_STREAM };
++    char const * const socket_options_names[] = { "SO_ACCEPTCONN", "SO_TYPE" };
++#else
+     int const socket_options[] = { SO_DOMAIN, SO_ACCEPTCONN, SO_TYPE };
+     int const socket_options_values[] = { AF_UNIX, NON_ZERO_OPT, SOCK_STREAM};
+     char const * const socket_options_names[] = { "SO_DOMAIN", "SO_ACCEPTCONN", "SO_TYPE" };
++#endif
+ 
+     xassert(ALEN(socket_options) == ALEN(socket_options_values));
+     xassert(ALEN(socket_options) == ALEN(socket_options_names));
+@@ -575,7 +604,15 @@ server_init(struct config *conf, struct fdm *fdm, struct reaper *reaper,
+     }
+     else {
+         LOG_DBG("no suitable pre-existing socket found, creating our own");
++#if defined(__APPLE__)
++        fd = socket(AF_UNIX, SOCK_STREAM, 0);
++        if (fd != -1 && !fd_set_cloexec_nonblock(fd)) {
++            close(fd);
++            fd = -1;
++        }
++#else
+         fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
++#endif
+         if (fd == -1) {
+             LOG_ERRNO("failed to create UNIX socket");
+             return NULL;
+diff --git a/util.h b/util.h
+index 45722f39..7ca3a9c9 100644
+--- a/util.h
++++ b/util.h
+@@ -23,10 +23,30 @@ streq(const char *a, const char *b)
+ 
+ #if defined(__APPLE__)
+ /*
+- * pipe2() is a Linux/glibc extension (later adopted by *BSD), never
+- * implemented by Darwin on any macOS version. All current call sites
+- * only ever pass O_CLOEXEC and/or O_NONBLOCK.
++ * Darwin has neither FD_CLOEXEC/O_NONBLOCK-on-creation flags for
++ * socket()/accept() (SOCK_CLOEXEC, SOCK_NONBLOCK, accept4()) nor
++ * pipe2() -- all Linux extensions, later adopted by *BSD, never
++ * implemented by Darwin on any macOS version. Set both properties
++ * after the fact instead; this reintroduces the small race window
++ * between fd creation and the fcntl() calls that the atomic flags
++ * exist specifically to avoid, which is the accepted tradeoff on
++ * platforms lacking them.
+  */
++static inline bool
++fd_set_cloexec_nonblock(int fd)
++{
++    int f = fcntl(fd, F_GETFD);
++    if (f < 0 || fcntl(fd, F_SETFD, f | FD_CLOEXEC) < 0)
++        return false;
++
++    f = fcntl(fd, F_GETFL);
++    if (f < 0 || fcntl(fd, F_SETFL, f | O_NONBLOCK) < 0)
++        return false;
++
++    return true;
++}
++
++/* All current call sites only ever pass O_CLOEXEC and/or O_NONBLOCK. */
+ static inline int
+ pipe2(int fildes[2], int flags)
+ {
+-- 
+2.43.0
+
