@@ -1,0 +1,471 @@
+diff -ru a/config.h.in b/config.h.in
+--- a/config.h.in	2026-07-31 17:20:11.245975661 +0000
++++ b/config.h.in	2026-07-31 17:20:11.279976543 +0000
+@@ -4,6 +4,9 @@
+    don't. */
+ #undef HAVE_DECL_STRERROR_R
+ 
++/* Define to 1 if you have the <dispatch/dispatch.h> header file. */
++#undef HAVE_DISPATCH_DISPATCH_H
++
+ /* Define to 1 if you have the <dlfcn.h> header file. */
+ #undef HAVE_DLFCN_H
+ 
+diff -ru a/configure b/configure
+--- a/configure	2026-07-31 17:20:11.245975661 +0000
++++ b/configure	2026-07-31 17:20:11.283976647 +0000
+@@ -3555,6 +3555,12 @@
+ 
+     LDFLAGS="${LDFLAGS} -lobjc -Wl,-framework,IOKit,-framework,Cocoa,-framework,DiskArbitration"
+     SET_FEATURES="${SET_FEATURES} -D_DARWIN_C_SOURCE"
++    ac_fn_c_check_header_compile "$LINENO" "dispatch/dispatch.h" "ac_cv_header_dispatch_dispatch_h" "$ac_includes_default"
++if test "x$ac_cv_header_dispatch_dispatch_h" = xyes
++then :
++  printf "%s\n" "#define HAVE_DISPATCH_DISPATCH_H 1" >>confdefs.h
++
++fi
+     ;;
+   *)
+     SYS="${host_os}"
+diff -ru a/configure.ac b/configure.ac
+--- a/configure.ac	2026-07-31 17:20:11.245975661 +0000
++++ b/configure.ac	2026-07-31 17:20:11.283976647 +0000
+@@ -53,6 +53,9 @@
+     AC_DEFINE([USE_IOKIT], 1, [Use IOKit for MMC access])
+     LDFLAGS="${LDFLAGS} -lobjc -Wl,-framework,IOKit,-framework,Cocoa,-framework,DiskArbitration"
+     SET_FEATURES="${SET_FEATURES} -D_DARWIN_C_SOURCE"
++    dnl libdispatch/GCD is available since Mac OS X 10.6 (Snow Leopard).
++    dnl 10.5 and earlier need a pthread/CFRunLoop based fallback instead.
++    AC_CHECK_HEADERS([dispatch/dispatch.h])
+     ;;
+   *)
+     SYS="${host_os}"
+diff -ru a/src/file/mmc_device_darwin.c b/src/file/mmc_device_darwin.c
+--- a/src/file/mmc_device_darwin.c	2026-07-31 17:20:11.257975973 +0000
++++ b/src/file/mmc_device_darwin.c	2026-07-31 17:20:11.295976958 +0000
+@@ -29,6 +29,8 @@
+ #include "util/macro.h"
+ #include "util/strutl.h"
+ 
++#include <assert.h>
++#include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -66,6 +68,26 @@
+ #include <limits.h>
+ #endif
+ 
++/*
++ * libdispatch (Grand Central Dispatch) is available since Mac OS X 10.6
++ * (Snow Leopard). On 10.5 and earlier there is no libdispatch at all, so
++ * a pthread + CFRunLoop based fallback is used instead.
++ *
++ * Note: Blocks syntax ("^{ ... }") is intentionally never used anywhere
++ * in this file, even in the GCD path below. Blocks require a compiler
++ * with Blocks support (Apple GCC or clang); this code must also build
++ * with a vanilla GCC toolchain (eg. for PowerPC 10.5/10.6 targets), so
++ * only the plain C function-pointer flavoured dispatch APIs are used.
++ */
++#ifdef HAVE_DISPATCH_DISPATCH_H
++#include <dispatch/dispatch.h>
++#define MMC_HAVE_DISPATCH 1
++#else
++/* No libdispatch (Mac OS X 10.5 and earlier): pthread is always present
++ * as part of libSystem, so use it directly for the fallback below. */
++#include <pthread.h>
++#include <sys/time.h>
++#endif
+ 
+ /*
+  *
+@@ -77,6 +99,111 @@
+     disk_mounting
+ };
+ 
++/*
++ * mmc_sem_t: simple binary/counting semaphore with a timed wait,
++ * used to synchronize with DiskArbitration completion callbacks.
++ */
++#ifdef MMC_HAVE_DISPATCH
++
++typedef dispatch_semaphore_t mmc_sem_t;
++
++static int mmc_sem_init(mmc_sem_t *sem)
++{
++    *sem = dispatch_semaphore_create(0);
++    return *sem ? 0 : -1;
++}
++
++static void mmc_sem_destroy(mmc_sem_t *sem)
++{
++    if (*sem) {
++        dispatch_release(*sem);
++        *sem = NULL;
++    }
++}
++
++static void mmc_sem_signal(mmc_sem_t *sem)
++{
++    dispatch_semaphore_signal(*sem);
++}
++
++/* wait_ns == 0 means wait forever */
++static void mmc_sem_wait(mmc_sem_t *sem, uint64_t wait_ns)
++{
++    dispatch_time_t timeout = wait_ns ?
++        dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait_ns) :
++        DISPATCH_TIME_FOREVER;
++    dispatch_semaphore_wait(*sem, timeout);
++}
++
++#else /* !MMC_HAVE_DISPATCH : pthread mutex/cond fallback (Mac OS X 10.5) */
++
++typedef struct {
++    pthread_mutex_t mutex;
++    pthread_cond_t  cond;
++    int             count;
++} mmc_sem_t;
++
++static int mmc_sem_init(mmc_sem_t *sem)
++{
++    sem->count = 0;
++    if (0 != pthread_mutex_init(&sem->mutex, NULL)) {
++        return -1;
++    }
++    if (0 != pthread_cond_init(&sem->cond, NULL)) {
++        pthread_mutex_destroy(&sem->mutex);
++        return -1;
++    }
++    return 0;
++}
++
++static void mmc_sem_destroy(mmc_sem_t *sem)
++{
++    pthread_cond_destroy(&sem->cond);
++    pthread_mutex_destroy(&sem->mutex);
++}
++
++static void mmc_sem_signal(mmc_sem_t *sem)
++{
++    pthread_mutex_lock(&sem->mutex);
++    sem->count++;
++    pthread_cond_signal(&sem->cond);
++    pthread_mutex_unlock(&sem->mutex);
++}
++
++/* wait_ns == 0 means wait forever */
++static void mmc_sem_wait(mmc_sem_t *sem, uint64_t wait_ns)
++{
++    struct timespec deadline;
++
++    if (wait_ns) {
++        struct timeval now;
++        gettimeofday(&now, NULL);
++        uint64_t nsec = (uint64_t)now.tv_usec * 1000ULL + wait_ns;
++        deadline.tv_sec  = now.tv_sec + (time_t)(nsec / 1000000000ULL);
++        deadline.tv_nsec = (long)(nsec % 1000000000ULL);
++    }
++
++    pthread_mutex_lock(&sem->mutex);
++    while (sem->count == 0) {
++        int rc;
++        if (wait_ns) {
++            rc = pthread_cond_timedwait(&sem->cond, &sem->mutex, &deadline);
++            if (rc != 0) {
++                /* timed out (or error): stop waiting */
++                break;
++            }
++        } else {
++            pthread_cond_wait(&sem->cond, &sem->mutex);
++        }
++    }
++    if (sem->count > 0) {
++        sem->count--;
++    }
++    pthread_mutex_unlock(&sem->mutex);
++}
++
++#endif /* MMC_HAVE_DISPATCH */
++
+ struct mmcdev {
+     /* Interfaces required for low-level device communication */
+     IOCFPlugInInterface **plugInInterface;
+@@ -90,8 +217,16 @@
+     DADiskRef disk;
+     DASessionRef session;
+     enum disk_state_e disk_state;
+-    dispatch_semaphore_t sync_sem;
++    bool session_active; /* true once iokit_da_init() has succeeded */
++#ifdef MMC_HAVE_DISPATCH
++    mmc_sem_t sync_sem;
+     dispatch_queue_t background_queue;
++#else
++    /* Set by iokit_mount_complete()/iokit_unmount_complete() and polled
++     * by iokit_wait_op_done() while pumping the run loop on the same
++     * thread - see comment above iokit_wait_op_done(). */
++    volatile bool op_done;
++#endif
+ };
+ 
+ int device_send_cmd(MMCDEV *mmc, const uint8_t *cmd, uint8_t *buf, size_t tx, size_t rx)
+@@ -204,7 +339,11 @@
+         BD_DEBUG(DBG_MMC, "Disc unmounted\n");
+         mmc->disk_state = disk_unmounted;
+     }
+-    dispatch_semaphore_signal(mmc->sync_sem);
++#ifdef MMC_HAVE_DISPATCH
++    mmc_sem_signal(&mmc->sync_sem);
++#else
++    mmc->op_done = true;
++#endif
+ }
+ 
+ static void iokit_mount_complete(DADiskRef disk, DADissenterRef dissenter,
+@@ -220,12 +359,36 @@
+         BD_DEBUG(DBG_MMC, "Disc mounted\n");
+         mmc->disk_state = disk_mounted;
+     }
+-    dispatch_semaphore_signal(mmc->sync_sem);
++#ifdef MMC_HAVE_DISPATCH
++    mmc_sem_signal(&mmc->sync_sem);
++#else
++    mmc->op_done = true;
++#endif
++}
++
++#ifndef MMC_HAVE_DISPATCH
++/* No libdispatch available (Mac OS X 10.5): the DiskArbitration session
++ * is scheduled on the calling thread's run loop instead of a background
++ * queue, so completion callbacks only run while that same thread pumps
++ * its run loop. Since caller and callback share one thread here, a
++ * plain flag (mmc->op_done) is enough - there is no concurrent access.
++ */
++static void iokit_wait_op_done(MMCDEV *mmc, CFTimeInterval timeout_sec)
++{
++    CFTimeInterval waited = 0.0;
++    const CFTimeInterval slice = 0.1;
++
++    mmc->op_done = false;
++    while (!mmc->op_done && waited < timeout_sec) {
++        CFRunLoopRunInMode(kCFRunLoopDefaultMode, slice, true);
++        waited += slice;
++    }
+ }
++#endif
+ 
+ /* Unmount the disk at mmc->disk
+- * Note: This MAY NOT be called on the background queue,
+- *       as that would lead to a deadlock.
++ * Note: With the libdispatch backend, this MAY NOT be called on the
++ *       background queue, as that would lead to a deadlock.
+  */
+ static int iokit_unmount(MMCDEV *mmc) {
+     if (disk_unmounted == mmc->disk_state) {
+@@ -235,24 +398,32 @@
+     BD_DEBUG(DBG_MMC, "Unmounting disk\n");
+ 
+     DADiskUnmount(mmc->disk, kDADiskUnmountOptionForce, iokit_unmount_complete, mmc);
+-    dispatch_semaphore_wait(mmc->sync_sem, DISPATCH_TIME_FOREVER);
++#ifdef MMC_HAVE_DISPATCH
++    mmc_sem_wait(&mmc->sync_sem, 0);
++#else
++    iokit_wait_op_done(mmc, 30.0);
++#endif
+ 
+     return (mmc->disk_state == disk_unmounted) ? 0 : -1;
+ }
+ 
+ /* Mount the disk at mmc->disk
+- * Note: This MAY NOT be called on the background queue,
+- *       as that would lead to a deadlock.
++ * Note: With the libdispatch backend, this MAY NOT be called on the
++ *       background queue, as that would lead to a deadlock.
+  */
+ static int iokit_mount(MMCDEV *mmc) {
+     if (disk_mounted != mmc->disk_state) {
+         if (mmc->disk && mmc->session) {
+             mmc->disk_state = disk_mounting;
+             DADiskMount(mmc->disk, NULL, kDADiskMountOptionDefault, iokit_mount_complete, mmc);
+-            dispatch_semaphore_wait(mmc->sync_sem, DISPATCH_TIME_FOREVER);
++#ifdef MMC_HAVE_DISPATCH
++            mmc_sem_wait(&mmc->sync_sem, 0);
++#else
++            iokit_wait_op_done(mmc, 30.0);
++#endif
+         }
+     }
+-    return (mmc->disk_state == disk_unmounted) ? 0 : -1;
++    return (mmc->disk_state == disk_mounted) ? 0 : -1;
+ }
+ 
+ static int iokit_find_service_matching(MMCDEV *mmc, io_service_t *servp) {
+@@ -363,7 +534,11 @@
+     }
+ 
+     mmc->disk_state = disk_appeared;
+-    dispatch_semaphore_signal(mmc->sync_sem);
++#ifdef MMC_HAVE_DISPATCH
++    mmc_sem_signal(&mmc->sync_sem);
++#else
++    mmc->op_done = true;
++#endif
+ 
+     CFStringRef reason = CFSTR("Disk is going to be mounted libaacs");
+     return DADissenterCreate(kCFAllocatorDefault, kDAReturnBusy, reason);
+@@ -384,13 +559,33 @@
+         return -1;
+     }
+ 
++#ifdef MMC_HAVE_DISPATCH
+     mmc->background_queue = dispatch_queue_create("org.videolan.libaacs", DISPATCH_QUEUE_SERIAL);
+     DASessionSetDispatchQueue(mmc->session, mmc->background_queue);
++#else
++    /* No libdispatch: schedule on the calling thread's run loop instead.
++     * All DA calls and the wait loops below must happen on this same
++     * thread for callbacks to be delivered - see iokit_wait_op_done(). */
++    DASessionScheduleWithRunLoop(mmc->session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
++#endif
+ 
+     // Register event callbacks
+     DARegisterDiskMountApprovalCallback(mmc->session, NULL, iokit_mount_approval_cb, mmc);
+ 
+-    mmc->sync_sem = dispatch_semaphore_create(0);
++#ifdef MMC_HAVE_DISPATCH
++    if (0 != mmc_sem_init(&mmc->sync_sem)) {
++        BD_DEBUG(DBG_MMC | DBG_CRIT, "Could not create sync semaphore\n");
++        DAUnregisterApprovalCallback(mmc->session, iokit_mount_approval_cb, mmc);
++        DASessionSetDispatchQueue(mmc->session, NULL);
++        CFRelease(mmc->disk);
++        mmc->disk = NULL;
++        CFRelease(mmc->session);
++        mmc->session = NULL;
++        return -1;
++    }
++#endif
++
++    mmc->session_active = true;
+ 
+     return 0;
+ }
+@@ -403,7 +598,11 @@
+          * can mount it.
+          */
+         DAUnregisterApprovalCallback(mmc->session, iokit_mount_approval_cb, mmc);
++#ifdef MMC_HAVE_DISPATCH
+         DASessionSetDispatchQueue(mmc->session, NULL);
++#else
++        DASessionUnscheduleFromRunLoop(mmc->session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
++#endif
+         CFRelease(mmc->session);
+         mmc->session = NULL;
+     }
+@@ -413,7 +612,12 @@
+         mmc->disk = NULL;
+     }
+ 
+-    dispatch_release(mmc->sync_sem);
++#ifdef MMC_HAVE_DISPATCH
++    if (mmc->session_active) {
++        mmc_sem_destroy(&mmc->sync_sem);
++    }
++#endif
++    mmc->session_active = false;
+ }
+ 
+ static int mmc_open_iokit(const char *path, MMCDEV *mmc) {
+@@ -426,6 +630,7 @@
+     mmc->disk = NULL;
+     mmc->session = NULL;
+     mmc->disk_state = disk_mounted;
++    mmc->session_active = false;
+ 
+     /* get the bsd name associated with this mount */
+     rc = get_mounted_device_from_path(mmc, path);
+@@ -497,11 +702,35 @@
+     return mmc;
+ }
+ 
++#ifdef MMC_HAVE_DISPATCH
++struct device_close_ctx {
++    MMCDEV *mmc;
++    int     rc;
++};
++
++/* Plain C function-pointer callback for dispatch_sync_f() below.
++ * Deliberately NOT a Blocks literal ("^{ ... }"): this file must build
++ * with a vanilla GCC toolchain that has no Blocks support.
++ */
++static void device_close_check_disk_appeared(void *context)
++{
++    struct device_close_ctx *ctx = context;
++
++    if (disk_appeared != ctx->mmc->disk_state) {
++        BD_DEBUG(DBG_MMC | DBG_CRIT, "Timeout waiting for the disc to appear again!\n");
++        iokit_da_destroy(ctx->mmc);
++        ctx->rc = -1;
++        return;
++    }
++    ctx->rc = 0;
++}
++#endif
++
+ void device_close(MMCDEV **pp)
+ {
+-    __block int rc = 0;
+     if (pp && *pp) {
+         MMCDEV *mmc = *pp;
++        int rc;
+ 
+         /* When the exclusive access to the drive is released,
+          * the OS will see the device like a "new" device and
+@@ -538,7 +767,7 @@
+             IODestroyPlugInInterface(mmc->plugInInterface);
+         }
+ 
+-        if (!mmc->sync_sem) {
++        if (!mmc->session_active) {
+             /* open failed before iokit_da_init() */
+             X_FREE(*pp);
+             return;
+@@ -552,21 +781,30 @@
+          * so the long timeout shouldn't do much harm for thse
+          * cases.
+          */
+-        dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 20 * 1E+9);
+-        dispatch_semaphore_wait(mmc->sync_sem, timeout);
++#ifdef MMC_HAVE_DISPATCH
++        mmc_sem_wait(&mmc->sync_sem, 20ULL * 1000000000ULL);
+ 
+         /* It is crucial that this is done on the event handling queue
+          * else callbacks could be received while this code runs.
+          */
+-        dispatch_sync(mmc->background_queue, ^{
+-            if (disk_appeared != mmc->disk_state) {
+-                BD_DEBUG(DBG_MMC | DBG_CRIT, "Timeout waiting for the disc to appear again!\n");
+-                iokit_da_destroy(mmc);
+-                rc = -1;
+-                return;
+-            }
++        struct device_close_ctx ctx = { .mmc = mmc, .rc = 0 };
++        dispatch_sync_f(mmc->background_queue, &ctx, device_close_check_disk_appeared);
++        rc = ctx.rc;
++#else
++        /* No background queue: the wait loop below drives the run loop
++         * itself, so there is no separate event handling context to
++         * synchronize with - just check the state directly afterwards.
++         */
++        iokit_wait_op_done(mmc, 20.0);
++
++        if (disk_appeared != mmc->disk_state) {
++            BD_DEBUG(DBG_MMC | DBG_CRIT, "Timeout waiting for the disc to appear again!\n");
++            iokit_da_destroy(mmc);
++            rc = -1;
++        } else {
+             rc = 0;
+-        });
++        }
++#endif
+ 
+         if (rc == 0) {
+             /* Disk appeared successfully, mount it.
