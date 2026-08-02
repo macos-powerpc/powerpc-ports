@@ -1,0 +1,109 @@
+From 3e1e770d2efd83d7835a658f3c0edeb84da802db Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 24 Jul 2026 06:48:31 +0000
+Subject: [PATCH 17/20] avcodec/ppc: fix h264 v chroma loop filters for pix %
+ 16 == 8
+
+The vertical chroma deblock filters load with vec_ld, whose address
+truncation places the 8 chroma samples in lanes 8..15 whenever
+pix % 16 == 8 -- which happens for every odd macroblock column in real
+decode (chroma dest = base + 8*mb_x with a 16-aligned linesize).
+store8_altivec() already handled that case (it selects the vector half
+by dst alignment), but the filter math did not:
+
+- inter: the tc0 pattern was only built in lanes 0..7; lanes 8..15 of
+  tc0vec came from uninitialized stack bytes (temp[4..7] duplicated by
+  vec_mergeh), so the samples were clipped against garbage tc values.
+  Fix: write the tc0 pattern into both halves of temp so the mergeh
+  result is valid in whichever half the samples land.
+
+- intra: p0'/q0' were computed only from the VEC_MERGEH half and
+  duplicated by vec_packsu(v, v), so lanes 8..15 received the filtered
+  copy of lanes 0..7 (the left neighbour's columns). Fix: filter both
+  unpacked halves lane-wise and pack them.
+
+Not caught by checkasm: its h264dsp loop filter test only passes
+16-aligned pix to the v_loop_filter functions. Reproduced standalone
+(qemu -cpu 7400) with a C-vs-ALTIVEC comparison at pix % 16 == 8:
+both functions mismatched before this change, and pass 2000 random
+trials per function per alignment after it. checkasm h264dsp still
+passes across 4 seeds; full suite 530/530.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011BUPvhbJmFUU7zpuZf36JZ
+---
+ libavcodec/ppc/h264dsp.c | 35 ++++++++++++++++++++++++++---------
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/libavcodec/ppc/h264dsp.c b/libavcodec/ppc/h264dsp.c
+index b057e32..5cee7f9 100644
+--- a/libavcodec/ppc/h264dsp.c
++++ b/libavcodec/ppc/h264dsp.c
+@@ -904,8 +904,13 @@ static void h264_h_loop_filter_luma_intra_altivec(uint8_t *pix, ptrdiff_t stride
+                                                                               \
+     /* tc0[] has one entry per pair of edge samples (inner_iters == 2), so    \
+      * duplicate each byte twice to line the 8 chroma samples up with the 4   \
+-     * tc0 values. */                                                         \
++     * tc0 values.  The pattern is written into BOTH halves of the vector:    \
++     * the vertical filter loads with vec_ld, whose address truncation puts   \
++     * the 8 samples in lanes 8..15 when pix % 16 == 8 (every odd chroma MB   \
++     * column), so the tc mapping must be valid in whichever half the         \
++     * samples land. */                                                       \
+     AV_COPY32(temp, tc0);                                                     \
++    AV_COPY32(temp + 4, tc0);                                                 \
+     tc0vec = vec_ld(0, (signed char*)temp);                                   \
+     tc0vec = vec_mergeh(tc0vec, tc0vec);                                      \
+     /* skip lanes where the block mask is 0 or tc0 <= 0 (chroma tc == tc0) */ \
+@@ -984,14 +989,18 @@ static void h264_h_loop_filter_chroma_altivec(uint8_t *pix, ptrdiff_t stride,
+  *   p0' = (2*p1 + p0 + q1 + 2) >> 2
+  *   q0' = (2*q1 + q0 + p1 + 2) >> 2
+  * applied wherever the standard boundary-strength mask holds. Only p0/q0 are
+- * updated (2-tap chroma). Everything is done on the low 8 samples. */
++ * updated (2-tap chroma). All 16 lanes are filtered lane-wise: the vertical
++ * filter loads with vec_ld, whose address truncation puts the 8 samples in
++ * lanes 8..15 when pix % 16 == 8 (every odd chroma MB column), so the result
++ * must be valid in whichever half the samples land. */
+ #define h264_loop_filter_chroma_intra_altivec(p1, p0, q0, q1, alpha, beta) {  \
+     DECLARE_ALIGNED(16, unsigned char, temp)[16];                             \
+     register vec_u8 alphavec;                                                 \
+     register vec_u8 betavec;                                                  \
+     register vec_u8 mask;                                                     \
+     register vec_s16 p1h, p0h, q0h, q1h;                                      \
+-    register vec_s16 twos, np0, nq0;                                          \
++    register vec_s16 p1l, p0l, q0l, q1l;                                      \
++    register vec_s16 twos, np0, nq0, np0l, nq0l;                              \
+     register vec_u16 twosh;                                                   \
+     register vec_u8 np0_8, nq0_8;                                             \
+     LOAD_ZERO;                                                                \
+@@ -1009,14 +1018,22 @@ static void h264_h_loop_filter_chroma_altivec(uint8_t *pix, ptrdiff_t stride,
+     p0h = (vec_s16)VEC_MERGEH(zero_u8v, p0);                                  \
+     q0h = (vec_s16)VEC_MERGEH(zero_u8v, q0);                                  \
+     q1h = (vec_s16)VEC_MERGEH(zero_u8v, q1);                                  \
++    p1l = (vec_s16)VEC_MERGEL(zero_u8v, p1);                                  \
++    p0l = (vec_s16)VEC_MERGEL(zero_u8v, p0);                                  \
++    q0l = (vec_s16)VEC_MERGEL(zero_u8v, q0);                                  \
++    q1l = (vec_s16)VEC_MERGEL(zero_u8v, q1);                                  \
+     /* p0' = (2*p1 + p0 + q1 + 2) >> 2 */                                     \
+-    np0 = vec_add(vec_add(vec_add(p1h, p1h), p0h), vec_add(q1h, twos));       \
+-    np0 = vec_sra(np0, twosh);                                                \
++    np0  = vec_add(vec_add(vec_add(p1h, p1h), p0h), vec_add(q1h, twos));      \
++    np0  = vec_sra(np0, twosh);                                               \
++    np0l = vec_add(vec_add(vec_add(p1l, p1l), p0l), vec_add(q1l, twos));      \
++    np0l = vec_sra(np0l, twosh);                                              \
+     /* q0' = (2*q1 + q0 + p1 + 2) >> 2 */                                     \
+-    nq0 = vec_add(vec_add(vec_add(q1h, q1h), q0h), vec_add(p1h, twos));       \
+-    nq0 = vec_sra(nq0, twosh);                                                \
+-    np0_8 = vec_packsu(np0, np0);                                             \
+-    nq0_8 = vec_packsu(nq0, nq0);                                             \
++    nq0  = vec_add(vec_add(vec_add(q1h, q1h), q0h), vec_add(p1h, twos));      \
++    nq0  = vec_sra(nq0, twosh);                                               \
++    nq0l = vec_add(vec_add(vec_add(q1l, q1l), q0l), vec_add(p1l, twos));      \
++    nq0l = vec_sra(nq0l, twosh);                                              \
++    np0_8 = vec_packsu(np0, np0l);                                            \
++    nq0_8 = vec_packsu(nq0, nq0l);                                            \
+     p0 = vec_sel(p0, np0_8, mask);                                            \
+     q0 = vec_sel(q0, nq0_8, mask);                                            \
+ }
+-- 
+2.43.0
+

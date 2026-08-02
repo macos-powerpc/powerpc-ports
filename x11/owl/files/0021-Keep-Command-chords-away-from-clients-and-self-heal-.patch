@@ -1,0 +1,259 @@
+From 25413047cb26683d166109d65e30d5dc9eea4d44 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 31 Jul 2026 10:24:04 +0000
+Subject: [PATCH 21/22] Keep Command chords away from clients and self-heal
+ modifier state
+
+Cocoa swallows events around the Command key: key equivalents are
+routed to the menu system, and the keyUp for any key released while
+Command is held is never delivered to the view. Forwarding the
+keyDown of e.g. Cmd+V therefore left the 'v' key permanently stuck
+down in the client, which autorepeats it forever (repeat_info makes
+version 4+ clients repeat keys themselves until they see a release).
+
+Additionally, NSFlagsChanged only reaches us while an Owl surface is
+the first responder of the key window. A modifier released while the
+menu bar or another application had focus was never noticed, leaving
+a phantom Control/Shift/Command "held" in our global modifier state.
+Clients match key and *mouse* bindings against the exact modifier
+state, so a phantom modifier silently broke plain typing and even
+mouse text selection in foot.
+
+Address both by reserving Command for the compositor and making the
+modifier state self-correcting:
+
+* Never forward key presses while Command is held; Command is our
+  menu shortcut modifier, and no release would follow anyway.
+* Stop reporting Command to clients as Mod4/Meta altogether.
+* Track which key presses we have forwarded; when Command engages,
+  release them all, and never send a release for a key the client
+  has not seen pressed.
+* Reconcile our modifier state with the -[NSEvent modifierFlags] of
+  every key, button and scroll event, so a missed NSFlagsChanged
+  heals at the next interaction instead of persisting forever.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01G6m1eevhAns3j85HMZYKna
+---
+ Sources/Compositor/OwlSurface.m | 23 +++++++++++-
+ Sources/Seat/OwlKeyboard.h      |  7 ++++
+ Sources/Seat/OwlKeyboard.m      | 62 +++++++++++++++++++++++++++++----
+ 3 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/Sources/Compositor/OwlSurface.m b/Sources/Compositor/OwlSurface.m
+index 5fa57ff..fedd2d4 100644
+--- a/Sources/Compositor/OwlSurface.m
++++ b/Sources/Compositor/OwlSurface.m
+@@ -524,6 +524,10 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) mouseDown: (NSEvent *) event {
++    // The client matches its mouse bindings against the exact
++    // modifier state, so make sure ours isn't stale before it
++    // interprets the click.
++    [[self keyboard] reconcileModifierFlags: [event modifierFlags]];
+     [self ensureMouseIsInside: event];
+     [[self pointer] sendButton: BTN_LEFT isPressed: YES];
+     [[OwlServer sharedServer] flushClientsLater];
+@@ -536,6 +540,7 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) rightMouseDown: (NSEvent *) event {
++    [[self keyboard] reconcileModifierFlags: [event modifierFlags]];
+     [self ensureMouseIsInside: event];
+     [[self pointer] sendButton: BTN_RIGHT isPressed: YES];
+     [[OwlServer sharedServer] flushClientsLater];
+@@ -552,6 +557,7 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) scrollWheel: (NSEvent *) event {
++    [[self keyboard] reconcileModifierFlags: [event modifierFlags]];
+     [self ensureMouseIsInside: event];
+     [[self pointer] sendScrollByX: [event deltaX] byY: [event deltaY]];
+     [[OwlServer sharedServer] flushClientsLater];
+@@ -566,6 +572,16 @@ static const struct wl_surface_interface surface_interface = {
+     if (keyboard == nil) {
+         return;
+     }
++    [keyboard reconcileModifierFlags: [event modifierFlags]];
++    if ([event modifierFlags] & NSCommandKeyMask) {
++        // Command chords belong to the compositor (they are our
++        // menu shortcuts), so don't type them into the client.
++        // Cocoa would not deliver the matching keyUp anyway,
++        // which would leave the key stuck down and autorepeating
++        // in the client.
++        [[OwlServer sharedServer] flushClientsLater];
++        return;
++    }
+     // Don't forward Cocoa's autorepeat to version 4+ keyboards:
+     // those clients repeat keys themselves based on the
+     // repeat_info event we send them. Older clients rely on
+@@ -579,7 +595,12 @@ static const struct wl_surface_interface surface_interface = {
+ }
+ 
+ - (void) keyUp: (NSEvent *) event {
+-    [[self keyboard] sendKey: [event keyCode] isPressed: NO];
++    OwlKeyboard *keyboard = [self keyboard];
++    if (keyboard == nil) {
++        return;
++    }
++    [keyboard reconcileModifierFlags: [event modifierFlags]];
++    [keyboard sendKey: [event keyCode] isPressed: NO];
+     [[OwlServer sharedServer] flushClientsLater];
+ }
+ 
+diff --git a/Sources/Seat/OwlKeyboard.h b/Sources/Seat/OwlKeyboard.h
+index edb53a5..68e42b9 100644
+--- a/Sources/Seat/OwlKeyboard.h
++++ b/Sources/Seat/OwlKeyboard.h
+@@ -40,4 +40,11 @@
+  * plus a wl_keyboard.modifiers event. */
+ - (void) handleFlagsChanged: (NSEvent *) event;
+ 
++/* Bring our idea of the modifier state in sync with the given
++ * -[NSEvent modifierFlags] value. Cocoa delivers NSFlagsChanged
++ * to the first responder of the key window, so we miss changes
++ * that happen while the menu bar or another application has
++ * focus; calling this from every event self-heals the state. */
++- (void) reconcileModifierFlags: (NSUInteger) flags;
++
+ @end
+diff --git a/Sources/Seat/OwlKeyboard.m b/Sources/Seat/OwlKeyboard.m
+index dee99f4..2120d0f 100644
+--- a/Sources/Seat/OwlKeyboard.m
++++ b/Sources/Seat/OwlKeyboard.m
+@@ -37,7 +37,6 @@
+ #define OWL_MOD_LOCK    2
+ #define OWL_MOD_CONTROL 4
+ #define OWL_MOD_MOD1    8   /* Option/Alt */
+-#define OWL_MOD_MOD4    64  /* Command/Super */
+ 
+ /* Evdev keycodes for (left) modifier keys. */
+ #define OWL_KEY_LEFTCTRL   29
+@@ -63,10 +62,18 @@ static uint32_t current_mods_depressed;
+ static uint32_t current_mods_locked;
+ static NSUInteger previous_cocoa_flags;
+ 
++/* The evdev keycodes of the non-modifier keys whose press we have
++ * forwarded to a client and whose release we haven't. Global for
++ * the same reason the modifier state is: one physical keyboard. */
++static NSMutableIndexSet *pressed_keys;
++
+ + (void) initialize {
+     if (keyboards == nil) {
+         keyboards = [[NSMutableArray alloc] initWithCapacity: 1];
+     }
++    if (pressed_keys == nil) {
++        pressed_keys = [[NSMutableIndexSet alloc] init];
++    }
+ }
+ 
+ + (OwlKeyboard *) keyboardForClient: (struct wl_client *) client {
+@@ -332,6 +339,18 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+         return;
+     }
+ 
++    if (isPressed) {
++        [pressed_keys addIndex: xkbKeyCode];
++    } else {
++        if (![pressed_keys containsIndex: xkbKeyCode]) {
++            // We never forwarded the press (a Command chord, or
++            // it was force-released when Command engaged), so
++            // don't send a spurious release.
++            return;
++        }
++        [pressed_keys removeIndex: xkbKeyCode];
++    }
++
+     wl_keyboard_send_key(
+         _resource,
+         [[OwlServer sharedServer] nextSerial],
+@@ -355,6 +374,15 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+     );
+ }
+ 
++- (void) releaseAllKeys {
++    NSUInteger code = [pressed_keys firstIndex];
++    while (code != NSNotFound) {
++        [self sendKeyRaw: (uint32_t) code isPressed: NO];
++        code = [pressed_keys indexGreaterThanIndex: code];
++    }
++    [pressed_keys removeAllIndexes];
++}
++
+ - (void) sendModifiers: (uint32_t) modifiers {
+     uint32_t serial = [[OwlServer sharedServer] nextSerial];
+     wl_keyboard_send_modifiers(_resource, serial, modifiers, 0, 0, 0);
+@@ -372,7 +400,10 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+     );
+ }
+ 
+-- (void) handleFlagsChanged: (NSEvent *) event {
++- (void) reconcileModifierFlags: (NSUInteger) flags {
++    // Command is deliberately absent from this table: it is the
++    // compositor's modifier (menu shortcuts like Cmd+C/Cmd+V), so
++    // clients never see it as Mod4 or as a Meta key press.
+     static const struct {
+         NSUInteger cocoaMask;
+         uint32_t modMask;
+@@ -380,15 +411,18 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+     } modifiers[] = {
+         {NSShiftKeyMask, OWL_MOD_SHIFT, OWL_KEY_LEFTSHIFT},
+         {NSControlKeyMask, OWL_MOD_CONTROL, OWL_KEY_LEFTCTRL},
+-        {NSAlternateKeyMask, OWL_MOD_MOD1, OWL_KEY_LEFTALT},
+-        {NSCommandKeyMask, OWL_MOD_MOD4, OWL_KEY_LEFTMETA}
++        {NSAlternateKeyMask, OWL_MOD_MOD1, OWL_KEY_LEFTALT}
+     };
+     size_t modifiers_size = sizeof(modifiers) / sizeof(modifiers[0]);
+ 
+-    NSUInteger flags = [event modifierFlags];
+     NSUInteger changed = flags ^ previous_cocoa_flags;
++    BOOL modsChanged = NO;
+     size_t i;
+ 
++    if (changed == 0) {
++        return;
++    }
++
+     for (i = 0; i < modifiers_size; i++) {
+         if (!(changed & modifiers[i].cocoaMask)) {
+             continue;
+@@ -400,6 +434,7 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+             current_mods_depressed &= ~modifiers[i].modMask;
+         }
+         [self sendKeyRaw: modifiers[i].evdevCode isPressed: isPressed];
++        modsChanged = YES;
+     }
+ 
+     if (changed & NSAlphaShiftKeyMask) {
+@@ -409,11 +444,26 @@ static uint32_t MacosToXkbKeycode(unsigned short macCode) {
+         current_mods_locked ^= OWL_MOD_LOCK;
+         [self sendKeyRaw: OWL_KEY_CAPSLOCK isPressed: YES];
+         [self sendKeyRaw: OWL_KEY_CAPSLOCK isPressed: NO];
++        modsChanged = YES;
++    }
++
++    if ((changed & NSCommandKeyMask) && (flags & NSCommandKeyMask)) {
++        // Command is engaging. Cocoa will not deliver keyUp for
++        // keys released while Command is held, so release
++        // everything now rather than leave keys stuck down
++        // (and autorepeating) in the client.
++        [self releaseAllKeys];
+     }
+ 
+     previous_cocoa_flags = flags;
+ 
+-    [self sendCurrentModifiers];
++    if (modsChanged) {
++        [self sendCurrentModifiers];
++    }
++}
++
++- (void) handleFlagsChanged: (NSEvent *) event {
++    [self reconcileModifierFlags: [event modifierFlags]];
+ }
+ 
+ - (void) sendEnterSurface: (OwlSurface *) surface {
+-- 
+2.43.0
+
