@@ -4,8 +4,8 @@
 # Note settings here *must* match those in the lang/libgcc port and compilers PG
 # GCC 16 and 14 on all systems except i386 tiger (GCC14 only) due to:
 # https://github.com/macos-powerpc/powerpc-ports/issues/187
-global os.arch
-if {${os.major} == 8 && ${os.arch} eq "i386"} {
+global os.arch os.platform
+if {${os.platform} eq "darwin" && ${os.major} == 8 && ${os.arch} eq "i386"} {
     set gcc_main_version 14
 } else {
     set gcc_main_version 16
