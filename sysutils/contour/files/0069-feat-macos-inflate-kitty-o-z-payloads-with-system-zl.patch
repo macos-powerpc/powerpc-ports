@@ -1,0 +1,126 @@
+From 783c203f363bdf24d81de55eb228472bea65daad Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 2 Aug 2026 09:17:38 +0000
+Subject: [PATCH] feat(macos): inflate kitty o=z payloads with system zlib
+
+Wires the engine's new injected Terminal::inflate() callback (vendor) to a
+zlib inflater on the macOS side, the sibling of the ImageIO PNG decoder
+already injected here. Without an inflater the engine answers "ENOTSUP:
+compressed payloads are not supported" for any o=, yet `kitten icat` -- the
+kitty graphics protocol's own reference client -- deflates its raw RGB/RGBA
+payloads by default. So compressed sends went dark where kitty renders;
+this closes that gap for the native frontend.
+
+Uses system libz (guaranteed on every macOS incl. 10.6/PPC), linked via the
+plain -lz flag inside the existing if(APPLE) block rather than
+find_package(ZLIB), sidestepping the old SDK's CMake-module quirks. The
+inflater streams through a growing buffer (the wire states only the final
+pixel dimensions, not the inflated byte count) and caps output at 512 MiB
+as a decompression-bomb guard; the engine re-checks the inflated size
+against the declared dimensions and bounds the compressed input, so a
+corrupt or mismatched stream falls into the engine's existing EINVAL path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011h7K9xLzUrQysDc7pNd7Br
+---
+ src/contour_macos/CMakeLists.txt      |  8 ++--
+ src/contour_macos/TerminalSession.cpp | 53 +++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/src/contour_macos/CMakeLists.txt b/src/contour_macos/CMakeLists.txt
+index e2a62704..1259d932 100644
+--- a/src/contour_macos/CMakeLists.txt
++++ b/src/contour_macos/CMakeLists.txt
+@@ -52,9 +52,11 @@ target_compile_options(contour_macos PRIVATE ${_contour_macos_warn_opts})
+ if(APPLE)
+     option(CONTOUR_GL_BASELINE_105 "Build the GL backend against the conservative 10.5 GL 2.0 baseline" ON)
+     # GLRenderTarget uses OpenGL; TerminalSession uses ImageIO/CoreGraphics (via ApplicationServices,
+-    # as on 10.6) to decode inline PNG images. Link both into the library so the probe/smoke targets
+-    # that depend only on contour_macos link too.
+-    target_link_libraries(contour_macos PUBLIC "-framework OpenGL" "-framework ApplicationServices")
++    # as on 10.6) to decode inline PNG images, and system libz to inflate kitty `o=z` payloads. Link
++    # all into the library so the probe/smoke targets that depend only on contour_macos link too. Use
++    # the plain `-lz` system linker flag rather than find_package(ZLIB): libz is a guaranteed system
++    # dylib on every macOS incl. 10.6/PPC, and this sidesteps the old SDK's CMake module quirks.
++    target_link_libraries(contour_macos PUBLIC "-framework OpenGL" "-framework ApplicationServices" "-lz")
+     if(CONTOUR_GL_BASELINE_105)
+         target_compile_definitions(contour_macos PUBLIC CONTOUR_GL_BASELINE_105=1)
+     else()
+diff --git a/src/contour_macos/TerminalSession.cpp b/src/contour_macos/TerminalSession.cpp
+index 3042ba2d..7772791b 100644
+--- a/src/contour_macos/TerminalSession.cpp
++++ b/src/contour_macos/TerminalSession.cpp
+@@ -13,6 +13,9 @@
+ // a C API, so it is usable from this ordinary-C++ translation unit (no ObjC needed).
+ #include <ApplicationServices/ApplicationServices.h>
+ 
++// zlib (system libz on macOS, incl. 10.6/PPC) for inflating kitty graphics `o=z` payloads.
++#include <zlib.h>
++
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+@@ -164,6 +167,52 @@ namespace
+         CFRelease(cfData);
+         return result;
+     }
++
++    /// Inflates a raw zlib-deflate stream, for kitty graphics `o=z` payloads. `kitten icat` -- the
++    /// protocol's reference client -- deflates its raw pixel payloads by default, so without this the
++    /// engine answers ENOTSUP where kitty renders. The engine re-checks the inflated size against the
++    /// declared image dimensions once this returns and caps the compressed input, so the only ceiling
++    /// enforced here is a decompression-bomb guard.
++    [[nodiscard]] std::optional<vtbackend::Image::Data> inflateZlib(std::span<uint8_t const> data)
++    {
++        z_stream stream {};
++        if (inflateInit(&stream) != Z_OK)
++            return std::nullopt;
++
++        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(data.data()));
++        stream.avail_in = static_cast<uInt>(data.size());
++
++        // The output size is not known up front (the wire states only the final pixel dimensions), so
++        // stream through a growing buffer 64 KiB at a time until Z_STREAM_END. Cap the total against a
++        // deflate bomb: the engine's dimension check runs only after inflation completes.
++        constexpr size_t chunkSize = 64 * 1024;
++        constexpr size_t maxInflatedSize = static_cast<size_t>(512) * 1024 * 1024;
++        vtbackend::Image::Data out;
++        int status = Z_OK;
++        do
++        {
++            auto const oldSize = out.size();
++            if (oldSize + chunkSize > maxInflatedSize)
++            {
++                inflateEnd(&stream);
++                return std::nullopt;
++            }
++            out.resize(oldSize + chunkSize);
++            stream.next_out = reinterpret_cast<Bytef*>(out.data() + oldSize);
++            stream.avail_out = static_cast<uInt>(chunkSize);
++
++            status = inflate(&stream, Z_NO_FLUSH);
++            if (status != Z_OK && status != Z_STREAM_END)
++            {
++                inflateEnd(&stream);
++                return std::nullopt;
++            }
++            out.resize(oldSize + (chunkSize - stream.avail_out));
++        } while (status != Z_STREAM_END);
++
++        inflateEnd(&stream);
++        return out;
++    }
+ } // namespace
+ 
+ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+@@ -230,6 +279,10 @@ TerminalSession::TerminalSession(vtbackend::PageSize pageSize,
+     // decodePng() no-ops and PNG inline images are silently dropped.
+     _terminal->setImageDecoder(&decodePngViaImageIO);
+ 
++    // Inject the zlib inflater for kitty graphics `o=z` payloads; without it the engine answers
++    // ENOTSUP where kitty renders (kitten icat compresses its payloads by default).
++    _terminal->setInflate(&inflateZlib);
++
+     // setWordDelimiters() is what actually assigns the selection helper's `wordDelimited`
+     // std::function; without calling it, mouse selection invokes an empty std::function and
+     // throws std::bad_function_call. Seed with the usual terminal word-boundary set.

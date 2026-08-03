@@ -1,0 +1,1191 @@
+From f3e14061e7406f52d2436eeb953c3faa490cdd2d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 3 Aug 2026 00:03:59 +0000
+Subject: [PATCH 12/12] feat(vendor): kitty Unicode placeholders (U+10EEEE
+ virtual placements)
+
+Implements the kitty graphics protocol's multiplexer-safe placement mode:
+a=p/a=T with U=1 registers a virtual placement instead of drawing at the
+cursor, and printing U+10EEEE placeholder cells shows the image wherever
+they land -- which is how images survive tmux, and how ratatui-image,
+yazi and the rest of the modern image-TUI ecosystem place images.
+
+A placeholder cell encodes the image id in its foreground color (24-bit
+RGB or 256-palette low byte, plus an optional third diacritic for the
+high byte), the placement id in its underline color, and its row/column
+inside the placement in its first two combining diacritics (the
+protocol's 297-entry table, taken verbatim from kitty). Values the
+application omits are inherited from the resolved cell to the left, per
+the spec's three inheritance rules.
+
+Resolution happens at write time (base character and every diacritic
+append re-resolve the cell) and again page-wide when a virtual placement
+or a re-transmission under its id arrives -- placeholders legally
+precede their placement, e.g. when a multiplexer replays a pane. The
+page rescan probes line storage directly rather than through mutable
+cell proxies, so it neither bumps line generations (which would defeat
+dirty-line render skipping) nor materializes blank lines.
+
+Fragments are attached with ImageLayer::Replace so overwriting a
+placeholder with text drops its fragment; a failed re-resolution drops a
+stale fragment likewise. Placeholder text is never drawn: makeRenderCell
+suppresses the codepoints and any placeholder write untrivializes its
+line, so the trivial-line path cannot leak them as tofu either.
+
+One deliberate write-path change: a placeholder cluster's combining
+diacritics do NOT take the deferred wrap. Firing it there scrolled the
+page one codepoint early and appended the diacritics to the wrong line,
+tearing every full-width image row (the icat/tmux norm) -- kitty never
+wraps on them. Ordinary continuation codepoints still take the wrap
+first, preserving the abandoned-width-revision contract its test
+asserts.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DFiVLJJFoFvRaXdGkJuRyJ
+(cherry picked from commit 1f2a98b6e70a988527fbcbc4289eedc6dde1cb4b)
+---
+ src/vtbackend/KittyGraphics.cpp       |  80 +++++
+ src/vtbackend/KittyGraphics.h         |  27 ++
+ src/vtbackend/KittyGraphics_test.cpp  | 424 ++++++++++++++++++++++++++
+ src/vtbackend/RenderBufferBuilder.cpp |   8 +-
+ src/vtbackend/Screen.cpp              | 313 ++++++++++++++++++-
+ src/vtbackend/Screen.h                |  45 +++
+ 6 files changed, 892 insertions(+), 5 deletions(-)
+
+diff --git a/src/vtbackend/KittyGraphics.cpp b/src/vtbackend/KittyGraphics.cpp
+index 24fc02c3..88833ad2 100644
+--- a/src/vtbackend/KittyGraphics.cpp
++++ b/src/vtbackend/KittyGraphics.cpp
+@@ -1,8 +1,11 @@
+ // SPDX-License-Identifier: Apache-2.0
+ #include <vtbackend/KittyGraphics.h>
+ 
++#include <algorithm>
++#include <array>
+ #include <charconv>
+ #include <cstdlib>
++#include <iterator>
+ 
+ namespace vtbackend::kitty_graphics
+ {
+@@ -109,6 +112,12 @@ namespace
+                 command.doNotMoveCursor = number != 0;
+                 break;
+             }
++            case 'U': {
++                auto number = 0u;
++                (void) assignNumber(value, number);
++                command.virtualPlacement = number != 0;
++                break;
++            }
+             case 'q': {
+                 auto number = 0u;
+                 (void) assignNumber(value, number);
+@@ -130,6 +139,77 @@ namespace
+     }
+ } // namespace
+ 
++namespace
++{
++    /// The protocol's row/column diacritics, in encoding order: the codepoint at index N encodes the
++    /// value N. Taken verbatim from kitty's gen/rowcolumn-diacritics.txt (combining characters of
++    /// class 230 from Unicode 6.0, minus those with common precomposed forms); the table is part of
++    /// the wire format, so its content and order are not ours to choose. It is sorted by codepoint,
++    /// which lower_bound below relies on.
++    constexpr std::array<char32_t, 297> RowColumnDiacritics = {
++    0x00305, 0x0030D, 0x0030E, 0x00310, 0x00312, 0x0033D, 0x0033E, 0x0033F,
++    0x00346, 0x0034A, 0x0034B, 0x0034C, 0x00350, 0x00351, 0x00352, 0x00357,
++    0x0035B, 0x00363, 0x00364, 0x00365, 0x00366, 0x00367, 0x00368, 0x00369,
++    0x0036A, 0x0036B, 0x0036C, 0x0036D, 0x0036E, 0x0036F, 0x00483, 0x00484,
++    0x00485, 0x00486, 0x00487, 0x00592, 0x00593, 0x00594, 0x00595, 0x00597,
++    0x00598, 0x00599, 0x0059C, 0x0059D, 0x0059E, 0x0059F, 0x005A0, 0x005A1,
++    0x005A8, 0x005A9, 0x005AB, 0x005AC, 0x005AF, 0x005C4, 0x00610, 0x00611,
++    0x00612, 0x00613, 0x00614, 0x00615, 0x00616, 0x00617, 0x00657, 0x00658,
++    0x00659, 0x0065A, 0x0065B, 0x0065D, 0x0065E, 0x006D6, 0x006D7, 0x006D8,
++    0x006D9, 0x006DA, 0x006DB, 0x006DC, 0x006DF, 0x006E0, 0x006E1, 0x006E2,
++    0x006E4, 0x006E7, 0x006E8, 0x006EB, 0x006EC, 0x00730, 0x00732, 0x00733,
++    0x00735, 0x00736, 0x0073A, 0x0073D, 0x0073F, 0x00740, 0x00741, 0x00743,
++    0x00745, 0x00747, 0x00749, 0x0074A, 0x007EB, 0x007EC, 0x007ED, 0x007EE,
++    0x007EF, 0x007F0, 0x007F1, 0x007F3, 0x00816, 0x00817, 0x00818, 0x00819,
++    0x0081B, 0x0081C, 0x0081D, 0x0081E, 0x0081F, 0x00820, 0x00821, 0x00822,
++    0x00823, 0x00825, 0x00826, 0x00827, 0x00829, 0x0082A, 0x0082B, 0x0082C,
++    0x0082D, 0x00951, 0x00953, 0x00954, 0x00F82, 0x00F83, 0x00F86, 0x00F87,
++    0x0135D, 0x0135E, 0x0135F, 0x017DD, 0x0193A, 0x01A17, 0x01A75, 0x01A76,
++    0x01A77, 0x01A78, 0x01A79, 0x01A7A, 0x01A7B, 0x01A7C, 0x01B6B, 0x01B6D,
++    0x01B6E, 0x01B6F, 0x01B70, 0x01B71, 0x01B72, 0x01B73, 0x01CD0, 0x01CD1,
++    0x01CD2, 0x01CDA, 0x01CDB, 0x01CE0, 0x01DC0, 0x01DC1, 0x01DC3, 0x01DC4,
++    0x01DC5, 0x01DC6, 0x01DC7, 0x01DC8, 0x01DC9, 0x01DCB, 0x01DCC, 0x01DD1,
++    0x01DD2, 0x01DD3, 0x01DD4, 0x01DD5, 0x01DD6, 0x01DD7, 0x01DD8, 0x01DD9,
++    0x01DDA, 0x01DDB, 0x01DDC, 0x01DDD, 0x01DDE, 0x01DDF, 0x01DE0, 0x01DE1,
++    0x01DE2, 0x01DE3, 0x01DE4, 0x01DE5, 0x01DE6, 0x01DFE, 0x020D0, 0x020D1,
++    0x020D4, 0x020D5, 0x020D6, 0x020D7, 0x020DB, 0x020DC, 0x020E1, 0x020E7,
++    0x020E9, 0x020F0, 0x02CEF, 0x02CF0, 0x02CF1, 0x02DE0, 0x02DE1, 0x02DE2,
++    0x02DE3, 0x02DE4, 0x02DE5, 0x02DE6, 0x02DE7, 0x02DE8, 0x02DE9, 0x02DEA,
++    0x02DEB, 0x02DEC, 0x02DED, 0x02DEE, 0x02DEF, 0x02DF0, 0x02DF1, 0x02DF2,
++    0x02DF3, 0x02DF4, 0x02DF5, 0x02DF6, 0x02DF7, 0x02DF8, 0x02DF9, 0x02DFA,
++    0x02DFB, 0x02DFC, 0x02DFD, 0x02DFE, 0x02DFF, 0x0A66F, 0x0A67C, 0x0A67D,
++    0x0A6F0, 0x0A6F1, 0x0A8E0, 0x0A8E1, 0x0A8E2, 0x0A8E3, 0x0A8E4, 0x0A8E5,
++    0x0A8E6, 0x0A8E7, 0x0A8E8, 0x0A8E9, 0x0A8EA, 0x0A8EB, 0x0A8EC, 0x0A8ED,
++    0x0A8EE, 0x0A8EF, 0x0A8F0, 0x0A8F1, 0x0AAB0, 0x0AAB2, 0x0AAB3, 0x0AAB7,
++    0x0AAB8, 0x0AABE, 0x0AABF, 0x0AAC1, 0x0FE20, 0x0FE21, 0x0FE22, 0x0FE23,
++    0x0FE24, 0x0FE25, 0x0FE26, 0x10A0F, 0x10A38, 0x1D185, 0x1D186, 0x1D187,
++    0x1D188, 0x1D189, 0x1D1AA, 0x1D1AB, 0x1D1AC, 0x1D1AD, 0x1D242, 0x1D243,
++    0x1D244,
++    };
++} // namespace
++
++std::optional<uint16_t> rowColumnDiacriticValue(char32_t codepoint) noexcept
++{
++    auto const it = std::ranges::lower_bound(RowColumnDiacritics, codepoint);
++    if (it == RowColumnDiacritics.end() || *it != codepoint)
++        return std::nullopt;
++    return static_cast<uint16_t>(std::distance(RowColumnDiacritics.begin(), it));
++}
++
++std::optional<uint32_t> placeholderIdFromColor(Color color) noexcept
++{
++    switch (color.type())
++    {
++        case ColorType::RGB: return color.rgb().value();
++        case ColorType::Indexed: return color.index();
++        // Bright colors occupy palette slots 8..15, and the palette slot is what encodes the id.
++        case ColorType::Bright: return color.index() + 8u;
++        case ColorType::Undefined:
++        case ColorType::Default: break;
++    }
++    return std::nullopt;
++}
++
+ std::string_view errorCode(Error error) noexcept
+ {
+     switch (error)
+diff --git a/src/vtbackend/KittyGraphics.h b/src/vtbackend/KittyGraphics.h
+index da13cb82..a87770a1 100644
+--- a/src/vtbackend/KittyGraphics.h
++++ b/src/vtbackend/KittyGraphics.h
+@@ -1,15 +1,38 @@
+ // SPDX-License-Identifier: Apache-2.0
+ #pragma once
+ 
++#include <vtbackend/Color.h>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <expected>
++#include <optional>
+ #include <string>
+ #include <string_view>
+ 
+ namespace vtbackend::kitty_graphics
+ {
+ 
++/// The character an application prints to mark a cell as showing part of a virtually placed image
++/// (`U=1`). kitty names it IMAGE_PLACEHOLDER_CHAR; it lives in the plane-16 private use area, so it
++/// carries no meaning as text.
++inline constexpr char32_t PlaceholderCodepoint = U'\U0010EEEE';
++
++/// @return the 0-based value @p codepoint encodes as a placeholder row/column diacritic, or nullopt
++/// when it is not one of the protocol's 297 row/column diacritics.
++///
++/// A placeholder cell's first combining diacritic encodes its row inside the virtual placement, the
++/// second its column, and the third the most significant byte of the image id.
++[[nodiscard]] std::optional<uint16_t> rowColumnDiacriticValue(char32_t codepoint) noexcept;
++
++/// @return the image or placement id bits @p color encodes on a placeholder cell, or nullopt when
++/// the color carries none (default/unset).
++///
++/// The protocol encodes the low 24 bits of the image id in the foreground color when it is an RGB
++/// color, and the low 8 bits when it is a 256-palette index; the placement id is encoded the same
++/// way in the underline color.
++[[nodiscard]] std::optional<uint32_t> placeholderIdFromColor(Color color) noexcept;
++
+ /// Largest payload one chunked transmission (`m=1`) may accumulate, in base64 bytes.
+ ///
+ /// The chunk stream is attacker-controlled: every byte a remote host writes to the terminal ends up
+@@ -104,6 +127,10 @@ struct Command
+     /// Whether the cursor should move to just past the image (`C=`; 1 means do NOT move it).
+     bool doNotMoveCursor = false;
+ 
++    /// Whether the placement is virtual (`U=1`): nothing is drawn at the cursor; the image shows
++    /// wherever the application prints placeholder cells that name it. @see PlaceholderCodepoint.
++    bool virtualPlacement = false;
++
+     /// More chunks of this image follow (`m=1`).
+     bool moreChunksFollow = false;
+ 
+diff --git a/src/vtbackend/KittyGraphics_test.cpp b/src/vtbackend/KittyGraphics_test.cpp
+index 462cf66c..ee79d993 100644
+--- a/src/vtbackend/KittyGraphics_test.cpp
++++ b/src/vtbackend/KittyGraphics_test.cpp
+@@ -10,8 +10,11 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
++#include <libunicode/convert.h>
++
+ #include <zlib.h>
+ 
++#include <iterator>
+ #include <ranges>
+ #include <string>
+ #include <string_view>
+@@ -53,6 +56,34 @@ std::optional<Image::Data> inflateZlibForTest(std::span<uint8_t const> data)
+     return out;
+ }
+ 
++/// The placeholder character and the diacritics encoding the values 0, 1 and 2, spelled as
++/// codepoints so each test composes placeholder cells exactly as an application puts them on the
++/// wire: base character, row diacritic, column diacritic, optional id-high-byte diacritic.
++constexpr char32_t Placeholder = PlaceholderCodepoint;
++constexpr char32_t RowCol0 = U'\u0305';
++constexpr char32_t RowCol1 = U'\u030D';
++constexpr char32_t RowCol2 = U'\u030E';
++
++/// UTF-8-encodes @p codepoints into one string.
++std::string utf8(std::initializer_list<char32_t> codepoints)
++{
++    auto out = std::string {};
++    for (auto const codepoint: codepoints)
++        unicode::convert_to<char>(std::u32string_view(&codepoint, 1), std::back_inserter(out));
++    return out;
++}
++
++/// Quietly transmits (without displaying) a 4x4 RGBA image -- 2x2 cells at the placeholder tests'
++/// 2x2-pixel cell size -- under @p imageId.
++void transmitTestImage(MockTerm<vtpty::MockPty>& mock, uint32_t imageId)
++{
++    auto pixels = std::string {};
++    for (int i = 0; i < 16; ++i)
++        pixels += "\x00\xFF\x00\xFF"sv;
++    mock.writeToScreen(std::format(
++        "\033_Ga=t,f=32,s=4,v=4,i={},q=2;{}\033\\", imageId, crispy::base64::encode(pixels)));
++}
++
+ /// Deflates @p data with zlib, so a test can produce the exact `o=z` payload a real client sends.
+ std::string deflateZlibForTest(std::string_view data)
+ {
+@@ -578,6 +609,399 @@ TEST_CASE("KittyGraphics.non_kitty_APC_is_ignored", "[kitty]")
+     CHECK(mock.terminal.peekInput().empty());
+ }
+ 
++TEST_CASE("KittyGraphics.parse.virtual_placement_key", "[kitty]")
++{
++    auto const command = parseCommand("a=p,U=1,i=7"sv);
++    REQUIRE(command.has_value());
++    CHECK(command->virtualPlacement);
++    CHECK(command->imageId == 7);
++    CHECK_FALSE(parseCommand("a=p,i=7"sv)->virtualPlacement);
++}
++
++TEST_CASE("KittyGraphics.placeholder.diacritic_table_is_the_protocols", "[kitty]")
++{
++    CHECK(rowColumnDiacriticValue(U'\u0305') == uint16_t { 0 });
++    CHECK(rowColumnDiacriticValue(U'\u030D') == uint16_t { 1 });
++    CHECK(rowColumnDiacriticValue(U'\u030E') == uint16_t { 2 });
++    CHECK(rowColumnDiacriticValue(U'\U0001D244') == uint16_t { 296 });
++    // U+0300 is a combining character the protocol deliberately EXCLUDED (it has precomposed forms);
++    // counting it would shift every value after it.
++    CHECK_FALSE(rowColumnDiacriticValue(U'\u0300').has_value());
++    CHECK_FALSE(rowColumnDiacriticValue(U'a').has_value());
++}
++
++TEST_CASE("KittyGraphics.placeholder.ids_come_from_colors", "[kitty]")
++{
++    CHECK(placeholderIdFromColor(Color(RGBColor(1, 2, 3))) == uint32_t { 0x010203 });
++    CHECK(placeholderIdFromColor(Color::Indexed(42)) == uint32_t { 42 });
++    CHECK(placeholderIdFromColor(Color::Bright(1)) == uint32_t { 9 });
++    CHECK_FALSE(placeholderIdFromColor(Color::Default()).has_value());
++    CHECK_FALSE(placeholderIdFromColor(Color {}).has_value());
++}
++
++TEST_CASE("KittyGraphics.placeholder.virtual_placement_draws_nothing_at_the_cursor", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=2,q=2\033\\"sv);
++    for (auto const column: std::views::iota(0, 8))
++        CHECK_FALSE(
++            mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(column)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.cells_show_their_fragment_of_the_placed_image", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=2,q=2\033\\"sv);
++
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder, RowCol0, RowCol1 }));
++    mock.writeToScreen("\r\n"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol1, RowCol0 }) + utf8({ Placeholder, RowCol1, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    auto const f00 = screen.at(LineOffset(0), ColumnOffset(0)).imageFragment();
++    auto const f01 = screen.at(LineOffset(0), ColumnOffset(1)).imageFragment();
++    auto const f10 = screen.at(LineOffset(1), ColumnOffset(0)).imageFragment();
++    auto const f11 = screen.at(LineOffset(1), ColumnOffset(1)).imageFragment();
++    REQUIRE(f00);
++    REQUIRE(f01);
++    REQUIRE(f10);
++    REQUIRE(f11);
++    CHECK(f00->offset().line == LineOffset(0));
++    CHECK(f00->offset().column == ColumnOffset(0));
++    CHECK(f01->offset().line == LineOffset(0));
++    CHECK(f01->offset().column == ColumnOffset(1));
++    CHECK(f10->offset().line == LineOffset(1));
++    CHECK(f10->offset().column == ColumnOffset(0));
++    CHECK(f11->offset().line == LineOffset(1));
++    CHECK(f11->offset().column == ColumnOffset(1));
++    // One placement, one shared raster: every cell samples the same fitted image.
++    CHECK(&f00->rasterizedImage() == &f11->rasterizedImage());
++    CHECK(f00->rasterizedImage().cellSpan().lines == LineCount(2));
++    CHECK(f00->rasterizedImage().cellSpan().columns == ColumnCount(2));
++}
++
++TEST_CASE("KittyGraphics.placeholder.printed_before_the_placement_resolves_when_it_arrives", "[kitty]")
++{
++    // A multiplexer replays pane content from its own buffer, so placeholder cells legally reach the
++    // terminal before (or long after) the placement they name.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++
++    mock.writeToScreen("\033[38;5;7m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++    auto& screen = mock.terminal.primaryScreen();
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    transmitTestImage(mock, 7); // a transmission alone places nothing
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    mock.writeToScreen("\033_Ga=p,U=1,i=7,c=2,r=2,q=2\033\\"sv);
++    auto const fragment = screen.at(LineOffset(0), ColumnOffset(0)).imageFragment();
++    REQUIRE(fragment);
++    CHECK(fragment->offset().line == LineOffset(0));
++    CHECK(fragment->offset().column == ColumnOffset(0));
++}
++
++TEST_CASE("KittyGraphics.placeholder.omitted_diacritics_continue_the_run_leftwards", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 3);
++    mock.writeToScreen("\033_Ga=p,U=1,i=3,c=4,r=2,q=2\033\\"sv);
++
++    // One fully specified cell, then two bare placeholders: each continues its left neighbour one
++    // column further. Then a row-only cell whose row does NOT match its neighbour's: its column
++    // restarts at 0.
++    mock.writeToScreen("\033[38;5;3m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder })
++                       + utf8({ Placeholder }) + utf8({ Placeholder, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    auto const f1 = screen.at(LineOffset(0), ColumnOffset(1)).imageFragment();
++    auto const f2 = screen.at(LineOffset(0), ColumnOffset(2)).imageFragment();
++    auto const f3 = screen.at(LineOffset(0), ColumnOffset(3)).imageFragment();
++    REQUIRE(f1);
++    REQUIRE(f2);
++    REQUIRE(f3);
++    CHECK(f1->offset().line == LineOffset(0));
++    CHECK(f1->offset().column == ColumnOffset(1));
++    CHECK(f2->offset().line == LineOffset(0));
++    CHECK(f2->offset().column == ColumnOffset(2));
++    CHECK(f3->offset().line == LineOffset(1));
++    CHECK(f3->offset().column == ColumnOffset(0));
++
++    // A bare placeholder in a DIFFERENT foreground color is not part of the run: it names another
++    // image (which has no placement here), so it resolves to nothing.
++    mock.writeToScreen("\033[38;5;9m"sv);
++    mock.writeToScreen(utf8({ Placeholder }));
++    mock.writeToScreen("\033[39m"sv);
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(4)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.overwriting_the_cell_drops_its_fragment", "[kitty]")
++{
++    // The placeholder IS the placement: text overwriting it takes the image fragment with it,
++    // exactly as kitty stops drawing an image where its placeholder no longer stands.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder, RowCol0, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    mock.writeToScreen("\033[Hx"sv);
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++    CHECK(screen.at(LineOffset(0), ColumnOffset(1)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.deleting_the_placement_darkens_and_replacing_relights", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    // A lower-case delete removes the placement (fragments AND the virtual placement record) but
++    // keeps the transmitted data.
++    mock.writeToScreen("\033_Ga=d,d=i,i=1,q=2\033\\"sv);
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    // With the placement gone, fresh placeholders stay dark...
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(1)).imageFragment());
++
++    // ...until a new placement of the still-resident image lights every placeholder on the page up
++    // again, the old cell included.
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++    CHECK(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++    CHECK(screen.at(LineOffset(0), ColumnOffset(1)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.the_third_diacritic_supplies_the_high_id_byte", "[kitty]")
++{
++    // 256-color foregrounds encode only the low byte of the image id; ids beyond that carry their
++    // most significant byte in a third diacritic -- or inherit it from the cell to the left.
++    auto const imageId = 42u | (2u << 24);
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, imageId);
++    mock.writeToScreen(std::format("\033_Ga=p,U=1,i={},c=2,r=1,q=2\033\\", imageId));
++
++    mock.writeToScreen("\033[38;5;42m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0, RowCol2 })
++                       + utf8({ Placeholder, RowCol0, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    // The fully specified cell names id 42 + (2<<24); its right neighbour omits the third diacritic
++    // and inherits the whole identity from it.
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(1)).imageFragment());
++
++    // Standing alone, the same cell without the third diacritic names plain id 42, which has no
++    // placement: nothing to show.
++    mock.writeToScreen("\033[3;1H\033[38;5;42m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++    CHECK_FALSE(screen.at(LineOffset(2), ColumnOffset(0)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.the_underline_color_selects_the_placement", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 5);
++    mock.writeToScreen("\033_Ga=p,U=1,i=5,p=1,c=1,r=1,q=2\033\\"sv);
++    mock.writeToScreen("\033_Ga=p,U=1,i=5,p=2,c=2,r=2,q=2\033\\"sv);
++
++    // An underline color of 2 names placement 2, whose rectangle is 2x2 cells.
++    mock.writeToScreen("\033[38;5;5m\033[58;5;2m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol1, RowCol1 }));
++    mock.writeToScreen("\033[59m"sv);
++    auto& screen = mock.terminal.primaryScreen();
++    auto const chosen = screen.at(LineOffset(0), ColumnOffset(0)).imageFragment();
++    REQUIRE(chosen);
++    CHECK(chosen->rasterizedImage().cellSpan().lines == LineCount(2));
++    CHECK(chosen->rasterizedImage().cellSpan().columns == ColumnCount(2));
++
++    // No underline color means any placement of the image will do; row 1 does not fit placement 1's
++    // single-cell rectangle, so only a top-left placeholder shows anything.
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++    auto const any = screen.at(LineOffset(0), ColumnOffset(1)).imageFragment();
++    REQUIRE(any);
++    CHECK(any->rasterizedImage().cellSpan().lines == LineCount(1));
++    CHECK(any->rasterizedImage().cellSpan().columns == ColumnCount(1));
++}
++
++TEST_CASE("KittyGraphics.placeholder.cells_render_as_image_not_text", "[kitty]")
++{
++    // The placeholder character encodes data, it does not spell text: drawing it would put a .notdef
++    // box behind every transparent image region, and tofu where an image is missing -- kitty shows
++    // blank cells in both cases.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++
++    // Column 0: a resolved placeholder. Column 2: one naming an image that has no placement.
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[1;3H\033[38;5;9m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    mock.terminal.refreshRenderBuffer();
++    auto const buffer = mock.terminal.renderBuffer();
++    auto resolvedSeen = false;
++    auto unresolvedSeen = false;
++    for (auto const& cell: buffer.get().cells)
++    {
++        if (cell.position.line != LineOffset(0))
++            continue;
++        if (cell.position.column == ColumnOffset(0))
++        {
++            resolvedSeen = true;
++            CHECK(cell.codepoints.empty());
++            CHECK(cell.image);
++        }
++        if (cell.position.column == ColumnOffset(2))
++        {
++            unresolvedSeen = true;
++            CHECK(cell.codepoints.empty());
++            CHECK_FALSE(cell.image);
++        }
++    }
++    CHECK(resolvedSeen);
++    CHECK(unresolvedSeen);
++}
++
++TEST_CASE("KittyGraphics.placeholder.retransmission_updates_what_placeholders_show", "[kitty]")
++{
++    // Re-transmitting under an id with a live virtual placement is how an application updates the
++    // content shown by placeholders it already printed.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    auto const before = screen.at(LineOffset(0), ColumnOffset(0)).imageFragment();
++    REQUIRE(before);
++    auto const beforeImage = &before->rasterizedImage().image();
++
++    // A different 4x4 image (red instead of green) under the same id.
++    auto pixels = std::string {};
++    for (int i = 0; i < 16; ++i)
++        pixels += "\xFF\x00\x00\xFF"sv;
++    mock.writeToScreen(
++        std::format("\033_Ga=t,f=32,s=4,v=4,i=1,q=2;{}\033\\", crispy::base64::encode(pixels)));
++
++    auto const after0 = screen.at(LineOffset(0), ColumnOffset(0)).imageFragment();
++    auto const after1 = screen.at(LineOffset(0), ColumnOffset(1)).imageFragment();
++    REQUIRE(after0);
++    REQUIRE(after1);
++    CHECK(&after0->rasterizedImage().image() != beforeImage);
++    // The bare-diacritic cell followed its neighbour onto the new raster too.
++    CHECK(&after1->rasterizedImage() == &after0->rasterizedImage());
++    CHECK(after0->rasterizedImage().image().data()[0] == 0xFF);
++}
++
++TEST_CASE("KittyGraphics.placeholder.diacritics_do_not_take_the_pending_wrap", "[kitty]")
++{
++    // A placeholder written into the bottom-right cell arms the deferred wrap; its combining
++    // diacritics belong to THAT cell and must not consume the wrap -- doing so scrolled the page one
++    // codepoint early and appended the diacritics to the wrong line. Full-width image rows (the
++    // normal case for icat and tmux panes) hit this on every line.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=2,q=2\033\\"sv);
++
++    mock.writeToScreen("A"sv); // top-left marker: it vanishes if the page scrolls
++    mock.writeToScreen("\033[4;8H\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    CHECK(screen.at(LineOffset(0), ColumnOffset(0)).codepoint(0) == U'A');
++    auto const corner = screen.at(LineOffset(3), ColumnOffset(7));
++    CHECK(corner.codepointCount() == 3);
++    auto const fragment = corner.imageFragment();
++    REQUIRE(fragment);
++    CHECK(fragment->offset().line == LineOffset(0));
++    CHECK(fragment->offset().column == ColumnOffset(0));
++}
++
++TEST_CASE("KittyGraphics.placeholder.shrinking_the_placement_clears_out_of_range_cells", "[kitty]")
++{
++    // Re-creating a placement under the same identity replaces it; a placeholder cell that
++    // addressed the old, larger rectangle must stop showing its stale fragment rather than keep
++    // displaying pixels of a placement that no longer exists.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=2,q=2\033\\"sv);
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol1, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=1,r=1,q=2\033\\"sv);
++    CHECK_FALSE(screen.at(LineOffset(0), ColumnOffset(0)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.placeholder.a_uniform_pen_line_of_placeholders_never_renders_as_text",
++          "[kitty]")
++{
++    // Placeholders whose pen matches the line's fill SGR (erase-to-pen plus same-colored text) could
++    // slip through the trivial-line fast path, which draws raw codepoints and knows nothing of the
++    // glyph suppression. The contract: placeholder text is NEVER drawn, resolved or not.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++
++    // No placement exists yet -- the placeholders-precede-placement ordering.
++    mock.writeToScreen("\033[38;5;1m\033[2K"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder, RowCol0, RowCol1 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    mock.terminal.refreshRenderBuffer();
++    auto const buffer = mock.terminal.renderBuffer();
++    for (auto const& renderLine: buffer.get().lines)
++        CHECK(renderLine.lineOffset != LineOffset(0)); // the line may not batch as plain text
++    auto placeholderTextSeen = false;
++    for (auto const& cell: buffer.get().cells)
++        if (cell.position.line == LineOffset(0))
++            for (auto const cp: cell.codepoints)
++                placeholderTextSeen = placeholderTextSeen || cp == PlaceholderCodepoint;
++    CHECK_FALSE(placeholderTextSeen);
++}
++
+ // -- iTerm2 (OSC 1337) --------------------------------------------------------------------------
+ 
+ TEST_CASE("ITerm2.capabilities_are_reported", "[iterm2]")
+diff --git a/src/vtbackend/RenderBufferBuilder.cpp b/src/vtbackend/RenderBufferBuilder.cpp
+index 983456d3..389e8757 100644
+--- a/src/vtbackend/RenderBufferBuilder.cpp
++++ b/src/vtbackend/RenderBufferBuilder.cpp
+@@ -5,6 +5,7 @@
+ #include <vtbackend/CellUtil.h>
+ #include <vtbackend/Color.h>
+ #include <vtbackend/ColorPalette.h>
++#include <vtbackend/KittyGraphics.h>
+ 
+ #include <crispy/utils.h>
+ 
+@@ -266,7 +267,12 @@ RenderCell RenderBufferBuilder::makeRenderCell(ColorPalette const& colorPalette,
+     renderCell.sizing.scale = screenCell.textScale();
+     renderCell.sizing.columns = std::max<uint8_t>(1, screenCell.width());
+ 
+-    if (screenCell.codepointCount() != 0)
++    // A kitty image placeholder cell is never drawn as text: its codepoints only encode which image
++    // fragment it shows (carried in renderCell.image below when resolved). Rendering them would put
++    // a .notdef box behind every transparent image region -- and where the image is missing, kitty
++    // shows blank cells, not tofu.
++    auto const isImagePlaceholder = screenCell.codepoint(0) == kitty_graphics::PlaceholderCodepoint;
++    if (screenCell.codepointCount() != 0 && !isImagePlaceholder)
+     {
+         for (size_t i = 0; i < screenCell.codepointCount(); ++i)
+             renderCell.codepoints.push_back(screenCell.codepoint(i));
+diff --git a/src/vtbackend/Screen.cpp b/src/vtbackend/Screen.cpp
+index 9f60cd77..dcc0fd9b 100644
+--- a/src/vtbackend/Screen.cpp
++++ b/src/vtbackend/Screen.cpp
+@@ -564,7 +564,14 @@ void Screen::writeText(string_view text, size_t cellCount)
+ 
+         for (auto const rawCp: unicode::convert_to<char32_t>(text))
+         {
+-            crlfIfWrapPending();
++            // NOTE: the pending wrap is not taken up front but inside each branch below, because ONE
++            // kind of continuation codepoint must not take it: a kitty image placeholder's combining
++            // diacritics. They are data naming the cell's image fragment, not text -- a wrap fired
++            // between a corner placeholder and its diacritics scrolls the page one codepoint early
++            // and appends the diacritics to the wrong line, tearing every full-width image row
++            // (icat, tmux panes). kitty never wraps on them. Ordinary continuations still take the
++            // wrap first, preserving the deferred-wrap contract the abandoned-width-revision
++            // machinery relies on (@see AppendChar.abandoned_width_revision test).
+ 
+             // DRCS check: if the active charset is a DRCS font, render as image
+             if (auto const drcsFont = _cursor.charsets.activeDRCSFont(); drcsFont.has_value())
+@@ -575,6 +582,7 @@ void Screen::writeText(string_view text, size_t cellCount)
+                     auto const charPos = static_cast<int>(rawCp);
+                     if (auto const glyphIt = charset->glyphs.find(charPos); glyphIt != charset->glyphs.end())
+                     {
++                        crlfIfWrapPending();
+                         auto const fgColor = vtbackend::apply(_terminal->colorPalette(),
+                                                               _cursor.graphicsRendition.foregroundColor,
+                                                               ColorTarget::Foreground,
+@@ -599,17 +607,27 @@ void Screen::writeText(string_view text, size_t cellCount)
+             if (!prevCodepoint)
+             {
+                 unicode::grapheme_process_init(cp, localGraphemeState);
++                crlfIfWrapPending();
+                 writeCharToCurrentAndAdvance(cp);
+             }
+             else if (unicode::grapheme_process_breakable(cp, localGraphemeState))
+             {
++                crlfIfWrapPending();
+                 writeCharToCurrentAndAdvance(cp);
+             }
+             else
+             {
++                auto const continuesPlaceholder =
++                    usePreviousCell().codepoint(0) == kitty_graphics::PlaceholderCodepoint;
++                if (!continuesPlaceholder)
++                    crlfIfWrapPending();
+                 auto const widthChange = usePreviousCell().appendCharacter(cp, clusterWidthPolicy());
+                 applyClusterWidthChange(widthChange);
+                 _terminal->markCellDirty(_lastCursorPosition);
++                // A combining diacritic landing on a placeholder cell refines which image fragment
++                // the cell shows, so the cell is re-resolved after every append.
++                if (continuesPlaceholder)
++                    resolveKittyPlaceholder(_lastCursorPosition);
+             }
+ 
+             prevCodepoint = cp;
+@@ -673,7 +691,9 @@ void Screen::writeText(char32_t codepoint)
+ 
+ void Screen::writeTextInternal(char32_t sourceCodepoint)
+ {
+-    crlfIfWrapPending();
++    // NOTE: the pending wrap is not taken up front but inside each branch below -- a kitty image
++    // placeholder's combining diacritics must not take it. See the identical note in
++    // writeText(string_view) for the full reasoning.
+ 
+     // Check if the active charset is a DRCS font
+     if (auto const drcsFont = _cursor.charsets.activeDRCSFont(); drcsFont.has_value())
+@@ -683,6 +703,7 @@ void Screen::writeTextInternal(char32_t sourceCodepoint)
+             auto const charPos = static_cast<int>(sourceCodepoint);
+             if (auto const glyphIt = charset->glyphs.find(charPos); glyphIt != charset->glyphs.end())
+             {
++                crlfIfWrapPending();
+                 // Resolve foreground color for the glyph
+                 auto const fgColor = vtbackend::apply(_terminal->colorPalette(),
+                                                       _cursor.graphicsRendition.foregroundColor,
+@@ -744,17 +765,27 @@ void Screen::writeTextInternal(char32_t sourceCodepoint)
+     if (!precedingChar)
+     {
+         unicode::grapheme_process_init(codepoint, graphemeState);
++        crlfIfWrapPending();
+         writeCharToCurrentAndAdvance(codepoint);
+     }
+     else if (unicode::grapheme_process_breakable(codepoint, graphemeState))
+     {
++        crlfIfWrapPending();
+         writeCharToCurrentAndAdvance(codepoint);
+     }
+     else
+     {
++        auto const continuesPlaceholder =
++            usePreviousCell().codepoint(0) == kitty_graphics::PlaceholderCodepoint;
++        if (!continuesPlaceholder)
++            crlfIfWrapPending();
+         auto const widthChange = usePreviousCell().appendCharacter(codepoint, clusterWidthPolicy());
+         applyClusterWidthChange(widthChange);
+         _terminal->markCellDirty(_lastCursorPosition);
++        // A combining diacritic landing on a placeholder cell refines which image fragment the cell
++        // shows, so the cell is re-resolved after every append.
++        if (continuesPlaceholder)
++            resolveKittyPlaceholder(_lastCursorPosition);
+     }
+ 
+     _terminal->resetInstructionCounter();
+@@ -821,6 +852,9 @@ void Screen::writeCharToCurrentAndAdvance(char32_t codepoint) noexcept
+     //       conditional, something like: setReportDamage(bool);
+     //       The latter is probably the easiest.
+     _terminal->markCellDirty(_cursor.position);
++
++    if (codepoint == kitty_graphics::PlaceholderCodepoint)
++        resolveKittyPlaceholder(_lastCursorPosition);
+ }
+ 
+ ClusterWidthPolicy Screen::clusterWidthPolicy() const noexcept
+@@ -5440,6 +5474,7 @@ bool Screen::evictKittyImagesToFit(size_t incomingBytes, uint32_t keepId)
+             return true;
+ 
+         removeKittyPlacements(victim->second);
++        eraseKittyVirtualPlacements(victim->first);
+         _kittyImageLastUsed.erase(victim->first);
+         _kittyImages.erase(victim);
+     }
+@@ -5468,6 +5503,9 @@ void Screen::deleteKittyGraphics(kitty_graphics::Command const& command)
+         return; // Nothing transmitted under that id; nothing placed from it either.
+ 
+     removeKittyPlacements(image);
++    // Virtual placements are placements too: deleting them stops the affected placeholder cells
++    // from resolving again, exactly as clearing the fragments stopped them showing.
++    eraseKittyVirtualPlacements(target == 'i' ? command.imageId : 0);
+ 
+     if (!freesData)
+         return;
+@@ -5494,6 +5532,7 @@ void Screen::resetKittyState() noexcept
+     _kittyChunkedCommand.reset();
+     _kittyImages.clear();
+     _kittyImageLastUsed.clear();
++    _kittyVirtualPlacements.clear();
+     _terminal->kittyClipboardWrite().clear();
+     _terminal->kittyClipboardWriteOpen() = false;
+ }
+@@ -5568,7 +5607,10 @@ void Screen::processKittyGraphics(std::string_view body)
+             }
+             // Placing an image is a use: touch it so a later quota eviction treats it as recent.
+             _kittyImageLastUsed[command.imageId] = ++_kittyImageClock;
+-            renderKittyImage(command, it->second);
++            if (command.virtualPlacement)
++                createKittyVirtualPlacement(command, it->second);
++            else
++                renderKittyImage(command, it->second);
+             replyKittyGraphics(command, "OK");
+             return;
+         }
+@@ -5675,10 +5717,31 @@ void Screen::processKittyGraphics(std::string_view body)
+         }
+         _kittyImages[command.imageId] = image;
+         _kittyImageLastUsed[command.imageId] = ++_kittyImageClock;
++
++        // Re-transmitting under an id with live virtual placements is how an application updates
++        // placeholder-shown content in place; point those placements at the new pixels, and give the
++        // placeholder cells on the page fragments of them.
++        auto retargeted = false;
++        for (auto& placement: _kittyVirtualPlacements)
++        {
++            if (placement.imageId != command.imageId)
++                continue;
++            placement.image = image;
++            placement.rasterized.reset(); // resolveKittyPlaceholder rebuilds it on demand
++            retargeted = true;
++        }
++        if (retargeted)
++            resolveKittyPlaceholdersOnPage();
+     }
+ 
+     if (command.action == Action::TransmitAndDisplay)
+-        renderKittyImage(command, image);
++    {
++        if (!command.virtualPlacement)
++            renderKittyImage(command, image);
++        else if (command.imageId != 0)
++            // A virtual placement without an id would be one no placeholder cell can ever name.
++            createKittyVirtualPlacement(command, image);
++    }
+ 
+     replyKittyGraphics(command, "OK");
+ }
+@@ -5720,6 +5783,248 @@ void Screen::renderKittyImage(kitty_graphics::Command const& command,
+                 command.zIndex < 0 ? ImageLayer::Below : ImageLayer::Above);
+ }
+ 
++void Screen::createKittyVirtualPlacement(kitty_graphics::Command const& command,
++                                         std::shared_ptr<Image const> const& image)
++{
++    auto const cellSize = _terminal->cellPixelSize();
++    auto const cellWidth = std::max(unbox<unsigned>(cellSize.width), 1u);
++    auto const cellHeight = std::max(unbox<unsigned>(cellSize.height), 1u);
++    auto const pixels = image->size();
++
++    // The rectangle the image is fit into, from `c=`/`r=` or derived from the pixel size. Unlike a
++    // cursor placement it is NOT clamped to the page: the placement is a logical canvas whose cells
++    // the placeholders index, and a pane may legitimately show only a window of it. It is bounded
++    // all the same -- the wire value is a full uint32, and the diacritics can address no more than
++    // 297 rows or columns anyway, so an absurd extent only starves the visible cells of pixels.
++    auto constexpr MaxVirtualExtent = 10'000u;
++    auto const derivedColumns = (unbox<unsigned>(pixels.width) + cellWidth - 1) / cellWidth;
++    auto const derivedRows = (unbox<unsigned>(pixels.height) + cellHeight - 1) / cellHeight;
++    auto const columns =
++        std::clamp(command.columns != 0 ? command.columns : derivedColumns, 1u, MaxVirtualExtent);
++    auto const rows = std::clamp(command.rows != 0 ? command.rows : derivedRows, 1u, MaxVirtualExtent);
++    auto const gridSize =
++        GridSize { .lines = LineCount::cast_from(rows), .columns = ColumnCount::cast_from(columns) };
++
++    // ImageLayer::Replace, deliberately, for both its properties: overwriting a placeholder cell
++    // with text drops its fragment (the placeholder IS the placement, so its cell is the one kind of
++    // image cell a text write must clear), and the fragment still draws over whatever the cell holds
++    // (the placeholder character itself, which the render buffer additionally never emits as a
++    // glyph). The gap color is fully transparent: the bands a preserved aspect ratio leaves open
++    // show the cell's own background, as they do in kitty.
++    auto placement = KittyVirtualPlacement {
++        .imageId = command.imageId,
++        .placementId = command.placementId,
++        .gridSize = gridSize,
++        .image = image,
++        .rasterized = std::make_shared<RasterizedImage>(image,
++                                                        ImageAlignment::TopStart,
++                                                        ImageResize::ResizeToFit,
++                                                        RGBAColor {},
++                                                        gridSize,
++                                                        cellSize,
++                                                        ImageLayer::Replace),
++    };
++
++    auto const same = std::ranges::find_if(_kittyVirtualPlacements, [&](auto const& other) {
++        return other.imageId == command.imageId && other.placementId == command.placementId;
++    });
++    if (same != _kittyVirtualPlacements.end())
++        *same = std::move(placement);
++    else
++        _kittyVirtualPlacements.push_back(std::move(placement));
++
++    // Placeholders legally precede their placement: a pane redraw replays them from a multiplexer's
++    // own buffer, and nothing obliges an application to place before it prints. Whatever is already
++    // on the page gets its fragments now.
++    resolveKittyPlaceholdersOnPage();
++}
++
++Screen::KittyVirtualPlacement* Screen::findKittyVirtualPlacement(uint32_t imageId,
++                                                                 uint32_t placementId) noexcept
++{
++    for (auto& placement: _kittyVirtualPlacements)
++        if (placement.imageId == imageId
++            && (placementId == 0 || placement.placementId == placementId))
++            return &placement;
++    return nullptr;
++}
++
++void Screen::eraseKittyVirtualPlacements(uint32_t imageId) noexcept
++{
++    std::erase_if(_kittyVirtualPlacements, [imageId](KittyVirtualPlacement const& placement) {
++        return imageId == 0 || placement.imageId == imageId;
++    });
++}
++
++void Screen::resolveKittyPlaceholder(CellLocation position)
++{
++    using namespace kitty_graphics;
++
++    auto cell = at(position.line, position.column);
++    if (cell.codepoint(0) != PlaceholderCodepoint)
++        return;
++
++    // A placeholder line must never render through the trivial-line fast path: that path draws the
++    // raw codepoints as text, bypassing both the attached fragment and makeRenderCell's glyph
++    // suppression -- a row of placeholders whose pen matches the line's fill SGR would show as tofu.
++    grid().lineAt(position.line).materializedStorage().trivial = false;
++
++    // When re-resolution fails, the cell must stop showing whatever it showed before: a stale
++    // fragment would keep displaying an image the cell's current encoding no longer names (e.g. a
++    // diacritic append changed the id, or a re-transmission retired the raster this fragment reads).
++    auto const resolveToNothing = [&]() {
++        if (cell.imageFragment())
++        {
++            cell.clearImageFragment();
++            _terminal->markCellDirty(position);
++        }
++    };
++
++    // The first three row/column diacritics of the cluster encode the cell's row, its column, and
++    // the most significant byte of the image id, in that order. Combining characters outside the
++    // protocol's table are skipped rather than counted, as kitty skips them.
++    auto row = std::optional<uint16_t> {};
++    auto column = std::optional<uint16_t> {};
++    auto idMsb = std::optional<uint16_t> {};
++    for (size_t i = 1; i < cell.codepointCount() && !idMsb; ++i)
++    {
++        auto const value = rowColumnDiacriticValue(cell.codepoint(i));
++        if (!value)
++            continue;
++        if (!row)
++            row = value;
++        else if (!column)
++            column = value;
++        else
++            idMsb = value;
++    }
++
++    auto const idLow = placeholderIdFromColor(cell.foregroundColor());
++    if (!idLow)
++    {
++        resolveToNothing(); // No foreground color, no image id: the cell can name no image.
++        return;
++    }
++
++    // The cell to the left supplies whatever the application omitted, provided it is a resolved
++    // placeholder with the same colors -- visibly part of the same run. Its attached fragment IS its
++    // resolved position, so inheritance needs no side state; and because writes and the page rescan
++    // both proceed left to right, the left neighbour is always resolved first.
++    auto const inherited = [&]() -> std::shared_ptr<ImageFragment> {
++        if (position.column <= ColumnOffset(0))
++            return nullptr;
++        auto const left = at(position.line, position.column - 1);
++        if (left.codepoint(0) != PlaceholderCodepoint)
++            return nullptr;
++        if (left.foregroundColor() != cell.foregroundColor()
++            || left.underlineColor() != cell.underlineColor())
++            return nullptr;
++        return left.imageFragment();
++    }();
++    auto const placementOf = [&](ImageFragment const& fragment) -> KittyVirtualPlacement* {
++        for (auto& placement: _kittyVirtualPlacements)
++            if (placement.rasterized.get() == &fragment.rasterizedImage())
++                return &placement;
++        return nullptr;
++    };
++
++    KittyVirtualPlacement* placement = nullptr;
++    if (!row)
++    {
++        // No diacritics at all: the cell continues its left neighbour, one column further.
++        if (!inherited)
++        {
++            resolveToNothing();
++            return;
++        }
++        placement = placementOf(*inherited);
++        if (!placement)
++        {
++            resolveToNothing();
++            return;
++        }
++        row = static_cast<uint16_t>(unbox(inherited->offset().line));
++        column = static_cast<uint16_t>(unbox(inherited->offset().column) + 1);
++    }
++    else if (!column)
++    {
++        // Row only: the column continues the left neighbour when it shares that row.
++        if (inherited && unbox(inherited->offset().line) == int(*row))
++            column = static_cast<uint16_t>(unbox(inherited->offset().column) + 1);
++        else
++            column = 0;
++    }
++
++    if (!placement)
++    {
++        // An id wider than the colors encode carries its highest byte in the third diacritic;
++        // without one, a left neighbour on the same row and adjacent column supplies the whole
++        // identity.
++        if (!idMsb && inherited && unbox(inherited->offset().line) == int(*row)
++            && unbox(inherited->offset().column) + 1 == int(*column))
++            placement = placementOf(*inherited);
++    }
++    if (!placement)
++    {
++        auto const imageId = *idLow | (idMsb ? uint32_t(*idMsb) << 24 : 0u);
++        auto const placementId = placeholderIdFromColor(cell.underlineColor()).value_or(0u);
++        placement = findKittyVirtualPlacement(imageId, placementId);
++    }
++    if (!placement)
++    {
++        resolveToNothing(); // Nothing placed under that identity (yet); the page rescan retries later.
++        return;
++    }
++
++    if (int(*row) >= unbox<int>(placement->gridSize.lines)
++        || int(*column) >= unbox<int>(placement->gridSize.columns))
++    {
++        resolveToNothing(); // Addresses outside the placement rectangle show nothing.
++        return;
++    }
++
++    // A re-transmission under the same id, or a changed cell pixel size, retires the raster the
++    // placement was created with; rebuild it against the current image and metrics.
++    if (!placement->rasterized || placement->rasterized->cellSize() != _terminal->cellPixelSize())
++        placement->rasterized = std::make_shared<RasterizedImage>(placement->image,
++                                                                  ImageAlignment::TopStart,
++                                                                  ImageResize::ResizeToFit,
++                                                                  RGBAColor {},
++                                                                  placement->gridSize,
++                                                                  _terminal->cellPixelSize(),
++                                                                  ImageLayer::Replace);
++
++    cell.setImageFragment(
++        placement->rasterized,
++        CellLocation { .line = LineOffset(*row), .column = ColumnOffset(*column) });
++    // Showing an image is a use: keep what is on screen out of the quota eviction's way.
++    _kittyImageLastUsed[placement->imageId] = ++_kittyImageClock;
++    _terminal->markCellDirty(position);
++}
++
++void Screen::resolveKittyPlaceholdersOnPage()
++{
++    // Left to right, so a cell with omitted diacritics finds its left neighbour already resolved.
++    //
++    // The probe reads the line storage directly rather than through at(): the mutable CellProxy a
++    // non-const at() returns bumps the line's change generation on destruction and materializes
++    // blank lines, which would invalidate the dirty-line render optimization for the whole page on
++    // every placement event. Only actual placeholder cells are touched mutably.
++    for (auto const line: std::views::iota(0, *pageSize().lines))
++    {
++        auto const& lineRef = grid().lineAt(LineOffset(line));
++        if (lineRef.isBlank())
++            continue;
++        auto const& soa = lineRef.storage();
++        auto const columns =
++            std::min(static_cast<size_t>(*pageSize().columns), soa.codepoints.size());
++        for (auto const column: std::views::iota(size_t { 0 }, columns))
++            if (soa.codepoints[column] == kitty_graphics::PlaceholderCodepoint)
++                resolveKittyPlaceholder(CellLocation { .line = LineOffset(line),
++                                                       .column = ColumnOffset::cast_from(column) });
++    }
++}
++
+ void Screen::processSequence(Sequence const& seq)
+ {
+ #ifdef LIBTERMINAL_LOG_TRACE
+diff --git a/src/vtbackend/Screen.h b/src/vtbackend/Screen.h
+index dc7f118c..5e8353d3 100644
+--- a/src/vtbackend/Screen.h
++++ b/src/vtbackend/Screen.h
+@@ -247,6 +247,46 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+     /// half-open transmission for the next application to inherit.
+     void resetKittyState() noexcept;
+ 
++    /// A virtual placement (`U=1`): the size an image is fit into, shown not at a fixed grid position
++    /// but wherever the application prints placeholder cells naming it (multiplexer-safe placement,
++    /// how images survive tmux). @see resolveKittyPlaceholder.
++    struct KittyVirtualPlacement
++    {
++        uint32_t imageId = 0;
++        uint32_t placementId = 0; ///< 0 when the application named none.
++        GridSize gridSize;    ///< The cell rectangle the image is fit into, aspect ratio preserved.
++        std::shared_ptr<Image const> image;
++        std::shared_ptr<RasterizedImage> rasterized; ///< Rebuilt when the cell pixel size changes.
++    };
++
++    /// Registers (or replaces) the virtual placement @p command describes for @p image, and resolves
++    /// any placeholder cells already on the page that name it.
++    void createKittyVirtualPlacement(kitty_graphics::Command const& command,
++                                     std::shared_ptr<Image const> const& image);
++
++    /// @return the virtual placement placeholder cells with these ids show, or nullptr. A zero
++    /// @p placementId matches any placement of the image, as the protocol specifies for placeholder
++    /// cells that carry no underline color.
++    [[nodiscard]] KittyVirtualPlacement* findKittyVirtualPlacement(uint32_t imageId,
++                                                                   uint32_t placementId) noexcept;
++
++    /// Drops the virtual placements of image @p imageId, or all of them when it is zero.
++    void eraseKittyVirtualPlacements(uint32_t imageId) noexcept;
++
++    /// Attaches the image fragment a placeholder cell at @p position asks for, if the cell is one.
++    ///
++    /// A placeholder cell (PlaceholderCodepoint) encodes which image it shows in its foreground
++    /// color, which placement in its underline color, and its position inside the image in its
++    /// combining diacritics; values the application omitted are inherited from the cell to the left,
++    /// as the protocol specifies. Called wherever a write puts (or extends) a placeholder cluster in
++    /// a cell, and again for the whole page when a virtual placement arrives after its placeholders
++    /// were already printed.
++    void resolveKittyPlaceholder(CellLocation position);
++
++    /// Re-runs resolveKittyPlaceholder over every placeholder cell of the page. @see
++    /// createKittyVirtualPlacement.
++    void resolveKittyPlaceholdersOnPage();
++
+     /// Handles one `OSC 22` (kitty pointer shape protocol) request.
+     [[nodiscard]] ApplyResult processPointerShape(std::string_view payload);
+ 
+@@ -1016,6 +1056,11 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+     /// the eviction path without allocating a real 128 MiB of images. @see setKittyImageStoreQuota.
+     size_t _kittyImageStoreQuota = kitty_graphics::MaxStoredImageBytes;
+ 
++    /// The virtual placements (`U=1`) placeholder cells resolve against. A vector, not a map: there
++    /// are as many entries as images the application is showing this way, and lookup must support
++    /// placementId 0 meaning "any placement of the image". @see resolveKittyPlaceholder.
++    std::vector<KittyVirtualPlacement> _kittyVirtualPlacements {};
++
+     // NOTE: the `OSC 5522` write transmission lives on Terminal, not here: an application may switch
+     // screens (DECSASD, or a page change) between chunks, and a per-screen buffer would drop the
+     // chunks that landed elsewhere while still answering DONE. @see Terminal::kittyClipboardWrite.
+-- 
+2.43.0
+

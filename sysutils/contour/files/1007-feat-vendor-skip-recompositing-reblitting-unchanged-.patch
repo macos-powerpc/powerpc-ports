@@ -1,14 +1,21 @@
-From 10e5ccded8d847243176069bc518a7a7bdc9a9f9 Mon Sep 17 00:00:00 2001
+From 42d333760b197187b66db6c21f2ff318a7d6eaf9 Mon Sep 17 00:00:00 2001
 From: Sergey Fedorov <barracuda@macos-powerpc.org>
 Date: Tue, 21 Jul 2026 21:07:35 +0000
-Subject: [PATCH 08/10] feat(vendor): skip recompositing/reblitting unchanged
+Subject: [PATCH 07/12] feat(vendor): skip recompositing/reblitting unchanged
  rows in Renderer
 
-Consumes the per-line generation counters added in f81d736a. Renderer::render()
-gains an opt-in RenderDirtyMode::SkipUnchangedRows (default stays FullFrame,
-so every existing call site is unaffected): the single-pass render path
-diffs each row's RenderBuffer::lineGenerations entry against the previous
-frame's snapshot and filters cells/lines down to only the rows that
+Consumes upstream's per-line revision stamping (vtbackend::Line::revision(),
+batch-advanced by Grid::finalizeRevisions()). Terminal::captureLineGenerations()
+snapshots each visible row's revision into RenderBuffer::lineGenerations the same
+frame cells/lines are built. (The old vendor stack fed this from a bespoke
+LineSoA generation counter; upstream master since grew its own revision system,
+so that primitive was dropped on rebase and this consumer rewired to the upstream
+one -- same contract, no behavior change.)
+
+Renderer::render() gains an opt-in RenderDirtyMode::SkipUnchangedRows (default
+stays FullFrame, so every existing call site is unaffected): the single-pass
+render path diffs each row's RenderBuffer::lineGenerations entry against the
+previous frame's snapshot and filters cells/lines down to only the rows that
 changed, plus whichever row the cursor was on or has moved to (the cursor
 overlay leaves no trace in lineGenerations). lastDirtyRows() exposes which
 rows actually painted so a frontend can scope setNeedsDisplayInRect:/blit
@@ -30,21 +37,35 @@ separately on the `frontend` branch.
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01LzTmVgP2ruMz987VJ78k77
 ---
- src/vtbackend/RenderBuffer.h  |  8 ++++
- src/vtbackend/Terminal.cpp    |  1 +
- src/vtbackend/Terminal.h      |  7 +--
+ src/vtbackend/RenderBuffer.h  | 23 ++++++++++
+ src/vtbackend/Terminal.cpp    | 34 +++++++++++++++
+ src/vtbackend/Terminal.h      | 12 ++++++
  src/vtrasterizer/Renderer.cpp | 81 ++++++++++++++++++++++++++++++++---
  src/vtrasterizer/Renderer.h   | 71 +++++++++++++++++++++++++++++-
- 5 files changed, 158 insertions(+), 10 deletions(-)
+ 5 files changed, 214 insertions(+), 7 deletions(-)
 
 diff --git a/src/vtbackend/RenderBuffer.h b/src/vtbackend/RenderBuffer.h
-index af06c001..e934feb6 100644
+index fc3aee6c..50a3d9b1 100644
 --- a/src/vtbackend/RenderBuffer.h
 +++ b/src/vtbackend/RenderBuffer.h
-@@ -122,12 +122,20 @@ struct RenderBuffer
-     /// just diff blindly.
-     std::vector<uint64_t> lineGenerations {};
+@@ -109,11 +109,34 @@ struct RenderBuffer
+     std::optional<RenderCursor> cursor {};
+     uint64_t frameID {};
  
++    /// Per-screen-line snapshot of vtbackend::Line::revision(), indexed by screen row (0 = top of
++    /// the visible page), captured the same frame as cells/lines above. A frontend that wants to
++    /// avoid recompositing/reblitting unchanged rows compares this against the value it stored for
++    /// the SAME row last frame; a row whose revision is unchanged had no content mutation between
++    /// the two frames (Terminal::captureLineGenerations() calls Grid::finalizeRevisions() first, so
++    /// every line dirtied since the previous capture carries a strictly higher batch seqno). Always
++    /// populated -- the cost is one uint64_t copy per screen row (not per cell), negligible next to
++    /// building cells/lines above; a frontend that has no use for it (e.g. one that always
++    /// recomposites the whole frame anyway) simply never reads it. A resize/scroll/reflow
++    /// invalidates row INDICES (row 5 last frame is not necessarily the same content as row 5 this
++    /// frame), so a frontend must discard its own last-frame snapshot whenever pageSize() or
++    /// scrollOffset() changed, not just diff blindly.
++    std::vector<uint64_t> lineGenerations {};
++
 +    /// The LineOffset that lineGenerations[0] corresponds to (matches the starting offset
 +    /// Grid::render() itself walks from: -scrollOffset - extraLines). RenderCell::position.line and
 +    /// RenderLine::lineOffset are absolute grid LineOffsets, so a consumer maps either to a
@@ -57,46 +78,106 @@ index af06c001..e934feb6 100644
          cells.clear();
          lines.clear();
          cursor.reset();
-         lineGenerations.clear();
++        lineGenerations.clear();
 +        lineGenerationsBase = LineOffset {};
      }
  };
  
 diff --git a/src/vtbackend/Terminal.cpp b/src/vtbackend/Terminal.cpp
-index 62763409..f5dd8864 100644
+index 24da7c2b..fa2fab19 100644
 --- a/src/vtbackend/Terminal.cpp
 +++ b/src/vtbackend/Terminal.cpp
-@@ -665,6 +665,7 @@ void Terminal::captureLineGenerations(RenderBuffer& output,
+@@ -629,6 +629,7 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+     auto& displayedScreen = pageAt(_displayedPage);
  
-     output.lineGenerations.resize(static_cast<size_t>(rowCount));
-     auto i = -*scrollOffset - extraOffset;
-+    output.lineGenerationsBase = LineOffset(i);
-     for (auto row = size_t { 0 }; row < static_cast<size_t>(rowCount); ++row, ++i)
-         output.lineGenerations[row] = grid.lineAt(LineOffset(i)).generation();
+     if (_displayedPage == PageIndex(0))
++    {
+         _lastRenderPassHints = displayedScreen.render(RenderBufferBuilder { *this,
+                                                                             displayedScreen,
+                                                                             output,
+@@ -642,7 +643,10 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+                                                       _viewport.scrollOffset(),
+                                                       renderLinesPerCell,
+                                                       smoothScrollExtra);
++        captureLineGenerations(output, displayedScreen, _viewport.scrollOffset(), smoothScrollExtra);
++    }
+     else
++    {
+         _lastRenderPassHints = displayedScreen.render(RenderBufferBuilder { *this,
+                                                                             displayedScreen,
+                                                                             output,
+@@ -655,6 +659,8 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+                                                                             includeSelection },
+                                                       _viewport.scrollOffset(),
+                                                       renderLinesPerCell);
++        captureLineGenerations(output, displayedScreen, _viewport.scrollOffset(), LineCount(0));
++    }
+ 
+     // Save the baseLine used for the main screen before the bottom status line shifts it.
+     auto const mainScreenLine = baseLine;
+@@ -670,6 +676,34 @@ void Terminal::fillRenderBufferInternal(RenderBuffer& output, bool includeSelect
+     applyScreenTransitionBlending(output);
  }
+ 
++void Terminal::captureLineGenerations(RenderBuffer& output,
++                                      Screen& displayedScreen,
++                                      ScrollOffset scrollOffset,
++                                      LineCount extraLines)
++{
++    // Batch-stamp every line dirtied since the last capture, so the revisions read below are
++    // current. In this port captureLineGenerations() is the sole finalizer (no delta consumer /
++    // daemon is running to advance the seqno underneath us), so a line changed this frame carries a
++    // strictly higher revision than the value the previous frame captured for it. finalizeRevisions()
++    // is O(page) and no-ops the seqno when nothing was dirty, so an idle frame stays free.
++    auto& grid = displayedScreen.grid();
++    grid.finalizeRevisions();
++
++    // Mirrors Grid::render()'s own row range exactly (Grid.h): the scrolled-into-history start
++    // offset, the same extraLines widening for smooth scrolling, and the same page-size-driven
++    // row count -- so row N here is the SAME grid line Grid::render() just built RenderCells/
++    // RenderLines for.
++    auto const availableAbove = *grid.historyLineCount() - *scrollOffset;
++    auto const extraOffset = std::min(*extraLines, std::max(0, availableAbove));
++    auto const rowCount = *pageSize().lines + extraOffset;
++
++    output.lineGenerations.resize(static_cast<size_t>(rowCount));
++    auto i = -*scrollOffset - extraOffset;
++    output.lineGenerationsBase = LineOffset(i);
++    for (auto row = size_t { 0 }; row < static_cast<size_t>(rowCount); ++row, ++i)
++        output.lineGenerations[row] = grid.lineAt(LineOffset(i)).revision();
++}
++
+ void Terminal::updateCursorMotionAnimation(RenderBuffer& output)
+ {
+     if (!output.cursor.has_value())
 diff --git a/src/vtbackend/Terminal.h b/src/vtbackend/Terminal.h
-index 09344b19..c64d8a0b 100644
+index 941a7a2c..da932720 100644
 --- a/src/vtbackend/Terminal.h
 +++ b/src/vtbackend/Terminal.h
-@@ -1887,9 +1887,10 @@ class Terminal
+@@ -1925,6 +1925,18 @@ class Terminal
+     void mainLoop();
+     void fillRenderBufferInternal(RenderBuffer& output, bool includeSelection);
      LineCount fillRenderBufferStatusLine(RenderBuffer& output, bool includeSelection, LineOffset base);
- 
-     /// Snapshots each visible screen row's Line::generation() into output.lineGenerations, indexed
--    /// the same way Grid::render() walks rows (accounting for scrollOffset and extraLines), so a
--    /// frontend can diff row N this frame against row N last frame to skip recompositing/reblitting
--    /// unchanged rows. Purely additive bookkeeping -- does not affect cells/lines/cursor.
++
++    /// Snapshots each visible screen row's Line::revision() into output.lineGenerations, indexed
 +    /// the same way Grid::render() walks rows (accounting for scrollOffset and extraLines), and
 +    /// records that indexing's starting LineOffset into output.lineGenerationsBase, so a frontend
 +    /// can diff row N this frame against row N last frame to skip recompositing/reblitting unchanged
-+    /// rows. Purely additive bookkeeping -- does not affect cells/lines/cursor.
-     void captureLineGenerations(RenderBuffer& output,
-                                 Screen const& displayedScreen,
-                                 ScrollOffset scrollOffset,
++    /// rows. Runs Grid::finalizeRevisions() first (batch-stamping every line dirtied since the last
++    /// capture), so it is not const: the revisions it reads are the very thing it stamps. Purely
++    /// additive bookkeeping otherwise -- does not affect cells/lines/cursor.
++    void captureLineGenerations(RenderBuffer& output,
++                                Screen& displayedScreen,
++                                ScrollOffset scrollOffset,
++                                LineCount extraLines);
+     void updateIndicatorStatusLine();
+     void updateCursorVisibilityState() const noexcept;
+     void updateHoveringHyperlinkState();
 diff --git a/src/vtrasterizer/Renderer.cpp b/src/vtrasterizer/Renderer.cpp
-index c37c031a..a421cd76 100644
+index 82af28d0..18d1238d 100644
 --- a/src/vtrasterizer/Renderer.cpp
 +++ b/src/vtrasterizer/Renderer.cpp
-@@ -525,11 +525,11 @@ void Renderer::publishFontMetricsAndDescriptions()
+@@ -531,11 +531,11 @@ void Renderer::publishFontMetricsAndDescriptions()
      }
  }
  
@@ -110,7 +191,7 @@ index c37c031a..a421cd76 100644
      }
      catch (std::exception const& e)
      {
-@@ -542,7 +542,7 @@ bool Renderer::render(vtbackend::Terminal& terminal, bool pressure)
+@@ -548,7 +548,7 @@ bool Renderer::render(vtbackend::Terminal& terminal, bool pressure)
      return false;
  }
  
@@ -119,7 +200,7 @@ index c37c031a..a421cd76 100644
  {
      // Hold _applyMutex across the whole frame: this both applies any staged reconfiguration and then
      // renders from _gridMetrics / the texture atlas. Holding it for the full duration makes a GUI-thread
-@@ -620,16 +620,63 @@ bool Renderer::renderImpl(vtbackend::Terminal& terminal, bool pressure)
+@@ -626,16 +626,63 @@ bool Renderer::renderImpl(vtbackend::Terminal& terminal, bool pressure)
  
      auto const primaryPressure = pressure && terminal.isPrimaryScreen();
  
@@ -185,7 +266,7 @@ index c37c031a..a421cd76 100644
      }
      else
      {
-@@ -784,6 +831,30 @@ void Renderer::renderLines(std::span<vtbackend::RenderLine const> lines)
+@@ -790,6 +837,30 @@ void Renderer::renderLines(std::span<vtbackend::RenderLine const> lines)
      }
  }
  
@@ -217,7 +298,7 @@ index c37c031a..a421cd76 100644
                                          vtbackend::LineCount statusLineBoundary)
  {
 diff --git a/src/vtrasterizer/Renderer.h b/src/vtrasterizer/Renderer.h
-index 958332d4..bf7c56db 100644
+index 1a515a72..e4511a40 100644
 --- a/src/vtrasterizer/Renderer.h
 +++ b/src/vtrasterizer/Renderer.h
 @@ -43,6 +43,21 @@ struct RenderCursor
@@ -242,7 +323,7 @@ index 958332d4..bf7c56db 100644
  /**
   * Renders a terminal's screen to the current OpenGL context.
   */
-@@ -232,13 +247,32 @@ class Renderer
+@@ -240,13 +255,32 @@ class Renderer
       *                       CPU intensive but allow to render fast.
       *                       The user shall not notice that, because this frame
       *                       is known already to be updated right after again.
@@ -276,7 +357,7 @@ index 958332d4..bf7c56db 100644
  
      /// Synchronously applies any staged font/geometry reconfiguration.
      ///
-@@ -300,7 +334,7 @@ class Renderer
+@@ -308,7 +342,7 @@ class Renderer
  
    private:
      /// Internal implementation of render(), wrapped in a try/catch for graceful degradation.
@@ -285,7 +366,7 @@ index 958332d4..bf7c56db 100644
  
      void configureTextureAtlas();
  
-@@ -320,6 +354,18 @@ class Renderer
+@@ -328,6 +362,18 @@ class Renderer
      /// @param lines  Contiguous sub-range of RenderLine entries to render.
      void renderLines(std::span<vtbackend::RenderLine const> lines);
  
@@ -304,7 +385,7 @@ index 958332d4..bf7c56db 100644
      void executeImageDiscards();
  
      crispy::strong_hashtable_size _atlasHashtableSlotCount;
-@@ -423,6 +469,27 @@ class Renderer
+@@ -431,6 +477,27 @@ class Renderer
      /// UI resize. nullopt until the first frame seeds it.
      std::optional<vtbackend::PageSize> _lastObservedTotalPageSize;
  
