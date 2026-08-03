@@ -2,7 +2,14 @@
 
 # GCC version providing the primary runtime
 # Note settings here *must* match those in the lang/libgcc port and compilers PG
-set gcc_main_version 16
+# GCC 16 and 14 on all systems except i386 tiger (GCC14 only) due to:
+# https://github.com/macos-powerpc/powerpc-ports/issues/187
+global os.arch
+if {${os.major} == 8 && ${os.arch} eq "i386"} {
+    set gcc_main_version 14
+} else {
+    set gcc_main_version 16
+}
 
 # compiler links against libraries in libgcc\d* and/or libgcc-*
 if {[vercmp ${gcc_version} 4.6] < 0} {

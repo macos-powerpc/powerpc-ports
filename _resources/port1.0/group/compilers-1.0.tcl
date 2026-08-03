@@ -92,7 +92,13 @@ if { ${os.arch} eq "arm" || ${os.platform} ne "darwin" } {
     if { [vercmp ${xcodeversion} < 16.0] && [vercmp ${xcodecltversion} < 16.0] } {
         lappend gcc_versions 10 11 12 13
     }
-    lappend gcc_versions 16 14 devel
+    # GCC 16 and 14 on all systems except i386 tiger (GCC14 only) due to:
+    # https://github.com/macos-powerpc/powerpc-ports/issues/187
+    if {${os.major} == 8 && ${os.arch} eq "i386"} {
+        lappend gcc_versions 14
+    } else {
+        lappend gcc_versions 16 14 devel
+    }
 } else {
     set gcc_versions [list]
     if { ${os.major} < 15 } {
@@ -111,7 +117,13 @@ if { ${os.arch} eq "arm" || ${os.platform} ne "darwin" } {
 }
 # GCC version providing the primary runtime
 # Note settings here *must* match those in the lang/libgcc port.
-set gcc_main_version 16
+# GCC 16 and 14 on all systems except i386 tiger (GCC14 only) due to:
+# https://github.com/macos-powerpc/powerpc-ports/issues/187
+if {${os.major} == 8 && ${os.arch} eq "i386"} {
+    set gcc_main_version 14
+} else {
+    set gcc_main_version 16
+}
 
 ui_debug "GCC versions for Darwin ${os.major} ${os.arch} - ${gcc_versions}"
 foreach ver ${gcc_versions} {

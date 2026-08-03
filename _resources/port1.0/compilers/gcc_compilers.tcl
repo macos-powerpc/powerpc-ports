@@ -3,8 +3,14 @@
 # https://trac.macports.org/ticket/57135
 # https://trac.macports.org/ticket/61636
 
-# GCC 14 on all systems
-lappend compilers macports-gcc-16 macports-gcc-14
+# GCC 16 and 14 on all systems except i386 tiger (GCC14 only) due to:
+# https://github.com/macos-powerpc/powerpc-ports/issues/187
+global os.arch
+if {${os.major} == 8 && ${os.arch} eq "i386"} {
+    lappend compilers macports-gcc-14
+} else {
+    lappend compilers macports-gcc-16 macports-gcc-14
+}
 
 # GCC 11 to GCC 13 on OSX10.6+
 if {${os.major} >= 10 || [option os.platform] ne "darwin"} {
@@ -28,7 +34,6 @@ if {${os.major} >= 10} {
     lappend compilers macports-gcc-devel
 }
 
-global os.arch
 if {${os.arch} eq "powerpc"} {
     lappend compilers macports-gcc-powerpc
 }
