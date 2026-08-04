@@ -1,0 +1,788 @@
+From be8fd7e839ab35c9f9d9368ef17e98952e9ebc79 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 2 Aug 2026 09:14:07 +0000
+Subject: [PATCH 11/12] feat(vendor): accept kitty o=z payloads and evict (not
+ refuse) on quota
+
+Two kitty-graphics gaps where Contour diverged from kitty-the-terminal in
+ways that bite the wider client ecosystem (kitten icat, ratatui-image,
+yazi, timg), from the shigoku port-planning note. Both are engine-general,
+not PPC-specific.
+
+T1 -- accept o=z (zlib-deflate) payloads. validateKittyTransmission used
+to answer "ENOTSUP:compressed payloads are not supported" for any o=,
+yet `kitten icat` -- the protocol's own reference client -- deflates its
+raw RGB/RGBA payloads by default. Those senders got ENOTSUP where kitty
+renders: the single most likely "images work in kitty but not Contour"
+report. Compression wraps the whole payload (not each chunk), so we
+inflate after chunk reassembly and base64-decode, before the existing
+width*height*bpp size check -- which then runs against the inflated bytes
+unchanged, so a stream that inflates to the wrong length falls into the
+same EINVAL path as a mismatched raw payload. inflate() is reached through
+an injected Terminal::inflate() callback, kept out of vtbackend for the
+same reason PNG decode is (the backend must not link a codec directly);
+the Qt frontend supplies a streaming zlib inflater capped at 512 MiB
+against a decompression bomb. With no inflater wired, o=z still answers
+ENOTSUP, and a=q reflects that -- so a probing client never gets a yes it
+cannot rely on.
+
+T2 -- evict, don't refuse, under the store quota. A transmit that would
+exceed MaxStoredImageBytes (128 MiB) was refused with ENOSPC; kitty's
+documented behavior is the opposite -- delete the oldest images to make
+room. Long-running senders that keep transmitting fresh i= ids without
+housekeeping work forever on kitty and went dark on Contour once the quota
+filled, seeing an error kitty never sends in practice (so none of them
+handle it; they do handle the ENOENT that eviction produces). Eviction is
+LRU (images touched on store and on a=p), and spares images with a live
+on-screen placement until no unplaced image is left -- evicting a
+displayed image is visible where evicting an unplaced one is not (a redraw
+that needs it re-transmits). ENOSPC now survives only for the one case
+eviction cannot help: a single incoming image larger than the whole quota.
+The quota is a settable member (default unchanged) so the eviction path is
+unit-testable without allocating a real 128 MiB.
+
+Tests: o=z renders byte-identically to the raw send, single-chunk and
+split across chunks; corrupt deflate -> EINVAL, no crash; inflated size
+!= dims -> EINVAL; a=q with an inflater wired -> OK. Quota: overflow
+evicts the oldest and sends no refusal; a=p makes an image recently-used;
+an on-screen image is spared past a newer unplaced one; a single oversized
+image still gets ENOSPC. Risk: contained to the kitty graphics path;
+non-kitty image protocols (sixel/iTerm2/GIP) and the no-inflater build are
+unchanged. No local build available on this host; verified by inspection
+against the zlib/CellProxy/Grid/Image headers.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011h7K9xLzUrQysDc7pNd7Br
+(cherry picked from commit 5b133619b9d7560fa5b65888ee0e289500c52835)
+---
+ src/contour/display/CMakeLists.txt      |   2 +
+ src/contour/display/TerminalDisplay.cpp |  57 +++++
+ src/vtbackend/CMakeLists.txt            |   5 +-
+ src/vtbackend/KittyGraphics_test.cpp    | 266 +++++++++++++++++++++++-
+ src/vtbackend/Screen.cpp                | 123 ++++++++++-
+ src/vtbackend/Screen.h                  |  33 ++-
+ src/vtbackend/Terminal.h                |  15 ++
+ 7 files changed, 486 insertions(+), 15 deletions(-)
+
+diff --git a/src/contour/display/CMakeLists.txt b/src/contour/display/CMakeLists.txt
+index 0f1a1ae3..45e2bb0b 100644
+--- a/src/contour/display/CMakeLists.txt
++++ b/src/contour/display/CMakeLists.txt
+@@ -45,6 +45,7 @@ endif()
+ target_include_directories(ContourTerminalDisplay PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/../..")
+ # Note: qt6_add_shaders() links Qt6::ShaderTools via the keyword signature, so every
+ # target_link_libraries() call on this target must also use the keyword signature.
++find_package(ZLIB REQUIRED) # inflate() for kitty graphics `o=z` compressed payloads (TerminalDisplay.cpp)
+ target_link_libraries(ContourTerminalDisplay PUBLIC vtrasterizer)
+ # contour/Config.h -- included by the display sources -- exposes yaml-cpp in its
+ # interface, so this target needs yaml-cpp's headers in its own right. Without it
+@@ -57,5 +58,6 @@ target_link_libraries(ContourTerminalDisplay PUBLIC
+     Qt6::Multimedia
+     Qt6::Quick
+     Qt6::QuickControls2
++    ZLIB::ZLIB
+ )
+ set_target_properties(ContourTerminalDisplay PROPERTIES AUTOMOC ON)
+diff --git a/src/contour/display/TerminalDisplay.cpp b/src/contour/display/TerminalDisplay.cpp
+index 99e705df..edc6f9c7 100644
+--- a/src/contour/display/TerminalDisplay.cpp
++++ b/src/contour/display/TerminalDisplay.cpp
+@@ -41,6 +41,8 @@
+ #include <QtQml/QQmlContext>
+ #include <QtQuick/QQuickWindow>
+ 
++#include <zlib.h>
++
+ #include <chrono>
+ #include <filesystem>
+ #include <format>
+@@ -104,6 +106,59 @@ namespace
+         cerr << unhandledExceptionMessage(where, e) << '\n';
+     }
+ 
++    /// Inflates a raw zlib-deflate stream, for kitty graphics `o=z` payloads.
++    ///
++    /// The output size is not known ahead of time -- the wire only states the image's final pixel
++    /// dimensions, which the engine re-checks against these inflated bytes -- so this streams through
++    /// a growing buffer rather than sizing it up front. On any stream error it returns nullopt and the
++    /// engine answers EINVAL.
++    std::optional<vtbackend::Image::Data> inflateZlib(std::span<uint8_t const> data)
++    {
++        z_stream stream {};
++        if (inflateInit(&stream) != Z_OK)
++            return std::nullopt;
++
++        stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(data.data()));
++        stream.avail_in = static_cast<uInt>(data.size());
++
++        vtbackend::Image::Data out;
++        // Grow in fixed blocks: inflate() fills what it can, we hand it a fresh tail each pass until it
++        // reports Z_STREAM_END. 64 KiB keeps the reallocation count low for image-sized payloads.
++        constexpr size_t chunkSize = 64 * 1024;
++        // The payload is attacker-controlled, and a small deflate stream can expand enormously (zlib's
++        // worst case is ~1032x). The engine re-checks the inflated size against the declared image
++        // dimensions right after this returns, but that check runs only once inflation is DONE -- so
++        // cap the output here to keep a decompression bomb from exhausting memory first. The engine
++        // caps the compressed input at MaxChunkedPayloadSize (32 MiB); this ceiling is a generous
++        // multiple of the largest image that could legitimately decode to.
++        constexpr size_t maxInflatedSize = static_cast<size_t>(512) * 1024 * 1024;
++        int status = Z_OK;
++        do
++        {
++            auto const oldSize = out.size();
++            if (oldSize + chunkSize > maxInflatedSize)
++            {
++                inflateEnd(&stream);
++                return std::nullopt;
++            }
++            out.resize(oldSize + chunkSize);
++            stream.next_out = reinterpret_cast<Bytef*>(out.data() + oldSize);
++            stream.avail_out = static_cast<uInt>(chunkSize);
++
++            status = inflate(&stream, Z_NO_FLUSH);
++            if (status != Z_OK && status != Z_STREAM_END)
++            {
++                inflateEnd(&stream);
++                return std::nullopt;
++            }
++            // Trim the tail inflate() did not fill so out.size() is always the real byte count.
++            out.resize(oldSize + (chunkSize - stream.avail_out));
++        } while (status != Z_STREAM_END);
++
++        inflateEnd(&stream);
++        return out;
++    }
++
+ } // namespace
+ // }}}
+ 
+@@ -409,6 +464,8 @@ void TerminalDisplay::setSession(TerminalSession* newSession)
+             return pixels;
+         });
+ 
++    _session->terminal().setInflate(inflateZlib);
++
+     emit sessionChanged(newSession);
+ }
+ 
+diff --git a/src/vtbackend/CMakeLists.txt b/src/vtbackend/CMakeLists.txt
+index c149402c..21728cf2 100644
+--- a/src/vtbackend/CMakeLists.txt
++++ b/src/vtbackend/CMakeLists.txt
+@@ -205,7 +205,10 @@ if(LIBTERMINAL_TESTING)
+         ViCommands_test.cpp
+         VTWriter_test.cpp
+     )
+-    target_link_libraries(vtbackend_test Catch2::Catch2 vtbackend)
++    # ZLIB: the kitty graphics `o=z` tests inject a real inflater to prove the compressed-payload path
++    # end to end (KittyGraphics_test.cpp), matching the frontend's own zlib-based injection.
++    find_package(ZLIB REQUIRED)
++    target_link_libraries(vtbackend_test Catch2::Catch2 vtbackend ZLIB::ZLIB)
+     add_test(NAME vtbackend_test COMMAND $<TARGET_FILE:vtbackend_test>)
+ 
+     if(NOT WIN32)
+diff --git a/src/vtbackend/KittyGraphics_test.cpp b/src/vtbackend/KittyGraphics_test.cpp
+index a10d5a77..462cf66c 100644
+--- a/src/vtbackend/KittyGraphics_test.cpp
++++ b/src/vtbackend/KittyGraphics_test.cpp
+@@ -10,6 +10,8 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
++#include <zlib.h>
++
+ #include <ranges>
+ #include <string>
+ #include <string_view>
+@@ -18,6 +20,57 @@ using namespace std::string_view_literals;
+ using namespace vtbackend;
+ using namespace vtbackend::kitty_graphics;
+ 
++namespace
++{
++
++/// A real zlib inflater, matching the one the frontend injects, so the `o=z` tests exercise the
++/// actual decompression path rather than a stub that only echoes bytes.
++std::optional<Image::Data> inflateZlibForTest(std::span<uint8_t const> data)
++{
++    z_stream stream {};
++    if (inflateInit(&stream) != Z_OK)
++        return std::nullopt;
++    stream.next_in = const_cast<Bytef*>(reinterpret_cast<Bytef const*>(data.data()));
++    stream.avail_in = static_cast<uInt>(data.size());
++
++    Image::Data out;
++    int status = Z_OK;
++    do
++    {
++        auto const oldSize = out.size();
++        out.resize(oldSize + 4096);
++        stream.next_out = reinterpret_cast<Bytef*>(out.data() + oldSize);
++        stream.avail_out = 4096;
++        status = inflate(&stream, Z_NO_FLUSH);
++        if (status != Z_OK && status != Z_STREAM_END)
++        {
++            inflateEnd(&stream);
++            return std::nullopt;
++        }
++        out.resize(oldSize + (4096 - stream.avail_out));
++    } while (status != Z_STREAM_END);
++    inflateEnd(&stream);
++    return out;
++}
++
++/// Deflates @p data with zlib, so a test can produce the exact `o=z` payload a real client sends.
++std::string deflateZlibForTest(std::string_view data)
++{
++    auto bound = compressBound(static_cast<uLong>(data.size()));
++    std::string out;
++    out.resize(bound);
++    auto outLen = static_cast<uLongf>(bound);
++    auto const rc = compress(reinterpret_cast<Bytef*>(out.data()),
++                             &outLen,
++                             reinterpret_cast<Bytef const*>(data.data()),
++                             static_cast<uLong>(data.size()));
++    REQUIRE(rc == Z_OK);
++    out.resize(outLen);
++    return out;
++}
++
++} // namespace
++
+ TEST_CASE("KittyGraphics.parse.minimal_query", "[kitty]")
+ {
+     // The exact probe blessed/ucs-detect sends to decide whether the protocol is supported.
+@@ -111,8 +164,11 @@ TEST_CASE("KittyGraphics.query_validates_what_a_transmission_would_reject", "[ki
+         CHECK(mock.terminal.peekInput().contains("ENOTSUP"));
+     }
+ 
+-    SECTION("compressed payload")
++    SECTION("compressed payload with no inflater wired")
+     {
++        // This MockTerm has no inflate callback, so `o=z` cannot be honoured and the query must say so
++        // -- an application that gets OK here would then send a stream the terminal cannot read. The
++        // inverse (an inflater IS present -> OK) is covered by the `o=z` test group below.
+         mock.writeToScreen("\033_Gi=32,s=1,v=1,a=q,t=d,o=z,f=24;AAAA\033\\"sv);
+         CHECK(mock.terminal.peekInput().contains("ENOTSUP"));
+     }
+@@ -279,6 +335,104 @@ TEST_CASE("KittyGraphics.chunked_transmission_is_reassembled", "[kitty]")
+     CHECK(mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment());
+ }
+ 
++TEST_CASE("KittyGraphics.query_accepts_compression_when_an_inflater_is_wired", "[kitty]")
++{
++    // With an inflater injected, `o=z` is honourable, so the probe must answer OK -- the mirror of the
++    // no-inflater ENOTSUP case in `query_validates_what_a_transmission_would_reject`. `kitten icat`
++    // sends exactly this probe before compressing.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setInflate(&inflateZlibForTest);
++    mock.writeToScreen("\033_Gi=1,s=1,v=1,a=q,t=d,o=z,f=24;AAAA\033\\"sv);
++    auto const reply = std::string { mock.terminal.peekInput() };
++    CHECK(reply.contains("OK"));
++    CHECK_FALSE(reply.contains("ENOTSUP"));
++}
++
++TEST_CASE("KittyGraphics.a_zlib_deflated_payload_renders_identically_to_the_raw_one", "[kitty]")
++{
++    // `kitten icat` deflates raw RGB/RGBA payloads by default; the inflated bytes must be exactly what
++    // an uncompressed send of the same image would have produced.
++    auto raw = std::string {};
++    for (int i = 0; i < 4; ++i)
++        raw += "\x11\x22\x33\x44"sv; // a distinctive 2x2 RGBA block
++
++    // The reference: send it uncompressed and remember the stored pixels.
++    Image::Data reference;
++    {
++        auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++        mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++        mock.terminal.setInflate(&inflateZlibForTest);
++        mock.writeToScreen(
++            std::format("\033_Ga=T,f=32,s=2,v=2,i=1;{}\033\\", crispy::base64::encode(raw)));
++        auto const fragment =
++            mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment();
++        REQUIRE(fragment);
++        reference = fragment->rasterizedImage().image().data();
++    }
++
++    auto const deflated = deflateZlibForTest(raw);
++
++    SECTION("single chunk")
++    {
++        auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++        mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++        mock.terminal.setInflate(&inflateZlibForTest);
++        mock.writeToScreen(
++            std::format("\033_Ga=T,f=32,s=2,v=2,o=z,i=1;{}\033\\", crispy::base64::encode(deflated)));
++        auto const fragment =
++            mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment();
++        REQUIRE(fragment);
++        CHECK(fragment->rasterizedImage().image().data() == reference);
++    }
++
++    SECTION("split across chunks -- compression wraps the whole payload, not each chunk")
++    {
++        auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++        mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++        mock.terminal.setInflate(&inflateZlibForTest);
++        auto const encoded = crispy::base64::encode(deflated);
++        auto const third = encoded.size() / 3;
++        mock.writeToScreen(
++            std::format("\033_Ga=T,f=32,s=2,v=2,o=z,i=1,m=1;{}\033\\", encoded.substr(0, third)));
++        mock.writeToScreen(std::format("\033_Gm=1;{}\033\\", encoded.substr(third, third)));
++        mock.writeToScreen(std::format("\033_Gm=0;{}\033\\", encoded.substr(2 * third)));
++        auto const fragment =
++            mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment();
++        REQUIRE(fragment);
++        CHECK(fragment->rasterizedImage().image().data() == reference);
++    }
++}
++
++TEST_CASE("KittyGraphics.a_corrupt_deflate_stream_is_refused_not_crashed", "[kitty]")
++{
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.setInflate(&inflateZlibForTest);
++
++    // Not a valid zlib stream: inflateInit succeeds but the first inflate() rejects the header.
++    mock.writeToScreen(
++        std::format("\033_Ga=T,f=32,s=2,v=2,o=z,i=1;{}\033\\", crispy::base64::encode("not-zlib"sv)));
++    CHECK(mock.terminal.peekInput().contains("EINVAL"));
++    CHECK_FALSE(mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment());
++}
++
++TEST_CASE("KittyGraphics.an_inflated_payload_that_disagrees_with_the_dimensions_is_refused", "[kitty]")
++{
++    // The whole point of inflating before the size check: the existing width*height*bpp guard runs
++    // against the INFLATED bytes. A stream that inflates to the wrong length must hit that EINVAL,
++    // exactly as an uncompressed short payload does.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.setInflate(&inflateZlibForTest);
++
++    // Deflate only 4 bytes but claim a 2x2 RGBA (16-byte) image.
++    auto const deflated = deflateZlibForTest("AAAA"sv);
++    mock.writeToScreen(
++        std::format("\033_Ga=T,f=32,s=2,v=2,o=z,i=1;{}\033\\", crispy::base64::encode(deflated)));
++    CHECK(mock.terminal.peekInput().contains("EINVAL"));
++    CHECK_FALSE(mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment());
++}
++
+ TEST_CASE("KittyGraphics.transmit_then_put_displays_the_stored_image", "[kitty]")
+ {
+     auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
+@@ -304,6 +458,116 @@ TEST_CASE("KittyGraphics.put_of_an_unknown_image_reports_ENOENT", "[kitty]")
+     CHECK(mock.terminal.peekInput().contains("ENOENT"));
+ }
+ 
++namespace
++{
++    // A 2x2 RGBA transmission (16 decoded bytes) stored under @p id without displaying it.
++    std::string kittyStore2x2(uint32_t id)
++    {
++        auto pixels = std::string {};
++        for (int i = 0; i < 4; ++i)
++            pixels += "\x11\x22\x33\x44"sv;
++        return std::format("\033_Ga=t,f=32,s=2,v=2,i={};{}\033\\", id, crispy::base64::encode(pixels));
++    }
++
++    bool kittyImageStillResident(MockTerm<vtpty::MockPty>& mock, uint32_t id)
++    {
++        // `a=p` answers ENOENT for an evicted (or never-stored) id, OK for a resident one. Home the
++        // cursor first so the placement is deterministic, and flush so peekInput() sees only this reply.
++        mock.terminal.flushInput();
++        mock.writeToScreen(std::format("\033[H\033_Ga=p,i={}\033\\", id));
++        auto const evicted = std::string { mock.terminal.peekInput() }.contains("ENOENT");
++        mock.terminal.flushInput();
++        return !evicted;
++    }
++} // namespace
++
++TEST_CASE("KittyGraphics.quota_evicts_the_oldest_image_rather_than_refusing", "[kitty]")
++{
++    // kitty enforces its store quota by deleting the OLDEST images to make room, not by refusing the
++    // transmission with ENOSPC (an error real clients never see on kitty and so do not handle). A
++    // long-running sender that keeps transmitting fresh ids must keep working, losing only its oldest.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.primaryScreen().setKittyImageStoreQuota(32); // exactly two 16-byte images
++
++    mock.writeToScreen(kittyStore2x2(1));
++    mock.writeToScreen(kittyStore2x2(2));
++    mock.writeToScreen(kittyStore2x2(3)); // pushes past the quota
++
++    // No refusal was sent for the overflowing transmission ...
++    CHECK_FALSE(std::string { mock.terminal.peekInput() }.contains("ENOSPC"));
++    mock.terminal.flushInput();
++
++    // ... the oldest (id 1) was evicted, and the two newest remain.
++    CHECK_FALSE(kittyImageStillResident(mock, 1));
++    CHECK(kittyImageStillResident(mock, 2));
++    CHECK(kittyImageStillResident(mock, 3));
++}
++
++TEST_CASE("KittyGraphics.placing_an_image_makes_it_recently_used", "[kitty]")
++{
++    // Eviction is LRU, and `a=p` counts as a use: after placing the oldest-transmitted image, the
++    // NEXT-oldest becomes the eviction victim instead. Guards the touch-on-put half of the contract.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.primaryScreen().setKittyImageStoreQuota(32);
++
++    mock.writeToScreen(kittyStore2x2(1));
++    mock.writeToScreen(kittyStore2x2(2));
++
++    // Touch id 1 so id 2 is now the least-recently-used. Home + place, then clear the placement so it
++    // does not also count as "on screen" (that is the other test's concern).
++    mock.writeToScreen("\033[H\033_Ga=p,i=1\033\\"sv);
++    mock.writeToScreen("\033_Ga=d,d=a\033\\"sv); // remove placements, keep data
++    mock.terminal.flushInput();
++
++    mock.writeToScreen(kittyStore2x2(3)); // one must go
++
++    CHECK(kittyImageStillResident(mock, 1));       // spared: most-recently placed
++    CHECK_FALSE(kittyImageStillResident(mock, 2)); // evicted: least-recently used
++    CHECK(kittyImageStillResident(mock, 3));
++}
++
++TEST_CASE("KittyGraphics.an_on_screen_image_is_evicted_after_an_unplaced_one", "[kitty]")
++{
++    // Evicting an image that is currently displayed is visible where evicting an unplaced one is not
++    // (a redraw that needs it re-transmits). So eviction spares images with a live placement until no
++    // unplaced image is left -- even when the placed one is older.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.primaryScreen().setKittyImageStoreQuota(32);
++
++    // id 1: transmit-and-display, so it has a live placement despite being oldest.
++    auto placed = std::string {};
++    for (int i = 0; i < 4; ++i)
++        placed += "\x11\x22\x33\x44"sv;
++    mock.writeToScreen(std::format("\033_Ga=T,f=32,s=2,v=2,i=1;{}\033\\", crispy::base64::encode(placed)));
++    REQUIRE(mock.terminal.primaryScreen().at(LineOffset(0), ColumnOffset(0)).imageFragment());
++
++    mock.writeToScreen(kittyStore2x2(2)); // unplaced
++    mock.terminal.flushInput();
++
++    mock.writeToScreen(kittyStore2x2(3)); // forces one eviction
++
++    CHECK(kittyImageStillResident(mock, 1));       // spared: on screen
++    CHECK_FALSE(kittyImageStillResident(mock, 2)); // evicted: unplaced, even though newer than id 1
++    CHECK(kittyImageStillResident(mock, 3));
++}
++
++TEST_CASE("KittyGraphics.a_single_image_larger_than_the_whole_quota_still_gets_ENOSPC", "[kitty]")
++{
++    // Eviction cannot help when the incoming image alone exceeds the quota: there is nothing to evict
++    // that would make it fit. This is the one case ENOSPC survives.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    mock.terminal.primaryScreen().setKittyImageStoreQuota(8); // smaller than one 16-byte image
++
++    mock.writeToScreen(kittyStore2x2(1));
++    CHECK(mock.terminal.peekInput().contains("ENOSPC"));
++    mock.terminal.flushInput();
++    CHECK_FALSE(kittyImageStillResident(mock, 1));
++}
++
+ TEST_CASE("KittyGraphics.non_kitty_APC_is_ignored", "[kitty]")
+ {
+     // APC carries several application-defined protocols. One that is not ours must not be answered.
+diff --git a/src/vtbackend/Screen.cpp b/src/vtbackend/Screen.cpp
+index f541c48d..9f60cd77 100644
+--- a/src/vtbackend/Screen.cpp
++++ b/src/vtbackend/Screen.cpp
+@@ -42,6 +42,8 @@
+ #include <cstring>
+ #include <iostream>
+ #include <iterator>
++#include <limits>
++#include <numeric>
+ #include <optional>
+ #include <ranges>
+ #include <sstream>
+@@ -5324,7 +5326,7 @@ void Screen::replyKittyGraphics(kitty_graphics::Command const& command, std::str
+ }
+ 
+ std::optional<std::string_view> Screen::validateKittyTransmission(
+-    kitty_graphics::Command const& command) noexcept
++    kitty_graphics::Command const& command) const noexcept
+ {
+     using namespace kitty_graphics;
+ 
+@@ -5339,7 +5341,11 @@ std::optional<std::string_view> Screen::validateKittyTransmission(
+         // terminal at any file the user can read. Not implemented deliberately.
+         return "ENOTSUP:only direct transmission is supported";
+ 
+-    if (command.compression != Compression::None)
++    // `o=z` payloads are inflated through an injected dependency, exactly as PNG is decoded through
++    // one. Only refuse the compression when no inflater was wired up -- a query must then answer the
++    // same ENOTSUP the transmission would, so the application falls back rather than sends a stream we
++    // cannot read.
++    if (command.compression != Compression::None && !_terminal->inflate())
+         return "ENOTSUP:compressed payloads are not supported";
+ 
+     return std::nullopt;
+@@ -5367,6 +5373,79 @@ void Screen::removeKittyPlacements(std::shared_ptr<Image const> const& image)
+     }
+ }
+ 
++bool Screen::hasLiveKittyPlacement(std::shared_ptr<Image const> const& image) const
++{
++    // A placement is fragments-in-cells, so "is this image on screen" is a scan for any cell whose
++    // fragment points back to it. Only the visible page is checked: scrollback lines cannot be
++    // redrawn, so an image that has scrolled off is as evictable as one never placed.
++    for (auto const line: std::views::iota(0, *pageSize().lines))
++    {
++        for (auto const column: std::views::iota(0, *pageSize().columns))
++        {
++            auto const fragment = at(LineOffset(line), ColumnOffset(column)).imageFragment();
++            if (fragment && fragment->rasterizedImage().imagePointer() == image)
++                return true;
++        }
++    }
++    return false;
++}
++
++bool Screen::evictKittyImagesToFit(size_t incomingBytes, uint32_t keepId)
++{
++    // kitty enforces its store quota by deleting the oldest images to make room, NOT by refusing the
++    // transmission -- long-running senders (gallery scrollers, file managers) keep transmitting fresh
++    // ids without housekeeping and rely on the terminal to evict. Refusing with ENOSPC is an error
++    // kitty never sends in practice, so a client that matches on reply strings goes dark on it.
++
++    auto const storedExcept = [&](uint32_t skip) {
++        return std::accumulate(
++            _kittyImages.begin(), _kittyImages.end(), size_t { 0 }, [&](size_t sum, auto const& entry) {
++                return entry.first == skip ? sum : sum + entry.second->data().size();
++            });
++    };
++
++    // If even an empty store cannot hold the incoming image, eviction is pointless: refuse it alone.
++    // (`keepId` may already occupy the store as a prior version; it is replaced, so it does not count.)
++    if (incomingBytes > _kittyImageStoreQuota)
++        return false;
++
++    while (storedExcept(keepId) + incomingBytes > _kittyImageStoreQuota)
++    {
++        // Pick the eviction victim: least-recently-used, but spare images with a live on-screen
++        // placement until nothing unplaced remains. A redraw idiom that re-places an evicted image
++        // re-transmits it, so evicting an unplaced image is invisible where evicting a placed one is
++        // not. `keepId` is never a candidate.
++        auto victim = _kittyImages.end();
++        auto victimHasPlacement = true; // prefer any no-placement candidate over a placed one
++        auto victimTick = std::numeric_limits<uint64_t>::max();
++        for (auto it = _kittyImages.begin(); it != _kittyImages.end(); ++it)
++        {
++            if (it->first == keepId)
++                continue;
++            auto const tickIt = _kittyImageLastUsed.find(it->first);
++            auto const tick = tickIt != _kittyImageLastUsed.end() ? tickIt->second : uint64_t { 0 };
++            auto const placed = hasLiveKittyPlacement(it->second);
++            // Rank unplaced-before-placed first, then oldest-first within each group.
++            if (std::tuple(placed, tick) < std::tuple(victimHasPlacement, victimTick))
++            {
++                victim = it;
++                victimHasPlacement = placed;
++                victimTick = tick;
++            }
++        }
++
++        if (victim == _kittyImages.end())
++            // Defensive: the loop only runs while storedExcept(keepId) > 0, which means a non-keepId
++            // image exists to evict, so this is unreachable. Stop rather than spin if that ever breaks.
++            return true;
++
++        removeKittyPlacements(victim->second);
++        _kittyImageLastUsed.erase(victim->first);
++        _kittyImages.erase(victim);
++    }
++    return true;
++}
++
+ void Screen::deleteKittyGraphics(kitty_graphics::Command const& command)
+ {
+     // The CASE of `d=` decides how far the delete reaches: lower case removes placements and leaves
+@@ -5394,9 +5473,15 @@ void Screen::deleteKittyGraphics(kitty_graphics::Command const& command)
+         return;
+ 
+     if (target == 'i' && command.imageId != 0)
++    {
+         _kittyImages.erase(command.imageId);
++        _kittyImageLastUsed.erase(command.imageId);
++    }
+     else
++    {
+         _kittyImages.clear();
++        _kittyImageLastUsed.clear();
++    }
+ }
+ 
+ void Screen::resetKittyState() noexcept
+@@ -5408,6 +5493,7 @@ void Screen::resetKittyState() noexcept
+     _kittyChunkedPayload.clear();
+     _kittyChunkedCommand.reset();
+     _kittyImages.clear();
++    _kittyImageLastUsed.clear();
+     _terminal->kittyClipboardWrite().clear();
+     _terminal->kittyClipboardWriteOpen() = false;
+ }
+@@ -5480,6 +5566,8 @@ void Screen::processKittyGraphics(std::string_view body)
+                 replyKittyGraphics(command, "ENOENT:no such image");
+                 return;
+             }
++            // Placing an image is a use: touch it so a later quota eviction treats it as recent.
++            _kittyImageLastUsed[command.imageId] = ++_kittyImageClock;
+             renderKittyImage(command, it->second);
+             replyKittyGraphics(command, "OK");
+             return;
+@@ -5504,6 +5592,23 @@ void Screen::processKittyGraphics(std::string_view body)
+     auto const decoded = crispy::base64::decode(command.payload);
+     auto pixmap = Image::Data(decoded.begin(), decoded.end());
+ 
++    // `o=z` compresses the WHOLE payload, not each chunk, so inflation happens here -- after chunk
++    // reassembly and base64-decode, before the size-vs-dimensions check below. That check then runs
++    // against the inflated bytes unchanged, which is exactly what makes accepting compression safe:
++    // an inflated size that disagrees with the declared dimensions falls into the existing EINVAL
++    // path. validateKittyTransmission already refused this command if no inflater was wired, so a
++    // ZlibDeflate reaching here means _terminal->inflate() is present.
++    if (command.compression == Compression::ZlibDeflate)
++    {
++        auto inflated = _terminal->inflate()(pixmap);
++        if (!inflated)
++        {
++            replyKittyGraphics(command, "EINVAL:could not inflate compressed payload");
++            return;
++        }
++        pixmap = std::move(*inflated);
++    }
++
+     auto const format = [&] {
+         switch (command.format)
+         {
+@@ -5559,19 +5664,17 @@ void Screen::processKittyGraphics(std::string_view body)
+ 
+     if (command.imageId != 0)
+     {
+-        // Ids are 32-bit, so without a quota an application can park billions of decoded images in
+-        // the terminal. Refusing is preferable to evicting: the whole point of storing an image is
+-        // that a later `a=p` can place it, and silently dropping one turns that into ENOENT.
+-        auto const stored = std::accumulate(
+-            _kittyImages.begin(), _kittyImages.end(), size_t { 0 }, [&](size_t sum, auto const& entry) {
+-                return entry.first == command.imageId ? sum : sum + entry.second->data().size();
+-            });
+-        if (stored + image->data().size() > MaxStoredImageBytes)
++        // Ids are 32-bit, so without a quota an application can park billions of decoded images in the
++        // terminal. kitty's contract is to make room by evicting the oldest images rather than to
++        // refuse the transmission; ENOSPC is reserved for the one case eviction cannot help -- a
++        // single image larger than the whole quota. @see evictKittyImagesToFit.
++        if (!evictKittyImagesToFit(image->data().size(), command.imageId))
+         {
+             replyKittyGraphics(command, "ENOSPC:image storage quota exceeded");
+             return;
+         }
+         _kittyImages[command.imageId] = image;
++        _kittyImageLastUsed[command.imageId] = ++_kittyImageClock;
+     }
+ 
+     if (command.action == Action::TransmitAndDisplay)
+diff --git a/src/vtbackend/Screen.h b/src/vtbackend/Screen.h
+index da924fb7..dc7f118c 100644
+--- a/src/vtbackend/Screen.h
++++ b/src/vtbackend/Screen.h
+@@ -220,9 +220,10 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+     /// @return the wire status to answer with, or nullopt when the command is acceptable.
+     ///
+     /// Shared by the transmission path and by `a=q`, which exists precisely to let an application
+-    /// discover what a transmission would do without performing one.
+-    [[nodiscard]] static std::optional<std::string_view> validateKittyTransmission(
+-        kitty_graphics::Command const& command) noexcept;
++    /// discover what a transmission would do without performing one. Not static: whether `o=z` is
++    /// acceptable depends on whether an inflater was injected into the terminal.
++    [[nodiscard]] std::optional<std::string_view> validateKittyTransmission(
++        kitty_graphics::Command const& command) const noexcept;
+ 
+     /// Handles a kitty graphics `a=d`, honouring the case of its `d=` target: a lower-case target
+     /// removes placements only, an upper-case one additionally frees the transmitted image data.
+@@ -232,6 +233,16 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+     /// leaving the text sharing those cells untouched.
+     void removeKittyPlacements(std::shared_ptr<Image const> const& image);
+ 
++    /// @return true if any cell on the page currently shows a fragment of @p image, i.e. the image
++    /// has a live placement. Used by eviction to spare on-screen images until last.
++    [[nodiscard]] bool hasLiveKittyPlacement(std::shared_ptr<Image const> const& image) const;
++
++    /// Frees stored kitty images until @p incomingBytes more would fit under the quota, evicting in
++    /// LRU order and preferring images with no live on-screen placement. @p keepId (the id being
++    /// (re)transmitted) is never evicted. @return false only if the incoming image cannot fit even
++    /// after evicting everything else, in which case nothing is stored and the caller answers ENOSPC.
++    [[nodiscard]] bool evictKittyImagesToFit(size_t incomingBytes, uint32_t keepId);
++
+     /// Drops all kitty graphics and clipboard protocol state. Called on RIS, which must not leave a
+     /// half-open transmission for the next application to inherit.
+     void resetKittyState() noexcept;
+@@ -291,6 +302,11 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+ 
+     void writeTextFromExternal(std::string_view text);
+ 
++    /// Overrides the kitty-graphics store quota that eviction works against (default
++    /// @c kitty_graphics::MaxStoredImageBytes). Exists so tests can drive the eviction path with a
++    /// handful of small images instead of allocating the full 128 MiB. @see evictKittyImagesToFit.
++    void setKittyImageStoreQuota(size_t bytes) noexcept { _kittyImageStoreQuota = bytes; }
++
+     /// Renders the full screen by passing every grid cell to the callback.
+     ///
+     /// @param extraLines  Additional lines to render beyond the page size (e.g. for smooth scrolling).
+@@ -989,6 +1005,17 @@ class Screen final: public SequenceHandler, public capabilities::StaticDatabase
+     /// Images transmitted by a kitty graphics command but not yet displayed, keyed by their `i=` id.
+     std::unordered_map<uint32_t, std::shared_ptr<Image const>> _kittyImages {};
+ 
++    /// When each stored image was last transmitted or placed, for LRU eviction under quota pressure.
++    /// A monotonic tick rather than a wall clock so the ordering is deterministic and testable; the
++    /// value only ever has to be comparable, never meaningful. @see evictKittyImagesToFit.
++    std::unordered_map<uint32_t, uint64_t> _kittyImageLastUsed {};
++    uint64_t _kittyImageClock = 0;
++
++    /// The store quota eviction works against. A member rather than the bare
++    /// @c kitty_graphics::MaxStoredImageBytes constant so a test can lower it to a few bytes and drive
++    /// the eviction path without allocating a real 128 MiB of images. @see setKittyImageStoreQuota.
++    size_t _kittyImageStoreQuota = kitty_graphics::MaxStoredImageBytes;
++
+     // NOTE: the `OSC 5522` write transmission lives on Terminal, not here: an application may switch
+     // screens (DECSASD, or a page change) between chunks, and a per-screen buffer would drop the
+     // chunks that landed elsewhere while still answering DONE. @see Terminal::kittyClipboardWrite.
+diff --git a/src/vtbackend/Terminal.h b/src/vtbackend/Terminal.h
+index da932720..73cf0f8e 100644
+--- a/src/vtbackend/Terminal.h
++++ b/src/vtbackend/Terminal.h
+@@ -1840,6 +1840,20 @@ class Terminal
+     void setImageDecoder(ImageDecoderCallback decoder) noexcept { _imageDecoder = std::move(decoder); }
+     ImageDecoderCallback const& imageDecoder() const noexcept { return _imageDecoder; }
+ 
++    /// Callback for inflating a zlib-deflate stream, for kitty graphics `o=z` payloads.
++    ///
++    /// Kept out of vtbackend as an injected dependency for the same reason as @c ImageDecoderCallback:
++    /// the backend must not link a codec library directly. `kitten icat` -- the protocol's own
++    /// reference client -- deflates its raw pixel payloads by default, so without this those senders
++    /// get ENOTSUP where kitty renders.
++    ///
++    /// @param data  The raw (base64-decoded) zlib stream.
++    /// @returns The inflated bytes, or std::nullopt when the stream is corrupt.
++    using InflateCallback = std::function<std::optional<Image::Data>(std::span<uint8_t const> data)>;
++
++    void setInflate(InflateCallback inflate) noexcept { _inflate = std::move(inflate); }
++    InflateCallback const& inflate() const noexcept { return _inflate; }
++
+     bool syncWindowTitleWithHostWritableStatusDisplay() const noexcept
+     {
+         return _syncWindowTitleWithHostWritableStatusDisplay;
+@@ -2338,6 +2352,7 @@ class Terminal
+     /// the latter. @see popPointerShape.
+     bool _pointerShapeBaseSetByApplication = false;
+     ImageDecoderCallback _imageDecoder;
++    InflateCallback _inflate;
+ 
+     std::vector<ColumnOffset> _tabs;
+ 
+-- 
+2.43.0
+
