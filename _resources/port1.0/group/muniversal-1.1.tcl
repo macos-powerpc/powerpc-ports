@@ -628,10 +628,10 @@ rename portconfigure::choose_supported_archs portconfigure::choose_supported_arc
 pre-configure {
     ui_debug "muniversal-1.1 PG overloaded the choose_supported_archs procedure!"
 }
-proc portconfigure::choose_supported_archs {archs} {
+proc portconfigure::choose_supported_archs {args} {
     global  os.arch
 
-    set universal_archs_supported [portconfigure::choose_supported_archs_real ${archs}]
+    set universal_archs_supported [portconfigure::choose_supported_archs_real {*}$args]
 
     # user has specified that build platform must be able to run binaries for supported architectures
     if {[option muniversal.run_binaries]} {
