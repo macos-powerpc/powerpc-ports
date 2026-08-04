@@ -16,7 +16,6 @@
 
 namespace eval app {}
 
-
 #-------------------------------------------------------------------------------
 # app.create: whether to create the app bundle at all
 #
@@ -25,7 +24,6 @@ namespace eval app {}
 
 options app.create
 default app.create yes
-
 
 #-------------------------------------------------------------------------------
 # app.name: the name of the app that users will see in the Finder
@@ -47,7 +45,6 @@ proc app::get_default_name {} {
     return [string totitle ${name}]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.executable: the program the app will run
 #
@@ -67,7 +64,6 @@ proc app::get_default_name {} {
 options app.executable
 default app.executable {${name}}
 
-
 #-------------------------------------------------------------------------------
 # app.icon: the icon the app will have
 #
@@ -85,7 +81,6 @@ default app.executable {${name}}
 options app.icon
 default app.icon ""
 
-
 #-------------------------------------------------------------------------------
 # app.short_version_string: the version number
 #
@@ -98,7 +93,6 @@ default app.icon ""
 options app.short_version_string
 default app.short_version_string {${version}}
 
-
 #-------------------------------------------------------------------------------
 # app.version: the build number
 #
@@ -110,7 +104,6 @@ default app.short_version_string {${version}}
 
 options app.version
 default app.version {${version}}
-
 
 #-------------------------------------------------------------------------------
 # app.identifier: the app's unique bundle identifier
@@ -142,7 +135,6 @@ proc app::get_default_identifier {} {
     return [regsub -all -nocase {[^a-z0-9.-]} [join ${identifier} .] ""]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.retina: whether the app supports Retina display resolutions
 #
@@ -154,7 +146,6 @@ proc app::get_default_identifier {} {
 options app.retina
 default app.retina no
 
-
 #-------------------------------------------------------------------------------
 # app.dark_mode: whether the app supports dark mode
 #
@@ -165,7 +156,6 @@ default app.retina no
 
 options app.dark_mode
 default app.dark_mode yes
-
 
 #-------------------------------------------------------------------------------
 # app.privacy_microphone: whether the app needs microphone access
@@ -194,7 +184,6 @@ default app.privacy_microphone ""
 options app.privacy_camera
 default app.privacy_camera ""
 
-
 #-------------------------------------------------------------------------------
 # app.privacy_contacts: whether the app needs contacts access
 #
@@ -207,7 +196,6 @@ default app.privacy_camera ""
 
 options app.privacy_contacts
 default app.privacy_contacts ""
-
 
 #-------------------------------------------------------------------------------
 # app.privacy_calendars: whether the app needs calendars access
@@ -222,7 +210,6 @@ default app.privacy_contacts ""
 options app.privacy_calendars
 default app.privacy_calendars ""
 
-
 #-------------------------------------------------------------------------------
 # app.privacy_photo: whether the app needs photo access
 #
@@ -235,7 +222,6 @@ default app.privacy_calendars ""
 
 options app.privacy_photo
 default app.privacy_photo ""
-
 
 #-------------------------------------------------------------------------------
 # app.hide_dock_icon: hide the Dock icon
@@ -258,7 +244,6 @@ proc app::get_default_hide_dock_icon {} {
     return [variant_exists x11] && [variant_isset x11]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.use_launch_script: use shell launch script instead of symlink to executable
 #
@@ -272,6 +257,53 @@ proc app::get_default_hide_dock_icon {} {
 options app.use_launch_script
 default app.use_launch_script  no
 
+#-------------------------------------------------------------------------------
+# app.sign: sign the app bundle
+#
+# Sign the created app bundle. Useful for avoiding repeated firewall and privacy
+# popups, and crashes on Apple Silicon.
+#-------------------------------------------------------------------------------
+
+options app.sign
+default app.sign no
+
+#-------------------------------------------------------------------------------
+# app.signing_identity: identity used to sign the app
+#
+# Defaults to the adhoc identity (sign to run locally).
+#-------------------------------------------------------------------------------
+
+options app.signing_identity
+default app.signing_identity "-"
+
+#-------------------------------------------------------------------------------
+# app.signing_entitlements: entitlements file used to sign the app
+#
+# Defaults to the empty. If non empty, --entitlements arg will be added to
+# app.signing_args.
+#-------------------------------------------------------------------------------
+
+options app.signing_entitlements
+default app.signing_entitlements ""
+
+#-------------------------------------------------------------------------------
+# app.signing_args: extra auguments passed to codesign command
+#
+# Examples: --deep, --force
+#-------------------------------------------------------------------------------
+
+options app.signing_args
+default app.signing_args ""
+
+#-------------------------------------------------------------------------------
+# app.manual_post_destroot: do not automatically run app::post_destroot and
+# app::sign if enabled
+#
+# Can be manually called to ensure execution order
+#-------------------------------------------------------------------------------
+
+options app.manual_post_destroot
+default app.manual_post_destroot no
 
 proc app::pre_destroot {} {
     global destroot applications_dir
@@ -290,7 +322,6 @@ proc app::pre_destroot {} {
                     ${app_dir}/Contents/Resources
     }
 }
-
 
 proc app::post_destroot {} {
     global prefix destroot filespath workpath worksrcpath applications_dir
@@ -318,7 +349,7 @@ proc app::post_destroot {} {
 
     if {[tbool app_create]} {
         # Ensure app.identifier is valid.
-        if {[regexp -nocase {[^a-z0-9.-]} ${app_identifier}]} {
+        if {[regexp -nocase {[^a-z0-9._-]} ${app_identifier}]} {
             return -code error "app.identifier ${app_identifier} contains illegal characters"
         }
         if {[llength [split ${app_identifier} "."]] < 3} {
@@ -470,6 +501,24 @@ proc app::post_destroot {} {
     }
 }
 
+proc app::sign {} {
+    global destroot applications_dir
+    set app_create               [option app.create]
+    set app_name                 [option app.name]
+    set app_sign                 [option app.sign]
+    set app_signing_identity     [option app.signing_identity]
+    set app_signing_entitlements [option app.signing_entitlements]
+    set app_signing_args         [option app.signing_args]
+
+    if {[tbool app_create] && [tbool app_sign]} {
+        # Sign the app bundle.
+        if {${app_signing_entitlements} ne ""} {
+            set app_signing_args "--entitlements ${app_signing_entitlements} ${app_signing_args}"
+        }
+        system -W ${destroot}${applications_dir} \
+            "/usr/bin/codesign --sign ${app_signing_identity} ${app_signing_args} [shellescape ${app_name}].app"
+    }
+}
 
 proc app::check_app_icon {} {
     global depends_build
@@ -487,7 +536,6 @@ proc app::check_app_icon {} {
     }
 }
 
-
 # Recursively resolve a symlink in a destroot.
 proc app::resolve_symlink {path destroot} {
     if {[catch {set resolved_path [file join [file dirname ${path}] [file readlink ${destroot}${path}]]}]} {
@@ -497,7 +545,6 @@ proc app::resolve_symlink {path destroot} {
 #    ui_debug "In ${destroot}, ${path} is a symlink to ${resolved_path}"
     return [app::resolve_symlink ${resolved_path} ${destroot}]
 }
-
 
 # Write a launch script for the executable into the bundle, modifying PATH to
 # allow the executable to find other executables installed with MacPorts.
@@ -513,19 +560,22 @@ exec [shellescape ${executable}]
     file attributes ${app_destination} -permissions 0755
 }
 
-
 proc app::pg_callback {} {
+    set manual_post_destroot [option app.manual_post_destroot]
+
     app::check_app_icon
 
     pre-destroot {
         app::pre_destroot
     }
 
-    post-destroot {
-        app::post_destroot
+    if {![tbool manual_post_destroot]} {
+        post-destroot {
+            app::post_destroot
+            app::sign
+        }
     }
 }
-
 
 # callback after port is parsed
 port::register_callback app::pg_callback
