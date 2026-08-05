@@ -1,0 +1,188 @@
+From f9cd2964cbd0d6ed6c88dbd4d0e71e64c56c0569 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 4 Aug 2026 20:04:03 +0000
+Subject: [PATCH] video/repack: fix packed word repacking on big-endian hosts
+
+The PA_WORD_*/UN_WORD_* backends access the whole packed pixel as a
+single native integer, with component shifts describing the little
+endian layout (shift == 8 * byte offset of the component in memory).
+The packer selection metadata in setup_packed_packer() is byte-position
+based, so on big endian hosts the native word store reversed the
+component lanes in memory: packing yuv444p16 into xv36 wrote
+[pad][V][Y][U] instead of [U][Y][V][pad].
+
+Visible symptom: playing 10-bit video with --vo=gpu-next on PowerPC
+macOS (where the GL2 backend's format set makes autoconvert pick xv36,
+converted through the zimg wrapper) rendered green with orange
+highlights - the display sampled U from the zeroed padding lane and V
+from the luma lane.
+
+Mirror the shifts on big endian via LANE_SHIFT, which is valid for all
+lane-aligned packers (component size == plane_t size). The bit-packed
+10-bit formats (xv30 family) define the packed pixel by value rather
+than by lane position - there a native-endian store of the composed
+value is already correct for the native format variant on either
+endianness - so keep them on new _RAW macro variants with unmirrored
+shifts.
+
+No change in behavior on little endian hosts (LANE_SHIFT is an
+identity there).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FDvpzNGRvFJCGoZi6SdPKd
+---
+ video/repack.c | 87 ++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 71 insertions(+), 16 deletions(-)
+
+diff --git a/video/repack.c b/video/repack.c
+index ab1270277c..953f8113ae 100644
+--- a/video/repack.c
++++ b/video/repack.c
+@@ -190,14 +190,31 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
+ // Unpackers will often use "x" for padding, because they ignore it, while
+ // packers will use "z" because they write zero.
+ 
++// The shift arguments describe the LSB-to-MSB layout of the packed pixel as
++// read as a single native integer on a little endian machine, i.e. shift ==
++// 8 * byte offset of the component in memory. The repacker selection metadata
++// (see setup_packed_packer) is byte-position based, so on big endian hosts a
++// native word store would reverse the component lanes in memory. LANE_SHIFT
++// mirrors the shifts to compensate. This is valid only if the component size
++// equals plane_t's size (byte-aligned lanes). Formats whose components share
++// bytes (e.g. 10-bit-in-32-bit like XV30) define the packed pixel by value,
++// not by lane position, and must use the *_RAW macro variants, which keep the
++// shifts as-is on either endian.
++#define LANE_SHIFT(sh, packed_t, plane_t) \
++    (MP_SELECT_LE_BE(sh, 8 * (int)(sizeof(packed_t) - sizeof(plane_t)) - (sh)))
++
+ #define PA_WORD_4(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, sh_c3)      \
+     static void name(void *restrict dst, void *restrict src[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             ((packed_t *)dst)[x] =                                          \
+-                ((packed_t)((plane_t *)src[0])[x] << (sh_c0)) |             \
+-                ((packed_t)((plane_t *)src[1])[x] << (sh_c1)) |             \
+-                ((packed_t)((plane_t *)src[2])[x] << (sh_c2)) |             \
+-                ((packed_t)((plane_t *)src[3])[x] << (sh_c3));              \
++                ((packed_t)((plane_t *)src[0])[x]                           \
++                    << LANE_SHIFT(sh_c0, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[1])[x]                           \
++                    << LANE_SHIFT(sh_c1, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[2])[x]                           \
++                    << LANE_SHIFT(sh_c2, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[3])[x]                           \
++                    << LANE_SHIFT(sh_c3, packed_t, plane_t));               \
+         }                                                                   \
+     }
+ 
+@@ -205,15 +222,34 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
+     static void name(void *restrict src, void *restrict dst[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             packed_t c = ((packed_t *)src)[x];                              \
+-            ((plane_t *)dst[0])[x] = (c >> (sh_c0)) & (mask);               \
+-            ((plane_t *)dst[1])[x] = (c >> (sh_c1)) & (mask);               \
+-            ((plane_t *)dst[2])[x] = (c >> (sh_c2)) & (mask);               \
+-            ((plane_t *)dst[3])[x] = (c >> (sh_c3)) & (mask);               \
++            ((plane_t *)dst[0])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c0, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[1])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c1, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[2])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c2, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[3])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c3, packed_t, plane_t)) & (mask);       \
+         }                                                                   \
+     }
+ 
+ 
+ #define PA_WORD_3(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, pad)        \
++    static void name(void *restrict dst, void *restrict src[], int w) {     \
++        for (int x = 0; x < w; x++) {                                       \
++            ((packed_t *)dst)[x] = (pad) |                                  \
++                ((packed_t)((plane_t *)src[0])[x]                           \
++                    << LANE_SHIFT(sh_c0, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[1])[x]                           \
++                    << LANE_SHIFT(sh_c1, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[2])[x]                           \
++                    << LANE_SHIFT(sh_c2, packed_t, plane_t));               \
++        }                                                                   \
++    }
++
++// Like PA_WORD_3, but without the big endian lane mirroring: for bit-packed
++// formats defined as a single native integer (components not byte-aligned).
++#define PA_WORD_3_RAW(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, pad)    \
+     static void name(void *restrict dst, void *restrict src[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             ((packed_t *)dst)[x] = (pad) |                                  \
+@@ -230,6 +266,20 @@ UN_WORD_4(un_cccc16,  uint64_t, uint16_t,  0, 16,  32, 48, 0xFFFFu)
+ PA_WORD_4(pa_cccc16,  uint64_t, uint16_t,  0, 16,  32, 48)
+ 
+ #define UN_WORD_3(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, mask)       \
++    static void name(void *restrict src, void *restrict dst[], int w) {     \
++        for (int x = 0; x < w; x++) {                                       \
++            packed_t c = ((packed_t *)src)[x];                              \
++            ((plane_t *)dst[0])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c0, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[1])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c1, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[2])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c2, packed_t, plane_t)) & (mask);       \
++        }                                                                   \
++    }
++
++// Raw variant, see PA_WORD_3_RAW.
++#define UN_WORD_3_RAW(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, mask)   \
+     static void name(void *restrict src, void *restrict dst[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             packed_t c = ((packed_t *)src)[x];                              \
+@@ -243,8 +293,8 @@ UN_WORD_3(un_ccc8x8,  uint32_t, uint8_t,  0, 8,  16, 0xFFu)
+ PA_WORD_3(pa_ccc8z8,  uint32_t, uint8_t,  0, 8,  16, 0)
+ UN_WORD_3(un_x8ccc8,  uint32_t, uint8_t,  8, 16, 24, 0xFFu)
+ PA_WORD_3(pa_z8ccc8,  uint32_t, uint8_t,  8, 16, 24, 0)
+-UN_WORD_3(un_ccc10x2, uint32_t, uint16_t, 0, 10, 20, 0x3FFu)
+-PA_WORD_3(pa_ccc10z2, uint32_t, uint16_t, 0, 10, 20, 0)
++UN_WORD_3_RAW(un_ccc10x2, uint32_t, uint16_t, 0, 10, 20, 0x3FFu)
++PA_WORD_3_RAW(pa_ccc10z2, uint32_t, uint16_t, 0, 10, 20, 0)
+ UN_WORD_3(un_ccc16x16, uint64_t, uint16_t, 0, 16, 32, 0xFFFFu)
+ PA_WORD_3(pa_ccc16z16, uint64_t, uint16_t, 0, 16, 32, 0)
+ 
+@@ -252,8 +302,10 @@ PA_WORD_3(pa_ccc16z16, uint64_t, uint16_t, 0, 16, 32, 0)
+     static void name(void *restrict dst, void *restrict src[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             ((packed_t *)dst)[x] = (pad) |                                  \
+-                ((packed_t)((plane_t *)src[0])[x] << (sh_c0)) |             \
+-                ((packed_t)((plane_t *)src[1])[x] << (sh_c1));              \
++                ((packed_t)((plane_t *)src[0])[x]                           \
++                    << LANE_SHIFT(sh_c0, packed_t, plane_t)) |              \
++                ((packed_t)((plane_t *)src[1])[x]                           \
++                    << LANE_SHIFT(sh_c1, packed_t, plane_t));               \
+         }                                                                   \
+     }
+ 
+@@ -261,8 +313,10 @@ PA_WORD_3(pa_ccc16z16, uint64_t, uint16_t, 0, 16, 32, 0)
+     static void name(void *restrict src, void *restrict dst[], int w) {     \
+         for (int x = 0; x < w; x++) {                                       \
+             packed_t c = ((packed_t *)src)[x];                              \
+-            ((plane_t *)dst[0])[x] = (c >> (sh_c0)) & (mask);               \
+-            ((plane_t *)dst[1])[x] = (c >> (sh_c1)) & (mask);               \
++            ((plane_t *)dst[0])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c0, packed_t, plane_t)) & (mask);       \
++            ((plane_t *)dst[1])[x] =                                        \
++                (c >> LANE_SHIFT(sh_c1, packed_t, plane_t)) & (mask);       \
+         }                                                                   \
+     }
+ 
+@@ -379,8 +433,9 @@ static void setup_packed_packer(struct mp_repack *rp)
+     for (int i = 0; i < MP_ARRAY_SIZE(regular_repackers); i++) {
+         const struct regular_repacker *pa = &regular_repackers[i];
+ 
+-        // The following may assume little endian (because some repack backends
+-        // use word access, while the metadata here uses byte access).
++        // The metadata here uses byte access, while the word repack backends
++        // access the packed pixel as a single native word; LANE_SHIFT in the
++        // backends reconciles the two on big endian hosts.
+ 
+         int prepad = components[0] ? 0 : 8;
+         int first_comp = components[0] ? 0 : 1;
+-- 
+2.43.0
+
