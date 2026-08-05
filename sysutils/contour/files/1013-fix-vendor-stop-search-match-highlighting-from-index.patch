@@ -1,0 +1,185 @@
+From 70397c9c6932acf3639f22b2abdc5b1f0e3bd583 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 4 Aug 2026 20:50:49 +0000
+Subject: [PATCH] fix(vendor): stop search-match highlighting from indexing the
+ render buffer out of bounds
+
+Crash report from real hardware: scrolling shigoku (a TUI that renders kitty
+images) a few times aborted with `terminate called after throwing an
+instance of 'std::length_error' what(): basic_string::_S_create`, deep
+inside the Cocoa run loop -- nowhere near anything that touches a string.
+That is the signature of heap corruption surfacing later in an unrelated
+allocation, not a fault at the abort site.
+
+RenderBufferBuilder::matchSearchPattern() computed the start of a completed
+search/highlight match as:
+
+    auto const offsetIntoFront = _output->cells.size() - _searchPatternOffset;
+
+`_output->cells` gains exactly one entry per grid CELL rendered.
+`_searchPatternOffset` accumulates CODEPOINTS matched (cellText.
+codepointCount() per cell). These agree for ordinary text, where a cell
+holds one codepoint, so the subtraction never underflowed in practice. A
+resolved kitty Unicode placeholder cell (the T3 virtual-placement feature)
+holds up to four codepoints -- base U+10EEEE plus row/column/id diacritics
+-- behind a single cells[] entry. A search or double-click word-highlight
+pattern (HighlightSearchMatches::Yes fires whenever _search.pattern is
+non-empty, no explicit search session required -- see
+Terminal::updateSelectionMatches, wired into ordinary Shift+Click and
+double-click selection) that completes within a short run of placeholder
+cells can match more codepoints than cells have been emitted, making
+_searchPatternOffset exceed _output->cells.size(). The size_t subtraction
+wraps to a huge value, and the next line indexes _output->cells[
+offsetIntoFront] with an unchecked operator[] -- a wild out-of-bounds
+read/write. (The same unit mismatch was already latent for any ordinary
+multi-codepoint grapheme cluster; placeholder cells just made it common
+instead of a rare combining-mark edge case.)
+
+Fix: track cells consumed by the in-progress match separately from
+codepoints matched (_searchPatternCellCount alongside _searchPatternOffset,
+reset and incremented in lock-step at every existing site), and derive
+offsetIntoFront from the cell count so the units actually match what is
+being indexed.
+
+Regression test drives two adjacent resolved placeholder cells at the start
+of a line with a 6-codepoint search pattern set to their exact codepoints,
+completing the match on the second cell when only two entries exist in the
+render buffer's cell list -- the smallest-cells/most-codepoints case that
+used to underflow.
+
+Risk: contained to search/hint-mode highlight rendering; unrelated to
+placement, eviction, or scroll logic. No local build available on this
+host (known OOM/hang on this Linux box compiling the engine); verified by
+tracing the exact call chain (Terminal::onBufferScrolled ->
+RenderBufferBuilder::renderCell -> matchSearchPattern) and unit
+definitions (CellProxy::codepointCount() == clusterSize[_col],
+Search::pattern as std::u32string) against the current source, plus two
+independent adversarial-agent passes confirming no earlier guard prevents
+the underflow.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013cGNPqEn4CcfaGiGmydMNr
+---
+ src/vtbackend/KittyGraphics_test.cpp  | 35 +++++++++++++++++++++++++++
+ src/vtbackend/RenderBufferBuilder.cpp | 12 ++++++---
+ src/vtbackend/RenderBufferBuilder.h   |  8 +++++-
+ 3 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/src/vtbackend/KittyGraphics_test.cpp b/src/vtbackend/KittyGraphics_test.cpp
+index ee79d993..46b8fdfa 100644
+--- a/src/vtbackend/KittyGraphics_test.cpp
++++ b/src/vtbackend/KittyGraphics_test.cpp
+@@ -1002,6 +1002,41 @@ TEST_CASE("KittyGraphics.placeholder.a_uniform_pen_line_of_placeholders_never_re
+     CHECK_FALSE(placeholderTextSeen);
+ }
+ 
++TEST_CASE("KittyGraphics.placeholder.search_match_completing_within_placeholder_cells_does_not_underflow",
++          "[kitty]")
++{
++    // Regression test for RenderBufferBuilder::matchSearchPattern(): a resolved placeholder cell
++    // carries several codepoints (base + row/column diacritics) behind ONE entry in the render
++    // buffer's cell list. The match-completion arithmetic used to compute the highlighted range's
++    // start by subtracting CODEPOINTS matched from cells EMITTED -- two different units that happen
++    // to agree for plain text but not here, where two placeholder cells alone supply enough
++    // codepoints to satisfy a short pattern. That underflowed size_t and indexed the cell vector out
++    // of bounds. A search pattern set to the exact codepoints of two adjacent placeholder cells,
++    // starting at the first cell of the line (so as few cells as possible have been emitted when the
++    // match completes), reproduces the smallest-cells/most-codepoints case.
++    auto mock = MockTerm<vtpty::MockPty> { PageSize { LineCount(4), ColumnCount(8) } };
++    mock.terminal.setCellPixelSize(ImageSize { Width(2), Height(2) });
++    transmitTestImage(mock, 1);
++    mock.writeToScreen("\033_Ga=p,U=1,i=1,c=2,r=1,q=2\033\\"sv);
++
++    mock.writeToScreen("\033[38;5;1m"sv);
++    mock.writeToScreen(utf8({ Placeholder, RowCol0, RowCol0 }) + utf8({ Placeholder, RowCol1, RowCol0 }));
++    mock.writeToScreen("\033[39m"sv);
++
++    auto& screen = mock.terminal.primaryScreen();
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(0)).codepointCount() == 3);
++    REQUIRE(screen.at(LineOffset(0), ColumnOffset(1)).codepointCount() == 3);
++
++    // Six codepoints spread over two cells: completes the match on the second cell, when only two
++    // entries exist in the render buffer's cell list for this line so far.
++    auto const pattern =
++        std::u32string { Placeholder, RowCol0, RowCol0, Placeholder, RowCol1, RowCol0 };
++    mock.terminal.setNewSearchTerm(pattern, false);
++
++    mock.terminal.refreshRenderBuffer(); // must not corrupt the heap or crash
++    CHECK(mock.terminal.search().pattern == pattern);
++}
++
+ // -- iTerm2 (OSC 1337) --------------------------------------------------------------------------
+ 
+ TEST_CASE("ITerm2.capabilities_are_reported", "[iterm2]")
+diff --git a/src/vtbackend/RenderBufferBuilder.cpp b/src/vtbackend/RenderBufferBuilder.cpp
+index 389e8757..ced3608b 100644
+--- a/src/vtbackend/RenderBufferBuilder.cpp
++++ b/src/vtbackend/RenderBufferBuilder.cpp
+@@ -464,6 +464,7 @@ void RenderBufferBuilder::renderTrivialLine(TrivialLineBuffer const& lineBuffer,
+     // renderer and the grid disagree in GitHub #1752. An empty line has no text and only wants the
+     // fill loop below.
+     _searchPatternOffset = 0;
++    _searchPatternCellCount = 0;
+     renderGridText(CellLocation { .line = lineOffset, .column = ColumnOffset(0) },
+                    lineBuffer.textAttributes,
+                    textOverride);
+@@ -516,6 +517,7 @@ void RenderBufferBuilder::matchSearchPattern(T const& cellText)
+     {
+         // match fail
+         _searchPatternOffset = 0;
++        _searchPatternCellCount = 0;
+         return;
+     }
+ 
+@@ -523,13 +525,16 @@ void RenderBufferBuilder::matchSearchPattern(T const& cellText)
+         _searchPatternOffset += cellText.codepointCount();
+     else
+         _searchPatternOffset += cellText.size();
++    ++_searchPatternCellCount;
+ 
+     if (_searchPatternOffset < search.pattern.size())
+         return; // match incomplete
+ 
+-    // match complete
+-
+-    auto const offsetIntoFront = _output->cells.size() - _searchPatternOffset;
++    // match complete: offsetIntoFront is an index into _output->cells, so it must be computed in
++    // CELLS (_searchPatternCellCount), not codepoints (_searchPatternOffset) -- a cell can carry
++    // several codepoints (a grapheme cluster, or up to four for a kitty Unicode placeholder), which
++    // used to let this underflow into a huge size_t and index _output->cells wildly out of bounds.
++    auto const offsetIntoFront = _output->cells.size() - _searchPatternCellCount;
+ 
+     auto const isFocusedMatch =
+         CellLocationRange {
+@@ -568,6 +573,7 @@ void RenderBufferBuilder::matchSearchPattern(T const& cellText)
+         cellAttributes.foregroundColor = searchMatchColors.foreground;
+     }
+     _searchPatternOffset = 0;
++    _searchPatternCellCount = 0;
+ }
+ 
+ void RenderBufferBuilder::startLine(LineOffset line, LineFlags flags) noexcept
+diff --git a/src/vtbackend/RenderBufferBuilder.h b/src/vtbackend/RenderBufferBuilder.h
+index b50d2651..9ba153da 100644
+--- a/src/vtbackend/RenderBufferBuilder.h
++++ b/src/vtbackend/RenderBufferBuilder.h
+@@ -178,9 +178,15 @@ class RenderBufferBuilder
+     LineOffset _lineNr = LineOffset(0);
+     bool _useCursorlineColoring = false;
+ 
+-    // Offset into the search pattern that has been already matched.
++    // Offset into the search pattern that has been already matched, in CODEPOINTS.
+     size_t _searchPatternOffset = 0;
+ 
++    // Number of entries in _output->cells consumed by the in-progress match, in CELLS. A cell may
++    // carry several codepoints (a grapheme cluster, or up to four for a kitty Unicode placeholder),
++    // so this can differ from _searchPatternOffset -- the two must never be subtracted from one
++    // another or from _output->cells.size(), which is counted in cells.
++    size_t _searchPatternCellCount = 0;
++
+     // Current line flags being rendered.
+     LineFlags _currentLineFlags = LineFlag::None;
+ };
+-- 
+2.43.0
+
