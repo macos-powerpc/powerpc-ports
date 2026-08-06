@@ -1,0 +1,2600 @@
+From b6a1e46d640c18b7aac65eb91e041c894398c4cd Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 4 Aug 2026 16:23:21 +0000
+Subject: [PATCH 32/32] Add owl-egl, a client-side EGL-over-CGL library for
+ hardware GL
+
+Wayland GL clients under owl have so far rendered through Mesa
+swrast into wl_shm buffers. owl-egl is a drop-in libEGL.1.dylib that
+renders through CGL (the real GPU) into IOSurface-backed FBOs and
+shares them with the compositor over the existing
+zowl_iosurface_manager_v1 / zowl_mach_ipc_v1 protocols, whose
+compositor half has been waiting for exactly this client.
+
+EGL 1.4, desktop OpenGL only (CGL has no GLES), window surfaces
+only, wayland platform only. The client's "framebuffer 0" is the
+surface's back FBO: eglMakeCurrent leaves it bound, and clients that
+resolve GL through eglGetProcAddress (mpv, SDL2, EGL-built epoxy)
+get thin wrappers that remap explicit binds of 0 and the
+corresponding glGetIntegerv queries. Buffers (up to 3, lazily
+created, resized on acquisition) ride a private wayland event queue;
+eglSwapBuffers throttles on wl_surface.frame per the swap interval.
+EGL 1.5 entry points exist as failing stubs so binaries linked
+against Mesa's libEGL still load with this one substituted.
+
+Plain C, no ObjC and no blocks, -mmacosx-version-min=10.6 (on 10.5
+there is no IOSurface; software rendering remains the path there).
+Built by its own Makefile, Mac-only: wayland-scanner client code for
+the two owl protocols plus MIG user stubs from the same .defs the
+compositor builds its server stubs from. Installs into
+PREFIX/lib/owl-egl/ so it never collides with Mesa's libEGL; clients
+opt in with DYLD_LIBRARY_PATH=/opt/local/lib/owl-egl (dyld overrides
+by leaf name, no relinking).
+
+See HWGL.md at the repository root for the full design, the
+compositor survey it rests on, and the testing plan.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JBirQAT1FHQnSdUZ8fWdNw
+---
+ owl-egl/Makefile          |  102 +++
+ owl-egl/egl-core.c        | 1408 +++++++++++++++++++++++++++++++++++++
+ owl-egl/egl-fbzero.c      |  116 +++
+ owl-egl/egl-mach.c        |  153 ++++
+ owl-egl/egl-wayland.c     |  543 ++++++++++++++
+ owl-egl/owl-egl-private.h |  186 +++++
+ 6 files changed, 2508 insertions(+)
+ create mode 100644 owl-egl/Makefile
+ create mode 100644 owl-egl/egl-core.c
+ create mode 100644 owl-egl/egl-fbzero.c
+ create mode 100644 owl-egl/egl-mach.c
+ create mode 100644 owl-egl/egl-wayland.c
+ create mode 100644 owl-egl/owl-egl-private.h
+
+diff --git a/owl-egl/Makefile b/owl-egl/Makefile
+new file mode 100644
+index 0000000..c13990c
+--- /dev/null
++++ b/owl-egl/Makefile
+@@ -0,0 +1,102 @@
++# This file is part of Owl.
++#
++# owl-egl: client-side EGL over CGL + IOSurface. Mac-only, like the
++# rest of owl; see HWGL.md at the repository root.
++#
++# Build:    make [PREFIX=/opt/local]
++# Install:  make install [PREFIX=/opt/local] [DESTDIR=...]
++#
++# The library installs into $(PREFIX)/lib/owl-egl/ so it never
++# collides with Mesa's libEGL; clients opt in at runtime with
++#   DYLD_LIBRARY_PATH=$(PREFIX)/lib/owl-egl <client>
++# (dyld overrides by leaf name, so no relinking is needed).
++#
++# EGL headers come from the installed mesa port, whose eglplatform.h
++# carries the Apple pointer-native-types fix; this library implements
++# that ABI.
++
++PREFIX ?= /opt/local
++CC ?= cc
++PKG_CONFIG ?= pkg-config
++WAYLAND_SCANNER ?= wayland-scanner
++MIG ?= mig
++
++PROTO = ../Sources/Protocol
++
++LIB = libEGL.1.dylib
++LIBDIR = $(PREFIX)/lib/owl-egl
++
++CFLAGS ?= -O2 -g
++CFLAGS += -Wall -std=gnu99 -mmacosx-version-min=10.6 -I. \
++	$(shell $(PKG_CONFIG) --cflags wayland-client wayland-egl-backend egl)
++LIBS = $(shell $(PKG_CONFIG) --libs wayland-client) \
++	-framework OpenGL -framework IOSurface -framework CoreFoundation
++
++SCANNER_HEADERS = \
++	owl-mach-ipc-unstable-v1-client-protocol.h \
++	owl-iosurface-unstable-v1-client-protocol.h
++MIG_HEADERS = \
++	owl-mach-ipc-unstable-v1-mig.h \
++	owl-iosurface-unstable-v1-mig.h
++GENERATED_HEADERS = $(SCANNER_HEADERS) $(MIG_HEADERS)
++
++OBJS = \
++	egl-core.o \
++	egl-wayland.o \
++	egl-mach.o \
++	egl-fbzero.o \
++	owl-mach-ipc-unstable-v1-protocol.o \
++	owl-iosurface-unstable-v1-protocol.o \
++	owl-mach-ipc-unstable-v1-mig-user.o \
++	owl-iosurface-unstable-v1-mig-user.o
++
++all: $(LIB)
++
++$(LIB): $(OBJS)
++	$(CC) -dynamiclib -o $@ $(OBJS) \
++		-install_name $(LIBDIR)/$(LIB) \
++		-compatibility_version 1 -current_version 1 \
++		-mmacosx-version-min=10.6 \
++		$(LIBS)
++	ln -sf $(LIB) libEGL.dylib
++
++%-client-protocol.h: $(PROTO)/%.xml
++	$(WAYLAND_SCANNER) client-header $< $@
++
++%-protocol.c: $(PROTO)/%.xml
++	$(WAYLAND_SCANNER) private-code $< $@
++
++# The MIG import of the -mig-types.h header ends up as an #include in
++# the generated code; -I$(PROTO) on the compile lines resolves it.
++owl-mach-ipc-unstable-v1-mig-user.c owl-mach-ipc-unstable-v1-mig.h: \
++		$(PROTO)/owl-mach-ipc-unstable-v1-mig.defs
++	$(MIG) -user owl-mach-ipc-unstable-v1-mig-user.c \
++		-header owl-mach-ipc-unstable-v1-mig.h \
++		-server /dev/null -sheader /dev/null $<
++
++owl-iosurface-unstable-v1-mig-user.c owl-iosurface-unstable-v1-mig.h: \
++		$(PROTO)/owl-iosurface-unstable-v1-mig.defs
++	$(MIG) -user owl-iosurface-unstable-v1-mig-user.c \
++		-header owl-iosurface-unstable-v1-mig.h \
++		-server /dev/null -sheader /dev/null $<
++
++%.o: %.c
++	$(CC) $(CFLAGS) -I$(PROTO) -c -o $@ $<
++
++egl-core.o egl-wayland.o egl-mach.o egl-fbzero.o: \
++	owl-egl-private.h $(GENERATED_HEADERS)
++
++install: $(LIB)
++	mkdir -p $(DESTDIR)$(LIBDIR)
++	cp $(LIB) $(DESTDIR)$(LIBDIR)/
++	ln -sf $(LIB) $(DESTDIR)$(LIBDIR)/libEGL.dylib
++
++clean:
++	rm -f $(LIB) libEGL.dylib $(OBJS) \
++		$(GENERATED_HEADERS) \
++		owl-mach-ipc-unstable-v1-protocol.c \
++		owl-iosurface-unstable-v1-protocol.c \
++		owl-mach-ipc-unstable-v1-mig-user.c \
++		owl-iosurface-unstable-v1-mig-user.c
++
++.PHONY: all install clean
+diff --git a/owl-egl/egl-core.c b/owl-egl/egl-core.c
+new file mode 100644
+index 0000000..3382c70
+--- /dev/null
++++ b/owl-egl/egl-core.c
+@@ -0,0 +1,1408 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2026 Sergey Fedorov
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* The EGL entry points. EGL 1.4, OpenGL (desktop) API only, window
++ * surfaces only, wayland platform only. EGL 1.5 entry points exist as
++ * failing stubs so that binaries linked against a full EGL 1.5
++ * library (Mesa) still load with this one substituted via
++ * DYLD_LIBRARY_PATH.
++ */
++
++#include "owl-egl-private.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <dlfcn.h>
++
++#define OWL_EGL_VERSION_MAJOR 1
++#define OWL_EGL_VERSION_MINOR 4
++
++/* ---------- Per-thread state ---------- */
++
++pthread_mutex_t owl_egl_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static pthread_key_t thread_state_key;
++static pthread_once_t thread_state_once = PTHREAD_ONCE_INIT;
++
++static void thread_state_destroy(void *state) {
++    free(state);
++}
++
++static void thread_state_init(void) {
++    pthread_key_create(&thread_state_key, thread_state_destroy);
++}
++
++struct owl_egl_thread *owl_egl_thread_state(void) {
++    struct owl_egl_thread *thread;
++
++    pthread_once(&thread_state_once, thread_state_init);
++    thread = pthread_getspecific(thread_state_key);
++    if (thread == NULL) {
++        thread = calloc(1, sizeof *thread);
++        thread->error = EGL_SUCCESS;
++        /* The spec's initial per-thread API is OpenGL ES, which we do
++         * not implement at all; starting at OpenGL forgives clients
++         * that forget eglBindAPI. */
++        thread->api = EGL_OPENGL_API;
++        pthread_setspecific(thread_state_key, thread);
++    }
++    return thread;
++}
++
++void owl_egl_set_error(EGLint error) {
++    owl_egl_thread_state()->error = error;
++}
++
++EGLAPI EGLint EGLAPIENTRY eglGetError(void) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++    EGLint error = thread->error;
++
++    thread->error = EGL_SUCCESS;
++    return error;
++}
++
++/* ---------- Displays ---------- */
++
++static struct owl_egl_display *displays;
++
++static struct owl_egl_display *display_from_handle(EGLDisplay handle) {
++    struct owl_egl_display *display;
++
++    pthread_mutex_lock(&owl_egl_lock);
++    for (display = displays; display != NULL; display = display->next) {
++        if ((EGLDisplay) display == handle) {
++            break;
++        }
++    }
++    pthread_mutex_unlock(&owl_egl_lock);
++    return display;
++}
++
++static EGLDisplay display_get(struct wl_display *wl_display) {
++    struct owl_egl_display *display;
++
++    if (wl_display == NULL) {
++        return EGL_NO_DISPLAY;
++    }
++
++    pthread_mutex_lock(&owl_egl_lock);
++    for (display = displays; display != NULL; display = display->next) {
++        if (display->wl_display == wl_display) {
++            pthread_mutex_unlock(&owl_egl_lock);
++            return (EGLDisplay) display;
++        }
++    }
++    display = calloc(1, sizeof *display);
++    if (display != NULL) {
++        display->wl_display = wl_display;
++        display->server_port = MACH_PORT_NULL;
++        display->next = displays;
++        displays = display;
++    }
++    pthread_mutex_unlock(&owl_egl_lock);
++    return display != NULL ? (EGLDisplay) display : EGL_NO_DISPLAY;
++}
++
++EGLAPI EGLDisplay EGLAPIENTRY eglGetDisplay(EGLNativeDisplayType native) {
++    /* With the Apple eglplatform.h fix, EGLNativeDisplayType is a
++     * pointer; clients under owl pass their wl_display. We never own
++     * a wl_display connection ourselves, so EGL_DEFAULT_DISPLAY is
++     * not supported. */
++    owl_egl_set_error(EGL_SUCCESS);
++    return display_get((struct wl_display *) native);
++}
++
++EGLAPI EGLDisplay EGLAPIENTRY eglGetPlatformDisplay(
++    EGLenum platform, void *native_display, const EGLAttrib *attrib_list)
++{
++    if (platform != EGL_PLATFORM_WAYLAND_KHR) {
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return EGL_NO_DISPLAY;
++    }
++    owl_egl_set_error(EGL_SUCCESS);
++    return display_get((struct wl_display *) native_display);
++}
++
++EGLAPI EGLDisplay EGLAPIENTRY eglGetPlatformDisplayEXT(
++    EGLenum platform, void *native_display, const EGLint *attrib_list)
++{
++    return eglGetPlatformDisplay(platform, native_display, NULL);
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglInitialize(
++    EGLDisplay handle, EGLint *major, EGLint *minor)
++{
++    struct owl_egl_display *display = display_from_handle(handle);
++
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++
++    pthread_mutex_lock(&owl_egl_lock);
++    if (!display->initialized) {
++        if (!owl_egl_display_connect(display)) {
++            owl_egl_display_disconnect(display);
++            pthread_mutex_unlock(&owl_egl_lock);
++            owl_egl_set_error(EGL_NOT_INITIALIZED);
++            return EGL_FALSE;
++        }
++        display->initialized = EGL_TRUE;
++    }
++    pthread_mutex_unlock(&owl_egl_lock);
++
++    if (major != NULL) {
++        *major = OWL_EGL_VERSION_MAJOR;
++    }
++    if (minor != NULL) {
++        *minor = OWL_EGL_VERSION_MINOR;
++    }
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglTerminate(EGLDisplay handle) {
++    struct owl_egl_display *display = display_from_handle(handle);
++
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    /* Contexts and surfaces the application failed to destroy are not
++     * tracked and not freed here; the display handle itself stays
++     * valid for a later eglInitialize, per spec. */
++    pthread_mutex_lock(&owl_egl_lock);
++    if (display->initialized) {
++        owl_egl_display_disconnect(display);
++        display->initialized = EGL_FALSE;
++    }
++    pthread_mutex_unlock(&owl_egl_lock);
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++static const char *client_extensions =
++    "EGL_EXT_platform_base "
++    "EGL_KHR_platform_wayland "
++    "EGL_EXT_platform_wayland "
++    "EGL_KHR_client_get_all_proc_addresses";
++
++static const char *display_extensions =
++    "EGL_KHR_get_all_proc_addresses";
++
++EGLAPI const char *EGLAPIENTRY eglQueryString(
++    EGLDisplay handle, EGLint name)
++{
++    struct owl_egl_display *display;
++
++    if (handle == EGL_NO_DISPLAY) {
++        if (name == EGL_EXTENSIONS) {
++            owl_egl_set_error(EGL_SUCCESS);
++            return client_extensions;
++        }
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return NULL;
++    }
++
++    display = display_from_handle(handle);
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return NULL;
++    }
++    if (!display->initialized) {
++        owl_egl_set_error(EGL_NOT_INITIALIZED);
++        return NULL;
++    }
++
++    owl_egl_set_error(EGL_SUCCESS);
++    switch (name) {
++    case EGL_VENDOR:
++        return "owl";
++    case EGL_VERSION:
++        return "1.4 owl-egl";
++    case EGL_CLIENT_APIS:
++        return "OpenGL";
++    case EGL_EXTENSIONS:
++        return display_extensions;
++    default:
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return NULL;
++    }
++}
++
++/* ---------- Configs ---------- */
++
++static const struct owl_egl_config configs[] = {
++    /* id  r  g  b  a  depth stencil */
++    {  1,  8, 8, 8, 8, 24,   8 },
++    {  2,  8, 8, 8, 8,  0,   0 },
++    {  3,  8, 8, 8, 0, 24,   8 },
++    {  4,  8, 8, 8, 0,  0,   0 },
++};
++
++#define OWL_EGL_CONFIG_COUNT \
++    ((EGLint) (sizeof(configs) / sizeof(configs[0])))
++
++static const struct owl_egl_config *config_from_handle(EGLConfig handle) {
++    const struct owl_egl_config *config = handle;
++
++    if (config >= configs && config < configs + OWL_EGL_CONFIG_COUNT) {
++        return config;
++    }
++    return NULL;
++}
++
++static EGLBoolean config_get_attrib(const struct owl_egl_config *config,
++                                    EGLint attribute, EGLint *value)
++{
++    switch (attribute) {
++    case EGL_BUFFER_SIZE:
++        *value = config->red_size + config->green_size +
++                 config->blue_size + config->alpha_size;
++        break;
++    case EGL_RED_SIZE:
++        *value = config->red_size;
++        break;
++    case EGL_GREEN_SIZE:
++        *value = config->green_size;
++        break;
++    case EGL_BLUE_SIZE:
++        *value = config->blue_size;
++        break;
++    case EGL_ALPHA_SIZE:
++        *value = config->alpha_size;
++        break;
++    case EGL_DEPTH_SIZE:
++        *value = config->depth_size;
++        break;
++    case EGL_STENCIL_SIZE:
++        *value = config->stencil_size;
++        break;
++    case EGL_CONFIG_ID:
++        *value = config->config_id;
++        break;
++    case EGL_SURFACE_TYPE:
++        *value = EGL_WINDOW_BIT;
++        break;
++    case EGL_RENDERABLE_TYPE:
++    case EGL_CONFORMANT:
++        *value = EGL_OPENGL_BIT;
++        break;
++    case EGL_NATIVE_RENDERABLE:
++        *value = EGL_TRUE;
++        break;
++    case EGL_NATIVE_VISUAL_ID:
++    case EGL_NATIVE_VISUAL_TYPE:
++        *value = 0;
++        break;
++    case EGL_CONFIG_CAVEAT:
++        *value = EGL_NONE;
++        break;
++    case EGL_COLOR_BUFFER_TYPE:
++        *value = EGL_RGB_BUFFER;
++        break;
++    case EGL_MIN_SWAP_INTERVAL:
++        *value = 0;
++        break;
++    case EGL_MAX_SWAP_INTERVAL:
++        *value = 1;
++        break;
++    case EGL_SAMPLES:
++    case EGL_SAMPLE_BUFFERS:
++    case EGL_LEVEL:
++    case EGL_LUMINANCE_SIZE:
++    case EGL_ALPHA_MASK_SIZE:
++    case EGL_MAX_PBUFFER_WIDTH:
++    case EGL_MAX_PBUFFER_HEIGHT:
++    case EGL_MAX_PBUFFER_PIXELS:
++        *value = 0;
++        break;
++    case EGL_TRANSPARENT_TYPE:
++        *value = EGL_NONE;
++        break;
++    case EGL_TRANSPARENT_RED_VALUE:
++    case EGL_TRANSPARENT_GREEN_VALUE:
++    case EGL_TRANSPARENT_BLUE_VALUE:
++        *value = 0;
++        break;
++    case EGL_BIND_TO_TEXTURE_RGB:
++    case EGL_BIND_TO_TEXTURE_RGBA:
++        *value = EGL_FALSE;
++        break;
++    default:
++        return EGL_FALSE;
++    }
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglGetConfigAttrib(
++    EGLDisplay handle, EGLConfig config_handle,
++    EGLint attribute, EGLint *value)
++{
++    const struct owl_egl_config *config;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    config = config_from_handle(config_handle);
++    if (config == NULL) {
++        owl_egl_set_error(EGL_BAD_CONFIG);
++        return EGL_FALSE;
++    }
++    if (value == NULL || !config_get_attrib(config, attribute, value)) {
++        owl_egl_set_error(EGL_BAD_ATTRIBUTE);
++        return EGL_FALSE;
++    }
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglGetConfigs(
++    EGLDisplay handle, EGLConfig *config_handles,
++    EGLint config_size, EGLint *num_config)
++{
++    EGLint i, count;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (num_config == NULL) {
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return EGL_FALSE;
++    }
++    count = OWL_EGL_CONFIG_COUNT;
++    if (config_handles != NULL) {
++        if (count > config_size) {
++            count = config_size;
++        }
++        for (i = 0; i < count; i++) {
++            config_handles[i] = (EGLConfig) &configs[i];
++        }
++    }
++    *num_config = count;
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglChooseConfig(
++    EGLDisplay handle, const EGLint *attrib_list,
++    EGLConfig *config_handles, EGLint config_size, EGLint *num_config)
++{
++    /* Requested minimums / exact values. */
++    EGLint want_surface_type = EGL_WINDOW_BIT;
++    /* Spec default for EGL_RENDERABLE_TYPE is EGL_OPENGL_ES_BIT; we
++     * honor that (an ES-only request correctly matches nothing here
++     * and lets clients fall back to their desktop GL path). */
++    EGLint want_renderable = EGL_OPENGL_ES_BIT;
++    EGLint want_red = 0, want_green = 0, want_blue = 0, want_alpha = 0;
++    EGLint want_depth = 0, want_stencil = 0, want_buffer_size = 0;
++    EGLint want_samples = 0, want_sample_buffers = 0;
++    EGLint want_config_id = EGL_DONT_CARE;
++    EGLint i, count = 0;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (num_config == NULL) {
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return EGL_FALSE;
++    }
++
++    for (i = 0; attrib_list != NULL && attrib_list[i] != EGL_NONE; i += 2) {
++        EGLint attribute = attrib_list[i];
++        EGLint value = attrib_list[i + 1];
++
++        switch (attribute) {
++        case EGL_SURFACE_TYPE:
++            want_surface_type = value;
++            break;
++        case EGL_RENDERABLE_TYPE:
++            want_renderable = value;
++            break;
++        case EGL_RED_SIZE:
++            want_red = value;
++            break;
++        case EGL_GREEN_SIZE:
++            want_green = value;
++            break;
++        case EGL_BLUE_SIZE:
++            want_blue = value;
++            break;
++        case EGL_ALPHA_SIZE:
++            want_alpha = value;
++            break;
++        case EGL_DEPTH_SIZE:
++            want_depth = value;
++            break;
++        case EGL_STENCIL_SIZE:
++            want_stencil = value;
++            break;
++        case EGL_BUFFER_SIZE:
++            want_buffer_size = value;
++            break;
++        case EGL_SAMPLES:
++            want_samples = value;
++            break;
++        case EGL_SAMPLE_BUFFERS:
++            want_sample_buffers = value;
++            break;
++        case EGL_CONFIG_ID:
++            want_config_id = value;
++            break;
++        /* Accepted and ignored: either matching is trivially true
++         * for our configs, or clients pass defaults. */
++        case EGL_CONFIG_CAVEAT:
++        case EGL_COLOR_BUFFER_TYPE:
++        case EGL_LEVEL:
++        case EGL_NATIVE_RENDERABLE:
++        case EGL_NATIVE_VISUAL_TYPE:
++        case EGL_TRANSPARENT_TYPE:
++        case EGL_TRANSPARENT_RED_VALUE:
++        case EGL_TRANSPARENT_GREEN_VALUE:
++        case EGL_TRANSPARENT_BLUE_VALUE:
++        case EGL_MIN_SWAP_INTERVAL:
++        case EGL_MAX_SWAP_INTERVAL:
++        case EGL_LUMINANCE_SIZE:
++        case EGL_ALPHA_MASK_SIZE:
++        case EGL_BIND_TO_TEXTURE_RGB:
++        case EGL_BIND_TO_TEXTURE_RGBA:
++        case EGL_MAX_PBUFFER_WIDTH:
++        case EGL_MAX_PBUFFER_HEIGHT:
++        case EGL_MAX_PBUFFER_PIXELS:
++            break;
++        default:
++            owl_egl_set_error(EGL_BAD_ATTRIBUTE);
++            return EGL_FALSE;
++        }
++    }
++
++    for (i = 0; i < OWL_EGL_CONFIG_COUNT; i++) {
++        const struct owl_egl_config *config = &configs[i];
++
++        if (want_config_id != EGL_DONT_CARE) {
++            if (config->config_id != want_config_id) {
++                continue;
++            }
++        } else {
++            if (want_surface_type != EGL_DONT_CARE &&
++                (EGL_WINDOW_BIT & want_surface_type) != want_surface_type)
++            {
++                continue;
++            }
++            if (want_renderable != EGL_DONT_CARE &&
++                (EGL_OPENGL_BIT & want_renderable) != want_renderable)
++            {
++                continue;
++            }
++            if ((want_red != EGL_DONT_CARE &&
++                 config->red_size < want_red) ||
++                (want_green != EGL_DONT_CARE &&
++                 config->green_size < want_green) ||
++                (want_blue != EGL_DONT_CARE &&
++                 config->blue_size < want_blue) ||
++                (want_alpha != EGL_DONT_CARE &&
++                 config->alpha_size < want_alpha) ||
++                (want_depth != EGL_DONT_CARE &&
++                 config->depth_size < want_depth) ||
++                (want_stencil != EGL_DONT_CARE &&
++                 config->stencil_size < want_stencil))
++            {
++                continue;
++            }
++            if (want_buffer_size != EGL_DONT_CARE &&
++                config->red_size + config->green_size +
++                config->blue_size + config->alpha_size < want_buffer_size)
++            {
++                continue;
++            }
++            if ((want_samples != EGL_DONT_CARE && want_samples > 0) ||
++                (want_sample_buffers != EGL_DONT_CARE &&
++                 want_sample_buffers > 0))
++            {
++                continue;
++            }
++        }
++
++        if (config_handles != NULL && count < config_size) {
++            config_handles[count] = (EGLConfig) config;
++        }
++        count++;
++    }
++
++    if (config_handles != NULL && count > config_size) {
++        count = config_size;
++    }
++    *num_config = count;
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++/* ---------- API binding ---------- */
++
++EGLAPI EGLBoolean EGLAPIENTRY eglBindAPI(EGLenum api) {
++    if (api != EGL_OPENGL_API) {
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return EGL_FALSE;
++    }
++    owl_egl_thread_state()->api = api;
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLenum EGLAPIENTRY eglQueryAPI(void) {
++    return owl_egl_thread_state()->api;
++}
++
++/* ---------- Contexts ---------- */
++
++EGLAPI EGLContext EGLAPIENTRY eglCreateContext(
++    EGLDisplay handle, EGLConfig config_handle,
++    EGLContext share_handle, const EGLint *attrib_list)
++{
++    struct owl_egl_display *display = display_from_handle(handle);
++    const struct owl_egl_config *config;
++    struct owl_egl_context *context, *share = NULL;
++    CGLPixelFormatAttribute attributes[] = {
++        kCGLPFAAccelerated,
++        kCGLPFAColorSize, (CGLPixelFormatAttribute) 24,
++        kCGLPFAAlphaSize, (CGLPixelFormatAttribute) 8,
++        (CGLPixelFormatAttribute) 0
++    };
++    CGLPixelFormatObj pixel_format;
++    GLint virtual_screens = 0;
++    CGLError cgl_error;
++    EGLint i;
++
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_NO_CONTEXT;
++    }
++    if (!display->initialized) {
++        owl_egl_set_error(EGL_NOT_INITIALIZED);
++        return EGL_NO_CONTEXT;
++    }
++    config = config_from_handle(config_handle);
++    if (config == NULL) {
++        owl_egl_set_error(EGL_BAD_CONFIG);
++        return EGL_NO_CONTEXT;
++    }
++    if (share_handle != EGL_NO_CONTEXT) {
++        share = share_handle;
++    }
++
++    for (i = 0; attrib_list != NULL && attrib_list[i] != EGL_NONE; i += 2) {
++        EGLint attribute = attrib_list[i];
++        EGLint value = attrib_list[i + 1];
++
++        switch (attribute) {
++        case EGL_CONTEXT_CLIENT_VERSION: /* == EGL_CONTEXT_MAJOR_VERSION */
++            if (value > 2) {
++                /* Only the CGL legacy profile (GL 2.x) is offered. */
++                owl_egl_set_error(EGL_BAD_MATCH);
++                return EGL_NO_CONTEXT;
++            }
++            break;
++        default:
++            /* Without EGL_KHR_create_context advertised, clients
++             * should not pass anything else; be forgiving. */
++            break;
++        }
++    }
++
++    cgl_error = CGLChoosePixelFormat(
++        attributes, &pixel_format, &virtual_screens);
++    if (cgl_error != kCGLNoError || virtual_screens == 0 ||
++        pixel_format == NULL)
++    {
++        /* No accelerated renderer (VM, headless): fail here so the
++         * user falls back to Mesa swrast rather than getting Apple's
++         * software renderer by accident. */
++        fprintf(
++            stderr,
++            "owl-egl: no accelerated CGL renderer: %s\n",
++            CGLErrorString(cgl_error)
++        );
++        owl_egl_set_error(EGL_BAD_MATCH);
++        return EGL_NO_CONTEXT;
++    }
++
++    context = calloc(1, sizeof *context);
++    if (context == NULL) {
++        CGLDestroyPixelFormat(pixel_format);
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_NO_CONTEXT;
++    }
++    context->display = display;
++    context->config = config;
++
++    cgl_error = CGLCreateContext(
++        pixel_format,
++        share != NULL ? share->cgl : NULL,
++        &context->cgl
++    );
++    CGLDestroyPixelFormat(pixel_format);
++    if (cgl_error != kCGLNoError) {
++        fprintf(
++            stderr,
++            "owl-egl: CGLCreateContext failed: %s\n",
++            CGLErrorString(cgl_error)
++        );
++        free(context);
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_NO_CONTEXT;
++    }
++
++    owl_egl_set_error(EGL_SUCCESS);
++    return (EGLContext) context;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglDestroyContext(
++    EGLDisplay handle, EGLContext context_handle)
++{
++    struct owl_egl_context *context = context_handle;
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (context == NULL) {
++        owl_egl_set_error(EGL_BAD_CONTEXT);
++        return EGL_FALSE;
++    }
++    if (thread->current_context == context) {
++        CGLSetCurrentContext(NULL);
++        thread->current_context = NULL;
++        thread->current_surface = NULL;
++        thread->zero_fbo = 0;
++    }
++    CGLDestroyContext(context->cgl);
++    free(context);
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++static int gl_has_extension(const char *extensions, const char *name) {
++    size_t name_length = strlen(name);
++    const char *position = extensions;
++
++    if (extensions == NULL) {
++        return 0;
++    }
++    while ((position = strstr(position, name)) != NULL) {
++        if ((position == extensions || position[-1] == ' ') &&
++            (position[name_length] == ' ' || position[name_length] == '\0'))
++        {
++            return 1;
++        }
++        position += name_length;
++    }
++    return 0;
++}
++
++/* Must run with the context current. */
++static EGLBoolean context_check_extensions(struct owl_egl_context *context) {
++    const char *extensions;
++
++    if (context->checked_extensions) {
++        return context->has_fbo && context->has_texture_rectangle;
++    }
++    context->checked_extensions = 1;
++
++    extensions = (const char *) glGetString(GL_EXTENSIONS);
++    context->has_fbo =
++        gl_has_extension(extensions, "GL_EXT_framebuffer_object") ||
++        gl_has_extension(extensions, "GL_ARB_framebuffer_object");
++    context->has_texture_rectangle =
++        gl_has_extension(extensions, "GL_ARB_texture_rectangle") ||
++        gl_has_extension(extensions, "GL_EXT_texture_rectangle");
++    context->has_packed_depth_stencil =
++        gl_has_extension(extensions, "GL_EXT_packed_depth_stencil");
++
++    if (!context->has_fbo || !context->has_texture_rectangle) {
++        fprintf(
++            stderr,
++            "owl-egl: renderer %s lacks framebuffer objects or "
++            "rectangle textures; hardware GL is not possible here\n",
++            (const char *) glGetString(GL_RENDERER)
++        );
++        return EGL_FALSE;
++    }
++    return EGL_TRUE;
++}
++
++/* ---------- Surfaces ---------- */
++
++static void window_destroyed(void *driver_private) {
++    struct owl_egl_surface *surface = driver_private;
++
++    if (surface != NULL) {
++        surface->window = NULL;
++    }
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreateWindowSurface(
++    EGLDisplay handle, EGLConfig config_handle,
++    EGLNativeWindowType native_window, const EGLint *attrib_list)
++{
++    struct owl_egl_display *display = display_from_handle(handle);
++    const struct owl_egl_config *config;
++    struct wl_egl_window *window = (struct wl_egl_window *) native_window;
++    struct owl_egl_surface *surface;
++
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_NO_SURFACE;
++    }
++    if (!display->initialized) {
++        owl_egl_set_error(EGL_NOT_INITIALIZED);
++        return EGL_NO_SURFACE;
++    }
++    config = config_from_handle(config_handle);
++    if (config == NULL) {
++        owl_egl_set_error(EGL_BAD_CONFIG);
++        return EGL_NO_SURFACE;
++    }
++    if (window == NULL || window->surface == NULL ||
++        window->version != WL_EGL_WINDOW_VERSION)
++    {
++        /* An old-ABI wl_egl_window has a pointer where v3 keeps the
++         * version; wayland ≥ 1.15 (everything on these Macs) is v3. */
++        owl_egl_set_error(EGL_BAD_NATIVE_WINDOW);
++        return EGL_NO_SURFACE;
++    }
++    if (window->driver_private != NULL) {
++        /* Already the target of another EGL surface. */
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_NO_SURFACE;
++    }
++
++    surface = calloc(1, sizeof *surface);
++    if (surface == NULL) {
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_NO_SURFACE;
++    }
++    surface->display = display;
++    surface->config = config;
++    surface->window = window;
++    surface->wl_surface = window->surface;
++    surface->swap_interval = 1;
++
++    surface->wrapped_surface = wl_proxy_create_wrapper(window->surface);
++    if (surface->wrapped_surface == NULL) {
++        free(surface);
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_NO_SURFACE;
++    }
++    wl_proxy_set_queue(
++        (struct wl_proxy *) surface->wrapped_surface, display->queue);
++
++    window->driver_private = surface;
++    window->destroy_window_callback = window_destroyed;
++
++    owl_egl_set_error(EGL_SUCCESS);
++    return (EGLSurface) surface;
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformWindowSurface(
++    EGLDisplay handle, EGLConfig config_handle,
++    void *native_window, const EGLAttrib *attrib_list)
++{
++    return eglCreateWindowSurface(
++        handle, config_handle, (EGLNativeWindowType) native_window, NULL);
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformWindowSurfaceEXT(
++    EGLDisplay handle, EGLConfig config_handle,
++    void *native_window, const EGLint *attrib_list)
++{
++    return eglCreateWindowSurface(
++        handle, config_handle, (EGLNativeWindowType) native_window, NULL);
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglDestroySurface(
++    EGLDisplay handle, EGLSurface surface_handle)
++{
++    struct owl_egl_surface *surface = surface_handle;
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (surface == NULL) {
++        owl_egl_set_error(EGL_BAD_SURFACE);
++        return EGL_FALSE;
++    }
++
++    if (thread->current_surface == surface) {
++        thread->current_surface = NULL;
++        thread->zero_fbo = 0;
++    }
++    if (surface->frame_callback != NULL) {
++        wl_callback_destroy(surface->frame_callback);
++        surface->frame_callback = NULL;
++    }
++    owl_egl_surface_destroy_buffers(surface);
++    if (surface->window != NULL) {
++        surface->window->driver_private = NULL;
++        surface->window->destroy_window_callback = NULL;
++    }
++    wl_proxy_wrapper_destroy(surface->wrapped_surface);
++    free(surface);
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglQuerySurface(
++    EGLDisplay handle, EGLSurface surface_handle,
++    EGLint attribute, EGLint *value)
++{
++    struct owl_egl_surface *surface = surface_handle;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (surface == NULL || value == NULL) {
++        owl_egl_set_error(EGL_BAD_SURFACE);
++        return EGL_FALSE;
++    }
++
++    owl_egl_set_error(EGL_SUCCESS);
++    switch (attribute) {
++    case EGL_WIDTH:
++        *value = surface->window != NULL ? surface->window->width :
++                 (surface->back != NULL ? surface->back->width : 0);
++        return EGL_TRUE;
++    case EGL_HEIGHT:
++        *value = surface->window != NULL ? surface->window->height :
++                 (surface->back != NULL ? surface->back->height : 0);
++        return EGL_TRUE;
++    case EGL_CONFIG_ID:
++        *value = surface->config->config_id;
++        return EGL_TRUE;
++    case EGL_RENDER_BUFFER:
++        *value = EGL_BACK_BUFFER;
++        return EGL_TRUE;
++    case EGL_SWAP_BEHAVIOR:
++        *value = EGL_BUFFER_DESTROYED;
++        return EGL_TRUE;
++    case EGL_MULTISAMPLE_RESOLVE:
++        *value = EGL_MULTISAMPLE_RESOLVE_DEFAULT;
++        return EGL_TRUE;
++    case EGL_HORIZONTAL_RESOLUTION:
++    case EGL_VERTICAL_RESOLUTION:
++    case EGL_PIXEL_ASPECT_RATIO:
++        *value = EGL_UNKNOWN;
++        return EGL_TRUE;
++    case EGL_LARGEST_PBUFFER:
++    case EGL_MIPMAP_TEXTURE:
++    case EGL_MIPMAP_LEVEL:
++        *value = 0;
++        return EGL_TRUE;
++    case EGL_TEXTURE_FORMAT:
++    case EGL_TEXTURE_TARGET:
++        *value = EGL_NO_TEXTURE;
++        return EGL_TRUE;
++    default:
++        owl_egl_set_error(EGL_BAD_ATTRIBUTE);
++        return EGL_FALSE;
++    }
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglSurfaceAttrib(
++    EGLDisplay handle, EGLSurface surface_handle,
++    EGLint attribute, EGLint value)
++{
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++/* ---------- Making current, swapping ---------- */
++
++EGLAPI EGLBoolean EGLAPIENTRY eglMakeCurrent(
++    EGLDisplay handle, EGLSurface draw_handle,
++    EGLSurface read_handle, EGLContext context_handle)
++{
++    struct owl_egl_display *display = display_from_handle(handle);
++    struct owl_egl_surface *surface = draw_handle;
++    struct owl_egl_context *context = context_handle;
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (display == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++
++    if (context == NULL) {
++        if (draw_handle != EGL_NO_SURFACE || read_handle != EGL_NO_SURFACE) {
++            owl_egl_set_error(EGL_BAD_MATCH);
++            return EGL_FALSE;
++        }
++        CGLSetCurrentContext(NULL);
++        thread->current_display = NULL;
++        thread->current_context = NULL;
++        thread->current_surface = NULL;
++        thread->zero_fbo = 0;
++        owl_egl_set_error(EGL_SUCCESS);
++        return EGL_TRUE;
++    }
++
++    if (draw_handle != read_handle || surface == NULL) {
++        /* No separate read surfaces, no surfaceless contexts. */
++        owl_egl_set_error(EGL_BAD_MATCH);
++        return EGL_FALSE;
++    }
++
++    if (CGLSetCurrentContext(context->cgl) != kCGLNoError) {
++        owl_egl_set_error(EGL_BAD_ACCESS);
++        return EGL_FALSE;
++    }
++
++    if (!context_check_extensions(context)) {
++        CGLSetCurrentContext(NULL);
++        owl_egl_set_error(EGL_BAD_MATCH);
++        return EGL_FALSE;
++    }
++
++    if (surface->back == NULL) {
++        surface->back = owl_egl_surface_acquire_buffer(surface);
++        if (surface->back == NULL) {
++            CGLSetCurrentContext(NULL);
++            owl_egl_set_error(EGL_BAD_ALLOC);
++            return EGL_FALSE;
++        }
++    }
++    if (!owl_egl_buffer_ensure_gl(surface->back, context)) {
++        CGLSetCurrentContext(NULL);
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_FALSE;
++    }
++
++    owl_egl_fbzero_make_current(surface->back->fbo);
++
++    if (!surface->viewport_initialized) {
++        /* Per the EGL spec, the first time a context is made current
++         * with a surface, viewport and scissor are set to the surface
++         * size. Clients rely on this. */
++        glViewport(0, 0, surface->back->width, surface->back->height);
++        glScissor(0, 0, surface->back->width, surface->back->height);
++        surface->viewport_initialized = 1;
++    }
++
++    thread->current_display = display;
++    thread->current_context = context;
++    thread->current_surface = surface;
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglSwapBuffers(
++    EGLDisplay handle, EGLSurface surface_handle)
++{
++    struct owl_egl_surface *surface = surface_handle;
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++    GLuint saved_binding;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (surface == NULL || thread->current_surface != surface ||
++        thread->current_context == NULL)
++    {
++        owl_egl_set_error(EGL_BAD_SURFACE);
++        return EGL_FALSE;
++    }
++    if (surface->window == NULL) {
++        owl_egl_set_error(EGL_BAD_NATIVE_WINDOW);
++        return EGL_FALSE;
++    }
++
++    /* Per Apple, glFlush is what makes IOSurface-backed rendering
++     * visible to other processes (CGLFlushDrawable is for windowed
++     * contexts). */
++    glFlush();
++
++    if (!owl_egl_surface_swap(surface)) {
++        owl_egl_set_error(EGL_BAD_SURFACE);
++        return EGL_FALSE;
++    }
++
++    /* Rotate "framebuffer 0" onto the new back buffer. The client may
++     * be inside its own FBO mid-frame; preserve that binding. */
++    saved_binding = owl_egl_fbzero_real_binding();
++    if (!owl_egl_buffer_ensure_gl(surface->back, thread->current_context)) {
++        owl_egl_set_error(EGL_BAD_ALLOC);
++        return EGL_FALSE;
++    }
++    owl_egl_fbzero_rebind(surface->back->fbo);
++    if (!thread->app_at_zero) {
++        owl_egl_fbzero_restore(saved_binding);
++    }
++
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglSwapInterval(
++    EGLDisplay handle, EGLint interval)
++{
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (thread->current_surface == NULL) {
++        owl_egl_set_error(EGL_BAD_SURFACE);
++        return EGL_FALSE;
++    }
++    if (interval < 0) {
++        interval = 0;
++    }
++    if (interval > 1) {
++        interval = 1;
++    }
++    thread->current_surface->swap_interval = interval;
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLContext EGLAPIENTRY eglGetCurrentContext(void) {
++    return (EGLContext) owl_egl_thread_state()->current_context;
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglGetCurrentSurface(EGLint readdraw) {
++    if (readdraw != EGL_READ && readdraw != EGL_DRAW) {
++        owl_egl_set_error(EGL_BAD_PARAMETER);
++        return EGL_NO_SURFACE;
++    }
++    return (EGLSurface) owl_egl_thread_state()->current_surface;
++}
++
++EGLAPI EGLDisplay EGLAPIENTRY eglGetCurrentDisplay(void) {
++    struct owl_egl_display *display =
++        owl_egl_thread_state()->current_display;
++
++    return display != NULL ? (EGLDisplay) display : EGL_NO_DISPLAY;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglQueryContext(
++    EGLDisplay handle, EGLContext context_handle,
++    EGLint attribute, EGLint *value)
++{
++    struct owl_egl_context *context = context_handle;
++
++    if (display_from_handle(handle) == NULL) {
++        owl_egl_set_error(EGL_BAD_DISPLAY);
++        return EGL_FALSE;
++    }
++    if (context == NULL || value == NULL) {
++        owl_egl_set_error(EGL_BAD_CONTEXT);
++        return EGL_FALSE;
++    }
++    owl_egl_set_error(EGL_SUCCESS);
++    switch (attribute) {
++    case EGL_CONFIG_ID:
++        *value = context->config->config_id;
++        return EGL_TRUE;
++    case EGL_CONTEXT_CLIENT_TYPE:
++        *value = EGL_OPENGL_API;
++        return EGL_TRUE;
++    case EGL_CONTEXT_CLIENT_VERSION:
++        *value = 2;
++        return EGL_TRUE;
++    case EGL_RENDER_BUFFER:
++        *value = EGL_BACK_BUFFER;
++        return EGL_TRUE;
++    default:
++        owl_egl_set_error(EGL_BAD_ATTRIBUTE);
++        return EGL_FALSE;
++    }
++}
++
++/* ---------- Waiting, thread release ---------- */
++
++EGLAPI EGLBoolean EGLAPIENTRY eglWaitClient(void) {
++    if (owl_egl_thread_state()->current_context != NULL) {
++        glFinish();
++    }
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglWaitGL(void) {
++    return eglWaitClient();
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglWaitNative(EGLint engine) {
++    owl_egl_set_error(EGL_SUCCESS);
++    return EGL_TRUE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglReleaseThread(void) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (thread->current_context != NULL) {
++        CGLSetCurrentContext(NULL);
++    }
++    thread->current_display = NULL;
++    thread->current_context = NULL;
++    thread->current_surface = NULL;
++    thread->zero_fbo = 0;
++    thread->error = EGL_SUCCESS;
++    thread->api = EGL_OPENGL_API;
++    return EGL_TRUE;
++}
++
++/* ---------- Unsupported surface kinds and EGL 1.5 stubs ---------- */
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePbufferSurface(
++    EGLDisplay handle, EGLConfig config_handle, const EGLint *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_MATCH);
++    return EGL_NO_SURFACE;
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePixmapSurface(
++    EGLDisplay handle, EGLConfig config_handle,
++    EGLNativePixmapType pixmap, const EGLint *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_MATCH);
++    return EGL_NO_SURFACE;
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformPixmapSurface(
++    EGLDisplay handle, EGLConfig config_handle,
++    void *native_pixmap, const EGLAttrib *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_MATCH);
++    return EGL_NO_SURFACE;
++}
++
++EGLAPI EGLSurface EGLAPIENTRY eglCreatePbufferFromClientBuffer(
++    EGLDisplay handle, EGLenum buftype, EGLClientBuffer buffer,
++    EGLConfig config_handle, const EGLint *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_MATCH);
++    return EGL_NO_SURFACE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglBindTexImage(
++    EGLDisplay handle, EGLSurface surface_handle, EGLint buffer)
++{
++    owl_egl_set_error(EGL_BAD_SURFACE);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglReleaseTexImage(
++    EGLDisplay handle, EGLSurface surface_handle, EGLint buffer)
++{
++    owl_egl_set_error(EGL_BAD_SURFACE);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglCopyBuffers(
++    EGLDisplay handle, EGLSurface surface_handle,
++    EGLNativePixmapType target)
++{
++    owl_egl_set_error(EGL_BAD_NATIVE_PIXMAP);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLSync EGLAPIENTRY eglCreateSync(
++    EGLDisplay handle, EGLenum type, const EGLAttrib *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_NO_SYNC;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglDestroySync(
++    EGLDisplay handle, EGLSync sync)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLint EGLAPIENTRY eglClientWaitSync(
++    EGLDisplay handle, EGLSync sync, EGLint flags, EGLTime timeout)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglWaitSync(
++    EGLDisplay handle, EGLSync sync, EGLint flags)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglGetSyncAttrib(
++    EGLDisplay handle, EGLSync sync, EGLint attribute, EGLAttrib *value)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLImage EGLAPIENTRY eglCreateImage(
++    EGLDisplay handle, EGLContext context, EGLenum target,
++    EGLClientBuffer buffer, const EGLAttrib *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_NO_IMAGE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglDestroyImage(
++    EGLDisplay handle, EGLImage image)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++/* KHR-suffixed aliases, also exported by Mesa's libEGL; kept so that
++ * dyld can bind them if a client references them directly. */
++
++EGLAPI EGLImageKHR EGLAPIENTRY eglCreateImageKHR(
++    EGLDisplay handle, EGLContext context, EGLenum target,
++    EGLClientBuffer buffer, const EGLint *attrib_list)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_NO_IMAGE_KHR;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglDestroyImageKHR(
++    EGLDisplay handle, EGLImageKHR image)
++{
++    owl_egl_set_error(EGL_BAD_PARAMETER);
++    return EGL_FALSE;
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglSwapBuffersWithDamageKHR(
++    EGLDisplay handle, EGLSurface surface_handle,
++    const EGLint *rects, EGLint n_rects)
++{
++    return eglSwapBuffers(handle, surface_handle);
++}
++
++EGLAPI EGLBoolean EGLAPIENTRY eglSwapBuffersWithDamageEXT(
++    EGLDisplay handle, EGLSurface surface_handle,
++    const EGLint *rects, EGLint n_rects)
++{
++    return eglSwapBuffers(handle, surface_handle);
++}
++
++/* ---------- eglGetProcAddress ---------- */
++
++struct proc_entry {
++    const char *name;
++    void *function;
++};
++
++static void *opengl_framework;
++static pthread_once_t opengl_framework_once = PTHREAD_ONCE_INIT;
++
++static void opengl_framework_open(void) {
++    opengl_framework = dlopen(
++        "/System/Library/Frameworks/OpenGL.framework/OpenGL",
++        RTLD_LAZY | RTLD_LOCAL
++    );
++}
++
++EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY
++eglGetProcAddress(const char *name)
++{
++    static const struct proc_entry egl_procs[] = {
++        { "eglGetError", (void *) eglGetError },
++        { "eglGetDisplay", (void *) eglGetDisplay },
++        { "eglGetPlatformDisplay", (void *) eglGetPlatformDisplay },
++        { "eglGetPlatformDisplayEXT", (void *) eglGetPlatformDisplayEXT },
++        { "eglInitialize", (void *) eglInitialize },
++        { "eglTerminate", (void *) eglTerminate },
++        { "eglQueryString", (void *) eglQueryString },
++        { "eglGetConfigs", (void *) eglGetConfigs },
++        { "eglChooseConfig", (void *) eglChooseConfig },
++        { "eglGetConfigAttrib", (void *) eglGetConfigAttrib },
++        { "eglBindAPI", (void *) eglBindAPI },
++        { "eglQueryAPI", (void *) eglQueryAPI },
++        { "eglCreateContext", (void *) eglCreateContext },
++        { "eglDestroyContext", (void *) eglDestroyContext },
++        { "eglCreateWindowSurface", (void *) eglCreateWindowSurface },
++        { "eglCreatePlatformWindowSurface",
++          (void *) eglCreatePlatformWindowSurface },
++        { "eglCreatePlatformWindowSurfaceEXT",
++          (void *) eglCreatePlatformWindowSurfaceEXT },
++        { "eglDestroySurface", (void *) eglDestroySurface },
++        { "eglQuerySurface", (void *) eglQuerySurface },
++        { "eglSurfaceAttrib", (void *) eglSurfaceAttrib },
++        { "eglMakeCurrent", (void *) eglMakeCurrent },
++        { "eglSwapBuffers", (void *) eglSwapBuffers },
++        { "eglSwapBuffersWithDamageKHR",
++          (void *) eglSwapBuffersWithDamageKHR },
++        { "eglSwapBuffersWithDamageEXT",
++          (void *) eglSwapBuffersWithDamageEXT },
++        { "eglSwapInterval", (void *) eglSwapInterval },
++        { "eglGetCurrentContext", (void *) eglGetCurrentContext },
++        { "eglGetCurrentSurface", (void *) eglGetCurrentSurface },
++        { "eglGetCurrentDisplay", (void *) eglGetCurrentDisplay },
++        { "eglQueryContext", (void *) eglQueryContext },
++        { "eglWaitClient", (void *) eglWaitClient },
++        { "eglWaitGL", (void *) eglWaitGL },
++        { "eglWaitNative", (void *) eglWaitNative },
++        { "eglReleaseThread", (void *) eglReleaseThread },
++        { "eglGetProcAddress", (void *) eglGetProcAddress },
++        { NULL, NULL }
++    };
++    const struct proc_entry *entry;
++    void *function;
++
++    if (name == NULL) {
++        return NULL;
++    }
++
++    if (strncmp(name, "egl", 3) == 0) {
++        for (entry = egl_procs; entry->name != NULL; entry++) {
++            if (strcmp(entry->name, name) == 0) {
++                return (__eglMustCastToProperFunctionPointerType)
++                    entry->function;
++            }
++        }
++        return NULL;
++    }
++
++    /* The framebuffer-zero wrappers shadow a handful of GL entry
++     * points; everything else comes straight from Apple's OpenGL
++     * framework (EGL_KHR_get_all_proc_addresses). */
++    function = owl_egl_fbzero_lookup(name);
++    if (function != NULL) {
++        return (__eglMustCastToProperFunctionPointerType) function;
++    }
++
++    pthread_once(&opengl_framework_once, opengl_framework_open);
++    if (opengl_framework == NULL) {
++        return NULL;
++    }
++    return (__eglMustCastToProperFunctionPointerType)
++        dlsym(opengl_framework, name);
++}
+diff --git a/owl-egl/egl-fbzero.c b/owl-egl/egl-fbzero.c
+new file mode 100644
+index 0000000..6c41ac8
+--- /dev/null
++++ b/owl-egl/egl-fbzero.c
+@@ -0,0 +1,116 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2026 Sergey Fedorov
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* Framebuffer-zero remapping.
++ *
++ * An EGL client renders its final output to framebuffer 0, but under
++ * CGL with no drawable there is no usable framebuffer 0: the window
++ * surface is an IOSurface-backed FBO. eglMakeCurrent leaves that FBO
++ * bound, so a client that never explicitly binds framebuffer 0 works
++ * as-is. Clients that bind their own FBOs and then "return to 0"
++ * (mpv) resolve GL through eglGetProcAddress, which hands them the
++ * wrappers below: binding 0 binds the surface's back FBO instead, and
++ * querying the binding reports the FBO as 0. The remapping is
++ * per-thread, like the current context itself.
++ *
++ * Clients that both link Apple GL symbols directly AND explicitly
++ * bind framebuffer 0 would bypass this; none of the current targets
++ * do. The contingency for such clients is the pbuffer route described
++ * in HWGL.md.
++ */
++
++#include "owl-egl-private.h"
++
++#include <string.h>
++
++#ifndef GL_FRAMEBUFFER_BINDING_EXT
++#define GL_FRAMEBUFFER_BINDING_EXT 0x8CA6
++#endif
++#ifndef GL_READ_FRAMEBUFFER_BINDING_EXT
++#define GL_READ_FRAMEBUFFER_BINDING_EXT 0x8CAA
++#endif
++
++static void owl_egl_glBindFramebuffer(GLenum target, GLuint framebuffer) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    if (framebuffer == 0 && thread->zero_fbo != 0) {
++        thread->app_at_zero = 1;
++        framebuffer = thread->zero_fbo;
++    } else {
++        thread->app_at_zero = (framebuffer == thread->zero_fbo);
++    }
++    glBindFramebufferEXT(target, framebuffer);
++}
++
++static void owl_egl_glGetIntegerv(GLenum pname, GLint *params) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    glGetIntegerv(pname, params);
++    if (params == NULL || thread->zero_fbo == 0) {
++        return;
++    }
++    if (pname == GL_FRAMEBUFFER_BINDING_EXT ||
++        pname == GL_READ_FRAMEBUFFER_BINDING_EXT) {
++        if (*params == (GLint) thread->zero_fbo) {
++            *params = 0;
++        }
++    }
++}
++
++void *owl_egl_fbzero_lookup(const char *name) {
++    if (strcmp(name, "glBindFramebuffer") == 0 ||
++        strcmp(name, "glBindFramebufferEXT") == 0 ||
++        strcmp(name, "glBindFramebufferOES") == 0) {
++        return (void *) owl_egl_glBindFramebuffer;
++    }
++    if (strcmp(name, "glGetIntegerv") == 0) {
++        return (void *) owl_egl_glGetIntegerv;
++    }
++    return NULL;
++}
++
++void owl_egl_fbzero_make_current(GLuint fbo) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    thread->zero_fbo = fbo;
++    thread->app_at_zero = 1;
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++}
++
++/* After eglSwapBuffers rotates to a new back buffer, "0" must map to
++ * the new FBO; rebind only if the client is logically at 0 (it may be
++ * inside its own FBO mid-frame). */
++void owl_egl_fbzero_rebind(GLuint fbo) {
++    struct owl_egl_thread *thread = owl_egl_thread_state();
++
++    thread->zero_fbo = fbo;
++    if (thread->app_at_zero) {
++        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++    }
++}
++
++GLuint owl_egl_fbzero_real_binding(void) {
++    GLint binding = 0;
++
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &binding);
++    return (GLuint) binding;
++}
++
++void owl_egl_fbzero_restore(GLuint fbo) {
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
++}
+diff --git a/owl-egl/egl-mach.c b/owl-egl/egl-mach.c
+new file mode 100644
+index 0000000..5c7de6d
+--- /dev/null
++++ b/owl-egl/egl-mach.c
+@@ -0,0 +1,153 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2026 Sergey Fedorov
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* The Mach half of the buffer handshake: looking up the compositor's
++ * bootstrap port, retrieving per-IOSurface receiver ports with the
++ * secret from the zowl_mach_ipc_port_v1.secret event, and handing the
++ * compositor the IOSurface's Mach port. The MIG routines are
++ * synchronous (they carry a reply), and the compositor serves them on
++ * the same thread as its wayland event loop, so once a call returns,
++ * any wayland request we send afterwards is processed after it.
++ */
++
++#include "owl-egl-private.h"
++
++#include <stdio.h>
++#include <servers/bootstrap.h>
++#include <CoreFoundation/CoreFoundation.h>
++
++#include "owl-mach-ipc-unstable-v1-mig.h"
++#include "owl-iosurface-unstable-v1-mig.h"
++
++IOSurfaceRef owl_egl_iosurface_create(int width, int height) {
++    CFMutableDictionaryRef properties;
++    CFNumberRef width_number, height_number;
++    CFNumberRef bytes_per_element_number, bytes_per_row_number;
++    CFNumberRef pixel_format_number;
++    int bytes_per_element = 4;
++    size_t bytes_per_row;
++    /* The fourcc 'BGRA', matching what the compositor passes to
++     * CGLTexImageIOSurface2D; both sides use identical format/type
++     * parameters, so the pixel layout round-trips on both little-
++     * and big-endian machines by construction. */
++    uint32_t pixel_format =
++        ((uint32_t) 'B' << 24) | ((uint32_t) 'G' << 16) |
++        ((uint32_t) 'R' << 8) | (uint32_t) 'A';
++    IOSurfaceRef iosurface;
++
++    bytes_per_row = IOSurfaceAlignProperty(
++        kIOSurfaceBytesPerRow,
++        (size_t) width * bytes_per_element
++    );
++
++    properties = CFDictionaryCreateMutable(
++        kCFAllocatorDefault,
++        5,
++        &kCFTypeDictionaryKeyCallBacks,
++        &kCFTypeDictionaryValueCallBacks
++    );
++    width_number = CFNumberCreate(
++        kCFAllocatorDefault, kCFNumberIntType, &width);
++    height_number = CFNumberCreate(
++        kCFAllocatorDefault, kCFNumberIntType, &height);
++    bytes_per_element_number = CFNumberCreate(
++        kCFAllocatorDefault, kCFNumberIntType, &bytes_per_element);
++    bytes_per_row_number = CFNumberCreate(
++        kCFAllocatorDefault, kCFNumberLongType, &bytes_per_row);
++    pixel_format_number = CFNumberCreate(
++        kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
++
++    CFDictionarySetValue(properties, kIOSurfaceWidth, width_number);
++    CFDictionarySetValue(properties, kIOSurfaceHeight, height_number);
++    CFDictionarySetValue(
++        properties, kIOSurfaceBytesPerElement, bytes_per_element_number);
++    CFDictionarySetValue(
++        properties, kIOSurfaceBytesPerRow, bytes_per_row_number);
++    CFDictionarySetValue(
++        properties, kIOSurfacePixelFormat, pixel_format_number);
++
++    iosurface = IOSurfaceCreate(properties);
++
++    CFRelease(width_number);
++    CFRelease(height_number);
++    CFRelease(bytes_per_element_number);
++    CFRelease(bytes_per_row_number);
++    CFRelease(pixel_format_number);
++    CFRelease(properties);
++
++    return iosurface;
++}
++
++EGLBoolean owl_egl_mach_lookup_server(struct owl_egl_display *display) {
++    kern_return_t kr;
++
++    kr = bootstrap_look_up(
++        bootstrap_port,
++        display->bootstrap_name,
++        &display->server_port
++    );
++    if (kr != KERN_SUCCESS) {
++        fprintf(
++            stderr,
++            "owl-egl: bootstrap_look_up(%s) failed: %x\n",
++            display->bootstrap_name, kr
++        );
++        return EGL_FALSE;
++    }
++    return EGL_TRUE;
++}
++
++EGLBoolean owl_egl_mach_retrieve_port(mach_port_t server_port,
++                                      const char *secret,
++                                      mach_port_t *port_out)
++{
++    kern_return_t kr;
++
++    kr = owl_mach_ipc_v1_retrieve_port(server_port, secret, port_out);
++    if (kr != KERN_SUCCESS) {
++        fprintf(stderr, "owl-egl: retrieve_port failed: %x\n", kr);
++        return EGL_FALSE;
++    }
++    if (!MACH_PORT_VALID(*port_out)) {
++        fprintf(stderr, "owl-egl: retrieve_port returned a dead port\n");
++        return EGL_FALSE;
++    }
++    return EGL_TRUE;
++}
++
++EGLBoolean owl_egl_mach_set_surface_port(mach_port_t receiver_port,
++                                         IOSurfaceRef iosurface)
++{
++    mach_port_t iosurface_port;
++    kern_return_t kr;
++
++    iosurface_port = IOSurfaceCreateMachPort(iosurface);
++    if (!MACH_PORT_VALID(iosurface_port)) {
++        fprintf(stderr, "owl-egl: IOSurfaceCreateMachPort failed\n");
++        return EGL_FALSE;
++    }
++
++    kr = owl_iosurface_v1_set_surface_port(receiver_port, iosurface_port);
++    /* The MIG call copies the send right; drop our own. */
++    mach_port_deallocate(mach_task_self(), iosurface_port);
++    if (kr != KERN_SUCCESS) {
++        fprintf(stderr, "owl-egl: set_surface_port failed: %x\n", kr);
++        return EGL_FALSE;
++    }
++    return EGL_TRUE;
++}
+diff --git a/owl-egl/egl-wayland.c b/owl-egl/egl-wayland.c
+new file mode 100644
+index 0000000..39c0b7d
+--- /dev/null
++++ b/owl-egl/egl-wayland.c
+@@ -0,0 +1,543 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2026 Sergey Fedorov
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* The wayland half of owl-egl: binding the zowl globals on a private
++ * event queue, the per-surface buffer pool, and the swap path
++ * (frame-callback throttling, attach/damage/commit, rotation).
++ */
++
++#include "owl-egl-private.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <OpenGL/CGLIOSurface.h>
++
++#ifndef GL_TEXTURE_BINDING_RECTANGLE_ARB
++#define GL_TEXTURE_BINDING_RECTANGLE_ARB 0x84F6
++#endif
++#ifndef GL_RENDERBUFFER_BINDING_EXT
++#define GL_RENDERBUFFER_BINDING_EXT 0x8CA7
++#endif
++#ifndef GL_DEPTH24_STENCIL8_EXT
++#define GL_DEPTH24_STENCIL8_EXT 0x88F0
++#endif
++#ifndef GL_DEPTH_COMPONENT24
++#define GL_DEPTH_COMPONENT24 0x81A6
++#endif
++
++static void mach_ipc_bootstrap_name(void *data,
++                                    struct zowl_mach_ipc_v1 *mach_ipc,
++                                    const char *name)
++{
++    struct owl_egl_display *display = data;
++
++    free(display->bootstrap_name);
++    display->bootstrap_name = strdup(name);
++}
++
++static const struct zowl_mach_ipc_v1_listener mach_ipc_listener = {
++    mach_ipc_bootstrap_name
++};
++
++static void registry_global(void *data,
++                            struct wl_registry *registry,
++                            uint32_t name,
++                            const char *interface,
++                            uint32_t version)
++{
++    struct owl_egl_display *display = data;
++
++    if (strcmp(interface, zowl_mach_ipc_v1_interface.name) == 0) {
++        display->mach_ipc = wl_registry_bind(
++            registry, name, &zowl_mach_ipc_v1_interface, 1);
++        zowl_mach_ipc_v1_add_listener(
++            display->mach_ipc, &mach_ipc_listener, display);
++    } else if (strcmp(
++        interface, zowl_iosurface_manager_v1_interface.name) == 0)
++    {
++        display->iosurface_manager = wl_registry_bind(
++            registry, name, &zowl_iosurface_manager_v1_interface, 1);
++    }
++}
++
++static void registry_global_remove(void *data,
++                                   struct wl_registry *registry,
++                                   uint32_t name)
++{
++}
++
++static const struct wl_registry_listener registry_listener = {
++    registry_global,
++    registry_global_remove
++};
++
++EGLBoolean owl_egl_display_connect(struct owl_egl_display *display) {
++    display->queue = wl_display_create_queue(display->wl_display);
++    if (display->queue == NULL) {
++        return EGL_FALSE;
++    }
++    display->wrapped_display = wl_proxy_create_wrapper(display->wl_display);
++    if (display->wrapped_display == NULL) {
++        return EGL_FALSE;
++    }
++    wl_proxy_set_queue(
++        (struct wl_proxy *) display->wrapped_display, display->queue);
++
++    display->registry = wl_display_get_registry(display->wrapped_display);
++    wl_registry_add_listener(display->registry, &registry_listener, display);
++
++    /* First roundtrip delivers the globals (binding the mach IPC
++     * global makes the server send bootstrap_name); the second
++     * delivers events triggered by our binds. */
++    if (wl_display_roundtrip_queue(display->wl_display, display->queue) < 0 ||
++        wl_display_roundtrip_queue(display->wl_display, display->queue) < 0)
++    {
++        return EGL_FALSE;
++    }
++
++    if (display->mach_ipc == NULL ||
++        display->iosurface_manager == NULL ||
++        display->bootstrap_name == NULL)
++    {
++        fprintf(
++            stderr,
++            "owl-egl: compositor does not offer the owl IOSurface "
++            "protocol; is this owl?\n"
++        );
++        return EGL_FALSE;
++    }
++
++    return owl_egl_mach_lookup_server(display);
++}
++
++void owl_egl_display_disconnect(struct owl_egl_display *display) {
++    if (display->mach_ipc != NULL) {
++        zowl_mach_ipc_v1_destroy(display->mach_ipc);
++        display->mach_ipc = NULL;
++    }
++    if (display->iosurface_manager != NULL) {
++        zowl_iosurface_manager_v1_destroy(display->iosurface_manager);
++        display->iosurface_manager = NULL;
++    }
++    if (display->registry != NULL) {
++        wl_registry_destroy(display->registry);
++        display->registry = NULL;
++    }
++    if (display->wrapped_display != NULL) {
++        wl_proxy_wrapper_destroy(display->wrapped_display);
++        display->wrapped_display = NULL;
++    }
++    if (display->queue != NULL) {
++        wl_event_queue_destroy(display->queue);
++        display->queue = NULL;
++    }
++    free(display->bootstrap_name);
++    display->bootstrap_name = NULL;
++    if (MACH_PORT_VALID(display->server_port)) {
++        mach_port_deallocate(mach_task_self(), display->server_port);
++        display->server_port = MACH_PORT_NULL;
++    }
++}
++
++struct secret_data {
++    char *secret;
++};
++
++static void port_secret(void *data,
++                        struct zowl_mach_ipc_port_v1 *port,
++                        const char *secret)
++{
++    struct secret_data *secret_data = data;
++
++    free(secret_data->secret);
++    secret_data->secret = strdup(secret);
++}
++
++static const struct zowl_mach_ipc_port_v1_listener port_listener = {
++    port_secret
++};
++
++static void buffer_release(void *data, struct wl_buffer *wl_buffer) {
++    struct owl_egl_buffer *buffer = data;
++
++    buffer->busy = 0;
++}
++
++static const struct wl_buffer_listener buffer_listener = {
++    buffer_release
++};
++
++static struct owl_egl_buffer *owl_egl_buffer_create(
++    struct owl_egl_surface *surface, int width, int height)
++{
++    struct owl_egl_display *display = surface->display;
++    struct owl_egl_buffer *buffer;
++    struct zowl_mach_ipc_port_v1 *port;
++    struct secret_data secret_data = { NULL };
++    mach_port_t receiver_port;
++
++    buffer = calloc(1, sizeof *buffer);
++    if (buffer == NULL) {
++        return NULL;
++    }
++    buffer->surface = surface;
++    buffer->width = width;
++    buffer->height = height;
++
++    buffer->iosurface = owl_egl_iosurface_create(width, height);
++    if (buffer->iosurface == NULL) {
++        fprintf(stderr, "owl-egl: IOSurfaceCreate(%dx%d) failed\n",
++                width, height);
++        free(buffer);
++        return NULL;
++    }
++
++    /* See HWGL.md for the handshake. The port object and the
++     * zowl_iosurface_v1 are created (asynchronously), then one
++     * roundtrip guarantees the server has both the secret→port
++     * mapping and the MIG receiver port before the synchronous MIG
++     * calls below. */
++    port = zowl_mach_ipc_v1_create_port(display->mach_ipc);
++    zowl_mach_ipc_port_v1_add_listener(port, &port_listener, &secret_data);
++    buffer->zowl_surface = zowl_iosurface_manager_v1_create_surface(
++        display->iosurface_manager, port);
++
++    if (wl_display_roundtrip_queue(display->wl_display, display->queue) < 0 ||
++        secret_data.secret == NULL)
++    {
++        goto fail;
++    }
++
++    if (!owl_egl_mach_retrieve_port(
++            display->server_port, secret_data.secret, &receiver_port))
++    {
++        goto fail;
++    }
++    free(secret_data.secret);
++    secret_data.secret = NULL;
++
++    if (!owl_egl_mach_set_surface_port(receiver_port, buffer->iosurface)) {
++        mach_port_deallocate(mach_task_self(), receiver_port);
++        goto fail;
++    }
++    mach_port_deallocate(mach_task_self(), receiver_port);
++
++    buffer->wl_buffer = zowl_iosurface_v1_create_buffer(buffer->zowl_surface);
++    wl_buffer_add_listener(buffer->wl_buffer, &buffer_listener, buffer);
++
++    /* The port object's role has been played (the secret was consumed
++     * by retrieve_port); the receiver port itself lives on in the
++     * zowl_iosurface_v1. */
++    zowl_mach_ipc_port_v1_destroy(port);
++
++    return buffer;
++
++fail:
++    fprintf(stderr, "owl-egl: buffer handshake failed\n");
++    free(secret_data.secret);
++    zowl_mach_ipc_port_v1_destroy(port);
++    if (buffer->zowl_surface != NULL) {
++        zowl_iosurface_v1_destroy(buffer->zowl_surface);
++    }
++    CFRelease(buffer->iosurface);
++    free(buffer);
++    return NULL;
++}
++
++void owl_egl_buffer_destroy(struct owl_egl_buffer *buffer) {
++    if (buffer->has_gl && buffer->gl_ctx == CGLGetCurrentContext()) {
++        glDeleteTextures(1, &buffer->tex);
++        glDeleteFramebuffersEXT(1, &buffer->fbo);
++        if (buffer->depth_stencil != 0) {
++            glDeleteRenderbuffersEXT(1, &buffer->depth_stencil);
++        }
++    }
++    /* Otherwise the names die with their context. */
++    if (buffer->wl_buffer != NULL) {
++        wl_buffer_destroy(buffer->wl_buffer);
++    }
++    if (buffer->zowl_surface != NULL) {
++        zowl_iosurface_v1_destroy(buffer->zowl_surface);
++    }
++    if (buffer->iosurface != NULL) {
++        CFRelease(buffer->iosurface);
++    }
++    free(buffer);
++}
++
++void owl_egl_surface_destroy_buffers(struct owl_egl_surface *surface) {
++    int i;
++
++    for (i = 0; i < OWL_EGL_BUFFER_COUNT; i++) {
++        if (surface->buffers[i] != NULL) {
++            owl_egl_buffer_destroy(surface->buffers[i]);
++            surface->buffers[i] = NULL;
++        }
++    }
++    surface->back = NULL;
++}
++
++/* Find (or create) a non-busy buffer of the window's current size.
++ * Buffers of a stale size are destroyed as they become free, which is
++ * how resizes take effect. Blocks dispatching our queue if all
++ * buffers are busy (the compositor releases the previous buffer when
++ * the next commit replaces it). */
++struct owl_egl_buffer *owl_egl_surface_acquire_buffer(
++    struct owl_egl_surface *surface)
++{
++    struct owl_egl_display *display = surface->display;
++    int width, height, i;
++
++    if (surface->window == NULL) {
++        return NULL;
++    }
++    width = surface->window->width;
++    height = surface->window->height;
++    if (width <= 0) {
++        width = 1;
++    }
++    if (height <= 0) {
++        height = 1;
++    }
++
++    wl_display_dispatch_queue_pending(display->wl_display, display->queue);
++
++    for (;;) {
++        struct owl_egl_buffer *buffer;
++        int free_slot = -1;
++
++        for (i = 0; i < OWL_EGL_BUFFER_COUNT; i++) {
++            buffer = surface->buffers[i];
++            if (buffer == NULL) {
++                if (free_slot < 0) {
++                    free_slot = i;
++                }
++                continue;
++            }
++            if (buffer->busy) {
++                continue;
++            }
++            if (buffer->width != width || buffer->height != height) {
++                owl_egl_buffer_destroy(buffer);
++                surface->buffers[i] = NULL;
++                if (free_slot < 0) {
++                    free_slot = i;
++                }
++                continue;
++            }
++            return buffer;
++        }
++
++        if (free_slot >= 0) {
++            buffer = owl_egl_buffer_create(surface, width, height);
++            if (buffer == NULL) {
++                return NULL;
++            }
++            surface->buffers[free_slot] = buffer;
++            return buffer;
++        }
++
++        if (wl_display_dispatch_queue(
++                display->wl_display, display->queue) < 0)
++        {
++            return NULL;
++        }
++    }
++}
++
++static void frame_done(void *data,
++                       struct wl_callback *callback,
++                       uint32_t time)
++{
++    struct owl_egl_surface *surface = data;
++
++    wl_callback_destroy(callback);
++    if (surface->frame_callback == callback) {
++        surface->frame_callback = NULL;
++    }
++}
++
++static const struct wl_callback_listener frame_listener = {
++    frame_done
++};
++
++EGLBoolean owl_egl_surface_swap(struct owl_egl_surface *surface) {
++    struct owl_egl_display *display = surface->display;
++    struct owl_egl_buffer *buffer = surface->back;
++
++    if (surface->window == NULL || buffer == NULL) {
++        return EGL_FALSE;
++    }
++
++    wl_display_dispatch_queue_pending(display->wl_display, display->queue);
++
++    if (surface->frame_callback != NULL) {
++        if (surface->swap_interval > 0) {
++            /* Throttle: wait for the previous frame's callback. */
++            while (surface->frame_callback != NULL) {
++                if (wl_display_dispatch_queue(
++                        display->wl_display, display->queue) < 0)
++                {
++                    return EGL_FALSE;
++                }
++            }
++        } else {
++            /* Unthrottled: nobody will ever wait for it. */
++            wl_callback_destroy(surface->frame_callback);
++            surface->frame_callback = NULL;
++        }
++    }
++
++    surface->frame_callback = wl_surface_frame(surface->wrapped_surface);
++    wl_callback_add_listener(
++        surface->frame_callback, &frame_listener, surface);
++
++    wl_surface_attach(surface->wl_surface, buffer->wl_buffer, 0, 0);
++    wl_surface_damage(
++        surface->wl_surface, 0, 0, buffer->width, buffer->height);
++    wl_surface_commit(surface->wl_surface);
++    buffer->busy = 1;
++    wl_display_flush(display->wl_display);
++
++    surface->back = owl_egl_surface_acquire_buffer(surface);
++    return surface->back != NULL ? EGL_TRUE : EGL_FALSE;
++}
++
++/* Create (or adopt) the GL names for this buffer in the given
++ * context: an IOSurface-backed rectangle texture, an FBO with it as
++ * the color attachment, and a depth/stencil renderbuffer if the
++ * config asks for one. Restores the GL bindings it touches except
++ * the framebuffer binding, which the caller is about to set anyway. */
++EGLBoolean owl_egl_buffer_ensure_gl(struct owl_egl_buffer *buffer,
++                                    struct owl_egl_context *context)
++{
++    GLint saved_tex, saved_rb;
++    CGLError cgl_error;
++    GLenum status;
++
++    if (buffer->has_gl && buffer->gl_ctx == context->cgl) {
++        return EGL_TRUE;
++    }
++    if (buffer->has_gl) {
++        /* The names belong to a different context (surface moved
++         * between contexts); they die with it. Just forget them. */
++        buffer->has_gl = 0;
++        buffer->depth_stencil = 0;
++    }
++
++    glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE_ARB, &saved_tex);
++    glGetIntegerv(GL_RENDERBUFFER_BINDING_EXT, &saved_rb);
++
++    glGenTextures(1, &buffer->tex);
++    glBindTexture(GL_TEXTURE_RECTANGLE_ARB, buffer->tex);
++    cgl_error = CGLTexImageIOSurface2D(
++        context->cgl,
++        GL_TEXTURE_RECTANGLE_ARB,
++        GL_RGBA,
++        buffer->width,
++        buffer->height,
++        GL_BGRA,
++        GL_UNSIGNED_INT_8_8_8_8_REV,
++        buffer->iosurface,
++        0
++    );
++    glBindTexture(GL_TEXTURE_RECTANGLE_ARB, (GLuint) saved_tex);
++    if (cgl_error != kCGLNoError) {
++        fprintf(
++            stderr,
++            "owl-egl: CGLTexImageIOSurface2D failed: %s\n",
++            CGLErrorString(cgl_error)
++        );
++        glDeleteTextures(1, &buffer->tex);
++        return EGL_FALSE;
++    }
++
++    glGenFramebuffersEXT(1, &buffer->fbo);
++    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, buffer->fbo);
++    glFramebufferTexture2DEXT(
++        GL_FRAMEBUFFER_EXT,
++        GL_COLOR_ATTACHMENT0_EXT,
++        GL_TEXTURE_RECTANGLE_ARB,
++        buffer->tex,
++        0
++    );
++
++    if (buffer->surface->config->depth_size > 0) {
++        glGenRenderbuffersEXT(1, &buffer->depth_stencil);
++        glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, buffer->depth_stencil);
++        if (context->has_packed_depth_stencil) {
++            glRenderbufferStorageEXT(
++                GL_RENDERBUFFER_EXT,
++                GL_DEPTH24_STENCIL8_EXT,
++                buffer->width,
++                buffer->height
++            );
++            glFramebufferRenderbufferEXT(
++                GL_FRAMEBUFFER_EXT,
++                GL_DEPTH_ATTACHMENT_EXT,
++                GL_RENDERBUFFER_EXT,
++                buffer->depth_stencil
++            );
++            glFramebufferRenderbufferEXT(
++                GL_FRAMEBUFFER_EXT,
++                GL_STENCIL_ATTACHMENT_EXT,
++                GL_RENDERBUFFER_EXT,
++                buffer->depth_stencil
++            );
++        } else {
++            /* No packed depth/stencil on this renderer: depth only.
++             * The configs still advertise stencil 8; accepted small
++             * lie on museum GPUs (HWGL.md). */
++            glRenderbufferStorageEXT(
++                GL_RENDERBUFFER_EXT,
++                GL_DEPTH_COMPONENT24,
++                buffer->width,
++                buffer->height
++            );
++            glFramebufferRenderbufferEXT(
++                GL_FRAMEBUFFER_EXT,
++                GL_DEPTH_ATTACHMENT_EXT,
++                GL_RENDERBUFFER_EXT,
++                buffer->depth_stencil
++            );
++        }
++        glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, (GLuint) saved_rb);
++    }
++
++    status = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
++    if (status != GL_FRAMEBUFFER_COMPLETE_EXT) {
++        fprintf(
++            stderr,
++            "owl-egl: framebuffer incomplete: 0x%x "
++            "(rectangle textures not attachable on this renderer?)\n",
++            status
++        );
++        glDeleteTextures(1, &buffer->tex);
++        glDeleteFramebuffersEXT(1, &buffer->fbo);
++        if (buffer->depth_stencil != 0) {
++            glDeleteRenderbuffersEXT(1, &buffer->depth_stencil);
++            buffer->depth_stencil = 0;
++        }
++        return EGL_FALSE;
++    }
++
++    buffer->has_gl = 1;
++    buffer->gl_ctx = context->cgl;
++    return EGL_TRUE;
++}
+diff --git a/owl-egl/owl-egl-private.h b/owl-egl/owl-egl-private.h
+new file mode 100644
+index 0000000..e884687
+--- /dev/null
++++ b/owl-egl/owl-egl-private.h
+@@ -0,0 +1,186 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2026 Sergey Fedorov
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* owl-egl: client-side EGL over CGL + IOSurface for the owl compositor.
++ *
++ * Plain C (C99), no Objective-C and no blocks: this library must build
++ * with FSF GCC targeting Mac OS X 10.6 (including big-endian PowerPC).
++ * See HWGL.md at the repository root for the design.
++ */
++
++#ifndef OWL_EGL_PRIVATE_H
++#define OWL_EGL_PRIVATE_H
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++
++#include <wayland-client.h>
++#include <wayland-egl-backend.h>
++
++#include <OpenGL/OpenGL.h>
++#include <OpenGL/gl.h>
++#ifndef GL_GLEXT_PROTOTYPES
++#define GL_GLEXT_PROTOTYPES 1
++#endif
++#include <OpenGL/glext.h>
++#include <IOSurface/IOSurface.h>
++#include <mach/mach.h>
++#include <pthread.h>
++
++#include "owl-mach-ipc-unstable-v1-client-protocol.h"
++#include "owl-iosurface-unstable-v1-client-protocol.h"
++
++#ifndef EGL_PLATFORM_WAYLAND_KHR
++#define EGL_PLATFORM_WAYLAND_KHR 0x31D8
++#endif
++#ifndef EGL_PLATFORM_WAYLAND_EXT
++#define EGL_PLATFORM_WAYLAND_EXT 0x31D8
++#endif
++
++struct owl_egl_config {
++    EGLint config_id;
++    EGLint red_size;
++    EGLint green_size;
++    EGLint blue_size;
++    EGLint alpha_size;
++    EGLint depth_size;
++    EGLint stencil_size;
++};
++
++struct owl_egl_display {
++    struct wl_display *wl_display;
++
++    /* All of our objects live on a private event queue so that we
++     * never steal events from (or have events stolen by) the
++     * application's own dispatching. */
++    struct wl_event_queue *queue;
++    struct wl_display *wrapped_display;
++    struct wl_registry *registry;
++
++    struct zowl_mach_ipc_v1 *mach_ipc;
++    struct zowl_iosurface_manager_v1 *iosurface_manager;
++    char *bootstrap_name;
++    mach_port_t server_port;
++
++    EGLBoolean initialized;
++    struct owl_egl_display *next;
++};
++
++struct owl_egl_context {
++    struct owl_egl_display *display;
++    const struct owl_egl_config *config;
++    CGLContextObj cgl;
++    /* Extension availability, probed on first eglMakeCurrent. */
++    int checked_extensions;
++    int has_fbo;
++    int has_texture_rectangle;
++    int has_packed_depth_stencil;
++};
++
++struct owl_egl_surface;
++
++struct owl_egl_buffer {
++    struct owl_egl_surface *surface;
++    IOSurfaceRef iosurface;
++    struct zowl_iosurface_v1 *zowl_surface;
++    struct wl_buffer *wl_buffer;
++    int width;
++    int height;
++    /* Attached by a commit and not yet released by the compositor. */
++    int busy;
++
++    /* GL names live in a specific CGL context; recreated if the
++     * surface is later used with a different context. */
++    int has_gl;
++    CGLContextObj gl_ctx;
++    GLuint tex;
++    GLuint fbo;
++    GLuint depth_stencil;
++};
++
++#define OWL_EGL_BUFFER_COUNT 3
++
++struct owl_egl_surface {
++    struct owl_egl_display *display;
++    const struct owl_egl_config *config;
++    struct wl_egl_window *window;
++    struct wl_surface *wl_surface;
++    /* Wrapper proxy on our queue: wl_surface.frame callbacks created
++     * from it inherit the queue; attach/damage/commit go through the
++     * application's own proxy (requests carry no queue semantics). */
++    struct wl_surface *wrapped_surface;
++
++    struct owl_egl_buffer *buffers[OWL_EGL_BUFFER_COUNT];
++    struct owl_egl_buffer *back;
++    struct wl_callback *frame_callback;
++    int swap_interval;
++    /* Per EGL spec the viewport and scissor are initialized to the
++     * surface size the first time a context is made current with it. */
++    int viewport_initialized;
++};
++
++/* Per-thread EGL state. EGL's current context/surface and last error
++ * are thread-local, which matches CGLSetCurrentContext being
++ * per-thread. */
++struct owl_egl_thread {
++    EGLint error;
++    EGLenum api;
++    struct owl_egl_display *current_display;
++    struct owl_egl_context *current_context;
++    struct owl_egl_surface *current_surface;
++
++    /* Framebuffer-zero remapping (egl-fbzero.c): the FBO name that
++     * the client's "framebuffer 0" currently stands for, and whether
++     * the client is logically bound to 0 right now. */
++    GLuint zero_fbo;
++    int app_at_zero;
++};
++
++/* egl-core.c */
++struct owl_egl_thread *owl_egl_thread_state(void);
++void owl_egl_set_error(EGLint error);
++extern pthread_mutex_t owl_egl_lock;
++
++/* egl-wayland.c */
++EGLBoolean owl_egl_display_connect(struct owl_egl_display *display);
++void owl_egl_display_disconnect(struct owl_egl_display *display);
++struct owl_egl_buffer *owl_egl_surface_acquire_buffer(
++    struct owl_egl_surface *surface);
++EGLBoolean owl_egl_surface_swap(struct owl_egl_surface *surface);
++void owl_egl_buffer_destroy(struct owl_egl_buffer *buffer);
++void owl_egl_surface_destroy_buffers(struct owl_egl_surface *surface);
++EGLBoolean owl_egl_buffer_ensure_gl(struct owl_egl_buffer *buffer,
++                                    struct owl_egl_context *context);
++
++/* egl-mach.c */
++IOSurfaceRef owl_egl_iosurface_create(int width, int height);
++EGLBoolean owl_egl_mach_lookup_server(struct owl_egl_display *display);
++EGLBoolean owl_egl_mach_retrieve_port(mach_port_t server_port,
++                                      const char *secret,
++                                      mach_port_t *port_out);
++EGLBoolean owl_egl_mach_set_surface_port(mach_port_t receiver_port,
++                                         IOSurfaceRef iosurface);
++
++/* egl-fbzero.c */
++void *owl_egl_fbzero_lookup(const char *name);
++void owl_egl_fbzero_make_current(GLuint fbo);
++void owl_egl_fbzero_rebind(GLuint fbo);
++GLuint owl_egl_fbzero_real_binding(void);
++void owl_egl_fbzero_restore(GLuint fbo);
++
++#endif /* OWL_EGL_PRIVATE_H */
+-- 
+2.43.0
+
