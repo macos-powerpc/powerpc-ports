@@ -1,0 +1,151 @@
+From c549225dc071cbbe2741d016aeb2a7d40f8a5bfb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 2 Aug 2026 13:39:26 +0000
+Subject: [PATCH 03/25] trans: ppc32 has no lock-free 64-bit atomics - drop
+ AtomicU64 again
+
+std's atomics module documents ("Portability"): "All atomic types in
+this module are guaranteed to be lock-free if they're available. This
+means they don't internally acquire a global mutex." 32-bit PowerPC has
+no 8-byte atomic instructions, so libatomic implements them with a
+lock - exposing AtomicU64 on top of that breaks the documented
+contract, and lock-based atomics are not address-free (unusable across
+shared memory and in signal handlers).
+
+rustc agrees: every 32-bit powerpc target sets max_atomic_width 32, and
+rustc ships libstd for powerpc-unknown-linux-gnu built exactly that
+way - the AtomicU64 uses in std are cfg(target_has_atomic)-gated.
+
+The one exception in 1.74 libstd is the mach_timebase_info cache
+(sys/unix/time.rs), which packs numer/denom into a single AtomicU64
+with no fallback - upstream rustc could assume 64-bit atomics on every
+Apple target it supported. Patch it to a pair of AtomicU32s: denom == 0
+is still the uninitialized sentinel, and the numer store is published
+by the Release store of denom (racing initializers write identical
+values). With that, libstd 1.74 builds without AtomicU64.
+
+Drops the now-unneeded -latomic from the powerpc-apple-darwin spec.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0179wmF1vKBsFua4Wh36WFc5
+---
+ rustc-1.74.0-src.patch | 77 ++++++++++++++++++++++++++++++++++++++++++
+ src/trans/target.cpp   |  9 ++---
+ 2 files changed, 82 insertions(+), 4 deletions(-)
+
+diff --git a/rustc-1.74.0-src.patch b/rustc-1.74.0-src.patch
+index 3a2a2640..2ab41dc9 100644
+--- a/rustc-1.74.0-src.patch
++++ b/rustc-1.74.0-src.patch
+@@ -175,3 +175,80 @@
+          not(miri),
+      ))] {
+          mod darwin;
++
++# The mach_timebase_info cache was a single AtomicU64 - the only AtomicU64 use in
++# libstd without a target_has_atomic fallback. Split it into two AtomicU32s
++# (denom==0 is the uninitialized sentinel; numer is published by the Release store
++# of denom) so libstd builds on targets without 64-bit atomics (32-bit PowerPC).
++--- library/std/src/sys/unix/time.rs
+++++ library/std/src/sys/unix/time.rs
++@@ -223,7 +223,7 @@
++     target_os = "tvos"
++ ))]
++ mod inner {
++-    use crate::sync::atomic::{AtomicU64, Ordering};
+++    use crate::sync::atomic::{AtomicU32, Ordering};
++     use crate::sys::cvt;
++     use crate::sys_common::mul_div_u64;
++     use crate::time::Duration;
++@@ -298,19 +298,21 @@
++     }
++ 
++     fn info() -> mach_timebase_info {
++-        // INFO_BITS conceptually is an `Option<mach_timebase_info>`. We can do
++-        // this in 64 bits because we know 0 is never a valid value for the
++-        // `denom` field.
+++        // The numer/denom pair is cached in two `AtomicU32`s: `denom == 0`
+++        // marks an uninitialized value - we know 0 is never a valid `denom`.
++         //
++-        // Encoding this as a single `AtomicU64` allows us to use `Relaxed`
++-        // operations, as we are only interested in the effects on a single
++-        // memory location.
++-        static INFO_BITS: AtomicU64 = AtomicU64::new(0);
++-
++-        // If a previous thread has initialized `INFO_BITS`, use it.
++-        let info_bits = INFO_BITS.load(Ordering::Relaxed);
++-        if info_bits != 0 {
++-            return info_from_bits(info_bits);
+++        // The `numer` store happens-before the `denom` Release store, so a
+++        // thread that Acquire-loads a non-zero `denom` also observes the
+++        // matching `numer`; racing initializers all write the same values.
+++        // (Two 32-bit atomics rather than one `AtomicU64`, so that this also
+++        // works on targets without 64-bit atomics, e.g. 32-bit PowerPC.)
+++        static INFO_NUMER: AtomicU32 = AtomicU32::new(0);
+++        static INFO_DENOM: AtomicU32 = AtomicU32::new(0);
+++
+++        // If a previous thread has initialized these, use them.
+++        let denom = INFO_DENOM.load(Ordering::Acquire);
+++        if denom != 0 {
+++            return mach_timebase_info { numer: INFO_NUMER.load(Ordering::Relaxed), denom };
++         }
++ 
++         // ... otherwise learn for ourselves ...
++@@ -318,23 +320,14 @@
++             fn mach_timebase_info(info: mach_timebase_info_t) -> kern_return_t;
++         }
++ 
++-        let mut info = info_from_bits(0);
+++        let mut info = mach_timebase_info { numer: 0, denom: 0 };
++         unsafe {
++             mach_timebase_info(&mut info);
++         }
++-        INFO_BITS.store(info_to_bits(info), Ordering::Relaxed);
+++        INFO_NUMER.store(info.numer, Ordering::Relaxed);
+++        INFO_DENOM.store(info.denom, Ordering::Release);
++         info
++     }
++-
++-    #[inline]
++-    fn info_to_bits(info: mach_timebase_info) -> u64 {
++-        ((info.denom as u64) << 32) | (info.numer as u64)
++-    }
++-
++-    #[inline]
++-    fn info_from_bits(bits: u64) -> mach_timebase_info {
++-        mach_timebase_info { numer: bits as u32, denom: (bits >> 32) as u32 }
++-    }
++ }
++ 
++ #[cfg(not(any(
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index d1c860aa..e9d60e3d 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -69,8 +69,10 @@ const TargetArch ARCH_POWERPC64LE = {
+ const TargetArch ARCH_POWERPC = {
+     "powerpc",
+     32, true,
+-    // 8-byte atomics are lock-based via libatomic here, but still available: cfg'ing out AtomicU64 breaks libstd.
+-    { /*atomic(u8)=*/true, true, true, true,  true },
++    // NOTE: No AtomicU64 - ppc32 has no 8-byte atomic instructions, and libatomic's fallback takes a
++    // lock, which would break std's documented guarantee that available atomic types are lock-free.
++    // Matches rustc, where every 32-bit powerpc target sets `max_atomic_width: Some(32)`.
++    { /*atomic(u8)=*/true, true, true, false,  true },
+     TargetArch::Alignments(2, 4, 8, 8, 4, 8, 4)
+ };
+ const TargetArch ARCH_RISCV64 = {
+@@ -635,9 +637,8 @@ namespace
+         else if(target_name == "powerpc-apple-darwin")
+         {
+             // NOTE: OSX uses Mach-O binaries, which don't fully support the defaults used for GNU targets
+-            // NOTE: 32-bit PowerPC needs libatomic for the 8-byte atomics (see ARCH_POWERPC)
+             return TargetSpec {
+-                "unix", "macos", "", {CodegenMode::Gnu11, true, "powerpc-apple-darwin", {}, {}, {"-l", "atomic"}},
++                "unix", "macos", "", {CodegenMode::Gnu11, true, "powerpc-apple-darwin", {}, {}},
+                 ARCH_POWERPC
+                 };
+         }
+-- 
+2.43.0
+
