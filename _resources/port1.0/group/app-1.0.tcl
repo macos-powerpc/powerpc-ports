@@ -13,7 +13,6 @@
 # mechanism.
 #===============================================================================
 
-
 #-------------------------------------------------------------------------------
 # app.create: whether to create the app bundle at all
 #
@@ -22,7 +21,6 @@
 
 options app.create
 default app.create yes
-
 
 #-------------------------------------------------------------------------------
 # app.name: the name of the app that users will see in the Finder
@@ -44,7 +42,6 @@ proc app.get_default_name {} {
     return [string totitle ${name}]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.executable: the program the app will run
 #
@@ -64,7 +61,6 @@ proc app.get_default_name {} {
 options app.executable
 default app.executable {${name}}
 
-
 #-------------------------------------------------------------------------------
 # app.icon: the icon the app will have
 #
@@ -82,7 +78,6 @@ default app.executable {${name}}
 options app.icon
 default app.icon ""
 
-
 #-------------------------------------------------------------------------------
 # app.short_version_string: the version number
 #
@@ -95,7 +90,6 @@ default app.icon ""
 options app.short_version_string
 default app.short_version_string {${version}}
 
-
 #-------------------------------------------------------------------------------
 # app.version: the build number
 #
@@ -107,7 +101,6 @@ default app.short_version_string {${version}}
 
 options app.version
 default app.version {${version}}
-
 
 #-------------------------------------------------------------------------------
 # app.identifier: the app's unique bundle identifier
@@ -137,7 +130,6 @@ proc app.get_default_identifier {} {
     return [regsub -all -nocase {[^a-z0-9.-]} [join ${identifier} .] ""]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.retina: whether the app supports Retina display resolutions
 #
@@ -149,7 +141,6 @@ proc app.get_default_identifier {} {
 options app.retina
 default app.retina no
 
-
 #-------------------------------------------------------------------------------
 # app.dark_mode: whether the app supports dark mode
 #
@@ -160,7 +151,6 @@ default app.retina no
 
 options app.dark_mode
 default app.dark_mode yes
-
 
 #-------------------------------------------------------------------------------
 # app.privacy_microphone: whether the app needs microphone access
@@ -175,7 +165,6 @@ default app.dark_mode yes
 options app.privacy_microphone
 default app.privacy_microphone ""
 
-
 #-------------------------------------------------------------------------------
 # app.privacy_camera: whether the app needs camera access
 #
@@ -188,7 +177,6 @@ default app.privacy_microphone ""
 
 options app.privacy_camera
 default app.privacy_camera ""
-
 
 #-------------------------------------------------------------------------------
 # app.privacy_contacts: whether the app needs contacts access
@@ -203,7 +191,6 @@ default app.privacy_camera ""
 options app.privacy_contacts
 default app.privacy_contacts ""
 
-
 #-------------------------------------------------------------------------------
 # app.privacy_calendars: whether the app needs calendars access
 #
@@ -217,7 +204,6 @@ default app.privacy_contacts ""
 options app.privacy_calendars
 default app.privacy_calendars ""
 
-
 #-------------------------------------------------------------------------------
 # app.privacy_photo: whether the app needs photo access
 #
@@ -230,7 +216,6 @@ default app.privacy_calendars ""
 
 options app.privacy_photo
 default app.privacy_photo ""
-
 
 #-------------------------------------------------------------------------------
 # app.hide_dock_icon: hide the Dock icon
@@ -253,7 +238,6 @@ proc app.get_default_hide_dock_icon {} {
     return [variant_exists x11] && [variant_isset x11]
 }
 
-
 #-------------------------------------------------------------------------------
 # app.use_launch_script: use shell launch script instead of symlink to executable
 #
@@ -266,7 +250,6 @@ proc app.get_default_hide_dock_icon {} {
 
 options app.use_launch_script
 default app.use_launch_script  no
-
 
 platform macosx {
     pre-destroot {
@@ -285,7 +268,7 @@ platform macosx {
     post-destroot {
         if {[tbool app.create]} {
             # Ensure app.identifier is valid.
-            if {[regexp -nocase {[^a-z0-9.-]} ${app.identifier}]} {
+            if {[regexp -nocase {[^a-z0-9._-]} ${app.identifier}]} {
                 return -code error "app.identifier ${app.identifier} contains illegal characters"
             }
             if {[llength [split ${app.identifier} "."]] < 3} {
@@ -438,9 +421,8 @@ platform macosx {
     }
 }
 
-
 # Trace writes to app.icon and add or remove makeicns dependency as necessary.
-trace variable app.icon w app._icon_trace
+trace add variable app.icon write app._icon_trace
 
 proc app._icon_trace {optionName unusedIndex unusedOperation} {
     global depends_build
@@ -457,7 +439,6 @@ proc app._icon_trace {optionName unusedIndex unusedOperation} {
     }
 }
 
-
 # Recursively resolve a symlink in a destroot.
 proc app._resolve_symlink {path destroot} {
     if {[catch {set resolved_path [file join [file dirname ${path}] [file readlink ${destroot}${path}]]}]} {
@@ -467,7 +448,6 @@ proc app._resolve_symlink {path destroot} {
 #    ui_debug "In ${destroot}, ${path} is a symlink to ${resolved_path}"
     return [app._resolve_symlink ${resolved_path} ${destroot}]
 }
-
 
 # Write a launch script for the executable into the bundle, modifying PATH to
 # allow the executable to find other executables installed with MacPorts.

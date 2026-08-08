@@ -1,0 +1,616 @@
+From bfc74636a4599161faecad7a16d11adc8f6c2046 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 24 Jul 2026 05:31:54 +0000
+Subject: [PATCH 14/20] avcodec/ppc: H.264 chroma + intra loop filters and
+ chroma_mc4 AltiVec (O1)
+
+Fills the remaining H.264 deblock gaps on PPC (only the luma inter
+loop filters were previously vectorised) and adds the 4-wide chroma
+motion compensation kernel.
+
+libavcodec/ppc/h264dsp.c:
+- h264_{v,h}_loop_filter_chroma_altivec (inter): reuses the existing
+  boundary-strength mask (h264_deblock_mask) and the luma p0/q0 delta
+  macro (h264_deblock_p0_q0) verbatim -- the chroma delta formula
+  av_clip(((q0-p0)*4+(p1-q1)+4)>>3,-tc,tc) is identical to luma's, and
+  that macro already folds the block mask into tc0masked so tc==0 lanes
+  are left untouched. Chroma tc == tc0[i] (not tc0[i]+1) and lanes with
+  tc0<=0 are skipped, matching h264dsp_template.c. tc0[] has one entry
+  per pair of samples (inner_iters==2) so each byte is duplicated twice.
+- h264_{v,h}_loop_filter_chroma_intra_altivec: p0'=(2p1+p0+q1+2)>>2,
+  q0'=(2q1+q0+p1+2)>>2 under the same mask, done in s16.
+- h264_{v,h}_loop_filter_luma_intra_altivec: full two-branch intra
+  filter (strong p2..q2 rewrite / weak p0,q0) computed on both unpacked
+  halves in s16 and selected with vec_sel on mask/ap/p2/q2 masks.
+- New helpers: store8_altivec (8-wide RMW store that preserves the
+  adjacent 8 bytes, same idiom as h264pred.c st8()); readAndTranspose16x8
+  (readAndTranspose16x6 extended to emit columns 6 and 7, needed for
+  p3/q3); TRANSPOSE_8x4_LOAD (8-row x 4-col transpose for the horizontal
+  chroma edge). The horizontal chroma stores go through per-row scalar
+  writes; the horizontal luma-intra writes its six modified columns with
+  two overlapping write16x4() calls so nothing outside [pix-3,pix+2] is
+  touched. All transposed loads use unaligned_load(), recomputing the
+  alignment shift per row (no stride % 16 assumption), the same
+  correctness rule as the recent vp8/vp9 vertical-MC fixes.
+- Chroma filters are gated on chroma_format_idc <= 1 (the 4:2:2 variants
+  keep the C path), matching the other arches.
+
+libavcodec/ppc/h264chroma_template.c + _init.c:
+- put/avg_h264_chroma_mc4_altivec (pixels_tab[1]). Computes the full
+  A/B/C/D bilinear form (the C special-cases for B/C/D==0 are pure
+  micro-optimisations; the arithmetic is identical and the zeroed terms
+  make the extra src reads harmless), reusing OP_U8_ALTIVEC for the
+  put/avg split. dst is 4-aligned in every caller, so the result is
+  written a word at a time with vec_ste.
+
+Pure AltiVec C intrinsics only -- no inline asm, so nothing here depends
+on gas/Darwin assembler conventions; identical source builds for
+powerpc-apple-darwin and powerpc-linux.
+
+VALIDATED under the cross-PPC/qemu harness (qemu-ppc-static -cpu 7400):
+checkasm h264dsp (loop_filter, loop_filter_intra) and h264chroma
+(chroma_mc) show a real ALTIVEC: dispatch block and pass across 6 random
+seeds; full checkasm suite 523/523 with no regressions.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LCUwKztMy8skn2sLARXVo9
+---
+ libavcodec/ppc/h264chroma_init.c     |   6 +
+ libavcodec/ppc/h264chroma_template.c |  58 ++++
+ libavcodec/ppc/h264dsp.c             | 414 +++++++++++++++++++++++++++
+ 3 files changed, 478 insertions(+)
+
+diff --git a/libavcodec/ppc/h264chroma_init.c b/libavcodec/ppc/h264chroma_init.c
+index bd0d213..5d8f1c7 100644
+--- a/libavcodec/ppc/h264chroma_init.c
++++ b/libavcodec/ppc/h264chroma_init.c
+@@ -35,18 +35,22 @@
+ #define OP_U8_ALTIVEC                          PUT_OP_U8_ALTIVEC
+ #define PREFIX_h264_chroma_mc8_altivec         put_h264_chroma_mc8_altivec
+ #define PREFIX_h264_chroma_mc8_num             altivec_put_h264_chroma_mc8_num
++#define PREFIX_h264_chroma_mc4_altivec         put_h264_chroma_mc4_altivec
+ #include "h264chroma_template.c"
+ #undef OP_U8_ALTIVEC
+ #undef PREFIX_h264_chroma_mc8_altivec
+ #undef PREFIX_h264_chroma_mc8_num
++#undef PREFIX_h264_chroma_mc4_altivec
+ 
+ #define OP_U8_ALTIVEC                          AVG_OP_U8_ALTIVEC
+ #define PREFIX_h264_chroma_mc8_altivec         avg_h264_chroma_mc8_altivec
+ #define PREFIX_h264_chroma_mc8_num             altivec_avg_h264_chroma_mc8_num
++#define PREFIX_h264_chroma_mc4_altivec         avg_h264_chroma_mc4_altivec
+ #include "h264chroma_template.c"
+ #undef OP_U8_ALTIVEC
+ #undef PREFIX_h264_chroma_mc8_altivec
+ #undef PREFIX_h264_chroma_mc8_num
++#undef PREFIX_h264_chroma_mc4_altivec
+ #endif /* HAVE_ALTIVEC */
+ 
+ av_cold void ff_h264chroma_init_ppc(H264ChromaContext *c, int bit_depth)
+@@ -60,6 +64,8 @@ av_cold void ff_h264chroma_init_ppc(H264ChromaContext *c, int bit_depth)
+     if (!high_bit_depth) {
+         c->put_h264_chroma_pixels_tab[0] = put_h264_chroma_mc8_altivec;
+         c->avg_h264_chroma_pixels_tab[0] = avg_h264_chroma_mc8_altivec;
++        c->put_h264_chroma_pixels_tab[1] = put_h264_chroma_mc4_altivec;
++        c->avg_h264_chroma_pixels_tab[1] = avg_h264_chroma_mc4_altivec;
+     }
+ #endif /* HAVE_ALTIVEC */
+ }
+diff --git a/libavcodec/ppc/h264chroma_template.c b/libavcodec/ppc/h264chroma_template.c
+index c64856b..ec82e41 100644
+--- a/libavcodec/ppc/h264chroma_template.c
++++ b/libavcodec/ppc/h264chroma_template.c
+@@ -182,6 +182,64 @@ static void PREFIX_h264_chroma_mc8_altivec(uint8_t * dst, const uint8_t * src,
+ }
+ #endif
+ 
++#ifdef PREFIX_h264_chroma_mc4_altivec
++/* 4-wide chroma motion compensation. Only the low 4 samples of every vector are
++ * meaningful; the result is written 4 bytes at a time with vec_ste (dst is
++ * 4-aligned in every caller). src is loaded unaligned (recomputed per row), so
++ * no stride % 16 assumption is required here. */
++static void PREFIX_h264_chroma_mc4_altivec(uint8_t * dst, const uint8_t * src,
++                                           ptrdiff_t stride, int h,
++                                           int x, int y)
++{
++    DECLARE_ALIGNED(16, signed int, ABCD)[4] =
++                        {((8 - x) * (8 - y)),
++                         ((    x) * (8 - y)),
++                         ((8 - x) * (    y)),
++                         ((    x) * (    y))};
++    register int i;
++    LOAD_ZERO;
++    const vec_s32 vABCD = vec_ld(0, ABCD);
++    const vec_s16 vA = VEC_SPLAT16(vABCD, 1);
++    const vec_s16 vB = VEC_SPLAT16(vABCD, 3);
++    const vec_s16 vC = VEC_SPLAT16(vABCD, 5);
++    const vec_s16 vD = VEC_SPLAT16(vABCD, 7);
++    const vec_s16 v32ss = vec_sl(vec_splat_s16(1), vec_splat_u16(5));
++    const vec_u16 v6us  = vec_splat_u16(6);
++
++    for (i = 0; i < h; i++) {
++        /* row i and row i+1 of src; lanes 0..4 hold src[0..4] */
++        vec_u8 srcAuc = unaligned_load(0,      src);
++        vec_u8 srcCuc = unaligned_load(stride, src);
++        vec_u8 srcBuc = vec_sld(srcAuc, srcAuc, 1); /* src[1..] */
++        vec_u8 srcDuc = vec_sld(srcCuc, srcCuc, 1); /* src[stride+1..] */
++
++        vec_s16 srcAss = (vec_s16)VEC_MERGEH(zero_u8v, srcAuc);
++        vec_s16 srcBss = (vec_s16)VEC_MERGEH(zero_u8v, srcBuc);
++        vec_s16 srcCss = (vec_s16)VEC_MERGEH(zero_u8v, srcCuc);
++        vec_s16 srcDss = (vec_s16)VEC_MERGEH(zero_u8v, srcDuc);
++
++        vec_s16 psum = vec_mladd(vA, srcAss, v32ss);
++        psum = vec_mladd(vB, srcBss, psum);
++        psum = vec_mladd(vC, srcCss, psum);
++        psum = vec_mladd(vD, srcDss, psum);
++        psum = vec_sr(psum, v6us);
++
++        vec_u8 ppsum = (vec_u8)vec_pack((vec_u16)psum, (vec_u16)psum);
++        av_unused vec_u8 vdst = unaligned_load(0, dst);
++        vec_u8 fsum;
++
++        /* OP_U8_ALTIVEC is PUT (fsum = ppsum) or AVG (fsum = avg(vdst, ppsum));
++         * both only depend on the low 4 lanes we go on to store. */
++        OP_U8_ALTIVEC(fsum, ppsum, vdst);
++
++        vec_ste(vec_splat((vec_u32)fsum, 0), 0, (uint32_t *)dst);
++
++        dst += stride;
++        src += stride;
++    }
++}
++#endif
++
+ /* this code assume that stride % 16 == 0 */
+ #ifdef PREFIX_no_rnd_vc1_chroma_mc8_altivec
+ static void PREFIX_no_rnd_vc1_chroma_mc8_altivec(uint8_t *dst, const uint8_t *src,
+diff --git a/libavcodec/ppc/h264dsp.c b/libavcodec/ppc/h264dsp.c
+index 22d3db6..b057e32 100644
+--- a/libavcodec/ppc/h264dsp.c
++++ b/libavcodec/ppc/h264dsp.c
+@@ -35,6 +35,20 @@
+ 
+ #if HAVE_ALTIVEC
+ 
++/* Stores the low 8 bytes (lanes 0..7) of @a v to @a dst without disturbing the
++ * adjacent 8 bytes, whatever the alignment of dst mod 16. Same read/perm/store
++ * idiom as h264pred.c's st8() and CHROMA_MC8_ALTIVEC_CORE. */
++static inline void store8_altivec(uint8_t *dst, vec_u8 v)
++{
++    vec_u8 vdst = vec_ld(0, dst);
++    vec_u8 fperm = (((uintptr_t)dst) % 16 == 0) ?
++        (vec_u8){ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++                  0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F } :
++        (vec_u8){ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++                  0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F };
++    vec_st(vec_perm(vdst, v, fperm), 0, dst);
++}
++
+ /****************************************************************************
+  * IDCT transform:
+  ****************************************************************************/
+@@ -488,6 +502,70 @@ static inline void write16x4(uint8_t *dst, int dst_stride,
+                                                                            \
+ }
+ 
++/** @brief performs an 8x16 transpose of data in src, storing all 8 columns.
++    Identical construction to readAndTranspose16x6 (same merge tree, verified
++    against it) but also emits columns 6 and 7, which that macro discarded.
++    Needed by the intra luma filter, which reads p3..q3. */
++#define readAndTranspose16x8(src, src_stride, r8, r9, r10, r11, r12, r13, r14o, r15o) {\
++    register vec_u8 r0  = unaligned_load(0,             src);            \
++    register vec_u8 r1  = unaligned_load(   src_stride, src);            \
++    register vec_u8 r2  = unaligned_load(2* src_stride, src);            \
++    register vec_u8 r3  = unaligned_load(3* src_stride, src);            \
++    register vec_u8 r4  = unaligned_load(4* src_stride, src);            \
++    register vec_u8 r5  = unaligned_load(5* src_stride, src);            \
++    register vec_u8 r6  = unaligned_load(6* src_stride, src);            \
++    register vec_u8 r7  = unaligned_load(7* src_stride, src);            \
++    register vec_u8 r14 = unaligned_load(14*src_stride, src);            \
++    register vec_u8 r15 = unaligned_load(15*src_stride, src);            \
++                                                                           \
++    r8  = unaligned_load( 8*src_stride, src);                              \
++    r9  = unaligned_load( 9*src_stride, src);                              \
++    r10 = unaligned_load(10*src_stride, src);                              \
++    r11 = unaligned_load(11*src_stride, src);                              \
++    r12 = unaligned_load(12*src_stride, src);                              \
++    r13 = unaligned_load(13*src_stride, src);                              \
++                                                                           \
++    /*Merge first pairs*/                                                  \
++    r0 = vec_mergeh(r0, r8);    /*0, 8*/                                   \
++    r1 = vec_mergeh(r1, r9);    /*1, 9*/                                   \
++    r2 = vec_mergeh(r2, r10);   /*2,10*/                                   \
++    r3 = vec_mergeh(r3, r11);   /*3,11*/                                   \
++    r4 = vec_mergeh(r4, r12);   /*4,12*/                                   \
++    r5 = vec_mergeh(r5, r13);   /*5,13*/                                   \
++    r6 = vec_mergeh(r6, r14);   /*6,14*/                                   \
++    r7 = vec_mergeh(r7, r15);   /*7,15*/                                   \
++                                                                           \
++    /*Merge second pairs*/                                                 \
++    r8  = vec_mergeh(r0, r4);   /*0,4, 8,12 set 0*/                        \
++    r9  = vec_mergel(r0, r4);   /*0,4, 8,12 set 1*/                        \
++    r10 = vec_mergeh(r1, r5);   /*1,5, 9,13 set 0*/                        \
++    r11 = vec_mergel(r1, r5);   /*1,5, 9,13 set 1*/                        \
++    r12 = vec_mergeh(r2, r6);   /*2,6,10,14 set 0*/                        \
++    r13 = vec_mergel(r2, r6);   /*2,6,10,14 set 1*/                        \
++    r14 = vec_mergeh(r3, r7);   /*3,7,11,15 set 0*/                        \
++    r15 = vec_mergel(r3, r7);   /*3,7,11,15 set 1*/                        \
++                                                                           \
++    /*Third merge*/                                                        \
++    r0 = vec_mergeh(r8,  r12);  /*evens set 0*/                            \
++    r1 = vec_mergel(r8,  r12);  /*evens set 1*/                            \
++    r2 = vec_mergeh(r9,  r13);  /*evens set 2*/                            \
++    r3 = vec_mergel(r9,  r13);  /*evens set 3*/                            \
++    r4 = vec_mergeh(r10, r14);  /*odds set 0*/                             \
++    r5 = vec_mergel(r10, r14);  /*odds set 1*/                             \
++    r6 = vec_mergeh(r11, r15);  /*odds set 2*/                             \
++    r7 = vec_mergel(r11, r15);  /*odds set 3*/                             \
++                                                                           \
++    /*Final merge*/                                                        \
++    r8   = vec_mergeh(r0, r4);   /*col 0*/                                 \
++    r9   = vec_mergel(r0, r4);   /*col 1*/                                 \
++    r10  = vec_mergeh(r1, r5);   /*col 2*/                                 \
++    r11  = vec_mergel(r1, r5);   /*col 3*/                                 \
++    r12  = vec_mergeh(r2, r6);   /*col 4*/                                 \
++    r13  = vec_mergel(r2, r6);   /*col 5*/                                 \
++    r14o = vec_mergeh(r3, r7);   /*col 6*/                                 \
++    r15o = vec_mergel(r3, r7);   /*col 7*/                                 \
++}
++
+ // out: o = |x-y| < a
+ static inline vec_u8 diff_lt_altivec ( register vec_u8 x,
+                                          register vec_u8 y,
+@@ -652,6 +730,334 @@ static void h264_h_loop_filter_luma_altivec(uint8_t *pix, ptrdiff_t stride, int
+     write16x4(pix-2, stride, line1, line2, line3, line4);
+ }
+ 
++/****************************************************************************
++ * Luma loop filter (intra)
++ ****************************************************************************/
++
++/* Computes, for the 8 s16 samples of one half, the strong/weak intra outputs.
++ * Inputs p3h..q3h are s16 (0..255). Outputs are s16, still unclipped-to-u8
++ * (they are packed with vec_packsu by the caller). */
++#define LUMA_INTRA_HALF(p3h, p2h, p1h, p0h, q0h, q1h, q2h, q3h,               \
++                        sp0, sp1, sp2, sq0, sq1, sq2, wp0, wq0) {             \
++    register vec_s16 twov  = vec_splat_s16(2);                                \
++    register vec_s16 fourv = vec_splat_s16(4);                                \
++    register vec_u16 twosh   = vec_splat_u16(2);                              \
++    register vec_u16 threesh = vec_splat_u16(3);                              \
++    register vec_s16 sum;                                                     \
++    /* strong p0' = (p2 + 2p1 + 2p0 + 2q0 + q1 + 4) >> 3 */                   \
++    sum = vec_add(p2h, q1h);                                                  \
++    sum = vec_add(sum, vec_add(p1h, p1h));                                    \
++    sum = vec_add(sum, vec_add(p0h, p0h));                                    \
++    sum = vec_add(sum, vec_add(q0h, q0h));                                    \
++    sp0 = vec_sra(vec_add(sum, fourv), threesh);                             \
++    /* strong p1' = (p2 + p1 + p0 + q0 + 2) >> 2 */                          \
++    sum = vec_add(vec_add(p2h, p1h), vec_add(p0h, q0h));                      \
++    sp1 = vec_sra(vec_add(sum, twov), twosh);                                \
++    /* strong p2' = (2p3 + 3p2 + p1 + p0 + q0 + 4) >> 3 */                   \
++    sum = vec_add(vec_add(p3h, p3h), vec_add(p2h, vec_add(p2h, p2h)));       \
++    sum = vec_add(sum, vec_add(p1h, p0h));                                    \
++    sum = vec_add(sum, q0h);                                                  \
++    sp2 = vec_sra(vec_add(sum, fourv), threesh);                             \
++    /* strong q0' = (p1 + 2p0 + 2q0 + 2q1 + q2 + 4) >> 3 */                  \
++    sum = vec_add(p1h, q2h);                                                  \
++    sum = vec_add(sum, vec_add(p0h, p0h));                                    \
++    sum = vec_add(sum, vec_add(q0h, q0h));                                    \
++    sum = vec_add(sum, vec_add(q1h, q1h));                                    \
++    sq0 = vec_sra(vec_add(sum, fourv), threesh);                             \
++    /* strong q1' = (p0 + q0 + q1 + q2 + 2) >> 2 */                          \
++    sum = vec_add(vec_add(p0h, q0h), vec_add(q1h, q2h));                      \
++    sq1 = vec_sra(vec_add(sum, twov), twosh);                                \
++    /* strong q2' = (2q3 + 3q2 + q1 + q0 + p0 + 4) >> 3 */                   \
++    sum = vec_add(vec_add(q3h, q3h), vec_add(q2h, vec_add(q2h, q2h)));       \
++    sum = vec_add(sum, vec_add(q1h, q0h));                                    \
++    sum = vec_add(sum, p0h);                                                  \
++    sq2 = vec_sra(vec_add(sum, fourv), threesh);                             \
++    /* weak p0' = (2p1 + p0 + q1 + 2) >> 2 */                                \
++    sum = vec_add(vec_add(p1h, p1h), vec_add(p0h, q1h));                      \
++    wp0 = vec_sra(vec_add(sum, twov), twosh);                                \
++    /* weak q0' = (2q1 + q0 + p1 + 2) >> 2 */                                \
++    sum = vec_add(vec_add(q1h, q1h), vec_add(q0h, p1h));                      \
++    wq0 = vec_sra(vec_add(sum, twov), twosh);                                \
++}
++
++#define h264_loop_filter_luma_intra_altivec(p3, p2, p1, p0, q0, q1, q2, q3,   \
++                                            alpha, beta) {                    \
++    DECLARE_ALIGNED(16, unsigned char, temp)[16];                             \
++    register vec_u8 alphavec, betavec, alphaltvec;                            \
++    register vec_u8 mask, apmask, p2mask, q2mask;                             \
++    register vec_s16 sp0h, sp1h, sp2h, sq0h, sq1h, sq2h, wp0h, wq0h;          \
++    register vec_s16 sp0l, sp1l, sp2l, sq0l, sq1l, sq2l, wp0l, wq0l;          \
++    register vec_u8 sp0, sp1, sp2, sq0, sq1, sq2, wp0, wq0;                    \
++    LOAD_ZERO;                                                                \
++                                                                              \
++    temp[0] = alpha;                                                          \
++    temp[1] = beta;                                                           \
++    temp[2] = (alpha >> 2) + 2;                                               \
++    alphavec   = vec_ld(0, temp);                                             \
++    betavec    = vec_splat(alphavec, 0x1);                                    \
++    alphaltvec = vec_splat(alphavec, 0x2);                                    \
++    alphavec   = vec_splat(alphavec, 0x0);                                    \
++                                                                              \
++    mask   = h264_deblock_mask(p0, p1, q0, q1, alphavec, betavec);            \
++    apmask = vec_and(mask, diff_lt_altivec(p0, q0, alphaltvec));              \
++    p2mask = vec_and(apmask, diff_lt_altivec(p2, p0, betavec));               \
++    q2mask = vec_and(apmask, diff_lt_altivec(q2, q0, betavec));               \
++                                                                              \
++    LUMA_INTRA_HALF((vec_s16)VEC_MERGEH(zero_u8v, p3),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, p2),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, p1),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, p0),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, q0),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, q1),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, q2),                        \
++                    (vec_s16)VEC_MERGEH(zero_u8v, q3),                        \
++                    sp0h, sp1h, sp2h, sq0h, sq1h, sq2h, wp0h, wq0h);          \
++    LUMA_INTRA_HALF((vec_s16)VEC_MERGEL(zero_u8v, p3),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, p2),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, p1),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, p0),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, q0),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, q1),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, q2),                        \
++                    (vec_s16)VEC_MERGEL(zero_u8v, q3),                        \
++                    sp0l, sp1l, sp2l, sq0l, sq1l, sq2l, wp0l, wq0l);          \
++                                                                              \
++    sp0 = vec_packsu(sp0h, sp0l);                                             \
++    sp1 = vec_packsu(sp1h, sp1l);                                             \
++    sp2 = vec_packsu(sp2h, sp2l);                                             \
++    sq0 = vec_packsu(sq0h, sq0l);                                             \
++    sq1 = vec_packsu(sq1h, sq1l);                                             \
++    sq2 = vec_packsu(sq2h, sq2l);                                             \
++    wp0 = vec_packsu(wp0h, wp0l);                                             \
++    wq0 = vec_packsu(wq0h, wq0l);                                             \
++                                                                              \
++    /* p0' = mask ? (p2mask ? strong_p0 : weak_p0) : p0 */                    \
++    p0 = vec_sel(p0, vec_sel(wp0, sp0, p2mask), mask);                        \
++    q0 = vec_sel(q0, vec_sel(wq0, sq0, q2mask), mask);                        \
++    /* p1'/p2' only change on the strong p-side (p2mask); ditto q side */     \
++    p1 = vec_sel(p1, sp1, p2mask);                                            \
++    p2 = vec_sel(p2, sp2, p2mask);                                            \
++    q1 = vec_sel(q1, sq1, q2mask);                                            \
++    q2 = vec_sel(q2, sq2, q2mask);                                            \
++}
++
++static void h264_v_loop_filter_luma_intra_altivec(uint8_t *pix, ptrdiff_t stride,
++                                                  int alpha, int beta)
++{
++    register vec_u8 p3 = vec_ld(-4*stride, pix);
++    register vec_u8 p2 = vec_ld(-3*stride, pix);
++    register vec_u8 p1 = vec_ld(-2*stride, pix);
++    register vec_u8 p0 = vec_ld(-1*stride, pix);
++    register vec_u8 q0 = vec_ld(0, pix);
++    register vec_u8 q1 = vec_ld(stride, pix);
++    register vec_u8 q2 = vec_ld(2*stride, pix);
++    register vec_u8 q3 = vec_ld(3*stride, pix);
++    h264_loop_filter_luma_intra_altivec(p3, p2, p1, p0, q0, q1, q2, q3, alpha, beta);
++    vec_st(p2, -3*stride, pix);
++    vec_st(p1, -2*stride, pix);
++    vec_st(p0, -1*stride, pix);
++    vec_st(q0, 0, pix);
++    vec_st(q1, stride, pix);
++    vec_st(q2, 2*stride, pix);
++}
++
++static void h264_h_loop_filter_luma_intra_altivec(uint8_t *pix, ptrdiff_t stride,
++                                                  int alpha, int beta)
++{
++    /* p3 p2 p1 p0 q0 q1 q2 q3 = columns of the 16 rows starting at pix-4 */
++    register vec_u8 p3, p2, p1, p0, q0, q1, q2, q3;
++    register vec_u8 w0, w1, w2, w3;
++    readAndTranspose16x8(pix - 4, stride, p3, p2, p1, p0, q0, q1, q2, q3);
++    h264_loop_filter_luma_intra_altivec(p3, p2, p1, p0, q0, q1, q2, q3, alpha, beta);
++
++    /* Write the six modified columns p2 p1 p0 q0 q1 q2 (pix-3 .. pix+2) with two
++     * overlapping 4-wide writes; the shared columns p0/q0 are written twice with
++     * identical data, and no column outside [pix-3, pix+2] is touched. */
++    w0 = p2; w1 = p1; w2 = p0; w3 = q0;
++    transpose4x16(w0, w1, w2, w3);
++    write16x4(pix - 3, stride, w0, w1, w2, w3);
++
++    w0 = p0; w1 = q0; w2 = q1; w3 = q2;
++    transpose4x16(w0, w1, w2, w3);
++    write16x4(pix - 1, stride, w0, w1, w2, w3);
++}
++
++/* Filters the p0/q0 samples of a chroma edge; only the p0' and q0' outputs are
++ * used. The delta arithmetic and the tc0 clamping are identical to the luma
++ * p0/q0 stage, so h264_deblock_p0_q0() is reused verbatim. Because that macro
++ * folds the block mask into tc0masked (lanes with tc==0 are left untouched),
++ * the caller only has to build the correct per-lane tc vector. */
++#define h264_loop_filter_chroma_altivec(p1, p0, q0, q1, alpha, beta, tc0) {   \
++    DECLARE_ALIGNED(16, unsigned char, temp)[16];                             \
++    register vec_u8 alphavec;                                                 \
++    register vec_u8 betavec;                                                  \
++    register vec_u8 mask;                                                     \
++    register vector signed char tc0vec;                                       \
++    register vec_u8 tc0masked;                                                \
++                                                                              \
++    temp[0] = alpha;                                                          \
++    temp[1] = beta;                                                           \
++    alphavec = vec_ld(0, temp);                                               \
++    betavec  = vec_splat(alphavec, 0x1);                                      \
++    alphavec = vec_splat(alphavec, 0x0);                                      \
++    mask = h264_deblock_mask(p0, p1, q0, q1, alphavec, betavec);              \
++                                                                              \
++    /* tc0[] has one entry per pair of edge samples (inner_iters == 2), so    \
++     * duplicate each byte twice to line the 8 chroma samples up with the 4   \
++     * tc0 values. */                                                         \
++    AV_COPY32(temp, tc0);                                                     \
++    tc0vec = vec_ld(0, (signed char*)temp);                                   \
++    tc0vec = vec_mergeh(tc0vec, tc0vec);                                      \
++    /* skip lanes where the block mask is 0 or tc0 <= 0 (chroma tc == tc0) */ \
++    mask = vec_and(mask, vec_cmpgt(tc0vec, vec_splat_s8(0)));                 \
++    tc0masked = vec_and((vec_u8)tc0vec, mask);                                \
++                                                                              \
++    h264_deblock_p0_q0(p0, p1, q0, q1, tc0masked);                            \
++}
++
++static void h264_v_loop_filter_chroma_altivec(uint8_t *pix, ptrdiff_t stride,
++                                              int alpha, int beta, int8_t *tc0)
++{
++    register vec_u8 p1 = vec_ld(-2*stride, pix);
++    register vec_u8 p0 = vec_ld(-1*stride, pix);
++    register vec_u8 q0 = vec_ld(0, pix);
++    register vec_u8 q1 = vec_ld(stride, pix);
++    h264_loop_filter_chroma_altivec(p1, p0, q0, q1, alpha, beta, tc0);
++    store8_altivec(pix - 1*stride, p0);
++    store8_altivec(pix,           q0);
++}
++
++/* Reads 8 rows of 4 bytes at (base, base+stride, ..., base+7*stride) and
++ * transposes them so that column c (c = 0..3) of every row ends up in lanes
++ * 0..7 of the outputs. col01 holds columns 0 and 1 (lanes 0-7 and 8-15), col23
++ * holds columns 2 and 3. Alignment is recomputed per row via unaligned_load(),
++ * so any stride/base alignment is handled. */
++#define TRANSPOSE_8x4_LOAD(base, stride, col01, col23) {                      \
++    register vec_u8 r0 = unaligned_load(0*(stride), base);                    \
++    register vec_u8 r1 = unaligned_load(1*(stride), base);                    \
++    register vec_u8 r2 = unaligned_load(2*(stride), base);                    \
++    register vec_u8 r3 = unaligned_load(3*(stride), base);                    \
++    register vec_u8 r4 = unaligned_load(4*(stride), base);                    \
++    register vec_u8 r5 = unaligned_load(5*(stride), base);                    \
++    register vec_u8 r6 = unaligned_load(6*(stride), base);                    \
++    register vec_u8 r7 = unaligned_load(7*(stride), base);                    \
++    register vec_u8 t0 = vec_mergeh(r0, r1);                                  \
++    register vec_u8 t1 = vec_mergeh(r2, r3);                                  \
++    register vec_u8 t2 = vec_mergeh(r4, r5);                                  \
++    register vec_u8 t3 = vec_mergeh(r6, r7);                                  \
++    register vec_u8 u0 = (vec_u8)vec_mergeh((vec_u16)t0, (vec_u16)t1);        \
++    register vec_u8 u1 = (vec_u8)vec_mergeh((vec_u16)t2, (vec_u16)t3);        \
++    col01 = (vec_u8)vec_mergeh((vec_u32)u0, (vec_u32)u1);                     \
++    col23 = (vec_u8)vec_mergel((vec_u32)u0, (vec_u32)u1);                     \
++}
++
++static void h264_h_loop_filter_chroma_altivec(uint8_t *pix, ptrdiff_t stride,
++                                              int alpha, int beta, int8_t *tc0)
++{
++    register vec_u8 col01, col23;
++    register vec_u8 p1, p0, q0, q1;
++    DECLARE_ALIGNED(16, unsigned char, p0tmp)[16];
++    DECLARE_ALIGNED(16, unsigned char, q0tmp)[16];
++    int i;
++
++    TRANSPOSE_8x4_LOAD(pix - 2, stride, col01, col23);
++    p1 = col01;                       /* column 0 in lanes 0-7 */
++    p0 = vec_sld(col01, col01, 8);    /* column 1 in lanes 0-7 */
++    q0 = col23;                       /* column 2 in lanes 0-7 */
++    q1 = vec_sld(col23, col23, 8);    /* column 3 in lanes 0-7 */
++
++    h264_loop_filter_chroma_altivec(p1, p0, q0, q1, alpha, beta, tc0);
++
++    vec_st(p0, 0, p0tmp);
++    vec_st(q0, 0, q0tmp);
++    for (i = 0; i < 8; i++) {
++        pix[i * stride - 1] = p0tmp[i];
++        pix[i * stride           ] = q0tmp[i];
++    }
++}
++
++/****************************************************************************
++ * Chroma loop filter (intra)
++ ****************************************************************************/
++
++/* Intra chroma edge filter: no tc0, unconditional
++ *   p0' = (2*p1 + p0 + q1 + 2) >> 2
++ *   q0' = (2*q1 + q0 + p1 + 2) >> 2
++ * applied wherever the standard boundary-strength mask holds. Only p0/q0 are
++ * updated (2-tap chroma). Everything is done on the low 8 samples. */
++#define h264_loop_filter_chroma_intra_altivec(p1, p0, q0, q1, alpha, beta) {  \
++    DECLARE_ALIGNED(16, unsigned char, temp)[16];                             \
++    register vec_u8 alphavec;                                                 \
++    register vec_u8 betavec;                                                  \
++    register vec_u8 mask;                                                     \
++    register vec_s16 p1h, p0h, q0h, q1h;                                      \
++    register vec_s16 twos, np0, nq0;                                          \
++    register vec_u16 twosh;                                                   \
++    register vec_u8 np0_8, nq0_8;                                             \
++    LOAD_ZERO;                                                                \
++                                                                              \
++    temp[0] = alpha;                                                          \
++    temp[1] = beta;                                                           \
++    alphavec = vec_ld(0, temp);                                               \
++    betavec  = vec_splat(alphavec, 0x1);                                      \
++    alphavec = vec_splat(alphavec, 0x0);                                      \
++    mask = h264_deblock_mask(p0, p1, q0, q1, alphavec, betavec);              \
++                                                                              \
++    twos  = vec_splat_s16(2);                                                 \
++    twosh = vec_splat_u16(2);                                                 \
++    p1h = (vec_s16)VEC_MERGEH(zero_u8v, p1);                                  \
++    p0h = (vec_s16)VEC_MERGEH(zero_u8v, p0);                                  \
++    q0h = (vec_s16)VEC_MERGEH(zero_u8v, q0);                                  \
++    q1h = (vec_s16)VEC_MERGEH(zero_u8v, q1);                                  \
++    /* p0' = (2*p1 + p0 + q1 + 2) >> 2 */                                     \
++    np0 = vec_add(vec_add(vec_add(p1h, p1h), p0h), vec_add(q1h, twos));       \
++    np0 = vec_sra(np0, twosh);                                                \
++    /* q0' = (2*q1 + q0 + p1 + 2) >> 2 */                                     \
++    nq0 = vec_add(vec_add(vec_add(q1h, q1h), q0h), vec_add(p1h, twos));       \
++    nq0 = vec_sra(nq0, twosh);                                                \
++    np0_8 = vec_packsu(np0, np0);                                             \
++    nq0_8 = vec_packsu(nq0, nq0);                                             \
++    p0 = vec_sel(p0, np0_8, mask);                                            \
++    q0 = vec_sel(q0, nq0_8, mask);                                            \
++}
++
++static void h264_v_loop_filter_chroma_intra_altivec(uint8_t *pix, ptrdiff_t stride,
++                                                    int alpha, int beta)
++{
++    register vec_u8 p1 = vec_ld(-2*stride, pix);
++    register vec_u8 p0 = vec_ld(-1*stride, pix);
++    register vec_u8 q0 = vec_ld(0, pix);
++    register vec_u8 q1 = vec_ld(stride, pix);
++    h264_loop_filter_chroma_intra_altivec(p1, p0, q0, q1, alpha, beta);
++    store8_altivec(pix - 1*stride, p0);
++    store8_altivec(pix,           q0);
++}
++
++static void h264_h_loop_filter_chroma_intra_altivec(uint8_t *pix, ptrdiff_t stride,
++                                                    int alpha, int beta)
++{
++    register vec_u8 col01, col23;
++    register vec_u8 p1, p0, q0, q1;
++    DECLARE_ALIGNED(16, unsigned char, p0tmp)[16];
++    DECLARE_ALIGNED(16, unsigned char, q0tmp)[16];
++    int i;
++
++    TRANSPOSE_8x4_LOAD(pix - 2, stride, col01, col23);
++    p1 = col01;
++    p0 = vec_sld(col01, col01, 8);
++    q0 = col23;
++    q1 = vec_sld(col23, col23, 8);
++
++    h264_loop_filter_chroma_intra_altivec(p1, p0, q0, q1, alpha, beta);
++
++    vec_st(p0, 0, p0tmp);
++    vec_st(q0, 0, q0tmp);
++    for (i = 0; i < 8; i++) {
++        pix[i * stride - 1] = p0tmp[i];
++        pix[i * stride           ] = q0tmp[i];
++    }
++}
++
+ static av_always_inline
+ void weight_h264_W_altivec(uint8_t *block, int stride, int height,
+                            int log2_denom, int weight, int offset, int w)
+@@ -804,6 +1210,14 @@ av_cold void ff_h264dsp_init_ppc(H264DSPContext *c, const int bit_depth,
+         c->idct8_add4   = h264_idct8_add4_altivec;
+         c->v_loop_filter_luma = h264_v_loop_filter_luma_altivec;
+         c->h_loop_filter_luma = h264_h_loop_filter_luma_altivec;
++        c->v_loop_filter_luma_intra = h264_v_loop_filter_luma_intra_altivec;
++        c->h_loop_filter_luma_intra = h264_h_loop_filter_luma_intra_altivec;
++        if (chroma_format_idc <= 1) {
++            c->v_loop_filter_chroma = h264_v_loop_filter_chroma_altivec;
++            c->h_loop_filter_chroma = h264_h_loop_filter_chroma_altivec;
++            c->v_loop_filter_chroma_intra = h264_v_loop_filter_chroma_intra_altivec;
++            c->h_loop_filter_chroma_intra = h264_h_loop_filter_chroma_intra_altivec;
++        }
+ 
+         c->weight_pixels_tab[0]   = weight_h264_pixels16_altivec;
+         c->weight_pixels_tab[1]   = weight_h264_pixels8_altivec;
+-- 
+2.43.0
+

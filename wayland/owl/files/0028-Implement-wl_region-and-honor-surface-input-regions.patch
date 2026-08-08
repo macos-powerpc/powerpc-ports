@@ -1,0 +1,345 @@
+From af164c9d9f60c61e4825c37deca670f0c5e953ee Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 31 Jul 2026 13:38:11 +0000
+Subject: [PATCH] Implement wl_region and honor surface input regions
+
+wl_region's add/subtract and wl_surface.set_input_region were TODO
+stubs, so every surface accepted pointer input over its whole area.
+foot marks its overlay subsurfaces (e.g. the scrollback position
+indicator) input-transparent with an empty input region; when the
+pointer strayed over the indicator mid-scroll, we sent it
+wl_pointer.enter anyway, and foot aborted with "BUG in
+wl_pointer_enter(): Invalid surface type".
+
+OwlRegion now records its add/subtract operations, and the input
+region is snapshotted into the double-buffered surface state (the
+client may destroy the wl_region object right after the request).
+Point queries replay the operations in order, which matches the
+protocol's sequential union/subtract semantics exactly.
+
+OwlSurface honors the committed input region in three places:
+-hitTest: returns nil outside the region so clicks fall through to
+the surface underneath; the tracking rectangle is not installed at
+all for fully input-transparent surfaces (and is reconsidered when
+a commit changes the region), so they generate no enter/leave; and
+-mouseEntered: double-checks the entry point for partial regions.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01G6m1eevhAns3j85HMZYKna
+---
+ Sources/Compositor/OwlRegion.h       | 24 +++++++++-
+ Sources/Compositor/OwlRegion.m       | 54 ++++++++++++++++++++-
+ Sources/Compositor/OwlSurface.m      | 71 +++++++++++++++++++++++++++-
+ Sources/Compositor/OwlSurfaceState.h |  6 +++
+ Sources/Compositor/OwlSurfaceState.m | 12 +++++
+ 5 files changed, 163 insertions(+), 4 deletions(-)
+
+diff --git a/Sources/Compositor/OwlRegion.h b/Sources/Compositor/OwlRegion.h
+index dbd07b3..f327b06 100644
+--- a/Sources/Compositor/OwlRegion.h
++++ b/Sources/Compositor/OwlRegion.h
+@@ -19,11 +19,33 @@
+ #import <Cocoa/Cocoa.h>
+ #import <wayland-server.h>
+ 
++// One building operation of a wl_region. A region's effective
++// contents are the result of replaying its operations in order.
++struct OwlRegionOp {
++    BOOL isAdd;
++    NSRect rect;
++};
++
+ @interface OwlRegion : NSObject {
+     struct wl_resource *_resource;
+-    // TODO
++    // A sequence of struct OwlRegionOp.
++    NSMutableData *_ops;
+ }
+ 
+ - (id) initWithResource: (struct wl_resource *) resource;
+ 
++// An immutable snapshot of the operations, suitable for keeping in
++// a surface state after this region object is destroyed (clients
++// may destroy the wl_region right after e.g. set_input_region).
++// Never nil: an empty region gives an empty snapshot. "No region
++// set at all" is represented by nil at the call sites instead.
++- (NSData *) opsSnapshot;
++
+++ (BOOL) ops: (NSData *) ops containPoint: (NSPoint) point;
++
++// Whether the region could contain any point at all. Conservative:
++// a region whose adds were later all subtracted again still
++// reports YES, but the per-point queries remain exact.
+++ (BOOL) opsCanEverContainPoints: (NSData *) ops;
++
+ @end
+diff --git a/Sources/Compositor/OwlRegion.m b/Sources/Compositor/OwlRegion.m
+index b64c974..e535bff 100644
+--- a/Sources/Compositor/OwlRegion.m
++++ b/Sources/Compositor/OwlRegion.m
+@@ -33,6 +33,21 @@ static void region_destroy_handler(
+     wl_resource_destroy(resource);
+ }
+ 
++static void region_append_op(
++    struct wl_resource *resource,
++    BOOL isAdd,
++    int32_t x,
++    int32_t y,
++    int32_t width,
++    int32_t height
++) {
++    OwlRegion *self = wl_resource_get_user_data(resource);
++    struct OwlRegionOp op;
++    op.isAdd = isAdd;
++    op.rect = NSMakeRect(x, y, width, height);
++    [self->_ops appendBytes: &op length: sizeof(op)];
++}
++
+ static void region_add_handler(
+     struct wl_client *client,
+     struct wl_resource *resource,
+@@ -41,7 +56,7 @@ static void region_add_handler(
+     int32_t width,
+     int32_t height
+ ) {
+-    // TODO
++    region_append_op(resource, YES, x, y, width, height);
+ }
+ 
+ static void region_subtract_handler(
+@@ -52,7 +67,7 @@ static void region_subtract_handler(
+     int32_t width,
+     int32_t height
+ ) {
+-    // TODO
++    region_append_op(resource, NO, x, y, width, height);
+ }
+ 
+ static const struct wl_region_interface region_impl = {
+@@ -64,6 +79,7 @@ static const struct wl_region_interface region_impl = {
+ 
+ - (id) initWithResource: (struct wl_resource *) resource {
+     _resource = resource;
++    _ops = [NSMutableData new];
+     wl_resource_set_implementation(
+         resource,
+         &region_impl,
+@@ -73,4 +89,38 @@ static const struct wl_region_interface region_impl = {
+     return self;
+ }
+ 
++- (void) dealloc {
++    [_ops release];
++    [super dealloc];
++}
++
++- (NSData *) opsSnapshot {
++    return [NSData dataWithData: _ops];
++}
++
+++ (BOOL) ops: (NSData *) ops containPoint: (NSPoint) point {
++    const struct OwlRegionOp *op = [ops bytes];
++    NSUInteger i, count = [ops length] / sizeof(*op);
++    BOOL contained = NO;
++
++    for (i = 0; i < count; i++) {
++        if (NSPointInRect(point, op[i].rect)) {
++            contained = op[i].isAdd;
++        }
++    }
++    return contained;
++}
++
+++ (BOOL) opsCanEverContainPoints: (NSData *) ops {
++    const struct OwlRegionOp *op = [ops bytes];
++    NSUInteger i, count = [ops length] / sizeof(*op);
++
++    for (i = 0; i < count; i++) {
++        if (op[i].isAdd) {
++            return YES;
++        }
++    }
++    return NO;
++}
++
+ @end
+diff --git a/Sources/Compositor/OwlSurface.m b/Sources/Compositor/OwlSurface.m
+index a3fa14c..8c48a85 100644
+--- a/Sources/Compositor/OwlSurface.m
++++ b/Sources/Compositor/OwlSurface.m
+@@ -24,6 +24,7 @@
+ #import "OwlServer.h"
+ #import "OwlBuffer.h"
+ #import "OwlSurfaceState.h"
++#import "OwlRegion.h"
+ #import "OwlWlDataDevice.h"
+ #import "OwlDragDataSource.h"
+ #import <wayland-server.h>
+@@ -154,9 +155,53 @@ static void surface_damage_buffer_handler(
+     _openGLContext = nil;
+ }
+ 
++// Whether this surface accepts pointer input at the given point
++// (in surface-local coordinates), per its wl_surface input region.
++- (BOOL) acceptsPointerInputAtPoint: (NSPoint) point {
++    NSData *region = [_currentState inputRegion];
++    if (region == nil) {
++        // No region set: the whole surface accepts input.
++        return YES;
++    }
++    return [OwlRegion ops: region containPoint: point];
++}
++
++- (BOOL) acceptsAnyPointerInput {
++    NSData *region = [_currentState inputRegion];
++    if (region == nil) {
++        return YES;
++    }
++    return [OwlRegion opsCanEverContainPoints: region];
++}
++
++// Honor the input region during hit testing: returning nil makes
++// Cocoa fall through to whatever is underneath, e.g. the parent
++// surface below an input-transparent subsurface overlay (foot's
++// scrollback indicator sets an empty input region and aborts if it
++// receives pointer focus anyway).
++- (NSView *) hitTest: (NSPoint) point {
++    NSView *result = [super hitTest: point];
++    if (result != self) {
++        // A subview (e.g. a subsurface) was hit; its own hit test
++        // has already had its say.
++        return result;
++    }
++    NSPoint local = [self convertPoint: point fromView: [self superview]];
++    local.y = [self bounds].size.height - local.y;
++    if (![self acceptsPointerInputAtPoint: local]) {
++        return nil;
++    }
++    return result;
++}
++
+ - (void) updateTrackingRect {
+     if (_trackingRectTag != 0) {
+         [self removeTrackingRect: _trackingRectTag];
++        _trackingRectTag = 0;
++    }
++    if (![self acceptsAnyPointerInput]) {
++        // Fully input-transparent: no enter/leave events either.
++        return;
+     }
+     _trackingRectTag = [self addTrackingRect: [self bounds]
+                                        owner: self
+@@ -192,12 +237,21 @@ static void surface_damage_buffer_handler(
+         [oldBuffer notifyDetached];
+     }
+ 
++    // Compared by pointer below, never dereferenced: the old data
++    // may die with the old state.
++    NSData *oldInputRegion = [_currentState inputRegion];
++
+     // Actually set the pending state as our new state.
+     [_currentState release];
+     _currentState = _pendingState;
+     _pendingState = [OwlSurfaceState alloc];
+     _pendingState = [_pendingState initWithPreviousState: _currentState];
+ 
++    if ([_currentState inputRegion] != oldInputRegion) {
++        // The input region changed; reconsider the tracking rect.
++        [self updateTrackingRect];
++    }
++
+     [_callbacks addObjectsFromArray: [_currentState callbacks]];
+ 
+     // Any presentation feedbacks still queued at this point belong
+@@ -343,7 +397,16 @@ static void surface_set_input_region_handler(
+     struct wl_resource *resource,
+     struct wl_resource *region_resource
+ ) {
+-    // TODO
++    OwlSurface *self = wl_resource_get_user_data(resource);
++    NSData *ops = nil;
++    if (region_resource != NULL) {
++        OwlRegion *region = wl_resource_get_user_data(region_resource);
++        // Snapshot: the client may destroy the region object right
++        // after this request, but the input region is double-buffered
++        // state that outlives it.
++        ops = [region opsSnapshot];
++    }
++    [self->_pendingState setInputRegion: ops];
+ }
+ 
+ static void surface_set_buffer_scale_handler(
+@@ -488,6 +551,12 @@ static const struct wl_surface_interface surface_interface = {
+     _exitedDuringDrag = NO;
+     [[self window] setAcceptsMouseMovedEvents: YES];
+     NSPoint point = [self pointOfEvent: event];
++    if (![self acceptsPointerInputAtPoint: point]) {
++        // Input-transparent here (e.g. an overlay subsurface with
++        // an empty input region): the pointer focus stays with
++        // whatever surface is underneath.
++        return;
++    }
+     if (!_mouseIsInside) {
+         [[self pointer] sendEnterSurface: self atPoint: point];
+         _mouseIsInside = YES;
+diff --git a/Sources/Compositor/OwlSurfaceState.h b/Sources/Compositor/OwlSurfaceState.h
+index 593da23..cda7b37 100644
+--- a/Sources/Compositor/OwlSurfaceState.h
++++ b/Sources/Compositor/OwlSurfaceState.h
+@@ -29,6 +29,9 @@
+     NSMutableArray *_presentationFeedbacks;
+     NSMutableArray *_damage;
+     NSRect _geometry;
++    // The input region as an OwlRegion op list snapshot, or nil
++    // when the whole surface accepts input (the default).
++    NSData *_inputRegion;
+ }
+ 
+ - (id) init;
+@@ -49,4 +52,7 @@
+ - (NSRect) geometry;
+ - (void) setGeometry: (NSRect) geometry;
+ 
++- (NSData *) inputRegion;
++- (void) setInputRegion: (NSData *) inputRegion;
++
+ @end
+diff --git a/Sources/Compositor/OwlSurfaceState.m b/Sources/Compositor/OwlSurfaceState.m
+index efe7eb5..fcef7ca 100644
+--- a/Sources/Compositor/OwlSurfaceState.m
++++ b/Sources/Compositor/OwlSurfaceState.m
+@@ -38,6 +38,7 @@
+     self = [self init];
+     _buffer = [previousState->_buffer retain];
+     _geometry = previousState->_geometry;
++    _inputRegion = [previousState->_inputRegion retain];
+     return self;
+ }
+ 
+@@ -46,6 +47,7 @@
+     [_callbacks release];
+     [_presentationFeedbacks release];
+     [_damage release];
++    [_inputRegion release];
+     [super dealloc];
+ }
+ 
+@@ -92,4 +94,14 @@
+     _geometry = geometry;
+ }
+ 
++- (NSData *) inputRegion {
++    return _inputRegion;
++}
++
++- (void) setInputRegion: (NSData *) inputRegion {
++    [inputRegion retain];
++    [_inputRegion release];
++    _inputRegion = inputRegion;
++}
++
+ @end
+-- 
+2.43.0
+

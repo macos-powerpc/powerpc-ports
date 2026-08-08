@@ -1,0 +1,272 @@
+From abf28650ae657f171d684628d6ff62f2ac97d4e3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 24 Jul 2026 03:07:55 +0000
+Subject: [PATCH 04/20] avcodec/ppc: add AltiVec HEVC 8-bit qpel h/v/hv
+ reference kernels
+
+Adds put_hevc_qpel_{4..64}_8 h/v/hv (int16-dst variants) to
+libavcodec/ppc/hevcdsp.c, registered for all 10 width classes.
+Design notes for extending this to the full O5 replication pass
+(epel, uni/bi variants) are kept in a comment block in the file:
+
+- h: vmsummbm 4-tap groups on one 16B window.
+- v: vmladduhm 16-bit accumulation (safe: worst-case prefix magnitude
+  19380 < 32767 for 8-bit input).
+- hv 2nd pass: vmsumshm on merge-interleaved row pairs, >>6, modulo
+  pack (vec_pack, NOT vec_packs -- the C reference truncates, it does
+  not saturate).
+- Width tails (4 and 6 -- both exercised by checkasm) handled via
+  aligned spill + memcpy; kernels never store past the requested width.
+
+Skips weighted prediction and 10-bit (left in C) for this pass.
+
+NOT YET VALIDATED: no checkasm run performed. Profiling-driven
+prioritization for the rest of the HEVC kernel set (O5: SAO, deblock,
+remaining IDCTs) is still pending real G4/G5 profiling data.
+
+AltiVec-only (no VSX), 32-bit big-endian, G4 (7400) primary target.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0194bzLUrg6cVCQ7u4NNDpaB
+---
+ libavcodec/ppc/hevcdsp.c | 207 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 206 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/ppc/hevcdsp.c b/libavcodec/ppc/hevcdsp.c
+index 7b032ef..d1b2e70 100644
+--- a/libavcodec/ppc/hevcdsp.c
++++ b/libavcodec/ppc/hevcdsp.c
+@@ -21,8 +21,12 @@
+ 
+ #include "config.h"
+ 
++#include <string.h>
++
+ #include "libavutil/attributes.h"
+ #include "libavutil/cpu.h"
++#include "libavutil/macros.h"
++#include "libavutil/mem_internal.h"
+ #include "libavutil/ppc/cpu.h"
+ #include "libavutil/ppc/util_altivec.h"
+ 
+@@ -105,6 +109,199 @@ static av_always_inline void scale(vec_s32 res[4], vec_s16 res_packed[2],
+ #define BIT_DEPTH 10
+ #include "hevcdsp_template.c"
+ #undef BIT_DEPTH
++
++#if HAVE_BIGENDIAN
++/*
++ * 8-bit qpel motion compensation, plain (int16_t dst) variants.
++ *
++ * Layout of the port: the horizontal 8-tap runs as 4-way byte dot
++ * products (vmsummbm) on a single 16-byte source window per 8 outputs;
++ * the vertical 8-tap accumulates in 16-bit lanes (vmladduhm), which
++ * cannot overflow for 8-bit input (worst-case partial sum is
++ * 255 * 76 = 19380 < 32767); the hv second pass needs 32-bit lanes and
++ * runs as paired 16-bit dot products (vmsumshm) on row-interleaved
++ * vectors. The epel/uni/bi variants replicate these three kernels with
++ * different edge sizes and a final combine - extend here.
++ */
++
++#define QPEL_EXTRA_BEFORE 3
++#define QPEL_EXTRA        7
++
++/* per-lane 4-tap groups: taps k..k+3 for outputs 0..3 of a 16B window */
++static const vec_u8 qpel_taps_a = {  0,  1,  2,  3,  1,  2,  3,  4,
++                                     2,  3,  4,  5,  3,  4,  5,  6 };
++static const vec_u8 qpel_taps_b = {  4,  5,  6,  7,  5,  6,  7,  8,
++                                     6,  7,  8,  9,  7,  8,  9, 10 };
++static const vec_u8 qpel_taps_c = {  8,  9, 10, 11,  9, 10, 11, 12,
++                                    10, 11, 12, 13, 11, 12, 13, 14 };
++
++static av_always_inline vec_u8 load16_u(const uint8_t *p)
++{
++    vec_u8 a = vec_ld(0,  p);
++    vec_u8 b = vec_ld(15, p);
++    return vec_perm(a, b, vec_lvsl(0, p));
++}
++
++/* 8 horizontally filtered outputs from taps at p = &src[x0 - 3] */
++static av_always_inline vec_s16 qpel_h8(const uint8_t *p, vec_s8 fa, vec_s8 fb)
++{
++    const vec_s32 z32 = vec_splat_s32(0);
++    vec_u8 w  = load16_u(p);
++    vec_u8 d0 = vec_perm(w, w, qpel_taps_a);
++    vec_u8 d1 = vec_perm(w, w, qpel_taps_b);
++    vec_u8 d2 = vec_perm(w, w, qpel_taps_c);
++    vec_s32 lo = vec_msum(fa, d0, vec_msum(fb, d1, z32));
++    vec_s32 hi = vec_msum(fa, d1, vec_msum(fb, d2, z32));
++    return vec_pack(lo, hi);
++}
++
++/* 8 pixels zero-extended to 16 bits */
++static av_always_inline vec_s16 load_row8_s16(const uint8_t *p)
++{
++    vec_u8 a = vec_ld(0, p);
++    vec_u8 b = vec_ld(7, p);
++    vec_u8 w = vec_perm(a, b, vec_lvsl(0, p));
++    return (vec_s16) vec_mergeh(vec_splat_u8(0), w);
++}
++
++static av_always_inline void store_row(int16_t *dst, vec_s16 v, int n)
++{
++    if (n == 8) {
++        vec_st(v, 0, dst);
++    } else {
++        DECLARE_ALIGNED(16, int16_t, sp)[8];
++        vec_st(v, 0, sp);
++        memcpy(dst, sp, n * sizeof(int16_t));
++    }
++}
++
++static void put_hevc_qpel_h_altivec(int16_t *dst, const uint8_t *src,
++                                    ptrdiff_t srcstride, int height,
++                                    intptr_t mx, intptr_t my, int width)
++{
++    const vec_s8 fv = vec_ld(0, ff_hevc_qpel_filters[mx]);
++    const vec_s8 fa = (vec_s8) vec_splat((vec_s32) fv, 0);
++    const vec_s8 fb = (vec_s8) vec_splat((vec_s32) fv, 1);
++
++    for (int y = 0; y < height; y++) {
++        int x;
++        for (x = 0; x + 8 <= width; x += 8)
++            vec_st(qpel_h8(src + x - 3, fa, fb), 0, dst + x);
++        if (x < width)
++            store_row(dst + x, qpel_h8(src + x - 3, fa, fb), width - x);
++        src += srcstride;
++        dst += MAX_PB_SIZE;
++    }
++}
++
++static void put_hevc_qpel_v_altivec(int16_t *dst, const uint8_t *src,
++                                    ptrdiff_t srcstride, int height,
++                                    intptr_t mx, intptr_t my, int width)
++{
++    const vec_s8  fv  = vec_ld(0, ff_hevc_qpel_filters[my]);
++    const vec_s16 f16 = vec_unpackh(fv);
++    const vec_s16 z16 = vec_splat_s16(0);
++    const vec_s16 c0 = vec_splat(f16, 0), c1 = vec_splat(f16, 1),
++                  c2 = vec_splat(f16, 2), c3 = vec_splat(f16, 3),
++                  c4 = vec_splat(f16, 4), c5 = vec_splat(f16, 5),
++                  c6 = vec_splat(f16, 6), c7 = vec_splat(f16, 7);
++
++    for (int x = 0; x < width; x += 8) {
++        const int n = FFMIN(8, width - x);
++        const uint8_t *s = src + x - QPEL_EXTRA_BEFORE * srcstride;
++        int16_t       *d = dst + x;
++        vec_s16 r0 = load_row8_s16(s);
++        vec_s16 r1 = load_row8_s16(s +     srcstride);
++        vec_s16 r2 = load_row8_s16(s + 2 * srcstride);
++        vec_s16 r3 = load_row8_s16(s + 3 * srcstride);
++        vec_s16 r4 = load_row8_s16(s + 4 * srcstride);
++        vec_s16 r5 = load_row8_s16(s + 5 * srcstride);
++        vec_s16 r6 = load_row8_s16(s + 6 * srcstride);
++
++        s += 7 * srcstride;
++        for (int y = 0; y < height; y++) {
++            vec_s16 r7  = load_row8_s16(s);
++            vec_s16 acc = vec_mladd(r0, c0, z16);
++
++            acc = vec_mladd(r1, c1, acc);
++            acc = vec_mladd(r2, c2, acc);
++            acc = vec_mladd(r3, c3, acc);
++            acc = vec_mladd(r4, c4, acc);
++            acc = vec_mladd(r5, c5, acc);
++            acc = vec_mladd(r6, c6, acc);
++            acc = vec_mladd(r7, c7, acc);
++            store_row(d, acc, n);
++
++            r0 = r1; r1 = r2; r2 = r3; r3 = r4; r4 = r5; r5 = r6; r6 = r7;
++            s += srcstride;
++            d += MAX_PB_SIZE;
++        }
++    }
++}
++
++static void put_hevc_qpel_hv_altivec(int16_t *dst, const uint8_t *src,
++                                     ptrdiff_t srcstride, int height,
++                                     intptr_t mx, intptr_t my, int width)
++{
++    DECLARE_ALIGNED(16, int16_t, tmp_array)[(MAX_PB_SIZE + QPEL_EXTRA) * MAX_PB_SIZE];
++    const vec_s8  hfv = vec_ld(0, ff_hevc_qpel_filters[mx]);
++    const vec_s8  ha  = (vec_s8) vec_splat((vec_s32) hfv, 0);
++    const vec_s8  hb  = (vec_s8) vec_splat((vec_s32) hfv, 1);
++    const vec_s8  vfv = vec_ld(0, ff_hevc_qpel_filters[my]);
++    const vec_s16 v16 = vec_unpackh(vfv);
++    const vec_s16 fp0 = (vec_s16) vec_splat((vec_s32) v16, 0);
++    const vec_s16 fp1 = (vec_s16) vec_splat((vec_s32) v16, 1);
++    const vec_s16 fp2 = (vec_s16) vec_splat((vec_s32) v16, 2);
++    const vec_s16 fp3 = (vec_s16) vec_splat((vec_s32) v16, 3);
++    const vec_s32 z32 = vec_splat_s32(0);
++    const vec_u32 sh6 = vec_splat_u32(6);
++    int16_t *tmp = tmp_array;
++
++    /* horizontal pass over height + 7 rows; the scratch rows may be
++     * written a full vector wide (tail overshoot stays within the
++     * MAX_PB_SIZE row since width + 4 <= 64 whenever a tail exists) */
++    src -= QPEL_EXTRA_BEFORE * srcstride;
++    for (int y = 0; y < height + QPEL_EXTRA; y++) {
++        for (int x = 0; x < width; x += 8)
++            vec_st(qpel_h8(src + x - 3, ha, hb), 0, tmp + x);
++        src += srcstride;
++        tmp += MAX_PB_SIZE;
++    }
++
++    /* vertical pass on the int16 scratch, 32-bit paired dot products */
++    for (int x = 0; x < width; x += 8) {
++        const int n = FFMIN(8, width - x);
++        const int16_t *t = tmp_array + x;
++        int16_t       *d = dst + x;
++        vec_s16 r0 = vec_ld(0, t);
++        vec_s16 r1 = vec_ld(0, t +     MAX_PB_SIZE);
++        vec_s16 r2 = vec_ld(0, t + 2 * MAX_PB_SIZE);
++        vec_s16 r3 = vec_ld(0, t + 3 * MAX_PB_SIZE);
++        vec_s16 r4 = vec_ld(0, t + 4 * MAX_PB_SIZE);
++        vec_s16 r5 = vec_ld(0, t + 5 * MAX_PB_SIZE);
++        vec_s16 r6 = vec_ld(0, t + 6 * MAX_PB_SIZE);
++
++        t += 7 * MAX_PB_SIZE;
++        for (int y = 0; y < height; y++) {
++            vec_s16 r7 = vec_ld(0, t);
++            vec_s32 lo = vec_msum(vec_mergeh(r0, r1), fp0,
++                         vec_msum(vec_mergeh(r2, r3), fp1,
++                         vec_msum(vec_mergeh(r4, r5), fp2,
++                         vec_msum(vec_mergeh(r6, r7), fp3, z32))));
++            vec_s32 hi = vec_msum(vec_mergel(r0, r1), fp0,
++                         vec_msum(vec_mergel(r2, r3), fp1,
++                         vec_msum(vec_mergel(r4, r5), fp2,
++                         vec_msum(vec_mergel(r6, r7), fp3, z32))));
++
++            store_row(d, vec_pack(vec_sra(lo, sh6), vec_sra(hi, sh6)), n);
++
++            r0 = r1; r1 = r2; r2 = r3; r3 = r4; r4 = r5; r5 = r6; r6 = r7;
++            t += MAX_PB_SIZE;
++            d += MAX_PB_SIZE;
++        }
++    }
++}
++#endif /* HAVE_BIGENDIAN */
+ #endif /* HAVE_ALTIVEC */
+ 
+ av_cold void ff_hevc_dsp_init_ppc(HEVCDSPContext *c, const int bit_depth)
+@@ -113,8 +310,16 @@ av_cold void ff_hevc_dsp_init_ppc(HEVCDSPContext *c, const int bit_depth)
+     if (!PPC_ALTIVEC(av_get_cpu_flags()))
+         return;
+ 
+-    if (bit_depth == 8)
++    if (bit_depth == 8) {
+         c->idct[0] = ff_hevc_idct_4x4_8_altivec;
++#if HAVE_BIGENDIAN
++        for (int i = 0; i < 10; i++) {
++            c->put_hevc_qpel[i][0][1] = put_hevc_qpel_h_altivec;
++            c->put_hevc_qpel[i][1][0] = put_hevc_qpel_v_altivec;
++            c->put_hevc_qpel[i][1][1] = put_hevc_qpel_hv_altivec;
++        }
++#endif
++    }
+     if (bit_depth == 10)
+         c->idct[0] = ff_hevc_idct_4x4_10_altivec;
+ #endif /* HAVE_ALTIVEC */
+-- 
+2.43.0
+
