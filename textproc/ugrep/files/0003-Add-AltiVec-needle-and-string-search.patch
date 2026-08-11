@@ -1,0 +1,713 @@
+From 02ec42b0cb96fa1a89a850f9c484c3dc5a42ffb0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 11 Aug 2026 08:45:49 +0000
+Subject: [PATCH 3/3] Add AltiVec needle and string search
+
+Vectorizes the remaining search paths on AltiVec: advance_pattern_pin1_pma,
+advance_pattern_pin2..8_one and _pma, advance_chars and advance_chars_pma,
+and advance_string and advance_string_pma.
+
+The hot path tests the whole compare mask with simd_mask_any(), a single
+record form compare and a branch on CR6. Only on a match does
+ADV_ALTIVEC_SCAN store the mask and walk its bytes, so the store stays off
+the common path. The macro is endian aware so the same source works when
+built for VSX/little endian. Both lvsl load controls are hoisted out of
+each loop since the streams advance by 16 bytes.
+
+advance_string and advance_string_pma delegate to routines the way the NEON
+path does.
+
+pattern.cpp now treats AltiVec like NEON when choosing search strategy:
+pinmax 8 and freqmax3 160 (VMX is 128 bit, so pins above 8 are not
+supported), the needle frequency threshold, and no forcing of Boyer-Moore
+now that a 128 bit SIMD filter is available.
+
+Verified with the full ugrep test suite, single and multi threaded, under
+qemu-ppc -cpu 7400 (G4, AltiVec without VSX, so any accidental VSX
+instruction traps).  Also cross checked against GNU grep on a 2.2MB corpus
+over 63 runs driving pin counts 1 to 8, multi-char literals and the string
+paths, with counts and full -no output byte identical.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FSbbKgkiRQmVj792gErwVD
+---
+ include/reflex/matcher.h |   3 +
+ lib/matcher.cpp          | 545 ++++++++++++++++++++++++++++++++++++++-
+ lib/pattern.cpp          |  10 +-
+ 3 files changed, 552 insertions(+), 6 deletions(-)
+
+diff --git a/include/reflex/matcher.h b/include/reflex/matcher.h
+index 9421236..a751d70 100644
+--- a/include/reflex/matcher.h
++++ b/include/reflex/matcher.h
+@@ -1411,6 +1411,9 @@ class Matcher : public PatternMatcher<reflex::Pattern> {
+   // String NEON metnods
+   bool simd_advance_string_neon(const char *& s, const char *e);
+   bool simd_advance_string_pma_neon(const char *& s, const char *e);
++  // String AltiVec metnods
++  bool simd_advance_string_altivec(const char *& s, const char *e);
++  bool simd_advance_string_pma_altivec(const char *& s, const char *e);
+   // Fallback Boyer-Moore methods
+   bool advance_string_bm(size_t loc);
+   bool advance_string_bm_pma(size_t loc);
+diff --git a/lib/matcher.cpp b/lib/matcher.cpp
+index 5ac4297..cdf2ae9 100644
+--- a/lib/matcher.cpp
++++ b/lib/matcher.cpp
+@@ -38,6 +38,42 @@
+ 
+ namespace reflex {
+ 
++#if defined(HAVE_ALTIVEC)
++
++/// Scan a 16 byte compare mask for matching byte positions, AltiVec has no _mm_movemask_epi8() so the
++/// mask is stored and its bytes are scanned, BODY runs per match with k set to the position in buf_.
++/// Only reached when simd_mask_any() says there is a match, so the store stays off the hot path.
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++#define ADV_ALTIVEC_SCAN_TEST 0x000000ff
++#define ADV_ALTIVEC_SCAN_STEP >>=
++#else
++#define ADV_ALTIVEC_SCAN_TEST 0xff000000
++#define ADV_ALTIVEC_SCAN_STEP <<=
++#endif
++
++#define ADV_ALTIVEC_SCAN(VMASK, BASE, BODY) \
++  do \
++  { \
++    simd_mask_t vres_; \
++    vres_.v = (VMASK); \
++    for (uint32_t w_ = 0; w_ < 4; ++w_) \
++    { \
++      uint32_t mask_ = vres_.u[w_]; \
++      if (mask_ != 0) \
++      { \
++        size_t k = (BASE) + 4 * w_; \
++        do \
++        { \
++          if ((mask_ & ADV_ALTIVEC_SCAN_TEST) != 0) { BODY } \
++          mask_ ADV_ALTIVEC_SCAN_STEP 8; \
++          ++k; \
++        } while (mask_ != 0); \
++      } \
++    } \
++  } while (0);
++
++#endif // HAVE_ALTIVEC
++
+ /// Returns true if input matched the pattern using method Const::SCAN, Const::FIND, Const::SPLIT, or Const::MATCH.
+ size_t Matcher::match(Method method)
+ {
+@@ -774,7 +810,7 @@ void Matcher::init_advance()
+         else
+           adv_ = &Matcher::advance_pattern_pin1_pma;
+         break;
+-#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(HAVE_NEON)
++#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(HAVE_NEON) || defined(HAVE_ALTIVEC)
+       case 2:
+         INIT_ADV_PAT_PIN_CASE(2);
+         break;
+@@ -994,6 +1030,30 @@ bool Matcher::advance_pattern_pin1_pma(size_t loc)
+       }
+       s += 16;
+     }
++#elif defined(HAVE_ALTIVEC)
++    __vector unsigned char vlcp = simd_set1_u8(chr0);
++    __vector unsigned char vlcs = simd_set1_u8(chr1);
++    simd_ldu_t ctlp = simd_ldu_init(s);
++    simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp);
++    while (s <= e - 16)
++    {
++      __vector unsigned char vstrlcp = simd_ldu(s, ctlp);
++      __vector unsigned char vstrlcs = simd_ldu(s + lcs - lcp, ctls);
++      __vector unsigned char veqlcp = (__vector unsigned char)vec_cmpeq(vlcp, vstrlcp);
++      __vector unsigned char veqlcs = (__vector unsigned char)vec_cmpeq(vlcs, vstrlcs);
++      __vector unsigned char vmask = vec_and(veqlcp, veqlcs);
++      if (REFLEX_UNLIKELY(simd_mask_any(vmask)))
++      {
++        ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_),
++          if (REFLEX_UNLIKELY(k + Pattern::Const::PM_M > end_) || pat_->predict_match(&buf_[k]))
++          {
++            set_current(k);
++            return true;
++          }
++        )
++      }
++      s += 16;
++    }
+ #endif
+     e = buf_ + end_;
+     if (s < e && (s = static_cast<const char*>(std::memchr(s, chr0, e - s))) != NULL)
+@@ -1899,6 +1959,354 @@ ADV_PAT_PIN(8, \
+         vceqq_u8(vlcs7, vstrlcs)); \
+   )
+ 
++#elif defined(HAVE_ALTIVEC)
++
++/// My homegrown "needle search" methods for pins with min=0 or 1
++#define ADV_PAT_PIN_ONE(N, INIT, COMP) \
++bool Matcher::advance_pattern_pin##N##_one(size_t loc) \
++{ \
++  const char *chr = pat_->chr_; \
++  INIT \
++  while (true) \
++  { \
++    const char *s = buf_ + loc; \
++    const char *e = buf_ + end_; \
++    simd_ldu_t ctl = simd_ldu_init(s); \
++    while (s <= e - 16) \
++    { \
++      __vector unsigned char vstr = simd_ldu(s, ctl); \
++      __vector unsigned char veq = (__vector unsigned char)vec_cmpeq(v0, vstr); \
++      COMP \
++      if (REFLEX_UNLIKELY(simd_mask_any(veq))) \
++      { \
++        ADV_ALTIVEC_SCAN(veq, static_cast<size_t>(s - buf_), \
++          if (REFLEX_UNLIKELY(k + Pattern::Const::PM_M > end_) || pat_->predict_match(&buf_[k])) \
++          { \
++            set_current(k); \
++            return true; \
++          } \
++        ) \
++      } \
++      s += 16; \
++    } \
++    while (s < e - (Pattern::Const::PM_M - 1)) \
++    { \
++      if (pat_->predict_match(s++)) \
++      { \
++        size_t k = s - buf_ - 1; \
++        set_current(k); \
++        return true; \
++      } \
++    } \
++    loc = s - buf_; \
++    set_current_and_peek_more(loc); \
++    loc = cur_; \
++    if (loc + (Pattern::Const::PM_M - 1) >= end_) \
++      return true; \
++  } \
++}
++
++ADV_PAT_PIN_ONE(2, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(3, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(4, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char v3 = simd_set1_u8(chr[3]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v3, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(5, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char v3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char v4 = simd_set1_u8(chr[4]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v3, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v4, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(6, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char v3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char v4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char v5 = simd_set1_u8(chr[5]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v3, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v4, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v5, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(7, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char v3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char v4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char v5 = simd_set1_u8(chr[5]); \
++    __vector unsigned char v6 = simd_set1_u8(chr[6]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v3, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v4, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v5, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v6, vstr)); \
++  )
++
++ADV_PAT_PIN_ONE(8, \
++    __vector unsigned char v0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char v1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char v2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char v3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char v4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char v5 = simd_set1_u8(chr[5]); \
++    __vector unsigned char v6 = simd_set1_u8(chr[6]); \
++    __vector unsigned char v7 = simd_set1_u8(chr[7]); \
++  , \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v1, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v2, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v3, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v4, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v5, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v6, vstr)); \
++    veq = vec_or(veq, (__vector unsigned char)vec_cmpeq(v7, vstr)); \
++  )
++
++/// My homegrown "needle search" methods for pins
++#define ADV_PAT_PIN(N, INIT, COMP) \
++bool Matcher::advance_pattern_pin##N##_pma(size_t loc) \
++{ \
++  const char *chr = pat_->chr_; \
++  const uint16_t min = pat_->min_; \
++  const uint16_t lcp = pat_->lcp_; \
++  const uint16_t lcs = pat_->lcs_; \
++  INIT \
++  while (true) \
++  { \
++    const char *s = buf_ + loc + lcp; \
++    const char *e = buf_ + end_ + lcp - min + 1; \
++    simd_ldu_t ctlp = simd_ldu_init(s); \
++    simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp); \
++    while (s <= e - 16) \
++    { \
++      __vector unsigned char vstrlcp = simd_ldu(s, ctlp); \
++      __vector unsigned char vstrlcs = simd_ldu(s + lcs - lcp, ctls); \
++      __vector unsigned char veqlcp = (__vector unsigned char)vec_cmpeq(vlcp0, vstrlcp); \
++      __vector unsigned char veqlcs = (__vector unsigned char)vec_cmpeq(vlcs0, vstrlcs); \
++      COMP \
++      __vector unsigned char vmask = vec_and(veqlcp, veqlcs); \
++      if (REFLEX_UNLIKELY(simd_mask_any(vmask))) \
++      { \
++        ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_), \
++          if (REFLEX_UNLIKELY(k + Pattern::Const::PM_M > end_) || pat_->predict_match(&buf_[k])) \
++          { \
++            set_current(k); \
++            return true; \
++          } \
++        ) \
++      } \
++      s += 16; \
++    } \
++    s -= lcp; \
++    e = buf_ + end_ - (Pattern::Const::PM_M - 1); \
++    while (s < e) \
++    { \
++      if (pat_->predict_match(s++)) \
++      { \
++        size_t k = s - buf_ - 1; \
++        set_current(k); \
++        return true; \
++      } \
++    } \
++    loc = s - buf_; \
++    set_current_and_peek_more(loc); \
++    loc = cur_; \
++    if (loc + min > end_ && eof_) \
++      return false; \
++    if (loc + (Pattern::Const::PM_M - 1) >= end_) \
++      return true; \
++  } \
++}
++
++ADV_PAT_PIN(2, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[3]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(3, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[5]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(4, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcp3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[5]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[6]); \
++    __vector unsigned char vlcs3 = simd_set1_u8(chr[7]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp3, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs3, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(5, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcp3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcp4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[5]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[6]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[7]); \
++    __vector unsigned char vlcs3 = simd_set1_u8(chr[8]); \
++    __vector unsigned char vlcs4 = simd_set1_u8(chr[9]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp3, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp4, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs3, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs4, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(6, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcp3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcp4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcp5 = simd_set1_u8(chr[5]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[6]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[7]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[8]); \
++    __vector unsigned char vlcs3 = simd_set1_u8(chr[9]); \
++    __vector unsigned char vlcs4 = simd_set1_u8(chr[10]); \
++    __vector unsigned char vlcs5 = simd_set1_u8(chr[11]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp3, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp4, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp5, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs3, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs4, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs5, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(7, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcp3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcp4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcp5 = simd_set1_u8(chr[5]); \
++    __vector unsigned char vlcp6 = simd_set1_u8(chr[6]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[7]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[8]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[9]); \
++    __vector unsigned char vlcs3 = simd_set1_u8(chr[10]); \
++    __vector unsigned char vlcs4 = simd_set1_u8(chr[11]); \
++    __vector unsigned char vlcs5 = simd_set1_u8(chr[12]); \
++    __vector unsigned char vlcs6 = simd_set1_u8(chr[13]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp3, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp4, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp5, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp6, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs3, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs4, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs5, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs6, vstrlcs)); \
++  )
++
++ADV_PAT_PIN(8, \
++    __vector unsigned char vlcp0 = simd_set1_u8(chr[0]); \
++    __vector unsigned char vlcp1 = simd_set1_u8(chr[1]); \
++    __vector unsigned char vlcp2 = simd_set1_u8(chr[2]); \
++    __vector unsigned char vlcp3 = simd_set1_u8(chr[3]); \
++    __vector unsigned char vlcp4 = simd_set1_u8(chr[4]); \
++    __vector unsigned char vlcp5 = simd_set1_u8(chr[5]); \
++    __vector unsigned char vlcp6 = simd_set1_u8(chr[6]); \
++    __vector unsigned char vlcp7 = simd_set1_u8(chr[7]); \
++    __vector unsigned char vlcs0 = simd_set1_u8(chr[8]); \
++    __vector unsigned char vlcs1 = simd_set1_u8(chr[9]); \
++    __vector unsigned char vlcs2 = simd_set1_u8(chr[10]); \
++    __vector unsigned char vlcs3 = simd_set1_u8(chr[11]); \
++    __vector unsigned char vlcs4 = simd_set1_u8(chr[12]); \
++    __vector unsigned char vlcs5 = simd_set1_u8(chr[13]); \
++    __vector unsigned char vlcs6 = simd_set1_u8(chr[14]); \
++    __vector unsigned char vlcs7 = simd_set1_u8(chr[15]); \
++  , \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp1, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp2, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp3, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp4, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp5, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp6, vstrlcp)); \
++    veqlcp = vec_or(veqlcp, (__vector unsigned char)vec_cmpeq(vlcp7, vstrlcp)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs1, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs2, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs3, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs4, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs5, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs6, vstrlcs)); \
++    veqlcs = vec_or(veqlcs, (__vector unsigned char)vec_cmpeq(vlcs7, vstrlcs)); \
++  )
++
+ #endif
+ 
+ /// Minimal 1 byte long patterns with min=0 or 1 using 4-way bitap hashed pairs and PM
+@@ -2331,6 +2739,31 @@ bool Matcher::advance_chars(size_t loc)
+       }
+       s += 16;
+     }
++#elif defined(HAVE_ALTIVEC)
++    __vector unsigned char vlcp = simd_set1_u8(chr[lcp]);
++    __vector unsigned char vlcs = simd_set1_u8(chr[lcs]);
++    simd_ldu_t ctlp = simd_ldu_init(s);
++    simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp);
++    while (s <= e - 16)
++    {
++      __vector unsigned char vlcpm = simd_ldu(s, ctlp);
++      __vector unsigned char vlcsm = simd_ldu(s + lcs - lcp, ctls);
++      __vector unsigned char vlcpeq = (__vector unsigned char)vec_cmpeq(vlcp, vlcpm);
++      __vector unsigned char vlcseq = (__vector unsigned char)vec_cmpeq(vlcs, vlcsm);
++      __vector unsigned char vmask = vec_and(vlcpeq, vlcseq);
++      if (REFLEX_UNLIKELY(simd_mask_any(vmask)))
++      {
++        ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_),
++          if (LEN == 2 ||
++              (LEN == 3 ? buf_[k + 1] == chr[1] : std::memcmp(&buf_[k + 1], chr + 1, LEN - 1) == 0))
++          {
++            set_current(k);
++            return true;
++          }
++        )
++      }
++      s += 16;
++    }
+ #endif
+     while (s < e)
+     {
+@@ -2461,6 +2894,34 @@ bool Matcher::advance_chars_pma(size_t loc)
+       }
+       s += 16;
+     }
++#elif defined(HAVE_ALTIVEC)
++    __vector unsigned char vlcp = simd_set1_u8(chr[lcp]);
++    __vector unsigned char vlcs = simd_set1_u8(chr[lcs]);
++    simd_ldu_t ctlp = simd_ldu_init(s);
++    simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp);
++    while (s <= e - 16)
++    {
++      __vector unsigned char vlcpm = simd_ldu(s, ctlp);
++      __vector unsigned char vlcsm = simd_ldu(s + lcs - lcp, ctls);
++      __vector unsigned char vlcpeq = (__vector unsigned char)vec_cmpeq(vlcp, vlcpm);
++      __vector unsigned char vlcseq = (__vector unsigned char)vec_cmpeq(vlcs, vlcsm);
++      __vector unsigned char vmask = vec_and(vlcpeq, vlcseq);
++      if (REFLEX_UNLIKELY(simd_mask_any(vmask)))
++      {
++        ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_),
++          if (LEN == 2 ||
++              (LEN == 3 ? buf_[k + 1] == chr[1] : std::memcmp(&buf_[k + 1], chr + 1, LEN - 1) == 0))
++          {
++            if (REFLEX_UNLIKELY(k + LEN + Pattern::Const::PM_M > end_) || pat_->predict_match(&buf_[k + LEN]))
++            {
++              set_current(k);
++              return true;
++            }
++          }
++        )
++      }
++      s += 16;
++    }
+ #endif
+     while (s < e)
+     {
+@@ -2531,6 +2992,10 @@ bool Matcher::advance_string(size_t loc)
+     // slightly faster when abstracted into a routine
+     if (simd_advance_string_neon(s, e))
+       return true;
++#elif defined(HAVE_ALTIVEC)
++    // slightly faster when abstracted into a routine
++    if (simd_advance_string_altivec(s, e))
++      return true;
+ #endif
+     while (s < e)
+     {
+@@ -2601,6 +3066,10 @@ bool Matcher::advance_string_pma(size_t loc)
+     // slightly faster when abstracted into a routine
+     if (simd_advance_string_pma_neon(s, e))
+       return true;
++#elif defined(HAVE_ALTIVEC)
++    // slightly faster when abstracted into a routine
++    if (simd_advance_string_pma_altivec(s, e))
++      return true;
+ #endif
+     while (s < e)
+     {
+@@ -2765,6 +3234,80 @@ bool Matcher::simd_advance_string_pma_neon(const char *& s, const char *e)
+ 
+ #endif // HAVE_NEON
+ 
++#if defined(HAVE_ALTIVEC)
++
++// Implements the AltiVec/VMX string search scheme based on http://0x80.pl/articles/simd-friendly-karp-rabin.html
++bool Matcher::simd_advance_string_altivec(const char *& s, const char *e)
++{
++  const uint16_t lcp = pat_->lcp_;
++  const uint16_t lcs = pat_->lcs_;
++  const uint16_t len = pat_->len_;
++  const char *chr = pat_->chr_;
++  __vector unsigned char vlcp = simd_set1_u8(chr[lcp]);
++  __vector unsigned char vlcs = simd_set1_u8(chr[lcs]);
++  // the loops advance s by 16, so the alignment of both streams never changes: hoist the load controls
++  simd_ldu_t ctlp = simd_ldu_init(s);
++  simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp);
++  while (s <= e - 16)
++  {
++    __vector unsigned char vlcpm = simd_ldu(s, ctlp);
++    __vector unsigned char vlcsm = simd_ldu(s + lcs - lcp, ctls);
++    __vector unsigned char vlcpeq = (__vector unsigned char)vec_cmpeq(vlcp, vlcpm);
++    __vector unsigned char vlcseq = (__vector unsigned char)vec_cmpeq(vlcs, vlcsm);
++    __vector unsigned char vmask = vec_and(vlcpeq, vlcseq);
++    if (REFLEX_UNLIKELY(simd_mask_any(vmask)))
++    {
++      ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_),
++        if (std::memcmp(&buf_[k], chr, len) == 0)
++        {
++          set_current(k);
++          return true;
++        }
++      )
++    }
++    s += 16;
++  }
++  return false;
++}
++
++// Implements the AltiVec/VMX string search scheme based on http://0x80.pl/articles/simd-friendly-karp-rabin.html
++bool Matcher::simd_advance_string_pma_altivec(const char *& s, const char *e)
++{
++  const uint16_t lcp = pat_->lcp_;
++  const uint16_t lcs = pat_->lcs_;
++  const uint16_t len = pat_->len_;
++  const char *chr = pat_->chr_;
++  __vector unsigned char vlcp = simd_set1_u8(chr[lcp]);
++  __vector unsigned char vlcs = simd_set1_u8(chr[lcs]);
++  simd_ldu_t ctlp = simd_ldu_init(s);
++  simd_ldu_t ctls = simd_ldu_init(s + lcs - lcp);
++  while (s <= e - 16)
++  {
++    __vector unsigned char vlcpm = simd_ldu(s, ctlp);
++    __vector unsigned char vlcsm = simd_ldu(s + lcs - lcp, ctls);
++    __vector unsigned char vlcpeq = (__vector unsigned char)vec_cmpeq(vlcp, vlcpm);
++    __vector unsigned char vlcseq = (__vector unsigned char)vec_cmpeq(vlcs, vlcsm);
++    __vector unsigned char vmask = vec_and(vlcpeq, vlcseq);
++    if (REFLEX_UNLIKELY(simd_mask_any(vmask)))
++    {
++      ADV_ALTIVEC_SCAN(vmask, static_cast<size_t>(s - lcp - buf_),
++        if (std::memcmp(&buf_[k], chr, len) == 0)
++        {
++          if (REFLEX_UNLIKELY(k + len + Pattern::Const::PM_M > end_) || pat_->predict_match(&buf_[k + len]))
++          {
++            set_current(k);
++            return true;
++          }
++        }
++      )
++    }
++    s += 16;
++  }
++  return false;
++}
++
++#endif // HAVE_ALTIVEC
++
+ /// My homegrown improved Boyer-Moore string search, a fallback method
+ bool Matcher::advance_string_bm(size_t loc)
+ {
+diff --git a/lib/pattern.cpp b/lib/pattern.cpp
+index 3c90286..498a1c1 100644
+--- a/lib/pattern.cpp
++++ b/lib/pattern.cpp
+@@ -426,7 +426,7 @@ void Pattern::init(const char *options, const char *pred)
+       pinmax = 8;
+     else
+       pinmax = 1;
+-#elif defined(HAVE_NEON)
++#elif defined(HAVE_NEON) || defined(HAVE_ALTIVEC)
+     const uint16_t freqmax3 = 160; // upper bound for freqlcp+freqlcs when needle pins>6 and min>=4
+     pinmax = 8;
+ #else
+@@ -521,7 +521,7 @@ void Pattern::init(const char *options, const char *pred)
+     uint16_t n = std::max(nlcp, nlcs);
+     // determine if a needle-based search is worthwhile heuristically, when freqlcp + freqlcs <= freqmax
+     uint16_t freqmax = 2 * freqmax2;
+-#if defined(HAVE_NEON)
++#if defined(HAVE_NEON) || defined(HAVE_ALTIVEC)
+     if (n > 6 && min_ >= 4)
+       freqmax = freqmax3;
+ #else // only runtime AVX2 supports pins>8, which should be constrained, because it is noisy
+@@ -588,7 +588,7 @@ void Pattern::init(const char *options, const char *pred)
+       if (chr_[j - 1] == chr_[i])
+         break;
+     bmd_ = i - j + 1;
+-#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(__SSE2__) || defined(__x86_64__) || _M_IX86_FP == 2 || !defined(HAVE_NEON)
++#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(__SSE2__) || defined(__x86_64__) || _M_IX86_FP == 2 || (!defined(HAVE_NEON) && !defined(HAVE_ALTIVEC))
+     size_t score = 0;
+     for (i = 0; i < n; ++i)
+       score += bms_[static_cast<uint8_t>(chr_[i])];
+@@ -605,7 +605,7 @@ void Pattern::init(const char *options, const char *pred)
+     // SSE2 is available: only if B-M scoring is high and freq is high, then use our improved Boyer-Moore
+     if (score > 1 && fch > 35 && (score > 4 || fch > 50) && fch + score > 52)
+       lcs_ = 0xffff; // use B-M
+-#elif !defined(HAVE_NEON)
++#elif !defined(HAVE_NEON) && !defined(HAVE_ALTIVEC)
+     // no SIMD available: if B-M scoring is high and freq is high, then use our improved Boyer-Moore
+     if (score > 1 && fch > 35 && (score > 3 || fch > 50) && fch + score > 52)
+       lcs_ = 0xffff; // use B-M
+@@ -4370,7 +4370,7 @@ void Pattern::analyze_dfa(DFA::State *start)
+       }
+       state = next;
+     }
+-#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(HAVE_NEON)
++#if defined(HAVE_AVX512BW) || defined(HAVE_AVX2) || defined(HAVE_SSE2) || defined(HAVE_NEON) || defined(HAVE_ALTIVEC)
+     // do not allow len_ == 1 unless we're accepting, use needles or bitap
+     if (len_ == 1 && state->accept == 0 && !state->edges.empty())
+     {
