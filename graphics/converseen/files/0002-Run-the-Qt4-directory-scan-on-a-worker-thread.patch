@@ -1,0 +1,198 @@
+From 53a0f5393e1da757d6485716bb44950b2ff0c22e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 11 Aug 2026 06:21:15 +0000
+Subject: [PATCH 2/2] Run the Qt4 directory scan on a worker thread
+
+The previous commit ran the folder scan inline on Qt4, which blocks the UI:
+the modal "Scanning folders..." dialog cannot repaint, so a large tree on slow
+hardware looks like a hang. Restore the threaded behavior Qt5 gets.
+
+Qt4's QtConcurrent::run() dispatches on FunctionObject::result_type, a typedef
+lambdas do not have ("no type named 'result_type'"), and Qt4's connect() has no
+pointer-to-member-function overload. So the Qt5 lambda pair becomes an explicit
+DirectoryScanner functor plus a real directoryScanFinished() slot, which
+recovers its watcher from sender() and its progress dialog from a QHash. The
+hash keeps one entry per in-flight scan, so importing several directories at
+once still pairs each scan with its own dialog.
+
+The slot and the hash are declared unconditionally rather than behind a
+QT_VERSION guard. moc would have to resolve QT_VERSION through qglobal.h to see
+a guarded slot, and if it did not, the slot would silently drop out of the
+metaobject and fail at runtime with "No such slot" instead of at build time.
+Qt5 and Qt6 keep the lambda path and simply never connect the slot.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PYgCCiu49ZE7W7TqTdxhBi
+---
+ src/mainwindowimpl.cpp | 96 ++++++++++++++++++++++++++++++++++--------
+ src/mainwindowimpl.h   | 10 +++++
+ 2 files changed, 88 insertions(+), 18 deletions(-)
+
+diff --git a/src/mainwindowimpl.cpp b/src/mainwindowimpl.cpp
+index 1897df6..907d403 100755
+--- a/src/mainwindowimpl.cpp
++++ b/src/mainwindowimpl.cpp
+@@ -32,9 +32,13 @@
+ 
+ #if QT_VERSION >= QT_VERSION_CHECK(5, 0, 0)
+ #include <QtConcurrent>
+-#include <QFutureWatcher>
++#else
++// Qt4 ships QtConcurrent as part of QtCore.
++#include <QtConcurrentRun>
+ #endif
+ 
++#include <QFutureWatcher>
++
+ #include "mainwindowimpl.h"
+ #include "dialogoptions.h"
+ #include "dialoginfo.h"
+@@ -410,6 +414,48 @@ void MainWindowImpl::dropped(QStringList fileNames, QStringList directories)
+     }
+ }
+ 
++#if QT_VERSION < QT_VERSION_CHECK(5, 0, 0)
++namespace {
++
++/*
++ * Qt4's QtConcurrent::run() dispatches on Functor::result_type, a typedef
++ * lambdas do not provide, so the scan body needs an explicit functor.
++ */
++class DirectoryScanner
++{
++public:
++    typedef QStringList result_type;
++
++    DirectoryScanner(const QString &directory,
++                     const QStringList &nameFilters,
++                     QDirIterator::IteratorFlag flag)
++        : m_directory(directory)
++        , m_nameFilters(nameFilters)
++        , m_flag(flag)
++    {
++    }
++
++    QStringList operator()() const
++    {
++        QStringList fileNames;
++
++        QDirIterator it(m_directory, m_nameFilters, QDir::Files, m_flag);
++
++        while (it.hasNext())
++            fileNames << it.next();
++
++        return fileNames;
++    }
++
++private:
++    QString m_directory;
++    QStringList m_nameFilters;
++    QDirIterator::IteratorFlag m_flag;
++};
++
++}
++#endif
++
+ void MainWindowImpl::loadDirectoryFiles(
+     const QString &directory,
+     const QStringList &readableFiltersList,
+@@ -467,32 +513,46 @@ void MainWindowImpl::loadDirectoryFiles(
+             return fileNames;
+         }));
+ #else
+-    /*
+-     * Qt4's QtConcurrent::run() only accepts functors exposing a result_type
+-     * typedef, which lambdas do not provide, and its connect() has no
+-     * pointer-to-member-function overload. The scan therefore runs inline here,
+-     * as it did before the threaded version was introduced.
+-     */
+-    QApplication::processEvents();
++    QFutureWatcher<QStringList> *watcher = new QFutureWatcher<QStringList>(this);
+ 
+-    QStringList fileNames;
++    m_directoryScanProgress.insert(watcher, progress);
+ 
+-    QDirIterator it(directory,
+-                    readableFiltersList,
+-                    QDir::Files,
+-                    flag);
++    connect(watcher, SIGNAL(finished()), this, SLOT(directoryScanFinished()));
+ 
+-    while (it.hasNext())
+-        fileNames << it.next();
++    watcher->setFuture(QtConcurrent::run(
++        DirectoryScanner(directory, readableFiltersList, flag)));
++#endif
++}
++
++/*
++ * Completion handler for the Qt4 directory scan. Qt4's connect() has no
++ * pointer-to-member-function overload, so what is a lambda on Qt5 becomes a
++ * real slot that recovers its watcher from sender() and its progress dialog
++ * from m_directoryScanProgress. Unused on Qt5 and Qt6.
++ */
++void MainWindowImpl::directoryScanFinished()
++{
++    QFutureWatcher<QStringList> *watcher =
++        static_cast<QFutureWatcher<QStringList> *>(sender());
++
++    if (!watcher)
++        return;
++
++    QProgressDialog *progress = m_directoryScanProgress.take(watcher);
++
++    const QStringList fileNames = watcher->result();
+ 
+     if (!fileNames.isEmpty())
+         loadFiles(fileNames);
+ 
+-    progress->close();
+-    progress->deleteLater();
++    if (progress) {
++        progress->close();
++        progress->deleteLater();
++    }
+ 
+     QApplication::restoreOverrideCursor();
+-#endif
++
++    watcher->deleteLater();
+ }
+ 
+ void MainWindowImpl::loadFiles(QStringList fileNames)
+diff --git a/src/mainwindowimpl.h b/src/mainwindowimpl.h
+index 8e2a67b..3e4fe9d 100755
+--- a/src/mainwindowimpl.h
++++ b/src/mainwindowimpl.h
+@@ -26,6 +26,7 @@
+ 
+ #include <QMainWindow>
+ #include <QFileInfo>
++#include <QHash>
+ #include <QList>
+ #include <QSettings>
+ #include <QDropEvent>
+@@ -47,6 +48,7 @@
+ #include "magickdefine.h"
+ 
+ class QDropEvent;
++class QProgressDialog;
+ 
+ class MainWindowImpl : public QMainWindow, public Ui::MainWindow
+ {
+@@ -121,7 +123,15 @@ private:
+ 
+     IMFilterType m_resamplingFilter;
+ 
++    // Pairs each running directory scan with the dialog reporting its progress.
++    // Only used by the Qt4 code path, but kept unconditional: moc would have to
++    // resolve QT_VERSION through qglobal.h to see a guarded slot, and if it
++    // failed to, the slot would silently vanish from the metaobject.
++    QHash<QObject *, QProgressDialog *> m_directoryScanProgress;
++
+ private slots:
++    void directoryScanFinished();
++
+     void dropped(QStringList fileNames, QStringList directories);
+     void openFiles();
+     void addFiles();
