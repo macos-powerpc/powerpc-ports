@@ -1,0 +1,97 @@
+sh_lut: emulate texelFetch() on GLSL < 130
+
+The texture-backed LUT accessor is emitted unconditionally as
+
+    #define NAME(pos) (texelFetch(tex, ivec2(pos), 0).x)
+
+but texelFetch() only exists in GLSL 130 / GLSL ES 300 and up. On a legacy
+GL 2.x context (GLSL 120) every shader that instantiates a texture LUT fails
+to compile:
+
+    ERROR: 0:58: Invalid call of undeclared identifier 'texelFetch'
+    Failed compiling/linking GLSL program
+    Failed creating pass / Failed rendering image!
+
+In practice this hits pl_shader_dither(): mpv's default dither (fruit/blue
+noise) builds a 64x64 LUT, so *every* render pass fails and the window stays
+a solid colour. It stayed hidden on GPUs without GL_ARB_texture_rg, because
+there sh_lut() cannot allocate the LUT texture at all ("Can't generate LUT:
+no compatible methods!") and dithering falls back to the procedural white
+noise path. It appears as soon as the GL 2.1 driver does expose r8/r16
+(e.g. Intel HD 4000 on macOS 10.15 with a legacy NSOpenGL context).
+
+Fix: when the target is GLSL < 130, emit a nearest-neighbour lookup at
+normalized coordinates instead. The LUT dimensions are fixed at shader
+generation time, so texel_scale(size, /* normalized */ false) already gives
+exactly the (i + 0.5) / size mapping needed to address a texel centre; the
+texture is bound with PL_TEX_SAMPLE_NEAREST, so the result is bit-identical
+to texelFetch(). This mirrors the structure of the is_linear branch directly
+above it. Restricted to PL_VAR_FLOAT LUTs, since integer samplers do not
+exist below GLSL 130 anyway.
+
+Generated GLSL, GLSL 120 (dither LUT, 64x64, 1 component):
+
+    #define _7(x) (_9 * (x) + _8)
+    #define _a(x) (_c * (x) + _b)
+    #define _5(pos) (texture2D(_6, vec2(\
+        _7(float(ivec2(pos).x))\
+       ,_a(float(ivec2(pos).y))\
+      )).x)
+    ...
+    bias = _5(ivec2(pos * _e));
+
+GLSL >= 130 output is unchanged (still texelFetch).
+
+Verified against libplacebo v7.360.1 by generating the shader with a dummy
+GPU pinned to glsl.version = 120 and max_variable_comps = 0 (to force the
+texture LUT path); output above. Not upstream-submitted; upstream requires
+GL >= 3.0 for the OpenGL backend, so this only matters together with the
+GL2 backport patches.
+
+Applies on top of libplacebo-gl2-complete.patch, -osd-crashfix.patch and
+-16bit-luminance.patch (and also to a pristine v7.360.1 tree, with offset).
+
+--- a/src/shaders/lut.c
++++ b/src/shaders/lut.c
+@@ -651,6 +651,41 @@
+                 }
+             }
+             GLSLH("  ), 0.0).%s)\n", swizzles[params->comps - 1]);
++        } else if (sh_glsl(sh).version < 130 && vartype == PL_VAR_FLOAT) {
++            // texelFetch() requires GLSL 130 / GLSL ES 300. On older versions,
++            // emulate it with a nearest-neighbour lookup at normalized
++            // coordinates: the LUT dimensions are known at shader generation
++            // time, so texel_scale() can map an integer texel index onto the
++            // corresponding texel center statically.
++            static const char *const legacy_tex_fn[] = {
++                "texture1D", "texture2D", "texture3D",
++            };
++
++            PL_DEBUG(sh, "GLSL < 130: emulating texelFetch() for LUT lookup");
++
++            ident_t pos_macros[PL_ARRAY_SIZE(sizes)] = {0};
++            for (int i = 0; i < dims; i++)
++                pos_macros[i] = texel_scale(sh, sizes[i], false);
++
++            GLSLH("#define "$"(pos) (%s("$", %s(\\\n",
++                  name, legacy_tex_fn[texdim - 1], tex,
++                  vartypes[PL_VAR_FLOAT][texdim - 1]);
++
++            for (int i = 0; i < texdim; i++) {
++                char sep = i == 0 ? ' ' : ',';
++                if (pos_macros[i]) {
++                    if (dims > 1) {
++                        GLSLH("   %c"$"(float(%s(pos).%c))\\\n", sep,
++                              pos_macros[i], vartypes[PL_VAR_SINT][dims - 1],
++                              "xyzw"[i]);
++                    } else {
++                        GLSLH("   %c"$"(float(pos))\\\n", sep, pos_macros[i]);
++                    }
++                } else {
++                    GLSLH("   %c%f\\\n", sep, 0.5);
++                }
++            }
++            GLSLH("  )).%s)\n", swizzles[params->comps - 1]);
+         } else {
+             GLSLH("#define "$"(pos) (texelFetch("$", %s(pos",
+                   name, tex, vartypes[PL_VAR_SINT][texdim - 1]);
