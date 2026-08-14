@@ -1,0 +1,501 @@
+From 52db7e59e3d2d94079d4d67a292f769b65abd014 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 9 Aug 2026 07:57:28 +0000
+Subject: [PATCH] Implement zwp_idle_inhibit_manager_v1
+
+Owl doesn't track per-surface visibility/occlusion, so this counts
+every live inhibitor object as active (the spec explicitly allows
+"counting mapped inhibitors" as a v1-adequate approximation) and
+holds a single system power assertion for as long as that count is
+above zero, mirroring OwlWpContentType's per-surface destroy-listener
+bookkeeping for lifetime tracking.
+
+Three build configurations: IOPMAssertionCreateWithName with
+kIOPMAssertionTypeNoDisplaySleep on 10.6+ (the new OWL_HAS_IOPM
+feature flag; deliberately not the newer
+kIOPMAssertionTypePreventUserIdleDisplaySleep alias, which only
+exists since 10.7 and fails to build against the 10.6 SDK), a
+periodic UpdateSystemActivity() timer as the pre-IOPM Apple fallback,
+and a tracked-but-inert no-op on GNUstep, which has neither API.
+Links IOKit and CoreServices normally (unlike IOSurface, both exist
+on every supported OS version, so no need to weak_framework them).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01X4132h4W4m6yZEz9BE7yN4
+---
+ .../Compositor/OwlZwpIdleInhibitManagerV1.h   |  39 +++
+ .../Compositor/OwlZwpIdleInhibitManagerV1.m   | 263 ++++++++++++++++++
+ Sources/OwlFeatures.h                         |   6 +
+ Sources/Protocol/idle-inhibit-unstable-v1.xml |  83 ++++++
+ Sources/Server/OwlServer.m                    |   2 +
+ configure                                     |   6 +-
+ 6 files changed, 398 insertions(+), 1 deletion(-)
+ create mode 100644 Sources/Compositor/OwlZwpIdleInhibitManagerV1.h
+ create mode 100644 Sources/Compositor/OwlZwpIdleInhibitManagerV1.m
+ create mode 100644 Sources/Protocol/idle-inhibit-unstable-v1.xml
+
+diff --git a/Sources/Compositor/OwlZwpIdleInhibitManagerV1.h b/Sources/Compositor/OwlZwpIdleInhibitManagerV1.h
+new file mode 100644
+index 0000000..6f07779
+--- /dev/null
++++ b/Sources/Compositor/OwlZwpIdleInhibitManagerV1.h
+@@ -0,0 +1,39 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2019-2021 Sergey Bugaev <bugaevc@gmail.com>
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#import "OwlGlobal.h"
++#import <Cocoa/Cocoa.h>
++#import <wayland-server.h>
++
++
++/* Implements zwp_idle_inhibit_manager_v1.
++ *
++ * Owl doesn't track per-surface visibility/occlusion, so this counts
++ * every live inhibitor object as active (spec: "counting mapped
++ * inhibitors is close enough for v1") and holds a single system power
++ * assertion for as long as that count is above zero.
++ */
++@interface OwlZwpIdleInhibitManagerV1 : NSObject <OwlGlobal> {
++    struct wl_resource *_resource;
++}
++
++- (id) initWithResource: (struct wl_resource *) resource;
++
+++ (void) addGlobalToDisplay: (struct wl_display *) display;
++
++@end
+diff --git a/Sources/Compositor/OwlZwpIdleInhibitManagerV1.m b/Sources/Compositor/OwlZwpIdleInhibitManagerV1.m
+new file mode 100644
+index 0000000..1f99867
+--- /dev/null
++++ b/Sources/Compositor/OwlZwpIdleInhibitManagerV1.m
+@@ -0,0 +1,263 @@
++/* This file is part of Owl.
++ *
++ * Copyright © 2019-2021 Sergey Bugaev <bugaevc@gmail.com>
++ *
++ * Owl is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published
++ * by the Free Software Foundation, either version 3 of the License,
++ * or (at your option) any later version.
++ *
++ * Owl is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Owl.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#import "OwlZwpIdleInhibitManagerV1.h"
++#import "idle-inhibit-unstable-v1.h"
++#import "OwlFeatures.h"
++
++#ifdef OWL_HAS_IOPM
++#import <IOKit/pwr_mgt/IOPMLib.h>
++#elif defined(OWL_PLATFORM_APPLE)
++#import <CoreServices/CoreServices.h>
++#endif
++
++
++/* Tracks one live zwp_idle_inhibitor_v1, keyed to the wl_surface it
++ * was created for (only for destroy-listener bookkeeping symmetry
++ * with OwlWpContentType; unlike content-type, a surface may have any
++ * number of inhibitors, so there's no duplicate check here). */
++@interface OwlZwpIdleInhibitor : NSObject {
++@public
++    struct wl_resource *_resource;
++    struct wl_resource *_surfaceResource;
++    struct wl_listener _surfaceDestroyListener;
++}
++
++- (id) initWithResource: (struct wl_resource *) resource
++         surfaceResource: (struct wl_resource *) surfaceResource;
++
++@end
++
++@implementation OwlZwpIdleInhibitor
++
++static NSMutableArray *inhibitors;
++
+++ (void) initialize {
++    if (inhibitors == nil) {
++        inhibitors = [[NSMutableArray alloc] initWithCapacity: 1];
++    }
++}
++
++#ifdef OWL_HAS_IOPM
++static IOPMAssertionID powerAssertionID;
++static BOOL powerAssertionHeld;
++#elif defined(OWL_PLATFORM_APPLE)
++static NSTimer *activityTimer;
++#endif
++
++#if defined(OWL_PLATFORM_APPLE) && !defined(OWL_HAS_IOPM)
+++ (void) keepSystemActiveTimer: (NSTimer *) timer {
++    UpdateSystemActivity(OverallAct);
++}
++#endif
++
++// Called when the first inhibitor is created / the last one goes
++// away. Owl doesn't track per-surface visibility, so this simply
++// treats "at least one live inhibitor" as "inhibit idling", per the
++// spec's "counting mapped inhibitors is close enough for v1" note.
++static void acquirePowerAssertion(void) {
++#ifdef OWL_HAS_IOPM
++    if (powerAssertionHeld) {
++        return;
++    }
++    // kIOPMAssertionTypeNoDisplaySleep is the 10.6+ spelling; the
++    // newer kIOPMAssertionTypePreventUserIdleDisplaySleep alias
++    // only exists since 10.7 and fails to build against the 10.6
++    // SDK. The old name is deprecated (not removed) on 10.7+, so
++    // it's fine to use unconditionally here.
++    IOReturn ret = IOPMAssertionCreateWithName(
++        kIOPMAssertionTypeNoDisplaySleep,
++        kIOPMAssertionLevelOn,
++        CFSTR("Owl: a client is inhibiting idle"),
++        &powerAssertionID
++    );
++    powerAssertionHeld = (ret == kIOReturnSuccess);
++#elif defined(OWL_PLATFORM_APPLE)
++    if (activityTimer != nil) {
++        return;
++    }
++    // No IOPMAssertion API on 10.5; fall back to periodically
++    // resetting the idle timer. 15s comfortably beats any real
++    // idle/screensaver timeout.
++    activityTimer = [[NSTimer scheduledTimerWithTimeInterval: 15.0
++                                                        target: [OwlZwpIdleInhibitor class]
++                                                      selector: @selector(keepSystemActiveTimer:)
++                                                      userInfo: nil
++                                                       repeats: YES] retain];
++    UpdateSystemActivity(OverallAct);
++#endif
++}
++
++static void releasePowerAssertion(void) {
++#ifdef OWL_HAS_IOPM
++    if (!powerAssertionHeld) {
++        return;
++    }
++    IOPMAssertionRelease(powerAssertionID);
++    powerAssertionHeld = NO;
++#elif defined(OWL_PLATFORM_APPLE)
++    [activityTimer invalidate];
++    [activityTimer release];
++    activityTimer = nil;
++#endif
++}
++
++static void surface_destroy_notify(struct wl_listener *listener, void *data) {
++    OwlZwpIdleInhibitor *self = nil;
++    for (OwlZwpIdleInhibitor *inhibitor in inhibitors) {
++        if (&inhibitor->_surfaceDestroyListener == listener) {
++            self = inhibitor;
++            break;
++        }
++    }
++    if (self == nil) {
++        return;
++    }
++
++    self->_surfaceResource = NULL;
++    wl_list_remove(&self->_surfaceDestroyListener.link);
++    wl_list_init(&self->_surfaceDestroyListener.link);
++}
++
++static void idle_inhibitor_destroy(struct wl_resource *resource) {
++    OwlZwpIdleInhibitor *self = wl_resource_get_user_data(resource);
++    [inhibitors removeObjectIdenticalTo: self];
++    if ([inhibitors count] == 0) {
++        releasePowerAssertion();
++    }
++    [self release];
++}
++
++static void idle_inhibitor_destroy_handler(
++    struct wl_client *client,
++    struct wl_resource *resource
++) {
++    wl_resource_destroy(resource);
++}
++
++static const struct zwp_idle_inhibitor_v1_interface idle_inhibitor_impl = {
++    .destroy = idle_inhibitor_destroy_handler
++};
++
++- (id) initWithResource: (struct wl_resource *) resource
++         surfaceResource: (struct wl_resource *) surfaceResource
++{
++    _resource = resource;
++    _surfaceResource = surfaceResource;
++    _surfaceDestroyListener.notify = surface_destroy_notify;
++    wl_resource_add_destroy_listener(
++        surfaceResource,
++        &_surfaceDestroyListener
++    );
++    [inhibitors addObject: self];
++    acquirePowerAssertion();
++
++    wl_resource_set_implementation(
++        resource,
++        &idle_inhibitor_impl,
++        [self retain],
++        idle_inhibitor_destroy
++    );
++
++    return self;
++}
++
++- (void) dealloc {
++    if (_surfaceResource != NULL) {
++        wl_list_remove(&_surfaceDestroyListener.link);
++    }
++    [super dealloc];
++}
++
++@end
++
++
++@implementation OwlZwpIdleInhibitManagerV1
++
++static void idle_inhibit_manager_destroy(struct wl_resource *resource) {
++    OwlZwpIdleInhibitManagerV1 *self = wl_resource_get_user_data(resource);
++    [self release];
++}
++
++static void idle_inhibit_manager_destroy_handler(
++    struct wl_client *client,
++    struct wl_resource *resource
++) {
++    wl_resource_destroy(resource);
++}
++
++static void idle_inhibit_manager_create_inhibitor_handler(
++    struct wl_client *client,
++    struct wl_resource *resource,
++    uint32_t id,
++    struct wl_resource *surface_resource
++) {
++    struct wl_resource *inhibitor_resource = wl_resource_create(
++        client,
++        &zwp_idle_inhibitor_v1_interface,
++        wl_resource_get_version(resource),
++        id
++    );
++    OwlZwpIdleInhibitor *inhibitor = [OwlZwpIdleInhibitor alloc];
++    [[inhibitor initWithResource: inhibitor_resource
++                  surfaceResource: surface_resource] release];
++}
++
++static const struct zwp_idle_inhibit_manager_v1_interface
++idle_inhibit_manager_impl = {
++    .destroy = idle_inhibit_manager_destroy_handler,
++    .create_inhibitor = idle_inhibit_manager_create_inhibitor_handler
++};
++
++- (id) initWithResource: (struct wl_resource *) resource {
++    _resource = resource;
++    wl_resource_set_implementation(
++        resource,
++        &idle_inhibit_manager_impl,
++        [self retain],
++        idle_inhibit_manager_destroy
++    );
++    return self;
++}
++
++static void idle_inhibit_manager_bind(
++    struct wl_client *client,
++    void *data,
++    uint32_t version,
++    uint32_t id
++) {
++    struct wl_resource *resource = wl_resource_create(
++        client,
++        &zwp_idle_inhibit_manager_v1_interface,
++        version,
++        id
++    );
++    [[[OwlZwpIdleInhibitManagerV1 alloc] initWithResource: resource] release];
++}
++
+++ (void) addGlobalToDisplay: (struct wl_display *) display {
++    wl_global_create(
++        display,
++        &zwp_idle_inhibit_manager_v1_interface,
++        1,
++        NULL,
++        idle_inhibit_manager_bind
++    );
++}
++
++@end
+diff --git a/Sources/OwlFeatures.h b/Sources/OwlFeatures.h
+index 7ccc3a6..1038a01 100644
+--- a/Sources/OwlFeatures.h
++++ b/Sources/OwlFeatures.h
+@@ -31,14 +31,20 @@
+     #if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+         #define OWL_HAS_GCD 1
+         #define OWL_HAS_IOSURFACE 1
++        /* IOPMAssertionCreateWithName (IOKit power management) is
++         * also a 10.6+ API; on 10.5 idle-inhibit falls back to
++         * periodic UpdateSystemActivity() calls. */
++        #define OWL_HAS_IOPM 1
+     #else
+         #undef OWL_HAS_GCD
+         #undef OWL_HAS_IOSURFACE
++        #undef OWL_HAS_IOPM
+     #endif
+ #else
+     #undef OWL_PLATFORM_APPLE
+     #undef OWL_HAS_GCD
+     #undef OWL_HAS_IOSURFACE
++    #undef OWL_HAS_IOPM
+ #endif
+ 
+ #ifdef GS_API_VERSION
+diff --git a/Sources/Protocol/idle-inhibit-unstable-v1.xml b/Sources/Protocol/idle-inhibit-unstable-v1.xml
+new file mode 100644
+index 0000000..9c06cdc
+--- /dev/null
++++ b/Sources/Protocol/idle-inhibit-unstable-v1.xml
+@@ -0,0 +1,83 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="idle_inhibit_unstable_v1">
++
++  <copyright>
++    Copyright © 2015 Samsung Electronics Co., Ltd
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="zwp_idle_inhibit_manager_v1" version="1">
++    <description summary="control behavior when display idles">
++      This interface permits inhibiting the idle behavior such as screen
++      blanking, locking, and screensaving.  The client binds the idle manager
++      globally, then creates idle-inhibitor objects for each surface.
++
++      Warning! The protocol described in this file is experimental and
++      backward incompatible changes may be made. Backward compatible changes
++      may be added together with the corresponding interface version bump.
++      Backward incompatible changes are done by bumping the version number in
++      the protocol and interface names and resetting the interface version.
++      Once the protocol is to be declared stable, the 'z' prefix and the
++      version number in the protocol and interface names are removed and the
++      interface version number is reset.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the idle inhibitor object">
++	Destroy the inhibit manager.
++      </description>
++    </request>
++
++    <request name="create_inhibitor">
++      <description summary="create a new inhibitor object">
++	Create a new inhibitor object associated with the given surface.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_idle_inhibitor_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"
++	   summary="the surface that inhibits the idle behavior"/>
++    </request>
++
++  </interface>
++
++  <interface name="zwp_idle_inhibitor_v1" version="1">
++    <description summary="context object for inhibiting idle behavior">
++      An idle inhibitor prevents the output that the associated surface is
++      visible on from being set to a state where it is not visually usable due
++      to lack of user interaction (e.g. blanked, dimmed, locked, set to power
++      save, etc.)  Any screensaver processes are also blocked from displaying.
++
++      If the surface is destroyed, unmapped, becomes occluded, loses
++      visibility, or otherwise becomes not visually relevant for the user, the
++      idle inhibitor will not be honored by the compositor; if the surface
++      subsequently regains visibility the inhibitor takes effect once again.
++      Likewise, the inhibitor isn't honored if the system was already idled at
++      the time the inhibitor was established, although if the system later
++      de-idles and re-idles the inhibitor will take effect.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the idle inhibitor object">
++	Remove the inhibitor effect from the associated wl_surface.
++      </description>
++    </request>
++
++  </interface>
++</protocol>
+diff --git a/Sources/Server/OwlServer.m b/Sources/Server/OwlServer.m
+index a1312d8..cc4ecfe 100644
+--- a/Sources/Server/OwlServer.m
++++ b/Sources/Server/OwlServer.m
+@@ -31,6 +31,7 @@
+ #import "OwlWpSinglePixelBufferManagerV1.h"
+ #import "OwlWpPresentation.h"
+ #import "OwlWpViewporter.h"
++#import "OwlZwpIdleInhibitManagerV1.h"
+ #import "OwlSeat.h"
+ #import "OwlWpCursorShapeManagerV1.h"
+ #import "OwlOutput.h"
+@@ -142,6 +143,7 @@
+     [OwlWpSinglePixelBufferManagerV1 addGlobalToDisplay: _display];
+     [OwlWpPresentation addGlobalToDisplay: _display];
+     [OwlWpViewporter addGlobalToDisplay: _display];
++    [OwlZwpIdleInhibitManagerV1 addGlobalToDisplay: _display];
+     [OwlWlDataDeviceManager addGlobalToDisplay: _display];
+     [OwlZwpPrimarySelectionDeviceManagerV1 addGlobalToDisplay: _display];
+     [OwlSeat addGlobalToDisplay: _display];
+diff --git a/configure b/configure
+index a22e2e5..99b012e 100755
+--- a/configure
++++ b/configure
+@@ -27,7 +27,11 @@ if [ "$(uname)" = Darwin ]; then
+     # Use -weak_framework for IOSurface to support macOS 10.5 (Leopard)
+     # where IOSurface is not available. The code uses compile-time guards
+     # (OWL_HAS_IOSURFACE) to avoid calling IOSurface APIs on older systems.
+-    LIBS=${LIBS:-"-l wayland-server -framework Cocoa -framework OpenGL -weak_framework IOSurface"}
++    # IOKit provides the idle-inhibit power assertions (OWL_HAS_IOPM,
++    # 10.6+); CoreServices provides the UpdateSystemActivity() fallback
++    # used pre-10.6. Both frameworks exist on every supported OS version,
++    # so they're linked normally rather than weakly.
++    LIBS=${LIBS:-"-l wayland-server -framework Cocoa -framework OpenGL -weak_framework IOSurface -framework IOKit -framework CoreServices"}
+ else
+     LIBS=${LIBS:-"-l wayland-server -l gnustep-gui -l gnustep-base -l objc"}
+ fi
