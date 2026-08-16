@@ -1,0 +1,1192 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3a85a1e..3f727f3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -51,6 +51,19 @@ elseif("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU" OR "${CMAKE_CXX_COMPILER_ID}" MA
+     endif()
+ endif()
+ 
++# libunicode uses std::format() extensively. On libc++, that pulls in
++# std::to_chars()/from_chars() for floating point, which Apple's platform
++# availability macros gate to macOS 13.3+ -- and that's not just a compile-time
++# guard: pre-13.3 system libc++ dylibs genuinely lack the runtime symbols
++# std::format's internals need (e.g. __hash_memory), so disabling the
++# availability check alone just trades a compile error for a link error.
++# LIBUNICODE_USE_FMT switches every std::format/std::formatter use to
++# {fmt} instead, which has no such runtime dependency, so it works with any
++# deployment target as long as an {fmt} package is available (findable via
++# find_package(fmt); not vendored here).
++option(LIBUNICODE_USE_FMT
++       "libunicode: Use {fmt} instead of std::format/<format> (needed e.g. on macOS < 13.3, where libc++'s std::format cannot link) [default: OFF]" OFF)
++
+ include(EnableCcache)
+ include(ClangTidy)
+ include(PedanticCompiler)
+diff --git a/cmake/ThirdParties.cmake b/cmake/ThirdParties.cmake
+index ed5e529..58eefdc 100644
+--- a/cmake/ThirdParties.cmake
++++ b/cmake/ThirdParties.cmake
+@@ -65,6 +65,11 @@ if(LIBUNICODE_BENCHMARK)
+     endif()
+ endif()
+ 
++if(LIBUNICODE_USE_FMT)
++    find_package(fmt REQUIRED)
++    set(THIRDPARTY_BUILTIN_fmt "system package")
++endif()
++
+ 
+ macro(ThirdPartiesSummary2)
+     message(STATUS "==============================================================================")
+@@ -75,6 +80,9 @@ if(LIBUNICODE_TESTING)
+ endif()
+ if(LIBUNICODE_BENCHMARK)
+     message(STATUS "Benchmark           ${THIRDPARTY_BUILTIN_benchmark}")
++endif()
++if(LIBUNICODE_USE_FMT)
++    message(STATUS "fmt                 ${THIRDPARTY_BUILTIN_fmt}")
+ endif()
+     message(STATUS "------------------------------------------------------------------------------")
+ endmacro()
+diff --git a/src/libunicode/CMakeLists.txt b/src/libunicode/CMakeLists.txt
+index b616d5b..2d746e0 100644
+--- a/src/libunicode/CMakeLists.txt
++++ b/src/libunicode/CMakeLists.txt
+@@ -61,6 +61,22 @@ if(LIBUNICODE_HAS_PREGENERATED_FILES)
+     endforeach()
+ endif()
+ 
++# ucd_fmt.h hardcodes either std::formatter or fmt::formatter -- whichever LIBUNICODE_USE_FMT was set
++# to when unicode_tablegen last generated it. Flipping the option and reconfiguring touches no
++# tablegen source file, so the timestamp check above can't see that mismatch; without this, a stale
++# header would be reused as-is and silently fight the option.
++if(LIBUNICODE_HAS_PREGENERATED_FILES)
++    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/ucd_fmt.h" _LIBUNICODE_FMT_HEADER_LINE
++         REGEX "^struct (std|fmt)::formatter<" LIMIT_COUNT 1)
++    if(LIBUNICODE_USE_FMT AND NOT _LIBUNICODE_FMT_HEADER_LINE MATCHES "^struct fmt::formatter<")
++        message(STATUS "[libunicode] ucd_fmt.h was generated for std::format but LIBUNICODE_USE_FMT is ON; regenerating.")
++        set(LIBUNICODE_HAS_PREGENERATED_FILES FALSE)
++    elseif(NOT LIBUNICODE_USE_FMT AND NOT _LIBUNICODE_FMT_HEADER_LINE MATCHES "^struct std::formatter<")
++        message(STATUS "[libunicode] ucd_fmt.h was generated for {fmt} but LIBUNICODE_USE_FMT is OFF; regenerating.")
++        set(LIBUNICODE_HAS_PREGENERATED_FILES FALSE)
++    endif()
++endif()
++
+ # Emscripten cannot run the generator it would need, so a stale table there is undetectable at build
+ # time and ships as a wasm library whose widths disagree with the native one. Say so loudly.
+ if(EMSCRIPTEN AND NOT LIBUNICODE_HAS_PREGENERATED_FILES)
+@@ -108,6 +124,12 @@ set_target_properties(unicode_ucd PROPERTIES
+ )
+ target_include_directories(unicode_ucd PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+                                               $<INSTALL_INTERFACE:include>)
++if(LIBUNICODE_USE_FMT)
++    # ucd_fmt.h is a public header with fmt::formatter specializations, so both the macro
++    # and the library needed to call fmt::format() must reach anyone linking against unicode::ucd.
++    target_compile_definitions(unicode_ucd PUBLIC LIBUNICODE_USE_FMT)
++    target_link_libraries(unicode_ucd PUBLIC fmt::fmt)
++endif()
+ 
+ # =========================================================================================================
+ 
+@@ -133,6 +155,11 @@ if(LIBUNICODE_NEEDS_TABLEGEN)
+     set_target_properties(unicode_tablegen PROPERTIES CMAKE_BUILD_TYPE Release)
+     target_compile_definitions(unicode_tablegen PRIVATE LIBUNICODE_UCD_VERSION="${LIBUNICODE_UCD_VERSION}")
+     target_include_directories(unicode_tablegen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
++    if(LIBUNICODE_USE_FMT)
++        # Also decides which formatter flavor enum_generator.cpp bakes into the generated ucd_fmt.h.
++        target_compile_definitions(unicode_tablegen PRIVATE LIBUNICODE_USE_FMT)
++        target_link_libraries(unicode_tablegen PRIVATE fmt::fmt)
++    endif()
+ 
+     add_custom_command(
+         OUTPUT ${_LIBUNICODE_GENERATED_FILES}
+@@ -232,6 +259,7 @@ set(public_headers
+     codepoint_properties.h
+     convert.h
+     emoji_segmenter.h
++    format_compat.h
+     grapheme_segmenter.h
+     intrinsics.h
+     multistage_table_view.h
+diff --git a/src/libunicode/capi_test.cpp b/src/libunicode/capi_test.cpp
+index 64f3071..7d500ab 100644
+--- a/src/libunicode/capi_test.cpp
++++ b/src/libunicode/capi_test.cpp
+@@ -16,7 +16,6 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include <array>
+-#include <format>
+ #include <utility>
+ 
+ using namespace std;
+diff --git a/src/libunicode/convert_test.cpp b/src/libunicode/convert_test.cpp
+index 3222a19..904227c 100644
+--- a/src/libunicode/convert_test.cpp
++++ b/src/libunicode/convert_test.cpp
+@@ -17,7 +17,6 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
+-#include <format>
+ #include <iterator>
+ 
+ using namespace unicode;
+diff --git a/src/libunicode/emoji_segmenter.h b/src/libunicode/emoji_segmenter.h
+index 85b976b..0e66b8b 100644
+--- a/src/libunicode/emoji_segmenter.h
++++ b/src/libunicode/emoji_segmenter.h
+@@ -13,9 +13,9 @@
+  */
+ #pragma once
+ 
++#include <libunicode/format_compat.h>
+ #include <libunicode/support.h>
+ 
+-#include <format>
+ #include <ostream>
+ 
+ namespace unicode
+@@ -152,7 +152,7 @@ inline std::ostream& operator<<(std::ostream& os, EmojiSegmentationCategory valu
+ } // namespace unicode
+ 
+ template <>
+-struct std::formatter<unicode::PresentationStyle>: std::formatter<std::string_view>
++struct LIBUNICODE_FMT_NS::formatter<unicode::PresentationStyle>: LIBUNICODE_FMT_NS::formatter<std::string_view>
+ {
+     auto format(unicode::PresentationStyle value, auto& ctx) const
+     {
+@@ -167,7 +167,7 @@ struct std::formatter<unicode::PresentationStyle>: std::formatter<std::string_vi
+ };
+ 
+ template <>
+-struct std::formatter<unicode::EmojiSegmentationCategory>: std::formatter<std::string_view>
++struct LIBUNICODE_FMT_NS::formatter<unicode::EmojiSegmentationCategory>: LIBUNICODE_FMT_NS::formatter<std::string_view>
+ {
+     auto format(unicode::EmojiSegmentationCategory value, auto& ctx) const
+     {
+diff --git a/src/libunicode/emoji_segmenter_test.cpp b/src/libunicode/emoji_segmenter_test.cpp
+index 38fa5f7..07eb29f 100644
+--- a/src/libunicode/emoji_segmenter_test.cpp
++++ b/src/libunicode/emoji_segmenter_test.cpp
+@@ -12,14 +12,13 @@
+  * limitations under the License.
+  */
+ #include <libunicode/emoji_segmenter.h>
++#include <libunicode/format_compat.h>
+ #include <libunicode/grapheme_segmenter.h>
+ #include <libunicode/run_segmenter.h>
+ #include <libunicode/utf8.h>
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
+-#include <format>
+-
+ using namespace unicode;
+ using namespace std::string_literals;
+ using namespace std;
+@@ -46,14 +45,14 @@ void test_segments(int lineNo, std::vector<std::pair<std::u32string_view, Presen
+         i += text.size();
+     }
+ 
+-    INFO(std::format("Testing emoji segmentation from line {}: {}", lineNo, to_utf8(fullText)));
++    INFO(LIBUNICODE_FMT_NS::format("Testing emoji segmentation from line {}: {}", lineNo, to_utf8(fullText)));
+ 
+     size_t size {};
+     auto presentationStyle = PresentationStyle {};
+     auto segmenter = unicode::emoji_segmenter { fullText };
+     for (size_t i = 0; i < expectations.size(); ++i)
+     {
+-        INFO(std::format("run segmentation for part {}: \"{}\" to be {}",
++        INFO(LIBUNICODE_FMT_NS::format("run segmentation for part {}: \"{}\" to be {}",
+                          i,
+                          to_utf8(expectations[i].first),
+                          (unsigned) expectations[i].second));
+diff --git a/src/libunicode/format_compat.h b/src/libunicode/format_compat.h
+new file mode 100644
+index 0000000..89a074c
+--- /dev/null
++++ b/src/libunicode/format_compat.h
+@@ -0,0 +1,29 @@
++/**
++ * This file is part of the "libunicode" project
++ *   Copyright (c) 2020 Christian Parpart <christian@parpart.family>
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++// Selects between std::format and {fmt} depending on LIBUNICODE_USE_FMT
++// (see the LIBUNICODE_USE_FMT CMake option), so the rest of the codebase can
++// write LIBUNICODE_FMT_NS::format(...) / LIBUNICODE_FMT_NS::formatter<T> once
++// and get whichever one this build was configured with. {fmt} is a drop-in
++// for the subset of std::format used here, with no dependency on libc++'s
++// std::to_chars()/from_chars() runtime support -- which is what makes
++// std::format unusable on macOS deployment targets below 13.3.
++#if defined(LIBUNICODE_USE_FMT)
++    #include <fmt/format.h>
++    #define LIBUNICODE_FMT_NS fmt
++#else
++    #include <format>
++    #define LIBUNICODE_FMT_NS std
++#endif
+diff --git a/src/libunicode/scan_test.cpp b/src/libunicode/scan_test.cpp
+index baf87b0..37f5638 100644
+--- a/src/libunicode/scan_test.cpp
++++ b/src/libunicode/scan_test.cpp
+@@ -12,6 +12,7 @@
+  * limitations under the License.
+  */
+ #include <libunicode/convert.h>
++#include <libunicode/format_compat.h>
+ #include <libunicode/scan.h>
+ #include <libunicode/utf8.h>
+ #include <libunicode/width.h>
+@@ -19,7 +20,6 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include <array>
+-#include <format>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -55,11 +55,11 @@ std::string escape(uint8_t ch)
+         case '"': return "\\\"";
+         default:
+             if (ch < 0x20)
+-                return std::format("\\{:03o}", static_cast<uint8_t>(ch) & 0xFF);
++                return LIBUNICODE_FMT_NS::format("\\{:03o}", static_cast<uint8_t>(ch) & 0xFF);
+             else if (ch < 0x80)
+-                return std::format("{}", static_cast<char>(ch));
++                return LIBUNICODE_FMT_NS::format("{}", static_cast<char>(ch));
+             else
+-                return std::format("\\x{:02x}", static_cast<uint8_t>(ch) & 0xFF);
++                return LIBUNICODE_FMT_NS::format("\\x{:02x}", static_cast<uint8_t>(ch) & 0xFF);
+     }
+ }
+ 
+@@ -281,7 +281,7 @@ TEST_CASE("scan.any.ascii_complex_repeat")
+         auto const countSimple = ((i + 1) / 2) * 20;
+         auto const countComplex = (i / 2) * 2;
+ 
+-        INFO(std::format("i = {}, ascii# {}, complex# {}, count {}, actual {}, s = \"{}\"",
++        INFO(LIBUNICODE_FMT_NS::format("i = {}, ascii# {}, complex# {}, count {}, actual {}, s = \"{}\"",
+                          i,
+                          countSimple,
+                          countComplex,
+@@ -642,7 +642,7 @@ void testScanText(int lineNo,
+                   uint8_t stopByte,
+                   std::vector<std::u32string_view> const& analyzedGraphemeClusters)
+ {
+-    INFO(std::format("Testing scan segment from line {}: {} ({:02X})", lineNo, hex(expectation), stopByte));
++    INFO(LIBUNICODE_FMT_NS::format("Testing scan segment from line {}: {} ({:02X})", lineNo, hex(expectation), stopByte));
+     auto const maxColumnCount = 80;
+ 
+     std::string fullText;
+@@ -665,7 +665,7 @@ void testScanText(int lineNo,
+     auto const iMax = std::min(analyzedGraphemeClusters.size(), graphemeClusterCollector.output.size());
+     for (size_t i = 0; i < iMax; ++i)
+     {
+-        INFO(std::format("i: {}, lhs: {}, rhs: {}",
++        INFO(LIBUNICODE_FMT_NS::format("i: {}, lhs: {}, rhs: {}",
+                          i,
+                          u8(std::u32string_view(graphemeClusterCollector.output[i].data(),
+                                                 graphemeClusterCollector.output[i].size())),
+diff --git a/src/libunicode/tablegen/case_norm_generator.cpp b/src/libunicode/tablegen/case_norm_generator.cpp
+index 09d5381..e5e517a 100644
+--- a/src/libunicode/tablegen/case_norm_generator.cpp
++++ b/src/libunicode/tablegen/case_norm_generator.cpp
+@@ -13,8 +13,9 @@
+  */
+ #include "case_norm_generator.h"
+ 
++#include <libunicode/format_compat.h>
++
+ #include <algorithm>
+-#include <format>
+ #include <fstream>
+ #include <map>
+ #include <set>
+@@ -35,9 +36,9 @@ namespace
+         auto sortedItems = std::vector<std::pair<char32_t, char32_t>>(mappings.begin(), mappings.end());
+         std::sort(sortedItems.begin(), sortedItems.end());
+ 
+-        out << std::format("// Simple {} mappings: source -> target\n", name);
+-        out << std::format("// Total entries: {}\n", sortedItems.size());
+-        out << std::format(
++        out << LIBUNICODE_FMT_NS::format("// Simple {} mappings: source -> target\n", name);
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}\n", sortedItems.size());
++        out << LIBUNICODE_FMT_NS::format(
+             "inline constexpr std::array<std::pair<char32_t, char32_t>, {}> simple_{}_table {{{{\n", sortedItems.size(), name);
+ 
+         for (size_t i = 0; i < sortedItems.size(); ++i)
+@@ -45,7 +46,7 @@ namespace
+             auto const& [src, tgt] = sortedItems[i];
+             auto comma = (i < sortedItems.size() - 1) ? "," : "";
+             auto comment = (src >= 0x20 && src < 0x7F) ? std::string(1, static_cast<char>(src)) : std::string {};
+-            out << std::format(
++            out << LIBUNICODE_FMT_NS::format(
+                 "    {{ 0x{:04X}, 0x{:04X} }}{} // {}\n", static_cast<unsigned>(src), static_cast<unsigned>(tgt), comma, comment);
+         }
+         out << "}};\n";
+@@ -58,14 +59,14 @@ namespace
+         auto sortedItems = std::vector<std::pair<char32_t, std::vector<char32_t>>>(mappings.begin(), mappings.end());
+         std::sort(sortedItems.begin(), sortedItems.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+ 
+-        out << std::format("// Full {} mappings: source -> [target1, target2, target3]\n", name);
+-        out << std::format("// Total entries: {}\n", sortedItems.size());
+-        out << std::format("struct full_{}_entry {{\n", name);
++        out << LIBUNICODE_FMT_NS::format("// Full {} mappings: source -> [target1, target2, target3]\n", name);
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}\n", sortedItems.size());
++        out << LIBUNICODE_FMT_NS::format("struct full_{}_entry {{\n", name);
+         out << "    char32_t source;\n";
+         out << "    char32_t targets[3];\n";
+         out << "    uint8_t length;\n";
+         out << "};\n\n";
+-        out << std::format("inline constexpr std::array<full_{}_entry, {}> full_{}_table {{{{\n", name, sortedItems.size(), name);
++        out << LIBUNICODE_FMT_NS::format("inline constexpr std::array<full_{}_entry, {}> full_{}_table {{{{\n", name, sortedItems.size(), name);
+ 
+         for (size_t i = 0; i < sortedItems.size(); ++i)
+         {
+@@ -75,7 +76,7 @@ namespace
+             auto padded = targets;
+             while (padded.size() < 3)
+                 padded.push_back(char32_t(0));
+-            out << std::format("    {{ 0x{:04X}, {{ 0x{:04X}, 0x{:04X}, 0x{:04X} }}, {} }}{}\n",
++            out << LIBUNICODE_FMT_NS::format("    {{ 0x{:04X}, {{ 0x{:04X}, 0x{:04X}, 0x{:04X} }}, {} }}{}\n",
+                                static_cast<unsigned>(src),
+                                static_cast<unsigned>(padded[0]),
+                                static_cast<unsigned>(padded[1]),
+@@ -92,14 +93,14 @@ namespace
+         std::sort(sortedItems.begin(), sortedItems.end());
+ 
+         out << "// Canonical Combining Class entries for non-zero CCC values\n";
+-        out << std::format("// Total entries: {}\n", sortedItems.size());
+-        out << std::format("inline constexpr std::array<std::pair<char32_t, uint8_t>, {}> ccc_table {{{{\n", sortedItems.size());
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}\n", sortedItems.size());
++        out << LIBUNICODE_FMT_NS::format("inline constexpr std::array<std::pair<char32_t, uint8_t>, {}> ccc_table {{{{\n", sortedItems.size());
+ 
+         for (size_t i = 0; i < sortedItems.size(); ++i)
+         {
+             auto const& [cp, ccc] = sortedItems[i];
+             auto comma = (i < sortedItems.size() - 1) ? "," : "";
+-            out << std::format("    {{ 0x{:04X}, {} }}{}\n", static_cast<unsigned>(cp), ccc, comma);
++            out << LIBUNICODE_FMT_NS::format("    {{ 0x{:04X}, {} }}{}\n", static_cast<unsigned>(cp), ccc, comma);
+         }
+         out << "}};\n";
+     }
+@@ -119,13 +120,13 @@ namespace
+             maxLen = std::max(maxLen, d->targets.size());
+ 
+         out << "// Canonical decomposition mappings\n";
+-        out << std::format("// Total entries: {}, max length: {}\n", canonical.size(), maxLen);
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}, max length: {}\n", canonical.size(), maxLen);
+         out << "struct canonical_decomposition_entry {\n";
+         out << "    char32_t source;\n";
+-        out << std::format("    char32_t targets[{}];\n", maxLen);
++        out << LIBUNICODE_FMT_NS::format("    char32_t targets[{}];\n", maxLen);
+         out << "    uint8_t length;\n";
+         out << "};\n\n";
+-        out << std::format("inline constexpr std::array<canonical_decomposition_entry, {}> canonical_decomposition_table {{{{\n",
++        out << LIBUNICODE_FMT_NS::format("inline constexpr std::array<canonical_decomposition_entry, {}> canonical_decomposition_table {{{{\n",
+                            canonical.size());
+ 
+         for (size_t i = 0; i < canonical.size(); ++i)
+@@ -135,14 +136,14 @@ namespace
+             auto padded = d->targets;
+             while (padded.size() < maxLen)
+                 padded.push_back(char32_t(0));
+-            out << std::format("    {{ 0x{:04X}, {{ ", static_cast<unsigned>(cp));
++            out << LIBUNICODE_FMT_NS::format("    {{ 0x{:04X}, {{ ", static_cast<unsigned>(cp));
+             for (size_t j = 0; j < padded.size(); ++j)
+             {
+                 if (j > 0)
+                     out << ", ";
+-                out << std::format("0x{:04X}", static_cast<unsigned>(padded[j]));
++                out << LIBUNICODE_FMT_NS::format("0x{:04X}", static_cast<unsigned>(padded[j]));
+             }
+-            out << std::format(" }}, {} }}{}\n", d->targets.size(), comma);
++            out << LIBUNICODE_FMT_NS::format(" }}, {} }}{}\n", d->targets.size(), comma);
+         }
+         out << "}};\n";
+     }
+@@ -171,19 +172,19 @@ namespace
+         });
+ 
+         out << "// Canonical composition pairs (first + second -> composed)\n";
+-        out << std::format("// Total entries: {}\n", compositions.size());
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}\n", compositions.size());
+         out << "struct composition_pair {\n";
+         out << "    char32_t first;\n";
+         out << "    char32_t second;\n";
+         out << "    char32_t composed;\n";
+         out << "};\n\n";
+-        out << std::format("inline constexpr std::array<composition_pair, {}> composition_table {{{{\n", compositions.size());
++        out << LIBUNICODE_FMT_NS::format("inline constexpr std::array<composition_pair, {}> composition_table {{{{\n", compositions.size());
+ 
+         for (size_t i = 0; i < compositions.size(); ++i)
+         {
+             auto const& c = compositions[i];
+             auto comma = (i < compositions.size() - 1) ? "," : "";
+-            out << std::format("    {{ 0x{:04X}, 0x{:04X}, 0x{:04X} }}{}\n",
++            out << LIBUNICODE_FMT_NS::format("    {{ 0x{:04X}, 0x{:04X}, 0x{:04X} }}{}\n",
+                                static_cast<unsigned>(c.first),
+                                static_cast<unsigned>(c.second),
+                                static_cast<unsigned>(c.composed),
+@@ -231,14 +232,14 @@ namespace
+             maxLen = std::max(maxLen, d->targets.size());
+ 
+         out << "// Compatibility decomposition mappings\n";
+-        out << std::format("// Total entries: {}, max length: {}\n", compat.size(), maxLen);
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}, max length: {}\n", compat.size(), maxLen);
+         out << "struct compatibility_decomposition_entry {\n";
+         out << "    char32_t source;\n";
+-        out << std::format("    char32_t targets[{}];\n", maxLen);
++        out << LIBUNICODE_FMT_NS::format("    char32_t targets[{}];\n", maxLen);
+         out << "    uint8_t length;\n";
+         out << "    uint8_t decomp_type; // maps to Decomposition_Type enum ordinal\n";
+         out << "};\n\n";
+-        out << std::format(
++        out << LIBUNICODE_FMT_NS::format(
+             "inline constexpr std::array<compatibility_decomposition_entry, {}> compatibility_decomposition_table {{{{\n",
+             compat.size());
+ 
+@@ -249,14 +250,14 @@ namespace
+             auto padded = d->targets;
+             while (padded.size() < maxLen)
+                 padded.push_back(char32_t(0));
+-            out << std::format("    {{ 0x{:04X}, {{ ", static_cast<unsigned>(cp));
++            out << LIBUNICODE_FMT_NS::format("    {{ 0x{:04X}, {{ ", static_cast<unsigned>(cp));
+             for (size_t j = 0; j < padded.size(); ++j)
+             {
+                 if (j > 0)
+                     out << ", ";
+-                out << std::format("0x{:04X}", static_cast<unsigned>(padded[j]));
++                out << LIBUNICODE_FMT_NS::format("0x{:04X}", static_cast<unsigned>(padded[j]));
+             }
+-            out << std::format(" }}, {}, {} }}{}\n", d->targets.size(), decompositionTypeOrdinal(d->type), comma);
++            out << LIBUNICODE_FMT_NS::format(" }}, {}, {} }}{}\n", d->targets.size(), decompositionTypeOrdinal(d->type), comma);
+         }
+         out << "}};\n";
+     }
+@@ -266,9 +267,9 @@ namespace
+         auto sorted = std::vector<char32_t>(codepoints.begin(), codepoints.end());
+         std::sort(sorted.begin(), sorted.end());
+ 
+-        out << std::format("// {} codepoints\n", name);
+-        out << std::format("// Total entries: {}\n", sorted.size());
+-        out << std::format("inline constexpr std::array<char32_t, {}> {}_table {{{{\n", sorted.size(), name);
++        out << LIBUNICODE_FMT_NS::format("// {} codepoints\n", name);
++        out << LIBUNICODE_FMT_NS::format("// Total entries: {}\n", sorted.size());
++        out << LIBUNICODE_FMT_NS::format("inline constexpr std::array<char32_t, {}> {}_table {{{{\n", sorted.size(), name);
+ 
+         for (size_t i = 0; i < sorted.size(); i += 8)
+         {
+@@ -277,7 +278,7 @@ namespace
+             {
+                 if (j > i)
+                     out << ", ";
+-                out << std::format("0x{:04X}", static_cast<unsigned>(sorted[j]));
++                out << LIBUNICODE_FMT_NS::format("0x{:04X}", static_cast<unsigned>(sorted[j]));
+             }
+             if (i + 8 < sorted.size())
+                 out << ",";
+diff --git a/src/libunicode/tablegen/enum_generator.cpp b/src/libunicode/tablegen/enum_generator.cpp
+index 86b451a..3418566 100644
+--- a/src/libunicode/tablegen/enum_generator.cpp
++++ b/src/libunicode/tablegen/enum_generator.cpp
+@@ -13,8 +13,9 @@
+  */
+ #include "enum_generator.h"
+ 
++#include <libunicode/format_compat.h>
++
+ #include <algorithm>
+-#include <format>
+ #include <fstream>
+ #include <set>
+ #include <string>
+@@ -49,20 +50,22 @@ namespace
+ 
+     void writeEnumClass(std::ofstream& out, EnumDef const& def)
+     {
+-        out << std::format("enum class {}: {}\n{{\n", def.name, minimalUint(def.members.size()));
++        out << LIBUNICODE_FMT_NS::format("enum class {}: {}\n{{\n", def.name, minimalUint(def.members.size()));
+         for (size_t i = 0; i < def.members.size(); ++i)
+-            out << std::format("    {} = {},\n", sanitizeIdentifier(def.members[i]), i);
++            out << LIBUNICODE_FMT_NS::format("    {} = {},\n", sanitizeIdentifier(def.members[i]), i);
+         out << "};\n\n";
+     }
+ 
+     void writeEnumOstream(std::ofstream& out, EnumDef const& def)
+     {
+-        out << std::format("inline std::ostream& operator<<(std::ostream& os, {} value) noexcept\n{{\n", def.name);
++        out << LIBUNICODE_FMT_NS::format(
++            "inline std::ostream& operator<<(std::ostream& os, {} value) noexcept\n{{\n", def.name);
+         out << "    // clang-format off\n";
+         out << "    switch (value)\n";
+         out << "    {\n";
+         for (auto const& member: def.members)
+-            out << std::format("    case {}::{}: return os << \"{}\";\n", def.name, sanitizeIdentifier(member), member);
++            out << LIBUNICODE_FMT_NS::format(
++                "    case {}::{}: return os << \"{}\";\n", def.name, sanitizeIdentifier(member), member);
+         out << "    }\n";
+         out << "    // clang-format on\n";
+         out << "    return os << \"(\" << static_cast<unsigned>(value) << \")\";\n";
+@@ -71,17 +74,26 @@ namespace
+ 
+     void writeEnumFormatter(std::ofstream& out, EnumDef const& def)
+     {
++        // Bakes whichever formatter flavor unicode_tablegen was itself built with
++        // (LIBUNICODE_USE_FMT) into the generated ucd_fmt.h text, so that header needs no
++        // macro of its own at the point where a consumer includes it.
++#if defined(LIBUNICODE_USE_FMT)
++        constexpr auto* formatterNs = "fmt";
++#else
++        constexpr auto* formatterNs = "std";
++#endif
+         auto qualifiedName = "unicode::" + def.name;
+         out << "template <>\n";
+-        out << std::format("struct std::formatter<{}>: std::formatter<std::string_view>\n{{\n", qualifiedName);
+-        out << std::format("    auto format({} value, auto& ctx) const\n", qualifiedName);
++        out << LIBUNICODE_FMT_NS::format(
++            "struct {0}::formatter<{1}>: {0}::formatter<std::string_view>\n{{\n", formatterNs, qualifiedName);
++        out << LIBUNICODE_FMT_NS::format("    auto format({} value, auto& ctx) const\n", qualifiedName);
+         out << "    {\n";
+         out << "        std::string_view name;\n";
+         out << "        switch (value)\n";
+         out << "        {\n";
+         out << "            // clang-format off\n";
+         for (auto const& member: def.members)
+-            out << std::format(
++            out << LIBUNICODE_FMT_NS::format(
+                 "            case {}::{}: name = \"{}\"; break;\n", qualifiedName, sanitizeIdentifier(member), member);
+         out << "            // clang-format off\n";
+         out << "        }\n";
+@@ -270,7 +282,11 @@ void generateEnumFiles(UcdParser const& parser, std::string const& outputDir)
+         out << "\n";
+         out << "#include <libunicode/ucd_enums.h>\n";
+         out << "\n";
++#if defined(LIBUNICODE_USE_FMT)
++        out << "#include <fmt/format.h>\n";
++#else
+         out << "#include <format>\n";
++#endif
+         out << "\n";
+         for (auto const& def: enums)
+             writeEnumFormatter(out, def);
+diff --git a/src/libunicode/tablegen/ucd_api_generator.cpp b/src/libunicode/tablegen/ucd_api_generator.cpp
+index 7cfd1d2..b5f9067 100644
+--- a/src/libunicode/tablegen/ucd_api_generator.cpp
++++ b/src/libunicode/tablegen/ucd_api_generator.cpp
+@@ -13,8 +13,9 @@
+  */
+ #include "ucd_api_generator.h"
+ 
++#include <libunicode/format_compat.h>
++
+ #include <algorithm>
+-#include <format>
+ #include <fstream>
+ #include <map>
+ #include <set>
+@@ -53,13 +54,13 @@ namespace
+             {
+                 // Adjacent range with same value
+                 if (current.comments.size() == 1)
+-                    current.comments[0] = std::format("0x{:04X} .. 0x{:04X}: {}",
++                    current.comments[0] = LIBUNICODE_FMT_NS::format("0x{:04X} .. 0x{:04X}: {}",
+                                                       static_cast<unsigned>(current.rangeFrom),
+                                                       static_cast<unsigned>(current.rangeTo),
+                                                       current.comments[0]);
+                 if (!current.comments.empty())
+                 {
+-                    current.comments.push_back(std::format(
++                    current.comments.push_back(LIBUNICODE_FMT_NS::format(
+                         "0x{:04X} .. 0x{:04X}: {}", static_cast<unsigned>(r.first), static_cast<unsigned>(r.last), r.comment));
+                 }
+                 current.rangeTo = r.last;
+@@ -144,20 +145,20 @@ namespace unicode
+         auto elementType = std::string("Prop<::unicode::Plane>");
+         impl << "namespace tables\n{\n";
+         impl << "    // clang-format off\n";
+-        impl << std::format("    auto static const Plane = std::array<{}, {}>{{ // {}\n", elementType, planes.size(), FOLD_OPEN);
++        impl << LIBUNICODE_FMT_NS::format("    auto static const Plane = std::array<{}, {}>{{ // {}\n", elementType, planes.size(), FOLD_OPEN);
+         for (auto const& p: planes)
+         {
+-            impl << std::format("        {} {{ {{ 0x{:04X}, 0x{:04X} }}, unicode::Plane::{} }},",
++            impl << LIBUNICODE_FMT_NS::format("        {} {{ {{ 0x{:04X}, 0x{:04X} }}, unicode::Plane::{} }},",
+                                 elementType,
+                                 static_cast<unsigned>(p.start),
+                                 static_cast<unsigned>(p.end),
+                                 sanitizeIdentifier(p.name));
+             if (p.shortName.empty())
+-                impl << std::format(" // Plane {}\n", p.number);
++                impl << LIBUNICODE_FMT_NS::format(" // Plane {}\n", p.number);
+             else
+-                impl << std::format(" // Plane {} {}\n", p.number, p.shortName);
++                impl << LIBUNICODE_FMT_NS::format(" // Plane {} {}\n", p.number, p.shortName);
+         }
+-        impl << std::format("    }}; // {}\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("    }}; // {}\n", FOLD_CLOSE);
+         impl << "    // clang-format off\n";
+         impl << "} // namespace tables\n\n";
+ 
+@@ -173,14 +174,14 @@ namespace unicode
+         impl << "namespace tables {\n";
+         for (auto const& [name, ranges]: props)
+         {
+-            impl << std::format(
++            impl << LIBUNICODE_FMT_NS::format(
+                 "auto static const {} = std::array<{}, {}>{{ // {}\n", name, "Interval", ranges.size(), FOLD_OPEN);
+             for (auto const& r: ranges)
+-                impl << std::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
++                impl << LIBUNICODE_FMT_NS::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
+                                     static_cast<unsigned>(r.first),
+                                     static_cast<unsigned>(r.last),
+                                     r.comment);
+-            impl << std::format("}}; // {}\n", FOLD_CLOSE);
++            impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         }
+         impl << "} // end namespace tables\n\n";
+ 
+@@ -188,7 +189,7 @@ namespace unicode
+         impl << "    switch (prop)\n";
+         impl << "    {\n";
+         for (auto const& [name, ranges]: props)
+-            impl << std::format("        case Core_Property::{0:}: return contains(tables::{0:}, codepoint);\n", name);
++            impl << LIBUNICODE_FMT_NS::format("        case Core_Property::{0:}: return contains(tables::{0:}, codepoint);\n", name);
+         impl << "    }\n";
+         impl << "    return false;\n";
+         impl << "}\n\n";
+@@ -206,10 +207,10 @@ namespace unicode
+ 
+         // Main lookup table
+         impl << "namespace tables {\n";
+-        impl << std::format("auto const {} = std::array<{}, {}>{{\n", typeName, elementType, gcats.size());
++        impl << LIBUNICODE_FMT_NS::format("auto const {} = std::array<{}, {}>{{\n", typeName, elementType, gcats.size());
+         for (auto const& cat: gcats)
+         {
+-            impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }}, // {}\n",
++            impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }}, // {}\n",
+                                 elementType,
+                                 static_cast<unsigned>(cat.first),
+                                 static_cast<unsigned>(cat.last),
+@@ -221,10 +222,10 @@ namespace unicode
+         impl << "} // end namespace tables\n\n";
+ 
+         // Getter
+-        impl << std::format("namespace {}\n", "general_category");
++        impl << LIBUNICODE_FMT_NS::format("namespace {}\n", "general_category");
+         impl << "{\n";
+-        impl << std::format("    {} get(char32_t value) noexcept {{\n", typeName);
+-        impl << std::format("        return search(tables::{}, value).value_or({}::Unspecified);\n", typeName, typeName);
++        impl << LIBUNICODE_FMT_NS::format("    {} get(char32_t value) noexcept {{\n", typeName);
++        impl << LIBUNICODE_FMT_NS::format("        return search(tables::{}, value).value_or({}::Unspecified);\n", typeName, typeName);
+         impl << "    }\n";
+         impl << "}\n\n";
+ 
+@@ -232,14 +233,14 @@ namespace unicode
+         impl << "namespace tables {\n";
+         for (auto const& [name, ranges]: catsMap)
+         {
+-            impl << std::format(
++            impl << LIBUNICODE_FMT_NS::format(
+                 "auto static const {} = std::array<{}, {}>{{ // {}\n", name, "Interval", ranges.size(), FOLD_OPEN);
+             for (auto const& r: ranges)
+-                impl << std::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
++                impl << LIBUNICODE_FMT_NS::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
+                                     static_cast<unsigned>(r.first),
+                                     static_cast<unsigned>(r.last),
+                                     r.comment);
+-            impl << std::format("}}; // {}\n", FOLD_CLOSE);
++            impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         }
+         impl << "} // end namespace tables\n\n";
+ 
+@@ -248,7 +249,7 @@ namespace unicode
+         impl << "    switch (generalCategory)\n";
+         impl << "    {\n";
+         for (auto const& [name, ranges]: catsMap)
+-            impl << std::format("        case General_Category::{0:}: return contains(tables::{0:}, codepoint);\n", name);
++            impl << LIBUNICODE_FMT_NS::format("        case General_Category::{0:}: return contains(tables::{0:}, codepoint);\n", name);
+         impl << "        case General_Category::Unspecified: return false;\n";
+         impl << "    }\n";
+         impl << "    return false;\n";
+@@ -261,10 +262,10 @@ namespace unicode
+         header << "// clang-format off\n";
+         header << "namespace general_category\n";
+         header << "{\n";
+-        header << std::format("    {} get(char32_t value) noexcept;\n\n", typeName);
++        header << LIBUNICODE_FMT_NS::format("    {} get(char32_t value) noexcept;\n\n", typeName);
+         for (auto const& [name, ranges]: catsMap)
+         {
+-            header << std::format(
++            header << LIBUNICODE_FMT_NS::format(
+                 "    inline bool is_{}(char32_t codepoint) noexcept\n"
+                 "    {{\n"
+                 "        return contains(General_Category::{}, codepoint);\n"
+@@ -287,17 +288,17 @@ namespace unicode
+         auto elementType = std::string("Prop<unicode::Script>");
+ 
+         impl << "namespace tables {\n";
+-        impl << std::format("auto static const Script = std::array<{}, {}>{{ // {}\n", elementType, scripts.size(), FOLD_OPEN);
++        impl << LIBUNICODE_FMT_NS::format("auto static const Script = std::array<{}, {}>{{ // {}\n", elementType, scripts.size(), FOLD_OPEN);
+         for (auto const& r: scripts)
+         {
+-            impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, unicode::Script::{} }}, // {}\n",
++            impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, unicode::Script::{} }}, // {}\n",
+                                 elementType,
+                                 static_cast<unsigned>(r.first),
+                                 static_cast<unsigned>(r.last),
+                                 r.property,
+                                 r.comment);
+         }
+-        impl << std::format("}}; // {}\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         impl << "} // end namespace tables\n\n";
+ 
+         header << "Script script(char32_t codepoint) noexcept;\n\n";
+@@ -311,7 +312,7 @@ namespace unicode
+         auto const& sces = parser.scriptExtensions();
+         auto const& pva = parser.propertyValueAliases().at("Script");
+ 
+-        impl << std::format("namespace tables {{ // {} ScriptExtensions\n", FOLD_OPEN);
++        impl << LIBUNICODE_FMT_NS::format("namespace tables {{ // {} ScriptExtensions\n", FOLD_OPEN);
+ 
+         // Indirected lists
+         std::vector<std::string> doneList;
+@@ -324,25 +325,25 @@ namespace unicode
+                 continue;
+             doneList.push_back(key);
+ 
+-            impl << std::format("auto static const {} = std::array<{}, {}>{{\n", key, "unicode::Script", sce.properties.size());
++            impl << LIBUNICODE_FMT_NS::format("auto static const {} = std::array<{}, {}>{{\n", key, "unicode::Script", sce.properties.size());
+             for (auto const& scriptAbbrev: sce.properties)
+             {
+                 auto it = pva.find(scriptAbbrev);
+                 auto fullName = (it != pva.end()) ? it->second : scriptAbbrev;
+-                impl << std::format("    unicode::Script::{},\n", fullName);
++                impl << LIBUNICODE_FMT_NS::format("    unicode::Script::{},\n", fullName);
+             }
+             impl << "};\n\n";
+         }
+ 
+         // Main lookup table
+         auto elementType = std::string("Prop<std::pair<unicode::Script const*, std::size_t>>");
+-        impl << std::format("static const std::array<{}, {}> {} {{ {{\n", elementType, sces.size(), "sce");
++        impl << LIBUNICODE_FMT_NS::format("static const std::array<{}, {}> {} {{ {{\n", elementType, sces.size(), "sce");
+         for (auto const& sce: sces)
+         {
+             auto key = std::string("sce");
+             for (auto const& s: sce.properties)
+                 key += "_" + s;
+-            impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {{ {}.data(), {}.size() }} }}, // {}\n",
++            impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {{ {}.data(), {}.size() }} }}, // {}\n",
+                                 elementType,
+                                 static_cast<unsigned>(sce.first),
+                                 static_cast<unsigned>(sce.last),
+@@ -351,7 +352,7 @@ namespace unicode
+                                 sce.comment);
+         }
+         impl << "} };\n";
+-        impl << std::format("}} // {}\n\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("}} // {}\n\n", FOLD_CLOSE);
+ 
+         // Getter
+         header << "std::optional<std::span<Script const>> script_extensions(char32_t codepoint) noexcept;\n\n";
+@@ -369,10 +370,10 @@ namespace unicode
+         auto elementType = std::string("Prop<::unicode::Block>");
+ 
+         impl << "namespace tables {\n";
+-        impl << std::format("auto static const Block = std::array<{}, {}>{{ // {}\n", elementType, blocks.size(), FOLD_OPEN);
++        impl << LIBUNICODE_FMT_NS::format("auto static const Block = std::array<{}, {}>{{ // {}\n", elementType, blocks.size(), FOLD_OPEN);
+         for (auto const& b: blocks)
+         {
+-            impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }},\n",
++            impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }},\n",
+                                 elementType,
+                                 static_cast<unsigned>(b.first),
+                                 static_cast<unsigned>(b.last),
+@@ -394,12 +395,12 @@ namespace unicode
+         impl << "namespace tables {\n";
+         for (auto const& [name, ranges]: props)
+         {
+-            auto elementType = std::format("Prop<::unicode::{}>", name);
+-            impl << std::format(
++            auto elementType = LIBUNICODE_FMT_NS::format("Prop<::unicode::{}>", name);
++            impl << LIBUNICODE_FMT_NS::format(
+                 "auto static const {} = std::array<{}, {}>{{ // {}\n", name, elementType, ranges.size(), FOLD_OPEN);
+             for (auto const& r: ranges)
+             {
+-                impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, ::unicode::{}::{} }}, // {}\n",
++                impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, ::unicode::{}::{} }}, // {}\n",
+                                     elementType,
+                                     static_cast<unsigned>(r.first),
+                                     static_cast<unsigned>(r.last),
+@@ -407,23 +408,23 @@ namespace unicode
+                                     r.property,
+                                     r.comment);
+             }
+-            impl << std::format("}}; // {}\n", FOLD_CLOSE);
++            impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         }
+         impl << "} // end namespace tables\n\n";
+ 
+         for (auto const& [name, ranges]: props)
+         {
+-            header << std::format("{} {}(char32_t codepoint) noexcept;\n", name, [&name = name] {
++            header << LIBUNICODE_FMT_NS::format("{} {}(char32_t codepoint) noexcept;\n", name, [&name = name] {
+                 auto lower = name;
+                 std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                 return lower;
+             }());
+-            impl << std::format("{} {}(char32_t codepoint) noexcept {{\n", name, [&name = name] {
++            impl << LIBUNICODE_FMT_NS::format("{} {}(char32_t codepoint) noexcept {{\n", name, [&name = name] {
+                 auto lower = name;
+                 std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                 return lower;
+             }());
+-            impl << std::format("    return search(tables::{}, codepoint).value_or({}::Undefined);\n", name, name);
++            impl << LIBUNICODE_FMT_NS::format("    return search(tables::{}, codepoint).value_or({}::Undefined);\n", name, name);
+             impl << "}\n\n";
+         }
+         header << "\n";
+@@ -443,7 +444,7 @@ namespace unicode
+         header << "    switch (value)\n";
+         header << "    {\n";
+         for (auto const& v: { "Ambiguous", "FullWidth", "HalfWidth", "Neutral", "Narrow", "Wide", "Unspecified" })
+-            header << std::format("        case EastAsianWidth::{}: return \"{}\";\n", v, v);
++            header << LIBUNICODE_FMT_NS::format("        case EastAsianWidth::{}: return \"{}\";\n", v, v);
+         header << "    }\n";
+         header << "    return \"Unknown\";\n";
+         header << "}\n\n";
+@@ -452,26 +453,26 @@ namespace unicode
+ 
+         // Impl: range tables
+         impl << "namespace tables {\n";
+-        impl << std::format(
++        impl << LIBUNICODE_FMT_NS::format(
+             "auto static const EastAsianWidth = std::array<{}, {}>{{ // {}\n", elementType, compactRanges.size(), FOLD_OPEN);
+         for (auto const& range: compactRanges)
+         {
+             if (range.comments.size() > 1)
+                 for (auto const& comment: range.comments)
+-                    impl << std::format("    // {}\n", comment);
+-            impl << std::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }},",
++                    impl << LIBUNICODE_FMT_NS::format("    // {}\n", comment);
++            impl << LIBUNICODE_FMT_NS::format("    {} {{ {{ 0x{:04X}, 0x{:04X} }}, {}::{} }},",
+                                 elementType,
+                                 static_cast<unsigned>(range.rangeFrom),
+                                 static_cast<unsigned>(range.rangeTo),
+                                 propType,
+                                 widthName(range.value));
+             if (range.count == 1 && range.comments.size() == 1)
+-                impl << std::format(" // {}", range.comments[0]);
++                impl << LIBUNICODE_FMT_NS::format(" // {}", range.comments[0]);
+             else if (range.count > 1)
+-                impl << std::format(" // #{}", range.count);
++                impl << LIBUNICODE_FMT_NS::format(" // #{}", range.count);
+             impl << "\n";
+         }
+-        impl << std::format("}}; // {}\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         impl << "} // end namespace tables\n\n";
+ 
+         impl << "EastAsianWidth east_asian_width(char32_t codepoint) noexcept {\n";
+@@ -486,14 +487,14 @@ namespace unicode
+         impl << "namespace tables {\n";
+         for (auto const& [name, ranges]: emojiProps)
+         {
+-            impl << std::format(
++            impl << LIBUNICODE_FMT_NS::format(
+                 "auto static const {} = std::array<{}, {}>{{ // {}\n", name, "Interval", ranges.size(), FOLD_OPEN);
+             for (auto const& r: ranges)
+-                impl << std::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
++                impl << LIBUNICODE_FMT_NS::format("    Interval{{ 0x{:04X}, 0x{:04X} }}, // {}\n",
+                                     static_cast<unsigned>(r.first),
+                                     static_cast<unsigned>(r.last),
+                                     r.comment);
+-            impl << std::format("}}; // {}\n", FOLD_CLOSE);
++            impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+         }
+         impl << "} // end namespace tables\n\n";
+ 
+@@ -501,8 +502,8 @@ namespace unicode
+         {
+             auto lowerName = name;
+             std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+-            impl << std::format("bool is_{}(char32_t codepoint) noexcept {{\n", lowerName);
+-            impl << std::format("    return contains(tables::{}, codepoint);\n", name);
++            impl << LIBUNICODE_FMT_NS::format("bool is_{}(char32_t codepoint) noexcept {{\n", lowerName);
++            impl << LIBUNICODE_FMT_NS::format("    return contains(tables::{}, codepoint);\n", name);
+             impl << "}\n\n";
+         }
+ 
+@@ -510,7 +511,7 @@ namespace unicode
+         {
+             auto lowerName = name;
+             std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+-            header << std::format("bool is_{}(char32_t codepoint) noexcept;\n", lowerName);
++            header << LIBUNICODE_FMT_NS::format("bool is_{}(char32_t codepoint) noexcept;\n", lowerName);
+         }
+         header << "\n";
+     }
+@@ -523,21 +524,21 @@ namespace unicode
+         impl << "namespace tables {\n";
+ 
+         // Bidi_Mirrored interval table
+-        impl << std::format("auto static const Bidi_Mirrored = std::array<Interval, {}>{{ // {}\n", intervals.size(), FOLD_OPEN);
++        impl << LIBUNICODE_FMT_NS::format("auto static const Bidi_Mirrored = std::array<Interval, {}>{{ // {}\n", intervals.size(), FOLD_OPEN);
+         for (auto const& [start, end]: intervals)
+-            impl << std::format(
++            impl << LIBUNICODE_FMT_NS::format(
+                 "    Interval{{ 0x{:04X}, 0x{:04X} }},\n", static_cast<unsigned>(start), static_cast<unsigned>(end));
+-        impl << std::format("}}; // {}\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+ 
+         // Bidi_Mirroring_Glyph pair table
+-        impl << std::format("auto static const Bidi_Mirroring_Glyph = std::array<std::pair<char32_t, char32_t>, {}>{{ // {}\n",
++        impl << LIBUNICODE_FMT_NS::format("auto static const Bidi_Mirroring_Glyph = std::array<std::pair<char32_t, char32_t>, {}>{{ // {}\n",
+                             pairs.size(),
+                             FOLD_OPEN);
+         for (auto const& [source, target]: pairs)
+-            impl << std::format("    std::pair<char32_t, char32_t>{{ 0x{:04X}, 0x{:04X} }},\n",
++            impl << LIBUNICODE_FMT_NS::format("    std::pair<char32_t, char32_t>{{ 0x{:04X}, 0x{:04X} }},\n",
+                                 static_cast<unsigned>(source),
+                                 static_cast<unsigned>(target));
+-        impl << std::format("}}; // {}\n", FOLD_CLOSE);
++        impl << LIBUNICODE_FMT_NS::format("}}; // {}\n", FOLD_CLOSE);
+ 
+         impl << "} // end namespace tables\n\n";
+ 
+@@ -597,10 +598,10 @@ namespace unicode
+             impl << "std::optional<Age> make_age(std::string_view value) noexcept {\n";
+             impl << "    using namespace std::string_view_literals;\n";
+             impl << "    // clang-format off\n";
+-            impl << std::format("    static constexpr auto mappings = std::array<std::pair<std::string_view, Age>, {}>{{\n",
++            impl << LIBUNICODE_FMT_NS::format("    static constexpr auto mappings = std::array<std::pair<std::string_view, Age>, {}>{{\n",
+                                 entries.size());
+             for (auto const& entry: entries)
+-                impl << std::format("        std::pair{{ \"{}\"sv, Age::{} }},\n", entry.abbrev, entry.enumName);
++                impl << LIBUNICODE_FMT_NS::format("        std::pair{{ \"{}\"sv, Age::{} }},\n", entry.abbrev, entry.enumName);
+             impl << "    };\n";
+             impl << "    // clang-format on\n";
+             impl << "    for (auto const& [key, val] : mappings)\n";
+diff --git a/src/libunicode/utf8_grapheme_segmenter_test.cpp b/src/libunicode/utf8_grapheme_segmenter_test.cpp
+index 9c048a6..946ec04 100644
+--- a/src/libunicode/utf8_grapheme_segmenter_test.cpp
++++ b/src/libunicode/utf8_grapheme_segmenter_test.cpp
+@@ -11,11 +11,11 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include <libunicode/format_compat.h>
+ #include <libunicode/utf8_grapheme_segmenter.h>
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
+-#include <format>
+ #include <string_view>
+ 
+ using namespace std::string_literals;
+@@ -31,7 +31,7 @@ std::string escape(std::string const& s)
+         if (std::isprint(ch))
+             t += ch;
+         else
+-            t += std::format("\\x{:02X}", ((unsigned) ch) & 0xFF);
++            t += LIBUNICODE_FMT_NS::format("\\x{:02X}", ((unsigned) ch) & 0xFF);
+     return t;
+ }
+ 
+@@ -50,7 +50,7 @@ void test_utf8_grapheme_cluster_segmentation(Ts... expects)
+     };
+ 
+     auto const checkOne = [&](std::u32string_view expected) -> void {
+-        INFO(std::format("expects: {}, actual {}", s8(expected), s8(*i)));
++        INFO(LIBUNICODE_FMT_NS::format("expects: {}, actual {}", s8(expected), s8(*i)));
+         REQUIRE(s8(*i) == s8(expected));
+         REQUIRE(i != e);
+         ++i;
+diff --git a/src/libunicode/utf8_test.cpp b/src/libunicode/utf8_test.cpp
+index 51baf31..6cecb88 100644
+--- a/src/libunicode/utf8_test.cpp
++++ b/src/libunicode/utf8_test.cpp
+@@ -11,6 +11,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include <libunicode/format_compat.h>
+ #include <libunicode/support.h>
+ #include <libunicode/utf8.h>
+ 
+@@ -19,7 +20,6 @@
+ #include <array>
+ #include <cassert>
+ #include <cstdlib>
+-#include <format>
+ #include <variant>
+ 
+ using namespace std;
+@@ -53,20 +53,20 @@ TEST_CASE("utf8.bytes_1", "[utf8]")
+     auto const r1 = from_utf8(state, C);
+     REQUIRE(holds_alternative<Success>(r1));
+     char32_t const b = get<Success>(r1).value;
+-    INFO(std::format("char32_t : 0x{:04X}", (unsigned) b));
++    INFO(LIBUNICODE_FMT_NS::format("char32_t : 0x{:04X}", (unsigned) b));
+     REQUIRE(b == C);
+ }
+ 
+ TEST_CASE("utf8.bytes_2", "[utf8]")
+ {
+     char32_t constexpr C { 0xF6 }; // 0xC3 0xB6, 'ö'
+-    INFO(std::format("codepoint : 0x{:04X}", (unsigned) C));
++    INFO(LIBUNICODE_FMT_NS::format("codepoint : 0x{:04X}", (unsigned) C));
+ 
+     // encode
+     uint8_t actual[2] = {};
+     auto const count = to_utf8(C, actual);
+-    INFO(std::format("utf8      : {:X} {:X}", actual[0], actual[1]));
+-    INFO(std::format("binary    : {} {}", binstr(actual[0]), binstr(actual[1])));
++    INFO(LIBUNICODE_FMT_NS::format("utf8      : {:X} {:X}", actual[0], actual[1]));
++    INFO(LIBUNICODE_FMT_NS::format("binary    : {} {}", binstr(actual[0]), binstr(actual[1])));
+     REQUIRE(count == 2);
+     CHECK(actual[0] == 0xC3);
+     CHECK(actual[1] == 0xB6);
+@@ -76,7 +76,7 @@ TEST_CASE("utf8.bytes_2", "[utf8]")
+     auto const a = from_utf8(actual, &len);
+     REQUIRE(holds_alternative<Success>(a));
+     char32_t b = get<Success>(a).value;
+-    INFO(std::format("char32_t : 0x{:04X} ==? 0x{:04X}", (unsigned) b, (unsigned) C));
++    INFO(LIBUNICODE_FMT_NS::format("char32_t : 0x{:04X} ==? 0x{:04X}", (unsigned) b, (unsigned) C));
+     REQUIRE(b == C);
+ }
+ 
+@@ -90,15 +90,15 @@ TEST_CASE("utf8.bytes_3", "[utf8]")
+     CHECK(b3[1] == 0x82);
+     CHECK(b3[2] == 0xAC);
+ 
+-    INFO(std::format("{:02X} {:02X} {:02X}", b3[0], b3[1], b3[2]));
+-    INFO(std::format("{} {} {}", binstr(b3[0]), binstr(b3[1]), binstr(b3[2])));
++    INFO(LIBUNICODE_FMT_NS::format("{:02X} {:02X} {:02X}", b3[0], b3[1], b3[2]));
++    INFO(LIBUNICODE_FMT_NS::format("{} {} {}", binstr(b3[0]), binstr(b3[1]), binstr(b3[2])));
+ 
+     // decode
+     size_t len = 0;
+     auto const a = from_utf8(b3, &len);
+     REQUIRE(holds_alternative<Success>(a));
+     char32_t const b = get<Success>(a).value;
+-    INFO(std::format("char32_t : 0x{:04X}", (unsigned) b));
++    INFO(LIBUNICODE_FMT_NS::format("char32_t : 0x{:04X}", (unsigned) b));
+     REQUIRE(b == 0x20AC);
+ }
+ 
+@@ -113,8 +113,8 @@ TEST_CASE("utf8.bytes_3_dash", "[utf8]")
+     CHECK(d3[1] == 0x94);
+     CHECK(d3[2] == 0x9C);
+ 
+-    INFO(std::format("{:02X} {:02X} {:02X}", d3[0], d3[1], d3[2]));
+-    INFO(std::format("{} {} {}", binstr(d3[0]), binstr(d3[1]), binstr(d3[2])));
++    INFO(LIBUNICODE_FMT_NS::format("{:02X} {:02X} {:02X}", d3[0], d3[1], d3[2]));
++    INFO(LIBUNICODE_FMT_NS::format("{} {} {}", binstr(d3[0]), binstr(d3[1]), binstr(d3[2])));
+ 
+     // decode
+     auto constexpr u8s = array<uint8_t, 4> { 0xe2, 0x94, 0x9c, 0x61 /*a*/ };
+diff --git a/src/tools/uc-inspect.cpp b/src/tools/uc-inspect.cpp
+index a397d3e..58d018a 100644
+--- a/src/tools/uc-inspect.cpp
++++ b/src/tools/uc-inspect.cpp
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include <libunicode/convert.h>
++#include <libunicode/format_compat.h>
+ #include <libunicode/grapheme_segmenter.h>
+ #include <libunicode/run_segmenter.h>
+ #include <libunicode/ucd.h>
+@@ -21,7 +22,6 @@
+ #include <libunicode/width.h>
+ 
+ #include <array>
+-#include <format>
+ #include <fstream>
+ #include <iomanip>
+ #include <iostream>
+@@ -91,9 +91,9 @@ inline string escape(uint8_t ch)
+         case '"': return "\\\"";
+         default:
+             if (std::isprint(static_cast<char>(ch)))
+-                return std::format("{}", static_cast<char>(ch));
++                return LIBUNICODE_FMT_NS::format("{}", static_cast<char>(ch));
+             else
+-                return std::format("\\x{:02X}", static_cast<uint8_t>(ch) & 0xFF);
++                return LIBUNICODE_FMT_NS::format("\\x{:02X}", static_cast<uint8_t>(ch) & 0xFF);
+     }
+ }
+ 
+@@ -161,7 +161,7 @@ void codepoints(istream& in) // {{{
+             {
+                 string const u8 = escape(unicode::to_utf8(wc));
+ 
+-                cout << std::format("{:>3}: U+{:08X} [{}] [{:<10}] {} width:{} UTF8:{}\n",
++                cout << LIBUNICODE_FMT_NS::format("{:>3}: U+{:08X} [{}] [{:<10}] {} width:{} UTF8:{}\n",
+                                     lastOffset,
+                                     static_cast<uint32_t>(wc),
+                                     isEmoji(wc) ? "EMOJI" : "TEXT ",
+@@ -187,7 +187,7 @@ string scriptExtensionsString(char32_t codepoint)
+ {
+     auto const exts = unicode::script_extensions(codepoint);
+     if (!exts)
+-        return std::format("{}", unicode::script(codepoint));
++        return LIBUNICODE_FMT_NS::format("{}", unicode::script(codepoint));
+ 
+     std::stringstream sstr;
+     auto first = true;
+@@ -195,7 +195,7 @@ string scriptExtensionsString(char32_t codepoint)
+     {
+         if (!first)
+             sstr << ", ";
+-        sstr << std::format("{}", s);
++        sstr << LIBUNICODE_FMT_NS::format("{}", s);
+         first = false;
+     }
+     return sstr.str();
+@@ -215,11 +215,11 @@ int scripts(istream& in) // {{{
+     cout << "   INDEX     CODEPOINT    TEXT  WIDTH   SCRIPT          SCRIPT EXTS\n";
+     while (segmenter.consume(out(nextPosition), out(script)))
+     {
+-        cout << std::format("{}-{}: {}\n", frontPosition, nextPosition - 1, script);
++        cout << LIBUNICODE_FMT_NS::format("{}-{}: {}\n", frontPosition, nextPosition - 1, script);
+         for (size_t i = frontPosition; i < nextPosition; ++i)
+         {
+             auto const cp = codepoints[i];
+-            cout << std::format("    {:>04}:    U+{:08X}   {}\t∆ {}\t{:<12}\t({})\n",
++            cout << LIBUNICODE_FMT_NS::format("    {:>04}:    U+{:08X}   {}\t∆ {}\t{:<12}\t({})\n",
+                                 i,
+                                 unsigned(cp),
+                                 convert_to<char>(cp),
+@@ -246,7 +246,7 @@ int runs(istream& in) // {{{
+         auto const script = get<unicode::Script>(run.properties);
+         auto const presentationStyle = get<unicode::PresentationStyle>(run.properties);
+ 
+-        cout << std::format("{}-{} ({}): {} {}\n", run.start, run.end - 1, run.end - run.start, script, presentationStyle);
++        cout << LIBUNICODE_FMT_NS::format("{}-{} ({}): {} {}\n", run.start, run.end - 1, run.end - run.start, script, presentationStyle);
+         auto const text32 = u32string_view(codepoints.data() + run.start, run.end - run.start);
+         auto const text8 = convert_to<char>(text32);
+         auto const textEscaped = replaceAll("\033"sv, "\\033"sv, string_view(text8));
+@@ -326,7 +326,7 @@ int main(int argc, char const* argv[])
+     }
+     catch (std::exception const& e)
+     {
+-        std::cerr << std::format("Unhandled exception caught ({}). {}\n", typeid(e).name(), e.what());
++        std::cerr << LIBUNICODE_FMT_NS::format("Unhandled exception caught ({}). {}\n", typeid(e).name(), e.what());
+         return EXIT_FAILURE;
+     }
+     catch (...)
