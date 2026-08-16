@@ -1,0 +1,368 @@
+From eacd49f1e8a94cdb3c8b848623f10863c50f8fb8 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 15 Aug 2026 20:35:37 +0000
+Subject: [PATCH 36/38] avcodec/ppc: h264chroma coefficient tables and
+ byte-precise put store, from PowerVLC
+
+Three micro-optimizations to the H.264 chroma MC kernels, all from
+PowerVLC (github.com/Olsro/powervlc, contrib/src/ffmpeg, their patches
+0002/0005/0007), measured by them on a 1.42 GHz 7447A:
+
+1. Table-driven bilinear weights (mc8 and mc4): the { (8-x)(8-y),
+   x(8-y), (8-x)y, xy } stack array costs, per coefficient, a scalar
+   multiply, a store, a scalar reload, a second store and a vector
+   load -- several round trips through memory before the loop starts,
+   each a load-hit-store flush on a 7450.  One vec_mladd over two
+   read-only 128-byte tables builds the same vector with no store for
+   the loads to hit.  Their measurement: +1.4% (720p) / +2.2% (1080p)
+   whole-decode.  The little-endian (VSX) build keeps the original
+   path.  The mc8 special-case tests become (x && y) / (y), which is
+   the same predicate without the array.
+
+2. Element stores for the put mc8 path: the destination vector was
+   loaded on every row for one reason only -- an 8-wide block covers
+   half a vector, so the other half had to be merged back and
+   rewritten.  Rotate with vec_lvsr and write two stvewx instead:
+   touches exactly the eight bytes, no read-modify-write, no dst load
+   (+0.8% on a 1080p24 High decode).  stvewx needs 4-byte alignment;
+   the check is loop-invariant and falls back to the old path.  avg
+   genuinely reads dst and keeps the original store; VC-1's no_rnd
+   template instantiations keep the original store via a default macro,
+   so nothing outside H.264 chroma changes.
+
+3. Our mc4's result broadcast switches from vec_splat((vec_u32)x, 0) to
+   a vec_perm: PowerVLC observed GCC lowering the cast-then-splat
+   through the stack (stvx, scalar lwz, stw, lvewx, vspltw -- five
+   memory operations and a load-hit-store) for a value that never had
+   to leave the register file.
+
+On the 970 all three are neutral-or-better by construction (fewer
+memory operations, no vector-width tradeoffs); our G5 bench has mc8 at
+5.1-6.7x vs C and mc4 at a 0.96-0.98x wash, which change 1+3 may
+improve.
+
+Validated: checkasm h264chroma bit-exact under the qemu -cpu 7400
+harness (covers mc8 and mc4, put and avg, all x/y phases).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PRRFPPzH3qXUcq8Ask5LZh
+---
+ libavcodec/ppc/h264chroma_init.c     |  53 ++++++++++
+ libavcodec/ppc/h264chroma_template.c | 144 +++++++++++++++++++--------
+ 2 files changed, 158 insertions(+), 39 deletions(-)
+
+diff --git a/libavcodec/ppc/h264chroma_init.c b/libavcodec/ppc/h264chroma_init.c
+index 5d8f1c7..286f03e 100644
+--- a/libavcodec/ppc/h264chroma_init.c
++++ b/libavcodec/ppc/h264chroma_init.c
+@@ -32,21 +32,74 @@
+ #define PUT_OP_U8_ALTIVEC(d, s, dst) d = s
+ #define AVG_OP_U8_ALTIVEC(d, s, dst) d = vec_avg(dst, s)
+ 
++#if HAVE_BIGENDIAN
++/*
++ * Storing the eight filtered chroma pixels of mc8.
++ *
++ * For "put", the destination vector the core used to load served one purpose
++ * only: preserving the eight bytes of the aligned vector the 8-wide block
++ * does not cover.  That is a read-modify-write per row of a 64-pixel block.
++ * Element stores do the same job without reading anything: rotate with
++ * vec_lvsr so each byte lands in the lane its address selects, then two
++ * stvewx write exactly the eight bytes -- the same idiom as the 8-wide
++ * h264qpel kernels in this tree.  stvewx needs a 4-byte aligned address; an
++ * 8-wide chroma block always starts on a multiple of 8, but the check is
++ * loop-invariant (hence predicted) and keeps the kernel correct whatever the
++ * caller does.
++ * From PowerVLC (github.com/Olsro/powervlc, contrib/src/ffmpeg): +0.8% on a
++ * 1080p24 High CABAC decode on a 1.42 GHz 7447A.
++ *
++ * "avg" genuinely needs the destination -- it averages with it -- so it
++ * keeps the original path.
++ */
++# define PUT_CHROMA_MC8_STORE(psum, dst, fperm)                          \
++    do {                                                                 \
++        vec_u8 pp_ = (vec_u8)vec_pack(psum, psum);                       \
++        if (((uintptr_t)(dst) & 3) == 0) {                               \
++            vec_u8 rot_ = vec_perm(pp_, pp_, vec_lvsr(0, (dst)));        \
++            vec_ste((vec_u32)rot_, 0, (unsigned int *)(dst));            \
++            vec_ste((vec_u32)rot_, 4, (unsigned int *)(dst));            \
++        } else {                                                         \
++            vec_u8 vd_ = vec_ld(0, (dst));                               \
++            vec_st(vec_perm(vd_, pp_, (fperm)), 0, (dst));               \
++        }                                                                \
++    } while (0)
++#else
++# define PUT_CHROMA_MC8_STORE(psum, dst, fperm)                          \
++    do {                                                                 \
++        vec_u8 vd_ = vec_ld(0, (dst));                                   \
++        vec_u8 pp_ = (vec_u8)vec_pack(psum, psum);                       \
++        vec_st(vec_perm(vd_, pp_, (fperm)), 0, (dst));                   \
++    } while (0)
++#endif
++
++#define AVG_CHROMA_MC8_STORE(psum, dst, fperm)                           \
++    do {                                                                 \
++        vec_u8 vd_ = vec_ld(0, (dst));                                   \
++        vec_u8 pp_ = (vec_u8)vec_pack(psum, psum);                       \
++        vec_u8 vf_ = vec_perm(vd_, pp_, (fperm));                        \
++        vec_st(vec_avg(vd_, vf_), 0, (dst));                             \
++    } while (0)
++
+ #define OP_U8_ALTIVEC                          PUT_OP_U8_ALTIVEC
++#define CHROMA_MC8_STORE                       PUT_CHROMA_MC8_STORE
+ #define PREFIX_h264_chroma_mc8_altivec         put_h264_chroma_mc8_altivec
+ #define PREFIX_h264_chroma_mc8_num             altivec_put_h264_chroma_mc8_num
+ #define PREFIX_h264_chroma_mc4_altivec         put_h264_chroma_mc4_altivec
+ #include "h264chroma_template.c"
++#undef CHROMA_MC8_STORE
+ #undef OP_U8_ALTIVEC
+ #undef PREFIX_h264_chroma_mc8_altivec
+ #undef PREFIX_h264_chroma_mc8_num
+ #undef PREFIX_h264_chroma_mc4_altivec
+ 
+ #define OP_U8_ALTIVEC                          AVG_OP_U8_ALTIVEC
++#define CHROMA_MC8_STORE                       AVG_CHROMA_MC8_STORE
+ #define PREFIX_h264_chroma_mc8_altivec         avg_h264_chroma_mc8_altivec
+ #define PREFIX_h264_chroma_mc8_num             altivec_avg_h264_chroma_mc8_num
+ #define PREFIX_h264_chroma_mc4_altivec         avg_h264_chroma_mc4_altivec
+ #include "h264chroma_template.c"
++#undef CHROMA_MC8_STORE
+ #undef OP_U8_ALTIVEC
+ #undef PREFIX_h264_chroma_mc8_altivec
+ #undef PREFIX_h264_chroma_mc8_num
+diff --git a/libavcodec/ppc/h264chroma_template.c b/libavcodec/ppc/h264chroma_template.c
+index ec82e41..7d5ea7b 100644
+--- a/libavcodec/ppc/h264chroma_template.c
++++ b/libavcodec/ppc/h264chroma_template.c
+@@ -23,6 +23,22 @@
+ 
+ /* this code assume that stride % 16 == 0 */
+ 
++/* Other users of this template (VC-1) do not define a store: keep the
++ * original read-modify-write for them, so nothing outside H.264 chroma
++ * changes. */
++#ifndef CHROMA_MC8_STORE
++# define CHROMA_MC8_STORE_IS_LOCAL 1
++# define CHROMA_MC8_STORE(psum, dst, fperm)                              \
++    do {                                                                 \
++        vec_u8 vd_ = vec_ld(0, (dst));                                   \
++        vec_u8 pp_ = (vec_u8)vec_pack(psum, psum);                       \
++        vec_u8 vf_ = vec_perm(vd_, pp_, (fperm));                        \
++        vec_u8 fs_;                                                      \
++        OP_U8_ALTIVEC(fs_, vf_, vd_);                                    \
++        vec_st(fs_, 0, (dst));                                           \
++    } while (0)
++#endif
++
+ #define CHROMA_MC8_ALTIVEC_CORE(BIAS1, BIAS2) \
+         vsrc2ssH = (vec_s16)VEC_MERGEH(zero_u8v,(vec_u8)vsrc2uc);\
+         vsrc3ssH = (vec_s16)VEC_MERGEH(zero_u8v,(vec_u8)vsrc3uc);\
+@@ -34,13 +50,7 @@
+         psum = BIAS2(psum);\
+         psum = vec_sr(psum, v6us);\
+ \
+-        vdst = vec_ld(0, dst);\
+-        ppsum = (vec_u8)vec_pack(psum, psum);\
+-        vfdst = vec_perm(vdst, ppsum, fperm);\
+-\
+-        OP_U8_ALTIVEC(fsum, vfdst, vdst);\
+-\
+-        vec_st(fsum, 0, dst);\
++        CHROMA_MC8_STORE(psum, dst, fperm);\
+ \
+         vsrc0ssH = vsrc2ssH;\
+         vsrc1ssH = vsrc3ssH;\
+@@ -57,13 +67,7 @@
+         psum = vec_mladd(vE, vsrc1ssH, psum);\
+         psum = vec_sr(psum, v6us);\
+ \
+-        vdst = vec_ld(0, dst);\
+-        ppsum = (vec_u8)vec_pack(psum, psum);\
+-        vfdst = vec_perm(vdst, ppsum, fperm);\
+-\
+-        OP_U8_ALTIVEC(fsum, vfdst, vdst);\
+-\
+-        vec_st(fsum, 0, dst);\
++        CHROMA_MC8_STORE(psum, dst, fperm);\
+ \
+         dst += stride;\
+         src += stride;
+@@ -71,6 +75,72 @@
+ #define noop(a) a
+ #define add28(a) vec_add(v28ss, a)
+ 
++/* Only for the H.264 mc8/mc4 kernels below; VC-1's no_rnd variant keeps its
++ * original coefficient setup, so its translation units never see this. */
++#ifdef PREFIX_h264_chroma_mc8_altivec
++#if HAVE_BIGENDIAN
++#ifndef H264_CHROMA_ALTIVEC_COEFF_TABLES
++#define H264_CHROMA_ALTIVEC_COEFF_TABLES
++/* Bilinear weights for the chroma filter, as vectors instead of arithmetic.
++ *
++ * The original code computes { (8-x)(8-y), x(8-y), (8-x)y, xy } into a stack
++ * array and vec_ld's it back.  GCC compiles that, per coefficient, into a
++ * scalar multiply, a store to the stack, a scalar reload, a second store and
++ * an lvx/lvehx -- several round trips through memory before the loop even
++ * starts, each one a load-hit-store flush on a 7450, and a chroma block is
++ * far too small to amortise them.  xcoeff[x] * ycoeff[y] (one vec_mladd)
++ * rebuilds the same { A, B, C, D, ... } from two read-only 128-byte tables,
++ * with no store for the loads to hit.
++ * From PowerVLC (github.com/Olsro/powervlc, contrib/src/ffmpeg): measured
++ * +1.4% (720p) / +2.2% (1080p) on H.264 decode on a 1.42 GHz 7447A. */
++static const DECLARE_ALIGNED(16, int16_t, chroma_mc_xcoeff)[8][8] = {
++    { 8, 0, 8, 0, 8, 0, 8, 0 },
++    { 7, 1, 7, 1, 7, 1, 7, 1 },
++    { 6, 2, 6, 2, 6, 2, 6, 2 },
++    { 5, 3, 5, 3, 5, 3, 5, 3 },
++    { 4, 4, 4, 4, 4, 4, 4, 4 },
++    { 3, 5, 3, 5, 3, 5, 3, 5 },
++    { 2, 6, 2, 6, 2, 6, 2, 6 },
++    { 1, 7, 1, 7, 1, 7, 1, 7 },
++};
++static const DECLARE_ALIGNED(16, int16_t, chroma_mc_ycoeff)[8][8] = {
++    { 8, 8, 0, 0, 8, 8, 0, 0 },
++    { 7, 7, 1, 1, 7, 7, 1, 1 },
++    { 6, 6, 2, 2, 6, 6, 2, 2 },
++    { 5, 5, 3, 3, 5, 5, 3, 3 },
++    { 4, 4, 4, 4, 4, 4, 4, 4 },
++    { 3, 3, 5, 5, 3, 3, 5, 5 },
++    { 2, 2, 6, 6, 2, 2, 6, 6 },
++    { 1, 1, 7, 7, 1, 1, 7, 7 },
++};
++#endif /* H264_CHROMA_ALTIVEC_COEFF_TABLES */
++
++/* Sets vA/vB/vC/vD to the four bilinear weights for (x, y). */
++#define CHROMA_MC_LOAD_ABCD(x, y)                                        \
++    const vec_s16 vABCD = vec_mladd(vec_ld(0, chroma_mc_xcoeff[(x)]),    \
++                                    vec_ld(0, chroma_mc_ycoeff[(y)]),    \
++                                    vec_splat_s16(0));                   \
++    const vec_s16 vA = vec_splat(vABCD, 0);                              \
++    const vec_s16 vB = vec_splat(vABCD, 1);                              \
++    const vec_s16 vC = vec_splat(vABCD, 2);                              \
++    const vec_s16 vD = vec_splat(vABCD, 3)
++#else /* !HAVE_BIGENDIAN */
++/* Little-endian (POWER8+) keeps the original path: it has VSX loads and none
++ * of the 7450's store-forwarding cost. */
++#define CHROMA_MC_LOAD_ABCD(x, y)                                        \
++    DECLARE_ALIGNED(16, signed int, ABCD)[4] =                           \
++                        {((8 - (x)) * (8 - (y))),                        \
++                         ((    (x)) * (8 - (y))),                        \
++                         ((8 - (x)) * (    (y))),                        \
++                         ((    (x)) * (    (y)))};                       \
++    const vec_s32 vABCD = vec_ld(0, ABCD);                               \
++    const vec_s16 vA = VEC_SPLAT16(vABCD, 1);                            \
++    const vec_s16 vB = VEC_SPLAT16(vABCD, 3);                            \
++    const vec_s16 vC = VEC_SPLAT16(vABCD, 5);                            \
++    const vec_s16 vD = VEC_SPLAT16(vABCD, 7)
++#endif /* HAVE_BIGENDIAN */
++#endif /* PREFIX_h264_chroma_mc8_altivec */
++
+ #if HAVE_BIGENDIAN
+ #define GET_VSRC1(vs0, off, b, perm0, s){    \
+     vec_u8 vsrcCuc, vsrcDuc;                 \
+@@ -113,19 +183,10 @@ static void PREFIX_h264_chroma_mc8_altivec(uint8_t * dst, const uint8_t * src,
+                                            ptrdiff_t stride, int h,
+                                            int x, int y)
+ {
+-    DECLARE_ALIGNED(16, signed int, ABCD)[4] =
+-                        {((8 - x) * (8 - y)),
+-                         ((    x) * (8 - y)),
+-                         ((8 - x) * (    y)),
+-                         ((    x) * (    y))};
+     register int i;
+     vec_u8 fperm;
+     LOAD_ZERO;
+-    const vec_s32 vABCD = vec_ld(0, ABCD);
+-    const vec_s16 vA = VEC_SPLAT16(vABCD, 1);
+-    const vec_s16 vB = VEC_SPLAT16(vABCD, 3);
+-    const vec_s16 vC = VEC_SPLAT16(vABCD, 5);
+-    const vec_s16 vD = VEC_SPLAT16(vABCD, 7);
++    CHROMA_MC_LOAD_ABCD(x, y);
+     const vec_s16 v32ss = vec_sl(vec_splat_s16(1),vec_splat_u16(5));
+     const vec_u16 v6us = vec_splat_u16(6);
+ 
+@@ -134,7 +195,6 @@ static void PREFIX_h264_chroma_mc8_altivec(uint8_t * dst, const uint8_t * src,
+     vec_s16 vsrc0ssH, vsrc1ssH;
+     vec_u8 vsrc2uc, vsrc3uc;
+     vec_s16 vsrc2ssH, vsrc3ssH, psum;
+-    vec_u8 vdst, ppsum, vfdst, fsum;
+ #if HAVE_BIGENDIAN
+     register int loadSecond = (((unsigned long)src) % 16) <= 7 ? 0 : 1;
+     register int reallyBadAlign = (((unsigned long)src) % 16) == 15 ? 1 : 0;
+@@ -159,14 +219,16 @@ static void PREFIX_h264_chroma_mc8_altivec(uint8_t * dst, const uint8_t * src,
+     vsrc0ssH = (vec_s16)VEC_MERGEH(zero_u8v,(vec_u8)vsrc0uc);
+     vsrc1ssH = (vec_s16)VEC_MERGEH(zero_u8v,(vec_u8)vsrc1uc);
+ 
+-    if (ABCD[3]) {
++    /* D = x*y, C = (8-x)*y: with 0 <= x,y <= 7 those are non-zero exactly
++     * when (x && y) and when y is, so the tests need no ABCD array. */
++    if (x && y) {
+         for (i = 0 ; i < h ; i++) {
+             GET_VSRC(vsrc2uc, vsrc3uc, stride, 16, vsrcperm0, vsrcperm1, src);
+             CHROMA_MC8_ALTIVEC_CORE(v32ss, noop);
+         }
+     } else {
+         const vec_s16 vE = vec_add(vB, vC);
+-        if (ABCD[2]) { // x == 0 B == 0
++        if (y) { // x == 0 B == 0
+             for (i = 0 ; i < h ; i++) {
+                 GET_VSRC1(vsrc1uc, stride, 15, vsrcperm0, src);
+                 CHROMA_MC8_ALTIVEC_CORE_SIMPLE;
+@@ -191,18 +253,17 @@ static void PREFIX_h264_chroma_mc4_altivec(uint8_t * dst, const uint8_t * src,
+                                            ptrdiff_t stride, int h,
+                                            int x, int y)
+ {
+-    DECLARE_ALIGNED(16, signed int, ABCD)[4] =
+-                        {((8 - x) * (8 - y)),
+-                         ((    x) * (8 - y)),
+-                         ((8 - x) * (    y)),
+-                         ((    x) * (    y))};
+     register int i;
+     LOAD_ZERO;
+-    const vec_s32 vABCD = vec_ld(0, ABCD);
+-    const vec_s16 vA = VEC_SPLAT16(vABCD, 1);
+-    const vec_s16 vB = VEC_SPLAT16(vABCD, 3);
+-    const vec_s16 vC = VEC_SPLAT16(vABCD, 5);
+-    const vec_s16 vD = VEC_SPLAT16(vABCD, 7);
++    CHROMA_MC_LOAD_ABCD(x, y);
++    /* Broadcast of the result word to all four lanes, so vec_ste can pick
++     * whichever one the destination address selects.  Done with a permute
++     * rather than vec_splat((vec_u32)x, 0): GCC lowers that cast-then-splat
++     * by pushing the vector through the stack (stvx, scalar lwz, stw, lvewx,
++     * vspltw) -- five memory operations and a load-hit-store for a value
++     * that never had to leave the register file (observed by PowerVLC,
++     * github.com/Olsro/powervlc). */
++    const vec_u8 bcast_w0 = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+     const vec_s16 v32ss = vec_sl(vec_splat_s16(1), vec_splat_u16(5));
+     const vec_u16 v6us  = vec_splat_u16(6);
+ 
+@@ -232,7 +293,8 @@ static void PREFIX_h264_chroma_mc4_altivec(uint8_t * dst, const uint8_t * src,
+          * both only depend on the low 4 lanes we go on to store. */
+         OP_U8_ALTIVEC(fsum, ppsum, vdst);
+ 
+-        vec_ste(vec_splat((vec_u32)fsum, 0), 0, (uint32_t *)dst);
++        fsum = vec_perm(fsum, fsum, bcast_w0);
++        vec_ste((vec_u32)fsum, 0, (uint32_t *)dst);
+ 
+         dst += stride;
+         src += stride;
+@@ -267,7 +329,6 @@ static void PREFIX_no_rnd_vc1_chroma_mc8_altivec(uint8_t *dst, const uint8_t *sr
+     vec_s16 vsrc0ssH, vsrc1ssH;
+     vec_u8 vsrc2uc, vsrc3uc;
+     vec_s16 vsrc2ssH, vsrc3ssH, psum;
+-    vec_u8 vdst, ppsum, vfdst, fsum;
+ #if HAVE_BIGENDIAN
+     register int loadSecond     = (((unsigned long)src) % 16) <= 7 ? 0 : 1;
+     register int reallyBadAlign = (((unsigned long)src) % 16) == 15 ? 1 : 0;
+@@ -302,3 +363,8 @@ static void PREFIX_no_rnd_vc1_chroma_mc8_altivec(uint8_t *dst, const uint8_t *sr
+ #undef noop
+ #undef add28
+ #undef CHROMA_MC8_ALTIVEC_CORE
++
++#ifdef CHROMA_MC8_STORE_IS_LOCAL
++# undef CHROMA_MC8_STORE
++# undef CHROMA_MC8_STORE_IS_LOCAL
++#endif
+-- 
+2.43.0
+
