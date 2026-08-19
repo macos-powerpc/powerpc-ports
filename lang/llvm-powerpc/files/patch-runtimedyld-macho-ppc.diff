@@ -1,0 +1,663 @@
+diff -Naur a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp	2026-08-19 07:14:05.992360749 +0000
+@@ -15,6 +15,7 @@
+ #include "Targets/RuntimeDyldMachOAArch64.h"
+ #include "Targets/RuntimeDyldMachOARM.h"
+ #include "Targets/RuntimeDyldMachOI386.h"
++#include "Targets/RuntimeDyldMachOPPC.h"
+ #include "Targets/RuntimeDyldMachOX86_64.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/StringRef.h"
+@@ -349,12 +350,16 @@
+                          JITSymbolResolver &Resolver) {
+   switch (Arch) {
+   default:
+-    llvm_unreachable("Unsupported target for RuntimeDyldMachO.");
+-    break;
++    // Fail loudly: llvm_unreachable is undefined behaviour in release
++    // builds, and would send an unsupported architecture into an arbitrary
++    // case of this switch.
++    report_fatal_error("Unsupported target for RuntimeDyldMachO.");
+   case Triple::arm:
+     return make_unique<RuntimeDyldMachOARM>(MemMgr, Resolver);
+   case Triple::aarch64:
+     return make_unique<RuntimeDyldMachOAArch64>(MemMgr, Resolver);
++  case Triple::ppc:
++    return make_unique<RuntimeDyldMachOPPC>(MemMgr, Resolver);
+   case Triple::x86:
+     return make_unique<RuntimeDyldMachOI386>(MemMgr, Resolver);
+   case Triple::x86_64:
+diff -Naur a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOPPC.h b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOPPC.h
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOPPC.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOPPC.h	2026-08-19 07:13:52.594041333 +0000
+@@ -0,0 +1,524 @@
++//===-- RuntimeDyldMachOPPC.h ---- MachO/PPC specific code. -----*- C++ -*-===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// MachO/PPC (32-bit, big-endian, powerpc-apple-darwin) support for MCJIT's
++// runtime dynamic linker.
++//
++// Relocation semantics follow the Mach-O runtime ABI for PowerPC as
++// implemented by cctools/ld and mirrored by PPCMachObjectWriter:
++//
++//  * PPC_RELOC_HI16/HA16/LO16/LO14 entries are immediately followed by a
++//    PPC_RELOC_PAIR entry whose r_address field holds the "other half" of
++//    the original 32-bit value: the low half for HI16/HA16, the high half
++//    for LO16/LO14.  The r_address of the half relocation itself points at
++//    the start of the instruction word; the immediate lives in the low 16
++//    bits of the big-endian word.
++//
++//  * The *_SECTDIFF forms are scattered and compute "A - B + C".  The
++//    r_value of the SECTDIFF entry is the address of A, the r_value of the
++//    following PPC_RELOC_PAIR is the address of B, and for the half forms
++//    the PAIR's r_address again holds the other half of the encoded value.
++//
++//  * PPC_RELOC_BR24/BR14 branch displacements are relative to the address
++//    of the branch instruction itself (no PC bias).  Branches with a
++//    relocation are redirected through a lis/ori/mtctr/bctr island in the
++//    section's stub area so that targets anywhere in the address space are
++//    reachable.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_EXECUTIONENGINE_RUNTIMEDYLD_TARGETS_RUNTIMEDYLDMACHOPPC_H
++#define LLVM_LIB_EXECUTIONENGINE_RUNTIMEDYLD_TARGETS_RUNTIMEDYLDMACHOPPC_H
++
++#include "../RuntimeDyldMachO.h"
++#include "llvm/Support/MathExtras.h"
++#include <string>
++
++#define DEBUG_TYPE "dyld"
++
++namespace llvm {
++
++class RuntimeDyldMachOPPC
++    : public RuntimeDyldMachOCRTPBase<RuntimeDyldMachOPPC> {
++public:
++  typedef uint32_t TargetPtrT;
++
++  RuntimeDyldMachOPPC(RuntimeDyld::MemoryManager &MM,
++                      JITSymbolResolver &Resolver)
++      : RuntimeDyldMachOCRTPBase(MM, Resolver) {}
++
++  // Branch island: lis r12 / ori r12 / mtctr / bctr.
++  unsigned getMaxStubSize() override { return 16; }
++
++  unsigned getStubAlignment() override { return 4; }
++
++  Expected<relocation_iterator>
++  processRelocationRef(unsigned SectionID, relocation_iterator RelI,
++                       const ObjectFile &BaseObjT,
++                       ObjSectionToIDMap &ObjSectionToID,
++                       StubMap &Stubs) override {
++    const MachOObjectFile &Obj =
++        static_cast<const MachOObjectFile &>(BaseObjT);
++    MachO::any_relocation_info RelInfo =
++        Obj.getRelocation(RelI->getRawDataRefImpl());
++    uint32_t RelType = Obj.getAnyRelocationType(RelInfo);
++
++    if (Obj.isRelocationScattered(RelInfo)) {
++      switch (RelType) {
++      case MachO::PPC_RELOC_SECTDIFF:
++      case MachO::PPC_RELOC_LOCAL_SECTDIFF:
++      case MachO::PPC_RELOC_HI16_SECTDIFF:
++      case MachO::PPC_RELOC_LO16_SECTDIFF:
++      case MachO::PPC_RELOC_HA16_SECTDIFF:
++      case MachO::PPC_RELOC_LO14_SECTDIFF:
++        return processSECTDIFFRelocation(SectionID, RelI, Obj, ObjSectionToID);
++      case MachO::PPC_RELOC_VANILLA:
++        return processScatteredVANILLA(SectionID, RelI, Obj, ObjSectionToID);
++      case MachO::PPC_RELOC_HI16:
++      case MachO::PPC_RELOC_LO16:
++      case MachO::PPC_RELOC_HA16:
++      case MachO::PPC_RELOC_LO14:
++        return processScatteredHalf(SectionID, RelI, Obj, ObjSectionToID);
++      default:
++        return make_error<RuntimeDyldError>(
++            ("Unhandled PPC scattered relocation type: " + Twine(RelType))
++                .str());
++      }
++    }
++
++    switch (RelType) {
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_PAIR); // Consumed with its half.
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_PB_LA_PTR);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_JBSR);
++    // The SECTDIFF family is always scattered and handled above.
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_SECTDIFF);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_LOCAL_SECTDIFF);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_HI16_SECTDIFF);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_LO16_SECTDIFF);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_HA16_SECTDIFF);
++    UNIMPLEMENTED_RELOC(MachO::PPC_RELOC_LO14_SECTDIFF);
++    default:
++      if (RelType > MachO::PPC_RELOC_LOCAL_SECTDIFF)
++        return make_error<RuntimeDyldError>(
++            ("MachO PPC relocation type " + Twine(RelType) + " is out of range")
++                .str());
++      break;
++    }
++
++    RelocationEntry RE(getRelocationEntry(SectionID, Obj, RelI));
++    bool HasPair = false;
++
++    switch (RelType) {
++    default:
++      llvm_unreachable("Unhandled relocation type reached addend decoding");
++    case MachO::PPC_RELOC_VANILLA:
++      RE.Addend = SignExtend64(memcpyAddend(RE), 8 * (1 << RE.Size));
++      break;
++    case MachO::PPC_RELOC_BR24:
++      RE.Addend = SignExtend64<26>(readInstruction(RE) & 0x03FFFFFCU);
++      break;
++    case MachO::PPC_RELOC_BR14:
++      RE.Addend = SignExtend64<16>(readInstruction(RE) & 0xFFFCU);
++      break;
++    case MachO::PPC_RELOC_HI16:
++    case MachO::PPC_RELOC_LO16:
++    case MachO::PPC_RELOC_HA16:
++    case MachO::PPC_RELOC_LO14: {
++      relocation_iterator PairRelI = RelI;
++      ++PairRelI;
++      uint32_t OtherHalf;
++      if (auto OtherHalfOrErr = getPairOtherHalf(Obj, PairRelI))
++        OtherHalf = *OtherHalfOrErr;
++      else
++        return OtherHalfOrErr.takeError();
++      RE.Addend =
++          combineHalves(RelType, readInstruction(RE) & 0xFFFFU, OtherHalf);
++      HasPair = true;
++      break;
++    }
++    }
++
++    RelocationValueRef Value;
++    if (auto ValueOrErr = getRelocationValueRef(Obj, RelI, RE, ObjSectionToID))
++      Value = *ValueOrErr;
++    else
++      return ValueOrErr.takeError();
++
++    // PPCMachObjectWriter subtracts the object-layout address of the fixup
++    // for all PC-relative relocations, external and internal alike, and PPC
++    // branch displacements are relative to the branch instruction itself, so
++    // the effective PC offset is 0.
++    if (RE.IsPCRel)
++      makeValueAddendPCRel(Value, RelI, 0);
++
++    if (RelType == MachO::PPC_RELOC_BR24 || RelType == MachO::PPC_RELOC_BR14)
++      processBranchRelocation(RE, Value, Stubs);
++    else {
++      RE.Addend = Value.Offset;
++      if (Value.SymbolName)
++        addRelocationForSymbol(RE, Value.SymbolName);
++      else
++        addRelocationForSection(RE, Value.SectionID);
++    }
++
++    if (HasPair)
++      ++RelI;
++    return ++RelI;
++  }
++
++  void resolveRelocation(const RelocationEntry &RE, uint64_t Value) override {
++    LLVM_DEBUG(dumpRelocationToResolve(RE, Value));
++
++    const SectionEntry &Section = Sections[RE.SectionID];
++    uint8_t *LocalAddress = Section.getAddressWithOffset(RE.Offset);
++    uint64_t FinalAddress = Section.getLoadAddressWithOffset(RE.Offset);
++
++    switch (RE.RelType) {
++    default:
++      report_fatal_error("Unhandled MachO PPC relocation type in "
++                         "resolveRelocation");
++    case MachO::PPC_RELOC_VANILLA: {
++      uint64_t FinalValue = Value + RE.Addend;
++      if (RE.IsPCRel)
++        FinalValue -= FinalAddress;
++      writeBytesUnaligned(FinalValue, LocalAddress, 1 << RE.Size);
++      break;
++    }
++    case MachO::PPC_RELOC_BR24:
++    case MachO::PPC_RELOC_BR14: {
++      int64_t Displacement = static_cast<int64_t>(Value + RE.Addend) -
++                             static_cast<int64_t>(FinalAddress);
++      if (Displacement & 0x3)
++        report_fatal_error("PPC branch target is not 4-byte aligned");
++      uint32_t Mask;
++      if (RE.RelType == MachO::PPC_RELOC_BR24) {
++        if (!isInt<26>(Displacement))
++          report_fatal_error("PPC_RELOC_BR24 relocation out of range");
++        Mask = 0x03FFFFFC;
++      } else {
++        if (!isInt<16>(Displacement))
++          report_fatal_error("PPC_RELOC_BR14 relocation out of range");
++        Mask = 0xFFFC;
++      }
++      uint32_t Insn = readBytesUnaligned(LocalAddress, 4);
++      Insn = (Insn & ~Mask) | (static_cast<uint32_t>(Displacement) & Mask);
++      writeBytesUnaligned(Insn, LocalAddress, 4);
++      break;
++    }
++    case MachO::PPC_RELOC_HI16:
++    case MachO::PPC_RELOC_LO16:
++    case MachO::PPC_RELOC_HA16:
++    case MachO::PPC_RELOC_LO14:
++      applyHalf(RE.RelType, LocalAddress, Value + RE.Addend);
++      break;
++    case MachO::PPC_RELOC_SECTDIFF:
++    case MachO::PPC_RELOC_LOCAL_SECTDIFF:
++    case MachO::PPC_RELOC_HI16_SECTDIFF:
++    case MachO::PPC_RELOC_LO16_SECTDIFF:
++    case MachO::PPC_RELOC_HA16_SECTDIFF:
++    case MachO::PPC_RELOC_LO14_SECTDIFF: {
++      uint64_t SectionABase = Sections[RE.Sections.SectionA].getLoadAddress();
++      uint64_t SectionBBase = Sections[RE.Sections.SectionB].getLoadAddress();
++      assert((Value == SectionABase || Value == SectionBBase) &&
++             "Unexpected SECTDIFF relocation value.");
++      uint64_t FinalValue = SectionABase - SectionBBase + RE.Addend;
++      if (RE.RelType == MachO::PPC_RELOC_SECTDIFF ||
++          RE.RelType == MachO::PPC_RELOC_LOCAL_SECTDIFF)
++        writeBytesUnaligned(FinalValue, LocalAddress, 1 << RE.Size);
++      else
++        applyHalf(RE.RelType, LocalAddress, FinalValue);
++      break;
++    }
++    }
++  }
++
++  Error finalizeSection(const ObjectFile &Obj, unsigned SectionID,
++                        const SectionRef &Section) {
++    StringRef Name;
++    Section.getName(Name);
++
++    // Populate (eagerly bind) non-lazy and lazy symbol pointer sections
++    // from the indirect symbol table; their entries carry no relocations.
++    if (Name == "__nl_symbol_ptr" || Name == "__la_symbol_ptr" ||
++        Name == "__pointers")
++      return populateIndirectSymbolPointersSection(cast<MachOObjectFile>(Obj),
++                                                   Section, SectionID);
++    return Error::success();
++  }
++
++private:
++  /// Read the big-endian instruction word a relocation applies to.
++  uint32_t readInstruction(const RelocationEntry &RE) const {
++    const SectionEntry &Section = Sections[RE.SectionID];
++    return readBytesUnaligned(Section.getAddress() + RE.Offset, 4);
++  }
++
++  /// Fetch the PPC_RELOC_PAIR entry following a half relocation and return
++  /// the "other half" of the value from its r_address field.  The PAIR may
++  /// be either plain or scattered; r_address is read the same way for both.
++  Expected<uint32_t> getPairOtherHalf(const MachOObjectFile &Obj,
++                                      const relocation_iterator &PairRelI) {
++    MachO::any_relocation_info PairInfo =
++        Obj.getRelocation(PairRelI->getRawDataRefImpl());
++    if (Obj.getAnyRelocationType(PairInfo) != MachO::PPC_RELOC_PAIR)
++      return make_error<RuntimeDyldError>(
++          "PPC half relocation not followed by PPC_RELOC_PAIR");
++    return Obj.getAnyRelocationAddress(PairInfo) & 0xFFFFU;
++  }
++
++  /// Combine the 16 bits kept in a half relocation's instruction with the
++  /// other half from its PAIR entry into the original 32-bit value.
++  static int64_t combineHalves(uint32_t RelType, uint32_t InstHalf,
++                               uint32_t OtherHalf) {
++    uint32_t FullValue;
++    switch (RelType) {
++    default:
++      llvm_unreachable("Unexpected relocation type in combineHalves");
++    case MachO::PPC_RELOC_HI16:
++    case MachO::PPC_RELOC_HI16_SECTDIFF:
++      FullValue = (InstHalf << 16) | OtherHalf;
++      break;
++    case MachO::PPC_RELOC_HA16:
++    case MachO::PPC_RELOC_HA16_SECTDIFF:
++      // InstHalf is ha16(value): the high half adjusted for the sign of the
++      // low half.  Undo the adjustment when reassembling the value.
++      FullValue = (InstHalf << 16) + SignExtend32<16>(OtherHalf);
++      break;
++    case MachO::PPC_RELOC_LO16:
++    case MachO::PPC_RELOC_LO16_SECTDIFF:
++      FullValue = (OtherHalf << 16) | InstHalf;
++      break;
++    case MachO::PPC_RELOC_LO14:
++    case MachO::PPC_RELOC_LO14_SECTDIFF:
++      FullValue = (OtherHalf << 16) | (InstHalf & 0xFFFCU);
++      break;
++    }
++    return SignExtend64<32>(FullValue);
++  }
++
++  /// Patch the low 16 bits of the big-endian instruction word with the
++  /// appropriate half of Value.
++  void applyHalf(uint32_t RelType, uint8_t *LocalAddress, uint64_t Value) {
++    uint32_t Insn = readBytesUnaligned(LocalAddress, 4);
++    switch (RelType) {
++    default:
++      llvm_unreachable("Unexpected relocation type in applyHalf");
++    case MachO::PPC_RELOC_HI16:
++    case MachO::PPC_RELOC_HI16_SECTDIFF:
++      Insn = (Insn & 0xFFFF0000U) | ((Value >> 16) & 0xFFFFU);
++      break;
++    case MachO::PPC_RELOC_HA16:
++    case MachO::PPC_RELOC_HA16_SECTDIFF:
++      Insn = (Insn & 0xFFFF0000U) |
++             (((Value >> 16) + ((Value & 0x8000U) ? 1 : 0)) & 0xFFFFU);
++      break;
++    case MachO::PPC_RELOC_LO16:
++    case MachO::PPC_RELOC_LO16_SECTDIFF:
++      Insn = (Insn & 0xFFFF0000U) | (Value & 0xFFFFU);
++      break;
++    case MachO::PPC_RELOC_LO14:
++    case MachO::PPC_RELOC_LO14_SECTDIFF:
++      if (Value & 0x3)
++        report_fatal_error("PPC_RELOC_LO14 target is not 4-byte aligned");
++      Insn = (Insn & 0xFFFF0003U) | (Value & 0xFFFCU);
++      break;
++    }
++    writeBytesUnaligned(Insn, LocalAddress, 4);
++  }
++
++  /// Redirect a branch through an island in the section's stub area.  The
++  /// island loads the target address with lis/ori (patched via HI16/LO16
++  /// relocations on the island itself) and branches through CTR.  r12 and
++  /// CTR are volatile at call boundaries in the Darwin ABI, and r12 is the
++  /// register the static linker's branch islands use.
++  void processBranchRelocation(const RelocationEntry &RE,
++                               const RelocationValueRef &Value,
++                               StubMap &Stubs) {
++    SectionEntry &Section = Sections[RE.SectionID];
++    RuntimeDyldMachO::StubMap::const_iterator I = Stubs.find(Value);
++    uint8_t *Addr;
++    if (I != Stubs.end()) {
++      Addr = Section.getAddressWithOffset(I->second);
++    } else {
++      assert(Section.getStubOffset() % 4 == 0 && "Misaligned stub");
++      uintptr_t StubOffset = Section.getStubOffset();
++      Stubs[Value] = StubOffset;
++      Addr = Section.getAddressWithOffset(StubOffset);
++      writeBytesUnaligned(0x3D800000U, Addr, 4);      // lis r12, hi16(addr)
++      writeBytesUnaligned(0x618C0000U, Addr + 4, 4);  // ori r12, r12, lo16(addr)
++      writeBytesUnaligned(0x7D8903A6U, Addr + 8, 4);  // mtctr r12
++      writeBytesUnaligned(0x4E800420U, Addr + 12, 4); // bctr
++
++      RelocationEntry HiRE(RE.SectionID, StubOffset, MachO::PPC_RELOC_HI16,
++                           Value.Offset, false, 2);
++      RelocationEntry LoRE(RE.SectionID, StubOffset + 4, MachO::PPC_RELOC_LO16,
++                           Value.Offset, false, 2);
++      if (Value.SymbolName) {
++        addRelocationForSymbol(HiRE, Value.SymbolName);
++        addRelocationForSymbol(LoRE, Value.SymbolName);
++      } else {
++        addRelocationForSection(HiRE, Value.SectionID);
++        addRelocationForSection(LoRE, Value.SectionID);
++      }
++      Section.advanceStubOffset(getMaxStubSize());
++    }
++
++    // Resolve the branch to the island now; the displacement within the
++    // section does not change when the section's load address changes.
++    RelocationEntry TargetRE(RE.SectionID, RE.Offset, RE.RelType, 0,
++                             RE.IsPCRel, RE.Size);
++    resolveRelocation(TargetRE,
++                      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Addr)));
++  }
++
++  /// Process a scattered SECTDIFF relocation pair computing "A - B + C".
++  Expected<relocation_iterator>
++  processSECTDIFFRelocation(unsigned SectionID, relocation_iterator RelI,
++                            const MachOObjectFile &Obj,
++                            ObjSectionToIDMap &ObjSectionToID) {
++    MachO::any_relocation_info RE =
++        Obj.getRelocation(RelI->getRawDataRefImpl());
++
++    SectionEntry &Section = Sections[SectionID];
++    uint32_t RelocType = Obj.getAnyRelocationType(RE);
++    bool IsPCRel = Obj.getAnyRelocationPCRel(RE);
++    unsigned Size = Obj.getAnyRelocationLength(RE);
++    uint64_t Offset = RelI->getOffset();
++    uint8_t *LocalAddress = Section.getAddressWithOffset(Offset);
++
++    ++RelI;
++    MachO::any_relocation_info RE2 =
++        Obj.getRelocation(RelI->getRawDataRefImpl());
++    if (Obj.getAnyRelocationType(RE2) != MachO::PPC_RELOC_PAIR)
++      return make_error<RuntimeDyldError>(
++          "PPC SECTDIFF relocation not followed by PPC_RELOC_PAIR");
++
++    // Reassemble the encoded value "A - B + C".  The half forms keep 16
++    // bits in the instruction and the other 16 bits in the PAIR's
++    // r_address field.
++    int64_t EncodedValue;
++    switch (RelocType) {
++    default:
++      llvm_unreachable("Unexpected relocation type in "
++                       "processSECTDIFFRelocation");
++    case MachO::PPC_RELOC_SECTDIFF:
++    case MachO::PPC_RELOC_LOCAL_SECTDIFF:
++      EncodedValue = SignExtend64(readBytesUnaligned(LocalAddress, 1 << Size),
++                                  8 * (1 << Size));
++      break;
++    case MachO::PPC_RELOC_HI16_SECTDIFF:
++    case MachO::PPC_RELOC_LO16_SECTDIFF:
++    case MachO::PPC_RELOC_HA16_SECTDIFF:
++    case MachO::PPC_RELOC_LO14_SECTDIFF: {
++      uint32_t InstHalf = readBytesUnaligned(LocalAddress, 4) & 0xFFFFU;
++      uint32_t OtherHalf = Obj.getAnyRelocationAddress(RE2) & 0xFFFFU;
++      EncodedValue = combineHalves(RelocType, InstHalf, OtherHalf);
++      break;
++    }
++    }
++
++    uint32_t AddrA = Obj.getScatteredRelocationValue(RE);
++    section_iterator SAI = getSectionByAddress(Obj, AddrA);
++    assert(SAI != Obj.section_end() && "Can't find section for address A");
++    uint64_t SectionABase = SAI->getAddress();
++    uint64_t SectionAOffset = AddrA - SectionABase;
++    SectionRef SectionA = *SAI;
++    uint32_t SectionAID = ~0U;
++    if (auto SectionAIDOrErr =
++            findOrEmitSection(Obj, SectionA, SectionA.isText(), ObjSectionToID))
++      SectionAID = *SectionAIDOrErr;
++    else
++      return SectionAIDOrErr.takeError();
++
++    uint32_t AddrB = Obj.getScatteredRelocationValue(RE2);
++    section_iterator SBI = getSectionByAddress(Obj, AddrB);
++    assert(SBI != Obj.section_end() && "Can't find section for address B");
++    uint64_t SectionBBase = SBI->getAddress();
++    uint64_t SectionBOffset = AddrB - SectionBBase;
++    SectionRef SectionB = *SBI;
++    uint32_t SectionBID = ~0U;
++    if (auto SectionBIDOrErr =
++            findOrEmitSection(Obj, SectionB, SectionB.isText(), ObjSectionToID))
++      SectionBID = *SectionBIDOrErr;
++    else
++      return SectionBIDOrErr.takeError();
++
++    // Compute the addend 'C' from the original expression 'A - B + C'.
++    int64_t Addend = EncodedValue - (static_cast<int64_t>(AddrA) -
++                                     static_cast<int64_t>(AddrB));
++
++    LLVM_DEBUG(dbgs() << "Found SECTDIFF: AddrA: " << AddrA
++                      << ", AddrB: " << AddrB << ", Addend: " << Addend
++                      << ", SectionA ID: " << SectionAID << ", SectionAOffset: "
++                      << SectionAOffset << ", SectionB ID: " << SectionBID
++                      << ", SectionBOffset: " << SectionBOffset << "\n");
++    RelocationEntry R(SectionID, Offset, RelocType, Addend, SectionAID,
++                      SectionAOffset, SectionBID, SectionBOffset, IsPCRel,
++                      Size);
++
++    addRelocationForSection(R, SectionAID);
++
++    return ++RelI;
++  }
++
++  /// Process a scattered half relocation against "local symbol + offset".
++  /// PPCMachObjectWriter emits these when a defined symbol is referenced
++  /// with a non-zero offset that still fits the scattered encoding.
++  Expected<relocation_iterator>
++  processScatteredHalf(unsigned SectionID, relocation_iterator RelI,
++                       const MachOObjectFile &Obj,
++                       ObjSectionToIDMap &ObjSectionToID) {
++    MachO::any_relocation_info RE =
++        Obj.getRelocation(RelI->getRawDataRefImpl());
++
++    SectionEntry &Section = Sections[SectionID];
++    uint32_t RelocType = Obj.getAnyRelocationType(RE);
++    bool IsPCRel = Obj.getAnyRelocationPCRel(RE);
++    unsigned Size = Obj.getAnyRelocationLength(RE);
++    uint64_t Offset = RelI->getOffset();
++    uint32_t InstHalf =
++        readBytesUnaligned(Section.getAddressWithOffset(Offset), 4) & 0xFFFFU;
++
++    ++RelI;
++    uint32_t OtherHalf;
++    if (auto OtherHalfOrErr = getPairOtherHalf(Obj, RelI))
++      OtherHalf = *OtherHalfOrErr;
++    else
++      return OtherHalfOrErr.takeError();
++
++    // The encoded value is the object-layout address of the target plus the
++    // constant offset.
++    int64_t EncodedValue = combineHalves(RelocType, InstHalf, OtherHalf);
++
++    uint32_t SymbolBaseAddr = Obj.getScatteredRelocationValue(RE);
++    section_iterator TargetSI = getSectionByAddress(Obj, SymbolBaseAddr);
++    assert(TargetSI != Obj.section_end() && "Can't find section for symbol");
++    uint64_t SectionBaseAddr = TargetSI->getAddress();
++    SectionRef TargetSection = *TargetSI;
++    bool IsCode = TargetSection.isText();
++    uint32_t TargetSectionID = ~0U;
++    if (auto TargetSectionIDOrErr =
++            findOrEmitSection(Obj, TargetSection, IsCode, ObjSectionToID))
++      TargetSectionID = *TargetSectionIDOrErr;
++    else
++      return TargetSectionIDOrErr.takeError();
++
++    RelocationEntry R(SectionID, Offset, RelocType,
++                      EncodedValue - SectionBaseAddr, IsPCRel, Size);
++    addRelocationForSection(R, TargetSectionID);
++
++    return ++RelI;
++  }
++};
++
++} // end namespace llvm
++
++#undef DEBUG_TYPE
++
++#endif
+diff -Naur a/llvm/test/ExecutionEngine/RuntimeDyld/PowerPC/MachO_PPC_relocations.s b/llvm/test/ExecutionEngine/RuntimeDyld/PowerPC/MachO_PPC_relocations.s
+--- a/llvm/test/ExecutionEngine/RuntimeDyld/PowerPC/MachO_PPC_relocations.s
++++ b/llvm/test/ExecutionEngine/RuntimeDyld/PowerPC/MachO_PPC_relocations.s	2026-08-19 07:16:32.322878325 +0000
+@@ -0,0 +1,101 @@
++; RUN: rm -rf %t && mkdir -p %t
++; RUN: llvm-mc -triple=powerpc-apple-darwin9 -filetype=obj -o %t/ppc_macho.o %s
++; RUN: llvm-rtdyld -triple=powerpc-apple-darwin9 -verify -check=%s %t/ppc_macho.o
++
++        .section __TEXT,__text,regular,pure_instructions
++        .globl  _foo
++        .align  2
++_foo:
++        blr
++
++; Absolute high/low halves of a local symbol in another section
++; (regular HA16/LO16 relocations, each followed by a PPC_RELOC_PAIR):
++; rtdyld-check: *{4}insn1 = 0x3C400000 + (lcpi0 + 0x8000)[31:16]
++insn1:
++        lis r2, ha16(lcpi0)
++; rtdyld-check: *{4}insn2 = 0x60430000 + lcpi0[15:0]
++insn2:
++        ori r3, r2, lo16(lcpi0)
++
++; Same, with a non-zero offset from the symbol (scattered halves):
++; rtdyld-check: *{4}insn3 = 0x3C400000 + (lcpi0 + 8 + 0x8000)[31:16]
++insn3:
++        lis r2, ha16(lcpi0 + 8)
++; rtdyld-check: *{4}insn4 = 0x60430000 + (lcpi0 + 8)[15:0]
++insn4:
++        ori r3, r2, lo16(lcpi0 + 8)
++
++; Section-difference high/low halves (HA16_SECTDIFF/LO16_SECTDIFF pairs),
++; the pattern picbase-relative (PIC) addressing produces:
++; rtdyld-check: *{4}insn5 = 0x3C820000 + (ddata - _foo + 0x8000)[31:16]
++insn5:
++        addis r4, r2, ha16(ddata - _foo)
++; rtdyld-check: *{4}insn6 = 0x60850000 + (ddata - _foo)[15:0]
++insn6:
++        ori r5, r4, lo16(ddata - _foo)
++
++; Non-lazy symbol pointer addressing (regular halves against the pointer,
++; plus indirect-symbol population of the __nl_symbol_ptr entry itself):
++; rtdyld-check: *{4}insn7 = 0x3CC00000 + (ext_ptr + 0x8000)[31:16]
++insn7:
++        lis r6, ha16(ext_ptr)
++; rtdyld-check: *{4}insn8 = 0x80C60000 + ext_ptr[15:0]
++insn8:
++        lwz r6, lo16(ext_ptr)(r6)
++
++; External call: redirected through a lis/ori/mtctr/bctr island in the
++; stub area.  Check both the island contents and the branch to it.
++; rtdyld-check: *{4}(stub_addr(ppc_macho.o, __text, _baz)) = 0x3D800000 + _baz[31:16]
++; rtdyld-check: *{4}(stub_addr(ppc_macho.o, __text, _baz) + 4) = 0x618C0000 + _baz[15:0]
++; rtdyld-check: *{4}(stub_addr(ppc_macho.o, __text, _baz) + 8) = 0x7D8903A6
++; rtdyld-check: *{4}(stub_addr(ppc_macho.o, __text, _baz) + 12) = 0x4E800420
++; rtdyld-check: *{4}insn9 = 0x48000001 + (stub_addr(ppc_macho.o, __text, _baz) - insn9)[25:0]
++insn9:
++        bl _baz
++
++; Call to a symbol defined in this module (also via an island):
++; rtdyld-check: *{4}(stub_addr(ppc_macho.o, __text, _foo) + 4) = 0x618C0000 + _foo[15:0]
++insn10:
++        bl _foo
++        blr
++
++        .section __DATA,__data
++        .align  2
++lcpi0:
++        .long 1
++        .long 2
++        .long 3
++        .long 4
++ddata:
++        .long 0
++
++; 32-bit absolute pointers: defined-internal, defined-with-offset
++; (scattered VANILLA), and external:
++; rtdyld-check: *{4}p0 = _foo
++p0:
++        .long _foo
++; rtdyld-check: *{4}sv0 = lcpi0 + 8
++sv0:
++        .long lcpi0 + 8
++; rtdyld-check: *{4}pe0 = _baz
++pe0:
++        .long _baz
++
++; 32-bit section difference (LOCAL_SECTDIFF):
++; rtdyld-check: *{4}sd0 = insn2 - _foo
++sd0:
++        .long insn2 - _foo
++
++; Non-lazy symbol pointers get their values from the indirect symbol
++; table, not from relocations:
++; rtdyld-check: *{4}ext_ptr = _ext
++        .section __DATA,__nl_symbol_ptr,non_lazy_symbol_pointers
++        .align  2
++ext_ptr:
++        .indirect_symbol _ext
++        .long 0
++
++        .comm   _baz, 4, 2
++        .comm   _ext, 4, 2
++
++.subsections_via_symbols
