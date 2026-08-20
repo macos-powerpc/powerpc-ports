@@ -17,6 +17,13 @@
 ; 12(sp): reserved (compiler)
 ; 16(sp): reserved (binder)
 ; 20(sp): saved TOC (r2)
+; Frames built in invoke / exec_on_stack are 64 bytes: 24-byte linkage +
+; 32-byte parameter area + 8 bytes pad. The ABI requires both that the
+; stack pointer stays 16-byte aligned at every call (AltiVec stvx/lvx
+; silently mask the low 4 bits of the address, so a misaligned stack
+; corrupts memory instead of trapping) and that the caller provides a
+; parameter area the callee may spill its register arguments into (GCC
+; does so unconditionally at -O0).
 
   .machine ppc7400
   .text
@@ -98,7 +105,7 @@ _fiber_asm_switch:
   lwz r31, 88(r4)
 
   ; f14-f31 (18 FPRs) at offset 96
-  ; (offset 92 is __pad, never written - compiler inserts it for alignment)
+  ; (offset 92 is __pad, never written - it keeps f[] 8-byte aligned)
   stfd f14,  96(r3)
   stfd f15, 104(r3)
   stfd f16, 112(r3)
@@ -140,6 +147,8 @@ _fiber_asm_switch:
   ; v20-v31 (12 VMX regs).
   ; 16-byte align the vN area in r3/r4.
   ; Fixed part ends at 96 + 18*8 = 240 bytes; round the running pointer up.
+  ; The v[] member of FiberRegs has 16 bytes of slack so the aligned area
+  ; fits for any 4-byte-aligned struct base.
   addi r3, r3, 255
   rlwinm r3, r3, 0, 0, 27
   addi r4, r4, 255
@@ -191,18 +200,21 @@ END_FUNC(fiber_asm_switch)
 ; 4(sp):  function to call
 ; 8(sp):  old sp
 ; 12(sp): old lr
+; The entry sp is 16-byte aligned (fiber_reserve_return pushes 4 words
+; onto a 16-byte-aligned base), so the 64-byte frame keeps the callee's
+; sp 16-byte aligned as the ABI requires.
 FUNC(fiber_asm_invoke)
 _fiber_asm_invoke:
   lwz r3,  0(r1)          ; args    -> r3 (first argument)
   lwz r12, 4(r1)          ; func    -> r12/ctr
   mtctr r12
-  stwu r1, -24(r1)        ; 24-byte Darwin linkage frame
+  stwu r1, -64(r1)        ; linkage (24) + param area (32) + pad (8)
   stw r2, 20(r1)          ; preserve r2 across the call
   bctrl
   lwz r2, 20(r1)
-  lwz r0, 36(r1)          ; old lr  (12 + 24)
+  lwz r0, 76(r1)          ; old lr  (12 + 64)
   mtlr r0
-  lwz r3, 32(r1)          ; old sp  (8 + 24)
+  lwz r3, 72(r1)          ; old sp  (8 + 64)
   mr r1, r3
   blr
 END_FUNC(fiber_asm_invoke)
@@ -219,12 +231,12 @@ _fiber_asm_exec_on_stack:
   stw r0, 8(r1)           ; save lr in caller frame linkage
   mr r1, r5               ; switch to the temp stack
   stw r6, -8(r1)          ; stash caller's r31 below new sp
-  stwu r1, -24(r1)        ; 24-byte Darwin linkage frame
+  stwu r1, -64(r1)        ; linkage (24) + param area (32) + pad (8)
   stw r2, 20(r1)          ; preserve r2 across the call (linkage TOC slot)
   bctrl
   lwz r2, 20(r1)
   mr r3, r31              ; restore caller sp
-  lwz r31, 16(r1)         ; reload saved r31 (24 - 8)
+  lwz r31, 56(r1)         ; reload saved r31 (64 - 8)
   mr r1, r3
   lwz r0, 8(r1)
   mtlr r0
