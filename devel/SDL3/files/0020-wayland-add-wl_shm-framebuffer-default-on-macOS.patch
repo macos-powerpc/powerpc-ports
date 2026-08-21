@@ -1,0 +1,597 @@
+Add a native wl_shm window framebuffer and default macOS to it.
+
+SDL3's Wayland backend has no software framebuffer: SDL_GetWindowSurface
+routes the window surface through a GPU texture, which on macOS means an
+internal opengl(es) renderer on software Mesa via EGL - slower than a
+plain wl_shm copy, and it drags EGL and the Mesa rasterizers into apps
+that asked for pure software rendering.
+
+Bring back a per-buffer SHM allocator (with an explicit wl_shm format
+and release tracking) next to the cursor pool allocator, and add a
+window framebuffer on top of it: a shadow buffer the application draws
+into, with damaged regions copied into one of two XRGB8888 wl_shm
+buffers with busy/stale tracking; the frame is dropped rather than torn
+when the compositor still holds both. Prefer this over the GL-texture
+path on macOS, following the existing per-platform exceptions (WSL,
+Windows GDI); SDL_FRAMEBUFFER_ACCELERATION still overrides in both
+directions. Also let the SHM temp file fall back to TMPDIR when
+XDG_RUNTIME_DIR is unset, which is common on macOS. The new source file
+is picked up by the existing src/video/wayland/*.c glob; no build
+system change is needed.
+
+--- src/video/SDL_video.c
++++ src/video/SDL_video.c
+@@ -3625,6 +3625,11 @@ static bool ShouldAttemptTextureFramebuffer(void)
+             attempt_texture_framebuffer = false;
+         }
+ #endif
++#ifdef SDL_PLATFORM_MACOS // The only GL under the Wayland driver on macOS is software Mesa; the wl_shm framebuffer is faster.
++        if (_this->CreateWindowFramebuffer && (SDL_strcmp(_this->name, "wayland") == 0)) {
++            attempt_texture_framebuffer = false;
++        }
++#endif
+ #ifdef SDL_PLATFORM_EMSCRIPTEN
+         attempt_texture_framebuffer = false;
+ #endif
+--- /dev/null
++++ src/video/wayland/SDL_waylandframebuffer.c
+@@ -0,0 +1,316 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++
++#include "SDL_internal.h"
++
++#ifdef SDL_VIDEO_DRIVER_WAYLAND
++
++#include "SDL_waylandframebuffer.h"
++#include "SDL_waylandvideo.h"
++#include "SDL_waylandwindow.h"
++#include "SDL_waylandshmbuffer.h"
++
++/* Software rendering support, for windows that aren't backed by EGL: what the
++ * application draws into is a plain shadow buffer, whose damaged parts get
++ * copied into a wl_shm buffer and committed to the surface.
++ *
++ * The shadow is what makes the pixel pointer SDL hands out stay put for the
++ * lifetime of the window surface, which it has to: a wl_shm buffer can't be
++ * written to while the compositor is still reading it.
++ */
++#define SHM_FRAMEBUFFER_COUNT 2
++
++struct Wayland_SHMFrameBuffer
++{
++    struct Wayland_SHMBuffer buffers[SHM_FRAMEBUFFER_COUNT];
++
++    /* Whether a buffer holds something older than the last frame, and so needs
++     * a full copy rather than just the damaged rectangles.
++     */
++    bool stale[SHM_FRAMEBUFFER_COUNT];
++    int last; // the buffer that was committed last time around
++
++    void *shadow;
++    int width;
++    int height;
++    int pitch;
++
++    bool committed;
++};
++
++static void DestroyFrameBuffer(struct Wayland_SHMFrameBuffer *framebuffer)
++{
++    int i;
++
++    for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++        Wayland_ReleaseSHMBuffer(&framebuffer->buffers[i]);
++    }
++
++    SDL_free(framebuffer->shadow);
++    SDL_free(framebuffer);
++}
++
++/* Picks a buffer the compositor isn't reading from, preferring the one that was
++ * used last time: its contents are the previous frame, so an update that only
++ * damages part of the window only has to copy that part.
++ */
++static int AcquireBuffer(struct Wayland_SHMFrameBuffer *framebuffer)
++{
++    int i;
++
++    if (!framebuffer->buffers[framebuffer->last].busy) {
++        return framebuffer->last;
++    }
++
++    for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++        if (!framebuffer->buffers[i].busy) {
++            return i;
++        }
++    }
++
++    return -1;
++}
++
++/* wl_surface.damage_buffer takes buffer coordinates, which is what the update
++ * rectangles are in. Compositors older than version 4 only have
++ * wl_surface.damage, in surface coordinates, where scaling and viewports would
++ * have to be undone first; repainting the whole surface is both correct and
++ * simpler there.
++ */
++static bool CanDamageInBufferCoordinates(SDL_WindowData *data)
++{
++    return wl_compositor_get_version(data->waylandData->compositor) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION;
++}
++
++static void DamageWholeSurface(SDL_WindowData *data)
++{
++    if (CanDamageInBufferCoordinates(data)) {
++        wl_surface_damage_buffer(data->surface, 0, 0, SDL_MAX_SINT32, SDL_MAX_SINT32);
++    } else {
++        wl_surface_damage(data->surface, 0, 0, SDL_MAX_SINT32, SDL_MAX_SINT32);
++    }
++}
++
++bool Wayland_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, SDL_PixelFormat *format, void **pixels, int *pitch)
++{
++    SDL_VideoData *viddata = _this->internal;
++    SDL_WindowData *data = window->internal;
++    struct Wayland_SHMFrameBuffer *framebuffer;
++    int w, h, i;
++
++    if (!data) {
++        return SDL_SetError("Window not initialized");
++    }
++    if (!viddata->shm) {
++        return SDL_SetError("Wayland compositor has no wl_shm support");
++    }
++
++    // The video core recreates a window surface without destroying the old one.
++    Wayland_DestroyWindowFramebuffer(_this, window);
++
++    SDL_GetWindowSizeInPixels(window, &w, &h);
++    if (w <= 0 || h <= 0) {
++        return SDL_SetError("Invalid window framebuffer size");
++    }
++
++    framebuffer = (struct Wayland_SHMFrameBuffer *)SDL_calloc(1, sizeof(*framebuffer));
++    if (!framebuffer) {
++        return false;
++    }
++
++    framebuffer->width = w;
++    framebuffer->height = h;
++    framebuffer->pitch = w * 4;
++
++    framebuffer->shadow = SDL_calloc(1, (size_t)framebuffer->pitch * h);
++    if (!framebuffer->shadow) {
++        DestroyFrameBuffer(framebuffer);
++        return false;
++    }
++
++    for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++        /* XRGB8888, not ARGB8888: what the application leaves in the alpha
++         * channel is anyone's guess, and Wayland alpha is premultiplied, so an
++         * ARGB buffer would render a window that was never told about alpha
++         * as transparent.
++         */
++        if (!Wayland_AllocSHMBufferFormat(w, h, WL_SHM_FORMAT_XRGB8888, &framebuffer->buffers[i])) {
++            DestroyFrameBuffer(framebuffer);
++            return false; // SDL_SetError was called by the allocation
++        }
++        framebuffer->stale[i] = true;
++    }
++
++    data->shm_framebuffer = framebuffer;
++
++    *format = SDL_PIXELFORMAT_XRGB8888;
++    *pixels = framebuffer->shadow;
++    *pitch = framebuffer->pitch;
++
++    return true;
++}
++
++bool Wayland_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, const SDL_Rect *rects, int numrects)
++{
++    SDL_VideoData *viddata = _this->internal;
++    SDL_WindowData *data = window->internal;
++    struct Wayland_SHMFrameBuffer *framebuffer = data ? data->shm_framebuffer : NULL;
++    struct Wayland_SHMBuffer *buffer;
++    SDL_Rect surface_rect;
++    bool full_copy;
++    int index;
++    int i;
++
++    if (!framebuffer) {
++        return SDL_SetError("Window has no framebuffer");
++    }
++
++    /* Nothing can be committed to a surface that hasn't been given a role and
++     * had its first configure acknowledged yet; attaching a buffer before that
++     * is a protocol error. Showing the window is what moves it along.
++     */
++    if ((window->flags & SDL_WINDOW_HIDDEN) ||
++        (data->shell_surface_status != WAYLAND_SHELL_SURFACE_STATUS_WAITING_FOR_FRAME &&
++         data->shell_surface_status != WAYLAND_SHELL_SURFACE_STATUS_SHOWN)) {
++        return true;
++    }
++
++    /* A configure event can change the backbuffer size before the video core
++     * gets around to recreating the framebuffer. Committing a buffer of the old
++     * size is a protocol error on some compositors, so sit this frame out and
++     * wait for the new framebuffer.
++     */
++    if (framebuffer->width != data->current.pixel_width || framebuffer->height != data->current.pixel_height) {
++        return true;
++    }
++
++    index = AcquireBuffer(framebuffer);
++    if (index < 0) {
++        /* Every buffer is still held by the compositor. Dropping the frame is
++         * better than drawing into a buffer that is being read: the shadow
++         * still has the contents, so the next update repaints in full.
++         */
++        for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++            framebuffer->stale[i] = true;
++        }
++        return true;
++    }
++
++    buffer = &framebuffer->buffers[index];
++    full_copy = framebuffer->stale[index] || !framebuffer->committed;
++
++    surface_rect.x = 0;
++    surface_rect.y = 0;
++    surface_rect.w = framebuffer->width;
++    surface_rect.h = framebuffer->height;
++
++    if (full_copy) {
++        SDL_memcpy(buffer->shm_data, framebuffer->shadow, (size_t)framebuffer->pitch * framebuffer->height);
++    } else {
++        for (i = 0; i < numrects; ++i) {
++            SDL_Rect rect;
++            const Uint8 *src;
++            Uint8 *dst;
++            int row;
++
++            if (!SDL_GetRectIntersection(&rects[i], &surface_rect, &rect)) {
++                continue;
++            }
++
++            src = (const Uint8 *)framebuffer->shadow + (rect.y * framebuffer->pitch) + (rect.x * 4);
++            dst = (Uint8 *)buffer->shm_data + (rect.y * framebuffer->pitch) + (rect.x * 4);
++
++            for (row = 0; row < rect.h; ++row) {
++                SDL_memcpy(dst, src, (size_t)rect.w * 4);
++                src += framebuffer->pitch;
++                dst += framebuffer->pitch;
++            }
++        }
++    }
++
++    wl_surface_attach(data->surface, buffer->wl_buffer, 0, 0);
++
++    if (!framebuffer->committed || !CanDamageInBufferCoordinates(data)) {
++        DamageWholeSurface(data);
++    } else {
++        for (i = 0; i < numrects; ++i) {
++            SDL_Rect rect;
++
++            if (!SDL_GetRectIntersection(&rects[i], &surface_rect, &rect)) {
++                continue;
++            }
++
++            wl_surface_damage_buffer(data->surface, rect.x, rect.y, rect.w, rect.h);
++        }
++    }
++
++    wl_surface_commit(data->surface);
++    WAYLAND_wl_display_flush(viddata->display);
++
++    buffer->busy = true;
++
++    // This buffer now matches the shadow; every other one lags behind it.
++    for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++        framebuffer->stale[i] = (i != index);
++    }
++    framebuffer->last = index;
++    framebuffer->committed = true;
++
++    return true;
++}
++
++void Wayland_DetachWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window)
++{
++    SDL_WindowData *data = window->internal;
++    struct Wayland_SHMFrameBuffer *framebuffer = data ? data->shm_framebuffer : NULL;
++    int i;
++
++    if (framebuffer) {
++        /* The surface has just had its buffers dropped, which is what a NULL
++         * attach does. Nothing of ours is on screen or being read from any
++         * more, whether the release events have arrived yet or not, and the
++         * next frame has to be a full one.
++         */
++        for (i = 0; i < SHM_FRAMEBUFFER_COUNT; ++i) {
++            framebuffer->buffers[i].busy = false;
++            framebuffer->stale[i] = true;
++        }
++        framebuffer->committed = false;
++    }
++}
++
++void Wayland_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window)
++{
++    SDL_WindowData *data = window->internal;
++
++    if (data && data->shm_framebuffer) {
++        /* The buffers are just destroyed, not detached from the surface first:
++         * committing a NULL buffer would unmap the window, and this is called
++         * to replace the framebuffer on resize as much as to tear it down.
++         * A compositor that is still holding one of them is left with the last
++         * frame on screen until something else is committed.
++         */
++        DestroyFrameBuffer(data->shm_framebuffer);
++        data->shm_framebuffer = NULL;
++    }
++}
++
++#endif // SDL_VIDEO_DRIVER_WAYLAND
+--- /dev/null
++++ src/video/wayland/SDL_waylandframebuffer.h
+@@ -0,0 +1,40 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++
++#include "SDL_internal.h"
++
++#ifndef SDL_waylandframebuffer_h_
++#define SDL_waylandframebuffer_h_
++
++#include "../SDL_sysvideo.h"
++
++struct Wayland_SHMFrameBuffer;
++
++extern bool Wayland_CreateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, SDL_PixelFormat *format, void **pixels, int *pitch);
++extern bool Wayland_UpdateWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window, const SDL_Rect *rects, int numrects);
++extern void Wayland_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window);
++
++/* Called where the window's surface has its buffers detached, so that the
++ * framebuffer doesn't go on waiting for release events that aren't coming.
++ */
++extern void Wayland_DetachWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window);
++
++#endif // SDL_waylandframebuffer_h_
+--- src/video/wayland/SDL_waylandshmbuffer.c
++++ src/video/wayland/SDL_waylandshmbuffer.c
+@@ -81,6 +81,19 @@ static int CreateTempFD(off_t size)
+         char tmp_path[PATH_MAX];
+ 
+         xdg_path = SDL_getenv("XDG_RUNTIME_DIR");
++#ifdef SDL_PLATFORM_MACOS
++        /* XDG_RUNTIME_DIR isn't a given on macOS; the compositor can also be
++         * reached through an absolute WAYLAND_DISPLAY or through WAYLAND_SOCKET,
++         * neither of which requires it. Any directory we can hand a file
++         * descriptor out of will do here.
++         */
++        if (!xdg_path) {
++            xdg_path = SDL_getenv("TMPDIR");
++        }
++        if (!xdg_path) {
++            xdg_path = "/tmp";
++        }
++#endif
+         if (!xdg_path) {
+             return -1;
+         }
+@@ -186,4 +199,71 @@ void Wayland_ReleaseSHMPool(Wayland_SHMPool *shmPool)
+     }
+ }
+ 
++static void shm_buffer_handle_release(void *data, struct wl_buffer *wl_buffer)
++{
++    struct Wayland_SHMBuffer *shmBuffer = (struct Wayland_SHMBuffer *)data;
++
++    if (shmBuffer) {
++        shmBuffer->busy = false;
++    }
++}
++
++static struct wl_buffer_listener shm_buffer_listener = {
++    shm_buffer_handle_release
++};
++
++bool Wayland_AllocSHMBufferFormat(int width, int height, Uint32 shm_format, struct Wayland_SHMBuffer *shmBuffer)
++{
++    SDL_VideoDevice *vd = SDL_GetVideoDevice();
++    SDL_VideoData *data = vd->internal;
++    struct wl_shm_pool *shm_pool;
++    int shm_fd;
++    int stride;
++
++    if (!shmBuffer) {
++        return SDL_InvalidParamError("shmBuffer");
++    }
++
++    stride = width * 4;
++    shmBuffer->shm_data_size = stride * height;
++    shmBuffer->busy = false;
++
++    shm_fd = CreateTempFD(shmBuffer->shm_data_size);
++    if (shm_fd < 0) {
++        return SDL_SetError("Creating SHM buffer failed.");
++    }
++
++    shmBuffer->shm_data = mmap(NULL, shmBuffer->shm_data_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++    if (shmBuffer->shm_data == MAP_FAILED) {
++        shmBuffer->shm_data = NULL;
++        close(shm_fd);
++        return SDL_SetError("mmap() failed.");
++    }
++
++    shm_pool = wl_shm_create_pool(data->shm, shm_fd, shmBuffer->shm_data_size);
++    shmBuffer->wl_buffer = wl_shm_pool_create_buffer(shm_pool, 0, width, height, stride, shm_format);
++    wl_buffer_add_listener(shmBuffer->wl_buffer, &shm_buffer_listener, shmBuffer);
++
++    wl_shm_pool_destroy(shm_pool);
++    close(shm_fd);
++
++    return true;
++}
++
++void Wayland_ReleaseSHMBuffer(struct Wayland_SHMBuffer *shmBuffer)
++{
++    if (shmBuffer) {
++        if (shmBuffer->wl_buffer) {
++            wl_buffer_destroy(shmBuffer->wl_buffer);
++            shmBuffer->wl_buffer = NULL;
++        }
++        if (shmBuffer->shm_data) {
++            munmap(shmBuffer->shm_data, shmBuffer->shm_data_size);
++            shmBuffer->shm_data = NULL;
++        }
++        shmBuffer->shm_data_size = 0;
++        shmBuffer->busy = false;
++    }
++}
++
+ #endif
+--- src/video/wayland/SDL_waylandshmbuffer.h
++++ src/video/wayland/SDL_waylandshmbuffer.h
+@@ -30,4 +30,23 @@ extern Wayland_SHMPool *Wayland_AllocSHMPool(int size);
+ extern struct wl_buffer *Wayland_AllocBufferFromPool(Wayland_SHMPool *shmPool, int width, int height, void **data);
+ extern void Wayland_ReleaseSHMPool(Wayland_SHMPool *shmPool);
+ 
++/* A standalone buffer in its own pool, for users that need release
++ * tracking or a format other than the pool default. */
++struct Wayland_SHMBuffer
++{
++    struct wl_buffer *wl_buffer;
++    void *shm_data;
++    int shm_data_size;
++
++    /* Attached to a surface and not handed back by the compositor yet. Only
++     * meaningful for buffers that are committed more than once; whoever
++     * commits the buffer is the one that has to set it.
++     */
++    bool busy;
++};
++
++// Allocates an SHM buffer with an explicit wl_shm format
++extern bool Wayland_AllocSHMBufferFormat(int width, int height, Uint32 shm_format, struct Wayland_SHMBuffer *shmBuffer);
++extern void Wayland_ReleaseSHMBuffer(struct Wayland_SHMBuffer *shmBuffer);
++
+ #endif
+--- src/video/wayland/SDL_waylandvideo.c
++++ src/video/wayland/SDL_waylandvideo.c
+@@ -31,6 +31,7 @@
+ #include "SDL_waylandclipboard.h"
+ #include "SDL_waylandcolor.h"
+ #include "SDL_waylandevents_c.h"
++#include "SDL_waylandframebuffer.h"
+ #include "SDL_waylandkeyboard.h"
+ #include "SDL_waylandmessagebox.h"
+ #include "SDL_waylandmouse.h"
+@@ -646,6 +647,10 @@ static SDL_VideoDevice *Wayland_CreateDevice(bool require_preferred_protocols)
+     device->GL_GetEGLSurface = Wayland_GLES_GetEGLSurface;
+ #endif
+ 
++    device->CreateWindowFramebuffer = Wayland_CreateWindowFramebuffer;
++    device->UpdateWindowFramebuffer = Wayland_UpdateWindowFramebuffer;
++    device->DestroyWindowFramebuffer = Wayland_DestroyWindowFramebuffer;
++
+     device->CreateSDLWindow = Wayland_CreateWindow;
+     device->ShowWindow = Wayland_ShowWindow;
+     device->HideWindow = Wayland_HideWindow;
+--- src/video/wayland/SDL_waylandwindow.c
++++ src/video/wayland/SDL_waylandwindow.c
+@@ -30,6 +30,7 @@
+ #include "../../core/unix/SDL_appid.h"
+ #include "../SDL_egl_c.h"
+ #include "SDL_waylandevents_c.h"
++#include "SDL_waylandframebuffer.h"
+ #include "SDL_waylandmouse.h"
+ #include "SDL_waylandwindow.h"
+ #include "SDL_waylandvideo.h"
+@@ -1932,6 +1933,7 @@ void Wayland_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
+      */
+     wl_surface_attach(data->surface, NULL, 0, 0);
+     wl_surface_commit(data->surface);
++    Wayland_DetachWindowFramebuffer(_this, window);
+ 
+     // Create the shell surface and map the toplevel/popup
+ #ifdef HAVE_LIBDECOR_H
+@@ -2283,6 +2285,7 @@ void Wayland_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
+     // Attach a null buffer to unmap the surface.
+     wl_surface_attach(wind->surface, NULL, 0, 0);
+     wl_surface_commit(wind->surface);
++    Wayland_DetachWindowFramebuffer(_this, window);
+ 
+     SDL_zero(wind->shell_surface);
+     wind->show_hide_sync_required = true;
+@@ -3334,6 +3337,11 @@ void Wayland_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
+             WAYLAND_wl_egl_window_destroy(wind->egl_window);
+         }
+ 
++        /* The video core normally tears the framebuffer down before getting
++         * here; this is for the paths where it doesn't.
++         */
++        Wayland_DestroyWindowFramebuffer(_this, window);
++
+         if (wind->idle_inhibitor) {
+             zwp_idle_inhibitor_v1_destroy(wind->idle_inhibitor);
+         }
+--- src/video/wayland/SDL_waylandwindow.h
++++ src/video/wayland/SDL_waylandwindow.h
+@@ -30,6 +30,8 @@
+ #include "SDL_waylandvideo.h"
+ #include "SDL_waylandshmbuffer.h"
+ 
++struct Wayland_SHMFrameBuffer;
++
+ struct SDL_WindowData
+ {
+     SDL_Window *sdlwindow;
+@@ -132,6 +134,9 @@ struct SDL_WindowData
+     struct wl_buffer **icon_buffers;
+     int icon_buffer_count;
+ 
++    // Software rendering support; see SDL_waylandframebuffer.c
++    struct Wayland_SHMFrameBuffer *shm_framebuffer;
++
+     // Keyboard, pointer, and touch focus refcount.
+     int keyboard_focus_count;
+     int pointer_focus_count;
