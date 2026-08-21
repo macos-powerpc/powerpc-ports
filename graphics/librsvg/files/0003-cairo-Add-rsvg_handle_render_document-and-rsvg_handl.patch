@@ -1,0 +1,383 @@
+From 34021cbd58529cb4f736dd73eee8a2a20816a0cc Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <fygrave@gmail.com>
+Date: Sun, 16 Aug 2026 10:43:19 +0000
+Subject: [PATCH 3/7] cairo: Add rsvg_handle_render_document() and
+ rsvg_handle_render_layer()
+
+These render into a viewport supplied by the caller rather than at the
+document's own size, which is the whole reason applications reach for
+them: an SVG cursor drawn at an arbitrary pixel size, an icon drawn at
+the display's scale factor, a thumbnail composited into a corner.
+
+For the outermost <svg> this means the caller's viewport overrides its
+width and height, and a viewBox is synthesized from those dimensions when
+the document has none, following SVG2's initial coordinate system.  Do
+neither and a 24x24 document asked for at 256x256 paints 24x24 in the
+corner, which is worse than the build failure it replaces.
+
+The new drawing-context constructor is a sibling of
+rsvg_cairo_new_drawing_ctx() rather than a rewrite of it, and the
+outermost-<svg> override in rsvg_node_svg_draw() is gated on a field that
+only these entry points set, so rsvg_handle_render_cairo() keeps running
+exactly the code it ran before.
+
+Also initialize vb_stack, which rsvg_cairo_new_drawing_ctx() left
+uninitialized before _rsvg_push_view_box() prepended to it.  Harmless in
+practice, as nothing ever dereferences the stale tail.
+---
+ rsvg-cairo-render.c | 209 ++++++++++++++++++++++++++++++++++++++++++++
+ rsvg-cairo.h        |   5 ++
+ rsvg-private.h      |   8 ++
+ rsvg-structure.c    |  38 ++++++--
+ rsvg.symbols        |   2 +
+ 5 files changed, 255 insertions(+), 7 deletions(-)
+
+diff --git a/rsvg-cairo-render.c b/rsvg-cairo-render.c
+index 6876bbf47..b63c909f8 100644
+--- a/rsvg-cairo-render.c
++++ b/rsvg-cairo-render.c
+@@ -177,11 +177,13 @@ rsvg_cairo_new_drawing_ctx (cairo_t * cr, RsvgHandle * handle)
+     draw->dpi_y = handle->priv->dpi_y;
+     draw->vb.rect.width = data.em;
+     draw->vb.rect.height = data.ex;
++    draw->vb_stack = NULL;
+     draw->num_elements_acquired = 0;
+     draw->pango_context = NULL;
+     draw->drawsub_stack = NULL;
+     draw->acquired_nodes = NULL;
+     draw->is_testing = handle->priv->is_testing;
++    draw->toplevel_viewport.active = FALSE;
+ 
+     rsvg_state_push (draw);
+     state = rsvg_current_state (draw);
+@@ -280,3 +282,210 @@ rsvg_handle_render_cairo (RsvgHandle * handle, cairo_t * cr)
+ {
+     return rsvg_handle_render_cairo_sub (handle, cr, NULL);
+ }
++
++/* ------------------------------------------------------------------------
++ * Viewport-based API, compatible with librsvg 2.46 and later.
++ *
++ * These share the node tree and the bounding-box machinery with the legacy
++ * entry points above, but build their drawing context from a caller-supplied
++ * viewport instead of from the document's own size.  The legacy path is left
++ * untouched on purpose.
++ * ------------------------------------------------------------------------ */
++
++/* Like rsvg_cairo_new_drawing_ctx(), but the coordinate system is established
++ * from @viewport rather than from the document's own size.  When @fit_toplevel
++ * is TRUE the outermost <svg> is fitted into @viewport instead of using its own
++ * width/height; this is off when drawing a single element in isolation, which
++ * never goes through the outermost <svg>.  Returns NULL for a degenerate
++ * viewport.
++ */
++static RsvgDrawingCtx *
++rsvg_cairo_new_drawing_ctx_for_viewport (cairo_t * cr,
++                                         RsvgHandle * handle,
++                                         const RsvgRectangle * viewport,
++                                         gboolean fit_toplevel)
++{
++    RsvgDrawingCtx *draw;
++    RsvgCairoRender *render;
++    RsvgState *state;
++    cairo_matrix_t affine, offset_affine;
++    double bbx0, bby0, bbx1, bby1;
++
++    if (!(viewport->width > 0.0) || !(viewport->height > 0.0))
++        return NULL;
++
++    cairo_get_matrix (cr, &affine);
++
++    /* "The origin of both coordinate systems must be at the origin of the SVG
++     * viewport" - https://www.w3.org/TR/SVG2/coords.html#InitialCoordinateSystem
++     */
++    cairo_matrix_init_translate (&offset_affine, viewport->x, viewport->y);
++    cairo_matrix_multiply (&affine, &offset_affine, &affine);
++
++    /* Bounding box of the viewport as transformed by the current cairo matrix;
++     * this sizes the intermediate surfaces used for filters, masks and groups. */
++    rsvg_cairo_transformed_image_bounding_box (&affine,
++                                               viewport->width, viewport->height,
++                                               &bbx0, &bby0, &bbx1, &bby1);
++
++    render = rsvg_cairo_render_new (cr, bbx1 - bbx0, bby1 - bby0);
++    if (!render)
++        return NULL;
++
++    draw = g_new (RsvgDrawingCtx, 1);
++
++    draw->render = (RsvgRender *) render;
++    render->offset_x = bbx0;
++    render->offset_y = bby0;
++
++    draw->state = NULL;
++
++    draw->defs = handle->priv->defs;
++    draw->dpi_x = handle->priv->dpi_x;
++    draw->dpi_y = handle->priv->dpi_y;
++    draw->vb.rect.x = 0;
++    draw->vb.rect.y = 0;
++    draw->vb.rect.width = viewport->width;
++    draw->vb.rect.height = viewport->height;
++    draw->vb.active = TRUE;
++    draw->vb_stack = NULL;
++    draw->num_elements_acquired = 0;
++    draw->pango_context = NULL;
++    draw->drawsub_stack = NULL;
++    draw->acquired_nodes = NULL;
++    draw->is_testing = handle->priv->is_testing;
++
++    draw->toplevel_viewport.rect.x = 0;
++    draw->toplevel_viewport.rect.y = 0;
++    draw->toplevel_viewport.rect.width = viewport->width;
++    draw->toplevel_viewport.rect.height = viewport->height;
++    draw->toplevel_viewport.active = fit_toplevel;
++
++    rsvg_state_push (draw);
++    state = rsvg_current_state (draw);
++
++    cairo_matrix_multiply (&state->affine, &affine, &state->affine);
++
++    /* Compensated for in _set_rsvg_affine(), as in rsvg_cairo_new_drawing_ctx(). */
++    state->affine.x0 -= render->offset_x;
++    state->affine.y0 -= render->offset_y;
++
++    rsvg_bbox_init (&render->bbox, &state->affine);
++
++    return draw;
++}
++
++static gboolean
++rsvg_handle_lookup_drawsub (RsvgHandle * handle, const char *id,
++                            RsvgNode ** out_node, GError ** error)
++{
++    *out_node = NULL;
++
++    if (handle->priv->state != RSVG_HANDLE_STATE_CLOSED_OK) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "the handle is not loaded");
++        return FALSE;
++    }
++
++    if (id && *id) {
++        RsvgNode *node = rsvg_defs_lookup (handle->priv->defs, id);
++
++        if (node == NULL) {
++            g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                         "element id=\"%s\" does not exist", id);
++            return FALSE;
++        }
++
++        *out_node = node;
++    }
++
++    return TRUE;
++}
++
++/**
++ * rsvg_handle_render_layer:
++ * @handle: A #RsvgHandle
++ * @cr: A Cairo context
++ * @id: (nullable): An element's id within the SVG, starting with "##", or %NULL
++ *   to render the whole document.
++ * @viewport: Viewport size at which the whole SVG would be fitted.
++ * @error: (optional): a location to store a #GError
++ *
++ * Renders a single SVG element in the same place as for a whole SVG document
++ * (a "layer"), scaling the document to fit @viewport.
++ *
++ * Returns: %TRUE on success.
++ *
++ * Since: 2.46
++ */
++gboolean
++rsvg_handle_render_layer (RsvgHandle * handle,
++                          cairo_t * cr,
++                          const char *id,
++                          const RsvgRectangle * viewport,
++                          GError ** error)
++{
++    RsvgDrawingCtx *draw;
++    RsvgNode *drawsub = NULL;
++    gboolean retval;
++
++    g_return_val_if_fail (handle != NULL, FALSE);
++    g_return_val_if_fail (cr != NULL, FALSE);
++    g_return_val_if_fail (viewport != NULL, FALSE);
++    g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
++
++    if (!rsvg_handle_lookup_drawsub (handle, id, &drawsub, error))
++        return FALSE;
++
++    draw = rsvg_cairo_new_drawing_ctx_for_viewport (cr, handle, viewport, TRUE);
++    if (!draw) {
++        /* A degenerate viewport has nothing to draw, which is not an error. */
++        return TRUE;
++    }
++
++    while (drawsub != NULL) {
++        draw->drawsub_stack = g_slist_prepend (draw->drawsub_stack, drawsub);
++        drawsub = drawsub->parent;
++    }
++
++    rsvg_state_push (draw);
++    cairo_save (cr);
++
++    rsvg_node_draw ((RsvgNode *) handle->priv->treebase, draw, 0);
++
++    if (rsvg_drawing_ctx_limits_exceeded (draw)) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "instancing limit exceeded while rendering");
++        retval = FALSE;
++    } else {
++        retval = TRUE;
++    }
++
++    cairo_restore (cr);
++    rsvg_state_pop (draw);
++    rsvg_drawing_ctx_free (draw);
++
++    return retval;
++}
++
++/**
++ * rsvg_handle_render_document:
++ * @handle: A #RsvgHandle
++ * @cr: A Cairo context
++ * @viewport: Viewport size at which the whole SVG would be fitted.
++ * @error: (optional): a location to store a #GError
++ *
++ * Renders the whole SVG document fitted to a viewport.
++ *
++ * Returns: %TRUE on success.
++ *
++ * Since: 2.46
++ */
++gboolean
++rsvg_handle_render_document (RsvgHandle * handle,
++                             cairo_t * cr,
++                             const RsvgRectangle * viewport,
++                             GError ** error)
++{
++    return rsvg_handle_render_layer (handle, cr, NULL, viewport, error);
++}
+diff --git a/rsvg-cairo.h b/rsvg-cairo.h
+index d9ebfb2b5..1316b0b6a 100644
+--- a/rsvg-cairo.h
++++ b/rsvg-cairo.h
+@@ -37,6 +37,11 @@ G_BEGIN_DECLS
+ gboolean    rsvg_handle_render_cairo     (RsvgHandle * handle, cairo_t * cr);
+ gboolean    rsvg_handle_render_cairo_sub (RsvgHandle * handle, cairo_t * cr, const char *id);
+ 
++gboolean rsvg_handle_render_document (RsvgHandle          *handle,
++                                      cairo_t             *cr,
++                                      const RsvgRectangle *viewport,
++                                      GError             **error);
++
+ G_END_DECLS
+ 
+ #endif
+diff --git a/rsvg-private.h b/rsvg-private.h
+index 9e3b5f66c..fc8159442 100644
+--- a/rsvg-private.h
++++ b/rsvg-private.h
+@@ -212,6 +212,14 @@ struct RsvgDrawingCtx {
+     GSList *drawsub_stack;
+     GSList *acquired_nodes;
+     gboolean is_testing;
++
++    /* Viewport supplied by the caller of rsvg_handle_render_document() and
++     * friends.  When active, the outermost <svg> is fitted into this rectangle
++     * instead of using its own width/height, and a viewBox is synthesized from
++     * those dimensions if the document does not have one.  This stays inactive
++     * for rsvg_handle_render_cairo(), whose behaviour must not change.
++     */
++    RsvgViewBox toplevel_viewport;
+ };
+ 
+ /*Abstract base class for context for our backends (one as yet)*/
+diff --git a/rsvg-structure.c b/rsvg-structure.c
+index 4d8b0ce8e..3f44333ef 100644
+--- a/rsvg-structure.c
++++ b/rsvg-structure.c
+@@ -265,6 +265,7 @@ rsvg_node_svg_draw (RsvgNode * self, RsvgDrawingCtx * ctx, int dominate)
+     cairo_matrix_t affine, affine_old, affine_new;
+     guint i;
+     double nx, ny, nw, nh;
++    RsvgViewBox vbox;
+     sself = (RsvgNodeSvg *) self;
+ 
+     nx = _rsvg_css_normalize_length (&sself->x, ctx, 'h');
+@@ -272,26 +273,49 @@ rsvg_node_svg_draw (RsvgNode * self, RsvgDrawingCtx * ctx, int dominate)
+     nw = _rsvg_css_normalize_length (&sself->w, ctx, 'h');
+     nh = _rsvg_css_normalize_length (&sself->h, ctx, 'v');
+ 
++    vbox = sself->vbox;
++
++    /* When the caller supplied an explicit viewport, as with
++     * rsvg_handle_render_document(), the outermost <svg> is fitted into that
++     * rectangle rather than into its own width/height, and a viewBox is
++     * synthesized from the intrinsic dimensions if the document lacks one.
++     * See https://www.w3.org/TR/SVG2/coords.html#InitialCoordinateSystem .
++     */
++    if (ctx->toplevel_viewport.active && self->parent == NULL) {
++        if (!vbox.active && nw > 0.0 && nh > 0.0) {
++            vbox.rect.x = 0.0;
++            vbox.rect.y = 0.0;
++            vbox.rect.width = nw;
++            vbox.rect.height = nh;
++            vbox.active = TRUE;
++        }
++
++        nx = 0.0;
++        ny = 0.0;
++        nw = ctx->toplevel_viewport.rect.width;
++        nh = ctx->toplevel_viewport.rect.height;
++    }
++
+     rsvg_state_reinherit_top (ctx, self->state, dominate);
+ 
+     state = rsvg_current_state (ctx);
+ 
+     affine_old = state->affine;
+ 
+-    if (sself->vbox.active) {
++    if (vbox.active) {
+         double x = nx, y = ny, w = nw, h = nh;
+         rsvg_preserve_aspect_ratio (sself->preserve_aspect_ratio,
+-                                    sself->vbox.rect.width, sself->vbox.rect.height,
++                                    vbox.rect.width, vbox.rect.height,
+                                     &w, &h, &x, &y);
+         cairo_matrix_init (&affine,
+-                           w / sself->vbox.rect.width,
++                           w / vbox.rect.width,
+                            0,
+                            0,
+-                           h / sself->vbox.rect.height,
+-                           x - sself->vbox.rect.x * w / sself->vbox.rect.width,
+-                           y - sself->vbox.rect.y * h / sself->vbox.rect.height);
++                           h / vbox.rect.height,
++                           x - vbox.rect.x * w / vbox.rect.width,
++                           y - vbox.rect.y * h / vbox.rect.height);
+         cairo_matrix_multiply (&state->affine, &affine, &state->affine);
+-        _rsvg_push_view_box (ctx, sself->vbox.rect.width, sself->vbox.rect.height);
++        _rsvg_push_view_box (ctx, vbox.rect.width, vbox.rect.height);
+     } else {
+         cairo_matrix_init_translate (&affine, nx, ny);
+         cairo_matrix_multiply (&state->affine, &affine, &state->affine);
+diff --git a/rsvg.symbols b/rsvg.symbols
+index 44bce7189..e7f750708 100644
+--- a/rsvg.symbols
++++ b/rsvg.symbols
+@@ -30,6 +30,8 @@ rsvg_set_default_dpi_x_y
+ /* rsvg-cairo.h */
+ rsvg_handle_render_cairo
+ rsvg_handle_render_cairo_sub
++rsvg_handle_render_document
++rsvg_handle_render_layer
+ 
+ /* rsvg-css.h---semi-public for rsvg-convert */
+ rsvg_css_parse_color
+-- 
+2.43.0
+

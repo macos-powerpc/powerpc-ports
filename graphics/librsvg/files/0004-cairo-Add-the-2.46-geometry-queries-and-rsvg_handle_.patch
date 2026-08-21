@@ -1,0 +1,396 @@
+From 85c35089c54a8d686d6da7cc9bdae13b670a12dc Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <fygrave@gmail.com>
+Date: Sun, 16 Aug 2026 10:43:19 +0000
+Subject: [PATCH 4/7] cairo: Add the 2.46 geometry queries and
+ rsvg_handle_render_element()
+
+rsvg_handle_get_geometry_for_layer(), _for_element() and
+rsvg_handle_render_element() complete the 2.46 set.  The element-scoped
+calls draw the node in isolation, with the styles it inherits from its
+ancestors but without their transforms, which is what
+rsvg_state_reconstruct() already provides for filters and markers.
+
+This build keeps a single bounding box per element, the union of the fill
+and stroke extents, so both queries report it as the ink and the logical
+rectangle alike.  Tracking the two separately would mean an extra extents
+computation for every path drawn; that cost is not worth paying for an
+API whose callers here are asking "how big is this" rather than
+reproducing librsvg's own layout.
+
+rsvg_handle_render_element() sizes its intermediate surfaces from the
+target viewport rather than the unit viewport used for measuring, so that
+filters, masks and grouping opacity have somewhere real to draw.
+---
+ rsvg-cairo-render.c | 307 ++++++++++++++++++++++++++++++++++++++++++++
+ rsvg-cairo.h        |  25 ++++
+ rsvg.symbols        |   3 +
+ 3 files changed, 335 insertions(+)
+
+diff --git a/rsvg-cairo-render.c b/rsvg-cairo-render.c
+index b63c909f8..dfce74b84 100644
+--- a/rsvg-cairo-render.c
++++ b/rsvg-cairo-render.c
+@@ -489,3 +489,310 @@ rsvg_handle_render_document (RsvgHandle * handle,
+ {
+     return rsvg_handle_render_layer (handle, cr, NULL, viewport, error);
+ }
++
++/* Runs a drawing pass against a throwaway 1x1 surface purely to collect the
++ * bounding box.  @node is NULL for the whole document, or the node to which
++ * drawing should be limited.  @only_node draws @node in isolation, with the
++ * styles it inherits from its ancestors but without their transforms.
++ */
++static gboolean
++rsvg_handle_measure (RsvgHandle * handle,
++                     RsvgNode * node,
++                     gboolean only_node,
++                     const RsvgRectangle * viewport,
++                     RsvgBbox * out_bbox,
++                     GError ** error)
++{
++    cairo_surface_t *target;
++    cairo_t *cr;
++    RsvgDrawingCtx *draw;
++    gboolean retval;
++
++    target = cairo_image_surface_create (CAIRO_FORMAT_RGB24, 1, 1);
++    if (cairo_surface_status (target) != CAIRO_STATUS_SUCCESS) {
++        cairo_surface_destroy (target);
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "could not create a surface to measure the SVG");
++        return FALSE;
++    }
++
++    cr = cairo_create (target);
++
++    draw = rsvg_cairo_new_drawing_ctx_for_viewport (cr, handle, viewport, !only_node);
++    if (!draw) {
++        cairo_destroy (cr);
++        cairo_surface_destroy (target);
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "could not create a drawing context to measure the SVG");
++        return FALSE;
++    }
++
++    if (only_node) {
++        /* Fold in the styles inherited from the ancestors; their transforms are
++         * deliberately not applied, matching rsvg_handle_render_element(). */
++        rsvg_state_push (draw);
++        rsvg_state_reconstruct (rsvg_current_state (draw), node->parent);
++        rsvg_state_push (draw);
++        rsvg_node_draw (node, draw, 0);
++        rsvg_state_pop (draw);
++        rsvg_state_pop (draw);
++    } else {
++        RsvgNode *drawsub = node;
++
++        while (drawsub != NULL) {
++            draw->drawsub_stack = g_slist_prepend (draw->drawsub_stack, drawsub);
++            drawsub = drawsub->parent;
++        }
++
++        rsvg_state_push (draw);
++        rsvg_node_draw ((RsvgNode *) handle->priv->treebase, draw, 0);
++        rsvg_state_pop (draw);
++    }
++
++    if (rsvg_drawing_ctx_limits_exceeded (draw)) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "instancing limit exceeded while measuring");
++        retval = FALSE;
++    } else {
++        *out_bbox = RSVG_CAIRO_RENDER (draw->render)->bbox;
++        retval = TRUE;
++    }
++
++    rsvg_drawing_ctx_free (draw);
++    cairo_destroy (cr);
++    cairo_surface_destroy (target);
++
++    return retval;
++}
++
++static void
++rsvg_bbox_to_rectangle (const RsvgBbox * bbox, double dx, double dy, RsvgRectangle * out)
++{
++    if (bbox->virgin) {
++        out->x = out->y = out->width = out->height = 0.0;
++    } else {
++        out->x = bbox->rect.x + dx;
++        out->y = bbox->rect.y + dy;
++        out->width = bbox->rect.width;
++        out->height = bbox->rect.height;
++    }
++}
++
++/**
++ * rsvg_handle_get_geometry_for_layer:
++ * @handle: A #RsvgHandle
++ * @id: (nullable): An element's id within the SVG, starting with "##", or %NULL
++ *   for the whole SVG.
++ * @viewport: Viewport size at which the whole SVG would be fitted.
++ * @out_ink_rect: (out)(optional): Place to store the ink rectangle of the element.
++ * @out_logical_rect: (out)(optional): Place to store the logical rectangle of the element.
++ * @error: (optional): a location to store a #GError
++ *
++ * Computes the ink rectangle and logical rectangle of an SVG element, or of the
++ * whole SVG, as if the whole SVG were rendered to @viewport.
++ *
++ * Note that this build of librsvg keeps a single bounding box per element, so
++ * @out_ink_rect and @out_logical_rect are both set to the union of the fill and
++ * stroke extents.  Callers that need the two to differ will see the ink
++ * rectangle in both.
++ *
++ * Returns: %TRUE on success.
++ *
++ * Since: 2.46
++ */
++gboolean
++rsvg_handle_get_geometry_for_layer (RsvgHandle * handle,
++                                    const char *id,
++                                    const RsvgRectangle * viewport,
++                                    RsvgRectangle * out_ink_rect,
++                                    RsvgRectangle * out_logical_rect,
++                                    GError ** error)
++{
++    RsvgNode *node = NULL;
++    RsvgBbox bbox;
++
++    g_return_val_if_fail (handle != NULL, FALSE);
++    g_return_val_if_fail (viewport != NULL, FALSE);
++    g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
++
++    if (!rsvg_handle_lookup_drawsub (handle, id, &node, error))
++        return FALSE;
++
++    if (!rsvg_handle_measure (handle, node, FALSE, viewport, &bbox, error))
++        return FALSE;
++
++    /* The bounding box comes back relative to the viewport's origin. */
++    if (out_ink_rect)
++        rsvg_bbox_to_rectangle (&bbox, viewport->x, viewport->y, out_ink_rect);
++    if (out_logical_rect)
++        rsvg_bbox_to_rectangle (&bbox, viewport->x, viewport->y, out_logical_rect);
++
++    return TRUE;
++}
++
++/**
++ * rsvg_handle_get_geometry_for_element:
++ * @handle: A #RsvgHandle
++ * @id: (nullable): An element's id within the SVG, starting with "##", or %NULL
++ *   for the whole SVG.
++ * @out_ink_rect: (out)(optional): Place to store the ink rectangle of the element.
++ * @out_logical_rect: (out)(optional): Place to store the logical rectangle of the element.
++ * @error: (optional): a location to store a #GError
++ *
++ * Computes the ink rectangle and logical rectangle of a single SVG element,
++ * ignoring the transforms of its ancestors.  The returned rectangles are
++ * translated so that the ink rectangle is at the origin.
++ *
++ * The same single-bounding-box caveat as for
++ * rsvg_handle_get_geometry_for_layer() applies.
++ *
++ * Returns: %TRUE on success.
++ *
++ * Since: 2.46
++ */
++gboolean
++rsvg_handle_get_geometry_for_element (RsvgHandle * handle,
++                                      const char *id,
++                                      RsvgRectangle * out_ink_rect,
++                                      RsvgRectangle * out_logical_rect,
++                                      GError ** error)
++{
++    RsvgRectangle unit_viewport = { 0.0, 0.0, 1.0, 1.0 };
++    RsvgNode *node = NULL;
++    RsvgBbox bbox;
++    double dx, dy;
++
++    g_return_val_if_fail (handle != NULL, FALSE);
++    g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
++
++    if (!rsvg_handle_lookup_drawsub (handle, id, &node, error))
++        return FALSE;
++
++    if (node == NULL)
++        node = handle->priv->treebase;
++
++    if (node == NULL) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED, "the SVG has no elements");
++        return FALSE;
++    }
++
++    if (!rsvg_handle_measure (handle, node, TRUE, &unit_viewport, &bbox, error))
++        return FALSE;
++
++    /* Translate so that the ink rectangle is always at offset (0, 0). */
++    dx = bbox.virgin ? 0.0 : -bbox.rect.x;
++    dy = bbox.virgin ? 0.0 : -bbox.rect.y;
++
++    if (out_ink_rect)
++        rsvg_bbox_to_rectangle (&bbox, dx, dy, out_ink_rect);
++    if (out_logical_rect)
++        rsvg_bbox_to_rectangle (&bbox, dx, dy, out_logical_rect);
++
++    return TRUE;
++}
++
++/**
++ * rsvg_handle_render_element:
++ * @handle: A #RsvgHandle
++ * @cr: A Cairo context
++ * @id: (nullable): An element's id within the SVG, starting with "##", or %NULL
++ *   for the whole SVG.
++ * @element_viewport: Viewport size in which to fit the element.
++ * @error: (optional): a location to store a #GError
++ *
++ * Renders a single SVG element to a given viewport, scaled up or down to fit,
++ * and ignoring the transforms of the element's ancestors.
++ *
++ * Returns: %TRUE on success.
++ *
++ * Since: 2.46
++ */
++gboolean
++rsvg_handle_render_element (RsvgHandle * handle,
++                            cairo_t * cr,
++                            const char *id,
++                            const RsvgRectangle * element_viewport,
++                            GError ** error)
++{
++    RsvgRectangle unit_viewport = { 0.0, 0.0, 1.0, 1.0 };
++    RsvgNode *node = NULL;
++    RsvgDrawingCtx *draw;
++    RsvgBbox bbox;
++    double factor, sx, sy;
++    gboolean retval;
++
++    g_return_val_if_fail (handle != NULL, FALSE);
++    g_return_val_if_fail (cr != NULL, FALSE);
++    g_return_val_if_fail (element_viewport != NULL, FALSE);
++    g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
++
++    if (!rsvg_handle_lookup_drawsub (handle, id, &node, error))
++        return FALSE;
++
++    if (node == NULL)
++        node = handle->priv->treebase;
++
++    if (node == NULL) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED, "the SVG has no elements");
++        return FALSE;
++    }
++
++    if (!rsvg_handle_measure (handle, node, TRUE, &unit_viewport, &bbox, error))
++        return FALSE;
++
++    /* Nothing to draw. */
++    if (bbox.virgin || !(bbox.rect.width > 0.0) || !(bbox.rect.height > 0.0))
++        return TRUE;
++
++    sx = element_viewport->width / bbox.rect.width;
++    sy = element_viewport->height / bbox.rect.height;
++    factor = (sx < sy) ? sx : sy;
++
++    /* The context is built from the target viewport, not from the unit viewport
++     * used for measuring, so that the intermediate surfaces used by filters,
++     * masks and grouping opacity are sized for the area actually painted.
++     * Percentages inside the element still resolve against the unit viewport,
++     * matching the measuring pass that produced @factor.
++     */
++    draw = rsvg_cairo_new_drawing_ctx_for_viewport (cr, handle, element_viewport, FALSE);
++    if (!draw)
++        return TRUE;
++
++    draw->vb.rect.width = unit_viewport.width;
++    draw->vb.rect.height = unit_viewport.height;
++
++    cairo_save (cr);
++
++    {
++        /* Place the element's bounding box at the viewport's origin, scaled to
++         * fit.  The viewport's own offset is already folded into state->affine. */
++        RsvgState *state = rsvg_current_state (draw);
++        cairo_matrix_t place;
++
++        cairo_matrix_init_scale (&place, factor, factor);
++        cairo_matrix_translate (&place, -bbox.rect.x, -bbox.rect.y);
++
++        cairo_matrix_multiply (&state->affine, &place, &state->affine);
++        rsvg_bbox_init (&RSVG_CAIRO_RENDER (draw->render)->bbox, &state->affine);
++
++        rsvg_state_push (draw);
++        rsvg_state_reconstruct (rsvg_current_state (draw), node->parent);
++        rsvg_state_push (draw);
++        rsvg_node_draw (node, draw, 0);
++        rsvg_state_pop (draw);
++        rsvg_state_pop (draw);
++    }
++
++    if (rsvg_drawing_ctx_limits_exceeded (draw)) {
++        g_set_error (error, RSVG_ERROR, RSVG_ERROR_FAILED,
++                     "instancing limit exceeded while rendering");
++        retval = FALSE;
++    } else {
++        retval = TRUE;
++    }
++
++    cairo_restore (cr);
++    rsvg_drawing_ctx_free (draw);
++
++    return retval;
++}
+diff --git a/rsvg-cairo.h b/rsvg-cairo.h
+index 1316b0b6a..efa467ee4 100644
+--- a/rsvg-cairo.h
++++ b/rsvg-cairo.h
+@@ -42,6 +42,31 @@ gboolean rsvg_handle_render_document (RsvgHandle          *handle,
+                                       const RsvgRectangle *viewport,
+                                       GError             **error);
+ 
++gboolean rsvg_handle_get_geometry_for_layer (RsvgHandle          *handle,
++                                             const char          *id,
++                                             const RsvgRectangle *viewport,
++                                             RsvgRectangle       *out_ink_rect,
++                                             RsvgRectangle       *out_logical_rect,
++                                             GError             **error);
++
++gboolean rsvg_handle_render_layer (RsvgHandle          *handle,
++                                   cairo_t             *cr,
++                                   const char          *id,
++                                   const RsvgRectangle *viewport,
++                                   GError             **error);
++
++gboolean rsvg_handle_get_geometry_for_element (RsvgHandle     *handle,
++                                               const char     *id,
++                                               RsvgRectangle  *out_ink_rect,
++                                               RsvgRectangle  *out_logical_rect,
++                                               GError        **error);
++
++gboolean rsvg_handle_render_element (RsvgHandle          *handle,
++                                     cairo_t             *cr,
++                                     const char          *id,
++                                     const RsvgRectangle *element_viewport,
++                                     GError             **error);
++
+ G_END_DECLS
+ 
+ #endif
+diff --git a/rsvg.symbols b/rsvg.symbols
+index e7f750708..d74dd5cb0 100644
+--- a/rsvg.symbols
++++ b/rsvg.symbols
+@@ -32,6 +32,9 @@ rsvg_handle_render_cairo
+ rsvg_handle_render_cairo_sub
+ rsvg_handle_render_document
+ rsvg_handle_render_layer
++rsvg_handle_render_element
++rsvg_handle_get_geometry_for_layer
++rsvg_handle_get_geometry_for_element
+ 
+ /* rsvg-css.h---semi-public for rsvg-convert */
+ rsvg_css_parse_color
+-- 
+2.43.0
+
