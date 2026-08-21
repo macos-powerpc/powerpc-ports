@@ -1,0 +1,208 @@
+From ddb90e107a03aca154f734f98cb48caa88858711 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 21 Aug 2026 03:28:14 +0000
+Subject: [PATCH] compat_sem: fall back to Mach semaphores on pre-10.6 Darwin
+
+Darwin's POSIX unnamed semaphores are ENOSYS stubs, so compat_sem.h
+maps the few semaphore operations rwlock.c needs onto libdispatch.
+libdispatch only shipped with Mac OS X 10.6 though: with a deployment
+target of 10.5 or older <dispatch/dispatch.h> does not exist and the
+build fails outright.
+
+Select the backend on MAC_OS_X_VERSION_MIN_REQUIRED: below 1060, map
+sem_init()/sem_post()/sem_wait()/sem_destroy() onto Mach semaphores,
+which predate libdispatch by a long way. 10.6 and newer keep using
+libdispatch exactly as before.
+
+sem_t becomes an opaque struct wrapping the semaphore_t (a mach_port_t)
+so that the Mach headers stay out of the translation units this header
+is force-included into. kern_return_t is translated to errno, with
+KERN_ABORTED mapped to EINTR so that rwlock.c's sem_wait_nointr() retry
+loop keeps working. pshared != 0 reports ENOSYS as a task local Mach
+semaphore cannot be shared; epoll-shim only ever passes 0.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019f3sx3j1ciRv9B9AVyc9Bu
+---
+ src/compat_sem.c | 100 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/compat_sem.h |  48 +++++++++++++++++++++++
+ 2 files changed, 148 insertions(+)
+
+diff --git a/src/compat_sem.c b/src/compat_sem.c
+index 9e72271..60cc080 100644
+--- a/src/compat_sem.c
++++ b/src/compat_sem.c
+@@ -1 +1,101 @@
+ #include "compat_sem.h"
++
++#ifdef COMPAT_SEM_USE_MACH
++
++#include <errno.h>
++#include <limits.h>
++
++#include <mach/mach_init.h>
++#include <mach/semaphore.h>
++#include <mach/sync_policy.h>
++#include <mach/task.h>
++
++/*
++ * Mach semaphores, used to emulate the subset of POSIX semaphores that
++ * epoll-shim needs on Darwin releases without libdispatch (10.5 and
++ * older). See compat_sem.h.
++ */
++
++static int
++compat_sem_fail(kern_return_t kr)
++{
++	switch (kr) {
++	case KERN_RESOURCE_SHORTAGE:
++		errno = ENOMEM;
++		break;
++	case KERN_ABORTED:
++		/*
++		 * The wait was interrupted (a signal, thread_abort()).
++		 * POSIX callers retry on EINTR.
++		 */
++		errno = EINTR;
++		break;
++	default:
++		errno = EINVAL;
++		break;
++	}
++
++	return -1;
++}
++
++int
++compat_sem_init(compat_sem_t *sem, int pshared, unsigned int value)
++{
++	if (pshared != 0) {
++		/* A task local Mach semaphore cannot be shared. */
++		errno = ENOSYS;
++		return -1;
++	}
++
++	if (value > INT_MAX) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	semaphore_t semaphore;
++	kern_return_t kr = semaphore_create(mach_task_self(), &semaphore,
++	    SYNC_POLICY_FIFO, (int)value);
++	if (kr != KERN_SUCCESS) {
++		return compat_sem_fail(kr);
++	}
++
++	sem->mach_semaphore = semaphore;
++	return 0;
++}
++
++int
++compat_sem_post(compat_sem_t *sem)
++{
++	kern_return_t kr = semaphore_signal(sem->mach_semaphore);
++	if (kr != KERN_SUCCESS) {
++		return compat_sem_fail(kr);
++	}
++
++	return 0;
++}
++
++int
++compat_sem_wait(compat_sem_t *sem)
++{
++	kern_return_t kr = semaphore_wait(sem->mach_semaphore);
++	if (kr != KERN_SUCCESS) {
++		return compat_sem_fail(kr);
++	}
++
++	return 0;
++}
++
++int
++compat_sem_destroy(compat_sem_t *sem)
++{
++	kern_return_t kr = semaphore_destroy(mach_task_self(),
++	    sem->mach_semaphore);
++	if (kr != KERN_SUCCESS) {
++		return compat_sem_fail(kr);
++	}
++
++	sem->mach_semaphore = MACH_PORT_NULL;
++	return 0;
++}
++
++#endif
+diff --git a/src/compat_sem.h b/src/compat_sem.h
+index f32503d..5840b5a 100644
+--- a/src/compat_sem.h
++++ b/src/compat_sem.h
+@@ -1,9 +1,55 @@
+ #ifndef COMPAT_SEM_H
+ #define COMPAT_SEM_H
+ 
++/*
++ * Darwin's POSIX unnamed semaphores are stubs that always fail with
++ * ENOSYS, so the handful of semaphore operations epoll-shim needs are
++ * mapped onto something else.
++ *
++ * libdispatch first shipped with Mac OS X 10.6; on 10.5 and older
++ * <dispatch/dispatch.h> does not exist. For those deployment targets
++ * fall back to Mach semaphores, which have been available since well
++ * before that.
++ */
++#if defined(__APPLE__)
++#include <AvailabilityMacros.h>
++#if defined(MAC_OS_X_VERSION_MIN_REQUIRED) && \
++    MAC_OS_X_VERSION_MIN_REQUIRED < 1060
++#define COMPAT_SEM_USE_MACH
++#endif
++#endif
++
++#ifdef COMPAT_SEM_USE_MACH
++/*
++ * Wraps a Mach semaphore_t (a mach_port_t, i.e. an unsigned int)
++ * without pulling the Mach headers into every translation unit this
++ * header gets force-included into.
++ */
++typedef struct {
++	unsigned int mach_semaphore;
++} compat_sem_t;
++
++int compat_sem_init(compat_sem_t *sem, int pshared, unsigned int value);
++int compat_sem_post(compat_sem_t *sem);
++int compat_sem_wait(compat_sem_t *sem);
++int compat_sem_destroy(compat_sem_t *sem);
++#endif
++
+ #ifdef COMPAT_ENABLE_SEM
+ #include <semaphore.h>
+ 
++#ifdef COMPAT_SEM_USE_MACH
++
++#define sem_t compat_sem_t
++
++#define sem_init(sem, pshared, value) \
++	compat_sem_init((sem), (pshared), (value))
++#define sem_post(sem) compat_sem_post(sem)
++#define sem_wait(sem) compat_sem_wait(sem)
++#define sem_destroy(sem) compat_sem_destroy(sem)
++
++#else
++
+ #include <dispatch/dispatch.h>
+ 
+ #define sem_t dispatch_semaphore_t
+@@ -13,6 +59,8 @@
+ #define sem_post(sem) dispatch_semaphore_signal(*(sem))
+ #define sem_wait(sem) dispatch_semaphore_wait(*(sem), DISPATCH_TIME_FOREVER)
+ #define sem_destroy(sem) dispatch_release(*(sem))
++
++#endif
+ #endif
+ 
+ #endif
+-- 
+2.43.0
+
