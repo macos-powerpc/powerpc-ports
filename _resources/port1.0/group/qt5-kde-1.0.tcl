@@ -660,8 +660,8 @@ if {![info exists building_qt5]} {
 # }
 
 # use PKGCONFIG for Qt discovery in configure scripts
-depends_build-delete    port:pkgconfig
-depends_build-append    port:pkgconfig
+depends_build-delete    path:bin/pkg-config:pkgconfig port:pkgconfig
+depends_build-append    path:bin/pkg-config:pkgconfig
 
 # standard destroot environment
 pre-destroot {
