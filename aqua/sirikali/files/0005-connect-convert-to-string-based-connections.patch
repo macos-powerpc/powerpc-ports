@@ -1,0 +1,2140 @@
+From 3d270d3aa403439f796df2796157201c895e1ebe Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 22 Aug 2026 20:06:09 +0000
+Subject: [PATCH 5/9] connect: convert to string based connections
+
+Qt4 can not connect to a pointer to member function or to a functor,so
+every such connect in the tree becomes a SIGNAL() string connection,
+going through the connectFunctor*() helpers where the receiver is a
+lambda or a plain(non slot) member function.
+
+The 3 argument Qt5 form connect( sender,signal,functor ) ties the
+connection lifetime to the sender,so those call sites pass the sender as
+the context object;the 4 argument form keeps the context it had.
+
+Two receivers stayed real slots because a string based connection needs
+the slot argument types to spell out the same as the signal ones:
+sirikali::trayClicked() and checkforupdateswindow::add()/doneUpdating().
+
+Outside the GUI:
+
+- src/3rdParty/tasks/task.hpp: the two QThread::finished connects become
+  string based ones and Task::progress routes its functor through a real
+  slot on Qt4.
+- src/siripolkit: zuluPolkit gains Q_OBJECT with start() and
+  gotConnection() as real slots,which also lets main() drop the manual
+  single shot timer.
+- src/sirikali_cppcryptfs: uses the connectFunctor*() helpers.
+- utils/network_access_manager.hpp drops QMetaObject::Connection(Qt 5.0),
+  the carrier object returned by connectFunctor*() is deleted to break
+  the connection instead.
+- utils/single_instance.hpp loses its Qt < 5.4 Q_OBJECT variant of
+  details::exec,singleShotFunctor() covers every version and the header
+  is not moc'ed by any target.
+
+QProcess::ProcessError and QProcess::ExitStatus are registered as meta
+types while here.  A queued connection resolves the argument types of
+the signal through QMetaType::type() and silently refuses to deliver
+what it can not resolve,and Qt only started registering those two when
+Q_ENUM replaced Q_ENUMS in Qt 5.5.  utils/qprocess.hpp connects both of
+them queued.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J3PANPjHirYuwBkTemGj8R
+---
+ src/3rdParty/tasks/task.hpp            | 31 +++++++-
+ src/checkforupdates.cpp                | 11 ++-
+ src/checkforupdateswindow.cpp          | 20 +++---
+ src/checkforupdateswindow.h            |  5 +-
+ src/configoptions.cpp                  | 47 ++++++-------
+ src/createbackendwindow.cpp            |  5 +-
+ src/debugwindow.cpp                    | 11 ++-
+ src/engines/cryfscreateoptions.cpp     |  3 +-
+ src/engines/customcreateoptions.cpp    |  5 +-
+ src/engines/fscryptcreateoptions.cpp   | 13 ++--
+ src/engines/options.cpp                |  9 +--
+ src/favorites2.cpp                     | 97 +++++++++++++-------------
+ src/filemanager.cpp                    |  3 +-
+ src/functorslot.cpp                    | 27 +++++++
+ src/keydialog.cpp                      | 46 ++++++------
+ src/keydialog.h                        |  3 +-
+ src/mountinfo.cpp                      |  7 +-
+ src/oneinstance.cpp                    | 22 +++---
+ src/plugin.cpp                         |  7 +-
+ src/readonlywarning.cpp                |  9 ++-
+ src/sirikali.cpp                       | 68 ++++++++++--------
+ src/sirikali.h                         | 29 ++++++--
+ src/sirikali_cppcryptfs/CMakeLists.txt |  7 +-
+ src/sirikali_cppcryptfs/main.cpp       | 21 +++---
+ src/siripolkit/CMakeLists.txt          |  1 +
+ src/siripolkit/main.cpp                | 13 +---
+ src/siripolkit/zulupolkit.cpp          |  5 +-
+ src/siripolkit/zulupolkit.h            |  7 +-
+ src/systemsignalhandler.cpp            | 10 ++-
+ src/utility.cpp                        |  3 +-
+ src/utility.h                          | 10 ++-
+ src/utils/network_access_manager.hpp   | 43 +++++++++---
+ src/utils/qprocess.hpp                 | 55 ++++++++++-----
+ src/utils/single_instance.hpp          | 43 +++---------
+ src/utils/threads.hpp                  |  8 ++-
+ 35 files changed, 424 insertions(+), 280 deletions(-)
+
+diff --git a/src/3rdParty/tasks/task.hpp b/src/3rdParty/tasks/task.hpp
+index 184ac34..e8e096f 100644
+--- a/src/3rdParty/tasks/task.hpp
++++ b/src/3rdParty/tasks/task.hpp
+@@ -885,7 +885,7 @@ namespace Task
+ 					  [ this ](){ this->deleteLater() ; },
+ 					  [ this ](){ this->deleteLater() ; return m_function() ; } )
+ 			{
+-				connect( this,&QThread::finished,this,&QThread::deleteLater ) ;
++				connect( this,SIGNAL( finished() ),this,SLOT( deleteLater() ) ) ;
+ 			}
+ 			future<Type>& Future()
+ 			{
+@@ -916,7 +916,7 @@ namespace Task
+ 					  [ this ](){ this->deleteLater() ; },
+ 					  [ this ](){ m_function() ; this->deleteLater() ; } )
+ 			{
+-				connect( this,&QThread::finished,this,&QThread::deleteLater ) ;
++				connect( this,SIGNAL( finished() ),this,SLOT( deleteLater() ) ) ;
+ 			}
+ 			future< void >& Future()
+ 			{
+@@ -1087,13 +1087,40 @@ namespace Task
+ 		} ) ;
+ 	}
+ #endif
++	/*
++	 * Qt4 can not connect a signal to a functor,the forwarder below is a
++	 * real slot that carries one.  It is parented to the context object so
++	 * the connection dies together with it.
++	 */
++	class progressForwarder : public QObject{
++		Q_OBJECT
++	public:
++		progressForwarder( QObject * parent,std::function< void( QVariant ) > function ) :
++			QObject( parent ),m_function( std::move( function ) )
++		{
++		}
++	public slots:
++		void invoke( QVariant x )
++		{
++			m_function( std::move( x ) ) ;
++		}
++	private:
++		std::function< void( QVariant ) > m_function ;
++	};
++
+ 	class progress : public QObject{
+ 		Q_OBJECT
+ 	public:
+ 		template< typename function >
+ 		progress( QObject * obj,function fn )
+ 		{
++		#if QT_VERSION < QT_VERSION_CHECK( 5,0,0 )
++			auto s = new Task::progressForwarder( obj,std::move( fn ) ) ;
++
++			connect( this,SIGNAL( update( QVariant ) ),s,SLOT( invoke( QVariant ) ) ) ;
++		#else
+ 			connect( this,&progress::update,obj,std::move( fn ) ) ;
++		#endif
+ 		}
+ 	signals:
+ 		void update( QVariant x ) const ;
+diff --git a/src/checkforupdates.cpp b/src/checkforupdates.cpp
+index 88a9129..2d02e9c 100644
+--- a/src/checkforupdates.cpp
++++ b/src/checkforupdates.cpp
+@@ -19,6 +19,7 @@
+ 
+ 
+ #include "checkforupdates.h"
++#include "functorslot.h"
+ 
+ #include "settings.h"
+ #include "json_parser.hpp"
+@@ -58,10 +59,14 @@ void checkUpdates::check()
+ 
+ 	auto& m = checkforupdateswindow::instance( m_sirikali,m_network ) ;
+ 
+-	connect( this,&checkUpdates::update,&m,&checkforupdateswindow::add ) ;
+-	connect( this,&checkUpdates::done,&m,&checkforupdateswindow::doneUpdating ) ;
++	connect( this,
++		 SIGNAL( update( checkforupdateswindow::args ) ),
++		 &m,
++		 SLOT( add( checkforupdateswindow::args ) ) ) ;
+ 
+-	connect( &m,&checkforupdateswindow::closed,[ this ](){
++	connect( this,SIGNAL( done( bool ) ),&m,SLOT( doneUpdating( bool ) ) ) ;
++
++	connectFunctor( &m,SIGNAL( closed() ),&m,[ this ](){
+ 
+ 		if( m_backendsInUse == &m_backendsInstallable ){
+ 
+diff --git a/src/checkforupdateswindow.cpp b/src/checkforupdateswindow.cpp
+index 2d3b6bb..e738efd 100644
+--- a/src/checkforupdateswindow.cpp
++++ b/src/checkforupdateswindow.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "checkforupdateswindow.h"
++#include "functorslot.h"
+ #include "ui_checkforupdateswindow.h"
+ 
+ #include <QDebug>
+@@ -47,14 +48,14 @@ checkforupdateswindow::checkforupdateswindow( sirikali& parent,utils::network::m
+ 
+ 	this->setFixedSize( this->window()->size() ) ;
+ 
+-	connect( m_ui->pbOK,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbOK,SIGNAL( clicked() ),this,[ this ](){
+ 
+ 		this->closeUI() ;
+ 	} ) ;
+ 
+-	auto cm = &QTableWidget::customContextMenuRequested ;
++	auto cm = SIGNAL( customContextMenuRequested( QPoint ) ) ;
+ 
+-	connect( m_ui->tableWidget,cm,[ this ]( QPoint ){
++	connectFunctorPoint( m_ui->tableWidget,cm,this,[ this ]( const QPoint& ){
+ 
+ 		auto row = m_ui->tableWidget->currentRow() ;
+ 
+@@ -68,7 +69,7 @@ checkforupdateswindow::checkforupdateswindow( sirikali& parent,utils::network::m
+ 
+ 				ac->setEnabled( true ) ;
+ 
+-				connect( ac,&QAction::triggered,[ this,row ](){
++				connectFunctor( ac,SIGNAL( triggered() ),ac,[ this,row ](){
+ 
+ 					this->update( row ) ;
+ 				} ) ;
+@@ -82,10 +83,13 @@ checkforupdateswindow::checkforupdateswindow( sirikali& parent,utils::network::m
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidget,
+-		 &QTableWidget::currentItemChanged,
+-		 this,
+-		 &checkforupdateswindow::currentItemChanged ) ;
++	connectFunctorTableItems( m_ui->tableWidget,
++				  SIGNAL( currentItemChanged( QTableWidgetItem*,QTableWidgetItem* ) ),
++				  this,
++				  [ this ]( QTableWidgetItem * c,QTableWidgetItem * p ){
++
++		this->currentItemChanged( c,p ) ;
++	} ) ;
+ }
+ 
+ void checkforupdateswindow::add( const checkforupdateswindow::args& s )
+diff --git a/src/checkforupdateswindow.h b/src/checkforupdateswindow.h
+index f76e182..7fa4dc4 100644
+--- a/src/checkforupdateswindow.h
++++ b/src/checkforupdateswindow.h
+@@ -64,12 +64,13 @@ public:
+ 		QJsonObject data ;
+ 		const engines::engine * engine ;
+ 	} ;
+-	void add( const checkforupdateswindow::args& ) ;
+-	void doneUpdating( bool ) ;
+ 	void Show() ;
+ 	~checkforupdateswindow() ;
+ signals:
+ 	void closed() ;
++public slots:
++	void add( const checkforupdateswindow::args& ) ;
++	void doneUpdating( bool ) ;
+ private:
+ 	class Ctx
+ 	{
+diff --git a/src/configoptions.cpp b/src/configoptions.cpp
+index e7cd148..d858d4a 100644
+--- a/src/configoptions.cpp
++++ b/src/configoptions.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "configoptions.h"
++#include "functorslot.h"
+ #include "ui_configoptions.h"
+ 
+ #include "utility.h"
+@@ -102,9 +103,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		m_ui->cbThemes->setCurrentIndex( 0 ) ;
+ 	}
+ 
+-	auto sig = static_cast< void( QComboBox::* )( int ) >( &QComboBox::activated ) ;
+-
+-	connect( m_ui->cbThemes,sig,[ this ]( int m ){
++	connectFunctorInt( m_ui->cbThemes,SIGNAL( activated( int ) ),m_ui->cbThemes,[ this ]( int m ){
+ 
+ 		if( m == 0 ){
+ 
+@@ -118,19 +117,19 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pushButton,&QPushButton::clicked,[ this ](){ this->HideUI() ; } ) ;
++	connectFunctor( m_ui->pushButton,SIGNAL( clicked() ),m_ui->pushButton,[ this ](){ this->HideUI() ; } ) ;
+ 
+-	connect( m_ui->cbAutoOpenMountPoint,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbAutoOpenMountPoint,SIGNAL( toggled( bool ) ),m_ui->cbAutoOpenMountPoint,[ this ]( bool e ){
+ 
+ 		m_settings.autoOpenFolderOnMount( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbReUseMountPoint,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbReUseMountPoint,SIGNAL( toggled( bool ) ),m_ui->cbReUseMountPoint,[ this ]( bool e ){
+ 
+ 		m_settings.reUseMountPoint( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbInternallyManageBackEnds,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbInternallyManageBackEnds,SIGNAL( toggled( bool ) ),m_ui->cbInternallyManageBackEnds,[ this ]( bool e ){
+ 
+ 		m_settings.setInternallyManageBackEnds( e ) ;
+ 
+@@ -150,14 +149,14 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->cbStartMinimized,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbStartMinimized,SIGNAL( toggled( bool ) ),m_ui->cbStartMinimized,[ this ]( bool e ){
+ 
+ 		m_settings.setStartMinimized( e ) ;
+ 	} ) ;
+ 
+ 	m_ui->cbShowTrayIcon->setChecked( m_settings.showSystemTray() ) ;
+ 
+-	connect( m_ui->cbShowTrayIcon,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbShowTrayIcon,SIGNAL( toggled( bool ) ),m_ui->cbShowTrayIcon,[ this ]( bool e ){
+ 
+ 		m_settings.setShowSystemTray( e ) ;
+ 
+@@ -175,7 +174,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		m_ui->lineEditMountPointPrefix->setText( m_settings.mountPath() ) ;
+ 	}
+ 
+-	connect( m_ui->pbMountPointPrefix,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbMountPointPrefix,SIGNAL( clicked() ),m_ui->pbMountPointPrefix,[ this ](){
+ 
+ 		auto e = utility::getExistingDirectory( this,QString(),QDir::homePath() ) ;
+ 
+@@ -197,14 +196,14 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 
+ 	m_ui->pbSelectLanguage->setMenu( m ) ;
+ 
+-	connect( m,&QMenu::triggered,[ this ]( QAction * ac ){
++	connectFunctorAction( m,SIGNAL( triggered( QAction* ) ),m,[ this ]( QAction * ac ){
+ 
+ 		m_sirikali.updateLanguage( ac ) ;
+ 
+ 		this->translateUI() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbPostMountCommand,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbPostMountCommand,SIGNAL( pressed() ),m_ui->pbPostMountCommand,[ this ](){
+ 
+ 		auto e = QFileDialog::getOpenFileName( this,tr( "Set Post Mount Command" ),QDir::homePath() ) ;
+ 
+@@ -214,7 +213,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbPreUnMountCommand,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbPreUnMountCommand,SIGNAL( pressed() ),m_ui->pbPreUnMountCommand,[ this ](){
+ 
+ 		auto e = QFileDialog::getOpenFileName( this,tr( "Set Pre UnMount Command" ),QDir::homePath() ) ;
+ 
+@@ -224,7 +223,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbRunPeriodicallyCommand,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbRunPeriodicallyCommand,SIGNAL( pressed() ),m_ui->pbRunPeriodicallyCommand,[ this ](){
+ 
+ 		auto e = QFileDialog::getOpenFileName( this,tr( "Set Pre UnMount Command" ),QDir::homePath() ) ;
+ 
+@@ -234,7 +233,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbSetFileManager,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbSetFileManager,SIGNAL( pressed() ),m_ui->pbSetFileManager,[ this ](){
+ 
+ 		auto e = QFileDialog::getOpenFileName( this,tr( "Set Command To Open Mount Points" ),QDir::homePath() ) ;
+ 
+@@ -244,7 +243,7 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbSetExternalCommand,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbSetExternalCommand,SIGNAL( pressed() ),m_ui->pbSetExternalCommand,[ this ](){
+ 
+ 		if( utility::platformIsWindows() ){
+ 
+@@ -264,13 +263,13 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbSetFileManagerToDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbSetFileManagerToDefault,SIGNAL( pressed() ),m_ui->pbSetFileManagerToDefault,[ this ](){
+ 
+ 		m_settings.setFileManager( QString() ) ;
+ 		m_ui->lineEditFileManager->setText( m_settings.fileManager().toString() ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbExternalExecutableDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbExternalExecutableDefault,SIGNAL( pressed() ),m_ui->pbExternalExecutableDefault,[ this ](){
+ 
+ 		if( utility::platformIsWindows() ){
+ 
+@@ -284,33 +283,33 @@ configOptions::configOptions( sirikali * s,secrets& a,QMenu * m ) :
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbMountPointPrefixDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbMountPointPrefixDefault,SIGNAL( pressed() ),m_ui->pbMountPointPrefixDefault,[ this ](){
+ 
+ 		m_settings.setDefaultMountPointPrefix( QString() ) ;
+ 		m_ui->lineEditMountPointPrefix->setText( m_settings.mountPath() ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbRunPostMountCommandDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbRunPostMountCommandDefault,SIGNAL( pressed() ),m_ui->pbRunPostMountCommandDefault,[ this ](){
+ 
+ 		m_ui->lineEditAfterMountCommand->clear() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbRunPreUnMountCommandDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbRunPreUnMountCommandDefault,SIGNAL( pressed() ),m_ui->pbRunPreUnMountCommandDefault,[ this ](){
+ 
+ 		m_ui->lineEditBeforesUnMount->clear() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbRunCommandPeriodicallyDefault,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbRunCommandPeriodicallyDefault,SIGNAL( pressed() ),m_ui->pbRunCommandPeriodicallyDefault,[ this ](){
+ 
+ 		m_ui->lineEditRunPeriodically->clear() ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbHiDPI,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbHiDPI,SIGNAL( toggled( bool ) ),m_ui->cbHiDPI,[ this ]( bool e ){
+ 
+ 		m_ui->lineEditHiDPI->setEnabled( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->chShowDebugWindowOnStartup,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->chShowDebugWindowOnStartup,SIGNAL( toggled( bool ) ),m_ui->chShowDebugWindowOnStartup,[ this ]( bool e ){
+ 
+ 		m_settings.showDebugWindowOnStartup( e ) ;
+ 	} ) ;
+diff --git a/src/createbackendwindow.cpp b/src/createbackendwindow.cpp
+index 018e4a0..ed34a2d 100644
+--- a/src/createbackendwindow.cpp
++++ b/src/createbackendwindow.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "createbackendwindow.h"
++#include "functorslot.h"
+ #include "ui_createbackendwindow.h"
+ 
+ #include "json_parser.hpp"
+@@ -37,9 +38,9 @@ createBackendWIndow::createBackendWIndow( QWidget * parent ) :
+ 
+ 	this->window()->setFixedSize( this->window()->size() ) ;
+ 
+-	connect( m_ui->pbCreate,&QPushButton::clicked,[ this ](){ this->save() ; } ) ;
++	connectFunctor( m_ui->pbCreate,SIGNAL( clicked() ),m_ui->pbCreate,[ this ](){ this->save() ; } ) ;
+ 
+-	connect( m_ui->pbCancel,&QPushButton::clicked,[ this ](){ this->Hide() ; } ) ;
++	connectFunctor( m_ui->pbCancel,SIGNAL( clicked() ),m_ui->pbCancel,[ this ](){ this->Hide() ; } ) ;
+ 
+ 	this->show() ;
+ }
+diff --git a/src/debugwindow.cpp b/src/debugwindow.cpp
+index c37d22f..011d441 100644
+--- a/src/debugwindow.cpp
++++ b/src/debugwindow.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "debugwindow.h"
++#include "functorslot.h"
+ #include "ui_debugwindow.h"
+ #include "utility.h"
+ 
+@@ -31,17 +32,21 @@ debugWindow::debugWindow( QWidget * parent ) :
+ 
+ 	m_ui->pbClose->setFocus() ;
+ 
+-	connect( m_ui->pbClear,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbClear,SIGNAL( clicked() ),m_ui->pbClear,[ this ](){
+ 
+ 		m_ui->textEdit->setText( QString() ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbClose,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbClose,SIGNAL( clicked() ),m_ui->pbClose,[ this ](){
+ 
+ 		this->Hide() ;
+ 	} ) ;
+ 
+-	connect( this,&debugWindow::UpdateOutPut,this,&debugWindow::UpdateOutPutSlot,Qt::QueuedConnection ) ;
++	connect( this,
++		 SIGNAL( UpdateOutPut( QString,bool ) ),
++		 this,
++		 SLOT( UpdateOutPutSlot( QString,bool ) ),
++		 Qt::QueuedConnection ) ;
+ 
+ 	utility::miscOptions::instance().setDebugWindow( this ) ;
+ }
+diff --git a/src/engines/cryfscreateoptions.cpp b/src/engines/cryfscreateoptions.cpp
+index b72a1a6..d40f704 100644
+--- a/src/engines/cryfscreateoptions.cpp
++++ b/src/engines/cryfscreateoptions.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "cryfscreateoptions.h"
++#include "../functorslot.h"
+ #include "ui_cryfscreateoptions.h"
+ 
+ #include "../utility.h"
+@@ -61,7 +62,7 @@ cryfscreateoptions::cryfscreateoptions( const engines::engine& engine,
+ 			m->addAction( it )->setObjectName( it ) ;
+ 		}
+ 
+-		QObject::connect( m,&QMenu::triggered,[ this ]( QAction * ac ){
++		connectFunctorAction( m,SIGNAL( triggered( QAction* ) ),m,[ this ]( QAction * ac ){
+ 
+ 			int e = ac->objectName().replace( "KB","" ).toInt() * 1024 ;
+ 
+diff --git a/src/engines/customcreateoptions.cpp b/src/engines/customcreateoptions.cpp
+index c021e31..57c28ba 100644
+--- a/src/engines/customcreateoptions.cpp
++++ b/src/engines/customcreateoptions.cpp
+@@ -1,4 +1,5 @@
+ #include "customcreateoptions.h"
++#include "../functorslot.h"
+ #include "ui_customcreateoptions.h"
+ 
+ customcreateoptions::customcreateoptions( const engines::engine::createGUIOptions& s ) :
+@@ -8,12 +9,12 @@ customcreateoptions::customcreateoptions( const engines::engine::createGUIOption
+ {
+ 	m_ui->setupUi( this ) ;
+ 
+-	connect( m_ui->pbCancel,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbCancel,SIGNAL( clicked() ),m_ui->pbCancel,[ this ](){
+ 
+ 		this->HideUI() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbSet,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbSet,SIGNAL( clicked() ),m_ui->pbSet,[ this ](){
+ 
+ 		auto m = m_ui->lineEdit->text() ;
+ 
+diff --git a/src/engines/fscryptcreateoptions.cpp b/src/engines/fscryptcreateoptions.cpp
+index cfa0639..6394b09 100644
+--- a/src/engines/fscryptcreateoptions.cpp
++++ b/src/engines/fscryptcreateoptions.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "fscryptcreateoptions.h"
++#include "../functorslot.h"
+ #include "ui_fscryptcreateoptions.h"
+ 
+ #include "../utility.h"
+@@ -41,7 +42,7 @@ fscryptcreateoptions::fscryptcreateoptions( const engines::engine::createGUIOpti
+ 
+     m_ui->pbKeyFile->setIcon( QIcon( ":/icons/file.png" ) ) ;
+ 
+-	connect( m_ui->pbKeyFile,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbKeyFile,SIGNAL( clicked() ),m_ui->pbKeyFile,[ this ](){
+ 
+ 		auto e = QFileDialog::getOpenFileName( this,tr( "Select A 32 Byte KeyFile" ),QDir::homePath() ) ;
+ 
+@@ -51,7 +52,7 @@ fscryptcreateoptions::fscryptcreateoptions( const engines::engine::createGUIOpti
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbLoginPassPhrase,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbLoginPassPhrase,SIGNAL( toggled( bool ) ),m_ui->rbLoginPassPhrase,[ this ]( bool e ){
+ 
+ 		if( !e ){
+ 
+@@ -61,7 +62,7 @@ fscryptcreateoptions::fscryptcreateoptions( const engines::engine::createGUIOpti
+ 		m_ui->lineEditProtectorName ->setEnabled( !e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->rbRawKey,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbRawKey,SIGNAL( toggled( bool ) ),m_ui->rbRawKey,[ this ]( bool e ){
+ 
+ 		if( !e ){
+ 
+@@ -72,7 +73,7 @@ fscryptcreateoptions::fscryptcreateoptions( const engines::engine::createGUIOpti
+ 		m_ui->pbKeyFile->setEnabled( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->rbCustomKey,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbCustomKey,SIGNAL( toggled( bool ) ),m_ui->rbCustomKey,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -80,12 +81,12 @@ fscryptcreateoptions::fscryptcreateoptions( const engines::engine::createGUIOpti
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbCancel,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbCancel,SIGNAL( pressed() ),m_ui->pbCancel,[ this ](){
+ 
+ 		this->HideUI() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbOK,&QPushButton::pressed,[ this ](){
++	connectFunctor( m_ui->pbOK,SIGNAL( pressed() ),m_ui->pbOK,[ this ](){
+ 
+ 		auto m = m_ui->lineEditProtectorName->text() ;
+ 
+diff --git a/src/engines/options.cpp b/src/engines/options.cpp
+index 6ebaf71..e1cf30f 100644
+--- a/src/engines/options.cpp
++++ b/src/engines/options.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "options.h"
++#include "../functorslot.h"
+ #include "ui_options.h"
+ #include "../dialogmsg.h"
+ 
+@@ -45,10 +46,10 @@ options::options( const engines::engine& engine,const engines::engine::mountGUIO
+ 
+ 	this->setWindowIcon( QIcon( ":/sirikali.png" ) ) ;
+ 
+-	connect( m_ui->pbConfigFile,&QPushButton::clicked,this,&options::pbConfigFile ) ;
+-	connect( m_ui->pbKeyFile,&QPushButton::clicked,this,&options::pbKeyFile ) ;
+-	connect( m_ui->pbOK,&QPushButton::clicked,this,&options::pbSet ) ;
+-	connect( m_ui->pbCancel,&QPushButton::clicked,this,&options::pbCancel ) ;
++	connectFunctor( m_ui->pbConfigFile,SIGNAL( clicked() ),this,[ this ](){ this->pbConfigFile() ; } ) ;
++	connectFunctor( m_ui->pbKeyFile,SIGNAL( clicked() ),this,[ this ](){ this->pbKeyFile() ; } ) ;
++	connectFunctor( m_ui->pbOK,SIGNAL( clicked() ),this,[ this ](){ this->pbSet() ; } ) ;
++	connectFunctor( m_ui->pbCancel,SIGNAL( clicked() ),this,[ this ](){ this->pbCancel() ; } ) ;
+ 
+ 	utility::connectQCheckBox( m_ui->checkBox,[ this ]( bool e ){
+ 
+diff --git a/src/favorites2.cpp b/src/favorites2.cpp
+index 15db6ab..6c4544a 100644
+--- a/src/favorites2.cpp
++++ b/src/favorites2.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "favorites2.h"
++#include "functorslot.h"
+ #include "ui_favorites2.h"
+ 
+ #include "tablewidget.h"
+@@ -148,7 +149,7 @@ favorites2::favorites2( QWidget * parent,
+ 			m->addAction( ac ) ;
+ 		}
+ 
+-		connect( m,&QMenu::triggered,[ this ]( QAction * ac ){
++		connectFunctorAction( m,SIGNAL( triggered( QAction* ) ),m,[ this ]( QAction * ac ){
+ 
+ 			const auto& m = ac->objectName() ;
+ 
+@@ -167,14 +168,14 @@ favorites2::favorites2( QWidget * parent,
+ 		return m ;
+ 	}() ) ;
+ 
+-	connect( m_ui->cbAutoMountAtStartUp,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbAutoMountAtStartUp,SIGNAL( toggled( bool ) ),m_ui->cbAutoMountAtStartUp,[ this ]( bool e ){
+ 
+ 		m_settings.autoMountFavoritesOnStartUp( e ) ;
+ 	} ) ;
+ 
+ 	m_ui->cbAutoMountWhenAvailable->setChecked( m_settings.autoMountFavoritesOnAvailable() ) ;
+ 
+-	connect( m_ui->cbShowFavoriteListOnContextMenu,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbShowFavoriteListOnContextMenu,SIGNAL( toggled( bool ) ),m_ui->cbShowFavoriteListOnContextMenu,[ this ]( bool e ){
+ 
+ 		m_settings.showFavoritesInContextMenu( e ) ;
+ 	} ) ;
+@@ -189,22 +190,22 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->cbAllowExternalToolsToReadPasswords,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbAllowExternalToolsToReadPasswords,SIGNAL( toggled( bool ) ),m_ui->cbAllowExternalToolsToReadPasswords,[ this ]( bool e ){
+ 
+ 		m_settings.allowExternalToolsToReadPasswords( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbAutoMountWhenAvailable,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbAutoMountWhenAvailable,SIGNAL( toggled( bool ) ),m_ui->cbAutoMountWhenAvailable,[ this ]( bool e ){
+ 
+ 		m_settings.autoMountFavoritesOnAvailable( e ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbShowMountDialogWhenAutoMounting,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbShowMountDialogWhenAutoMounting,SIGNAL( toggled( bool ) ),m_ui->cbShowMountDialogWhenAutoMounting,[ this ]( bool e ){
+ 
+ 		m_settings.showMountDialogWhenAutoMounting( e ) ;
+ 	} ) ;	
+ 
+-	connect( m_ui->pbKeyFileVolumePathFromFavorites,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbKeyFileVolumePathFromFavorites,SIGNAL( clicked() ),m_ui->pbKeyFileVolumePathFromFavorites,[ this ](){
+ 
+ 		auto e = this->getExistingFile( tr( "Path To KeyFile" ) ) ;
+ 
+@@ -214,19 +215,19 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbConfigFilePath,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbConfigFilePath,SIGNAL( clicked() ),m_ui->pbConfigFilePath,[ this ](){
+ 
+ 		this->configPath() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbAdd,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbAdd,SIGNAL( clicked() ),m_ui->pbAdd,[ this ](){
+ 
+ 		this->updateFavorite( false ) ;
+ 	} ) ;
+ 
+ 	m_ui->pbFolderPath->setObjectName( "FolderHandle" ) ;
+ 
+-	connect( m_ui->pbFolderPath,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbFolderPath,SIGNAL( clicked() ),m_ui->pbFolderPath,[ this ](){
+ 
+ 		if( m_ui->pbFolderPath->objectName() == "FolderHandle" ){
+ 
+@@ -236,7 +237,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbFailedToCreateFavorite,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbFailedToCreateFavorite,SIGNAL( clicked() ),m_ui->pbFailedToCreateFavorite,[ this ](){
+ 
+ 		m_ui->pbFailedToCreateFavorite->setVisible( false ) ;
+ 
+@@ -247,7 +248,7 @@ favorites2::favorites2( QWidget * parent,
+ 		m_ui->pbAdd->setFocus() ;
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidgetWallet,&QTableWidget::customContextMenuRequested,[ this ]( QPoint s ){
++	connectFunctorPoint( m_ui->tableWidgetWallet,SIGNAL( customContextMenuRequested( QPoint ) ),m_ui->tableWidgetWallet,[ this ]( QPoint s ){
+ 
+ 		Q_UNUSED( s )
+ 
+@@ -259,54 +260,54 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidgetWallet,&QTableWidget::currentItemChanged,[]( QTableWidgetItem * c,QTableWidgetItem * p ){
++	connectFunctorTableItems( m_ui->tableWidgetWallet,SIGNAL( currentItemChanged( QTableWidgetItem*,QTableWidgetItem* ) ),m_ui->tableWidgetWallet,[]( QTableWidgetItem * c,QTableWidgetItem * p ){
+ 
+ 		tablewidget::selectRow( c,p ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbPreMount,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbPreMount,SIGNAL( clicked() ),m_ui->pbPreMount,[ this ](){
+ 
+ 		this->setCommand( m_ui->lineEditPreMount ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbPreUnMount,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbPreUnMount,SIGNAL( clicked() ),m_ui->pbPreUnMount,[ this ](){
+ 
+ 		this->setCommand( m_ui->lineEditPreUnMount ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbPostMount,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbPostMount,SIGNAL( clicked() ),m_ui->pbPostMount,[ this ](){
+ 
+ 		this->setCommand( m_ui->lineEditPostMount ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbPostUnmount,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbPostUnmount,SIGNAL( clicked() ),m_ui->pbPostUnmount,[ this ](){
+ 
+ 		this->setCommand( m_ui->lineEditPostUnmount ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbEdit,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbEdit,SIGNAL( clicked() ),m_ui->pbEdit,[ this ](){
+ 
+ 		m_editRow = m_ui->tableWidget->currentRow() ;
+ 
+ 		this->updateFavorite( true ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbReverseMode,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbReverseMode,SIGNAL( toggled( bool ) ),m_ui->cbReverseMode,[ this ]( bool e ){
+ 
+ 		m_reverseMode = e ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbVolumeNoPassword,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbVolumeNoPassword,SIGNAL( toggled( bool ) ),m_ui->cbVolumeNoPassword,[ this ]( bool e ){
+ 
+ 		m_volumeNeedNoPassword = e ;
+ 	} ) ;
+ 
+-	connect( m_ui->cbReadOnlyMode,&QCheckBox::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->cbReadOnlyMode,SIGNAL( toggled( bool ) ),m_ui->cbReadOnlyMode,[ this ]( bool e ){
+ 
+ 		m_mountReadOnly = e ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbIdentityFile,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbIdentityFile,SIGNAL( clicked() ),m_ui->pbIdentityFile,[ this ](){
+ 
+ 		auto e = this->getExistingFile( tr( "Path To A Config File" ) ) ;
+ 
+@@ -316,17 +317,17 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->tabWidget,&QTabWidget::currentChanged,[ this ]( int index ){
++	connectFunctorInt( m_ui->tabWidget,SIGNAL( currentChanged( int ) ),m_ui->tabWidget,[ this ]( int index ){
+ 
+ 		this->tabChanged( index ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbAddKeyToWallet,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbAddKeyToWallet,SIGNAL( clicked() ),m_ui->pbAddKeyToWallet,[ this ](){
+ 
+ 		this->addkeyToWallet() ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbAddToWallets,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbAddToWallets,SIGNAL( clicked() ),m_ui->pbAddToWallets,[ this ](){
+ 
+ 		auto a = m_ui->lineEditEncryptedFolderPath->toPlainText() ;
+ 
+@@ -345,7 +346,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbVolumePath,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbVolumePath,SIGNAL( clicked() ),m_ui->pbVolumePath,[ this ](){
+ 
+ 		auto s = this->getExistingDirectory( tr( "Path To An Encrypted Folder" ) ) ;
+ 
+@@ -355,12 +356,12 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( &m_volPathFav,&QMenu::triggered,[ this ]( QAction * ac ){
++	connectFunctorAction( &m_volPathFav,SIGNAL( triggered( QAction* ) ),&m_volPathFav,[ this ]( QAction * ac ){
+ 
+ 		m_ui->lineEditVolumePath->setText( ac->objectName() ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbVolumePathFromFavorites,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbVolumePathFromFavorites,SIGNAL( clicked() ),m_ui->pbVolumePathFromFavorites,[ this ](){
+ 
+ 		m_volPathFav.exec() ;
+ 	} ) ;
+@@ -435,7 +436,7 @@ favorites2::favorites2( QWidget * parent,
+ 		m_ui->rbNone->setChecked( true ) ;
+ 	}
+ 
+-	connect( m_ui->rbInternalWallet,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbInternalWallet,SIGNAL( toggled( bool ) ),m_ui->rbInternalWallet,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -455,7 +456,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbWindowsDPAPI,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbWindowsDPAPI,SIGNAL( toggled( bool ) ),m_ui->rbWindowsDPAPI,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -468,7 +469,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbKWallet,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbKWallet,SIGNAL( toggled( bool ) ),m_ui->rbKWallet,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -481,7 +482,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbLibSecret,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbLibSecret,SIGNAL( toggled( bool ) ),m_ui->rbLibSecret,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -493,7 +494,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbMacOSKeyChain,&QRadioButton::toggled,[ this ]( bool e ){
++	connectFunctorBool( m_ui->rbMacOSKeyChain,SIGNAL( toggled( bool ) ),m_ui->rbMacOSKeyChain,[ this ]( bool e ){
+ 
+ 		if( e ){
+ 
+@@ -505,7 +506,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->rbNone,&QRadioButton::toggled,[ this ](){
++	connectFunctor( m_ui->rbNone,SIGNAL( toggled( bool ) ),m_ui->rbNone,[ this ](){
+ 
+ 		m_ui->label_22->setText( tr( "Not Applicable" ) ) ;
+ 		m_ui->label_22->setEnabled( false ) ;
+@@ -523,20 +524,20 @@ favorites2::favorites2( QWidget * parent,
+ 
+ 		m_ui->labelMountPointPrefix->setText( tr( "Mount Point Prefix" ) ) ;
+ 
+-		connect( m_ui->pbMountPointPath,&QPushButton::clicked, [ this ](){
++		connectFunctor( m_ui->pbMountPointPath,SIGNAL( clicked() ),m_ui->pbMountPointPath, [ this ](){
+ 
+ 			this->mountPointPath() ;
+ 		} ) ;
+ 	}
+ 
+-	connect( m_ui->pbClose,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbClose,SIGNAL( clicked() ),m_ui->pbClose,[ this ](){
+ 
+ 		this->HideUI() ;
+ 	} ) ;
+ 
+ 	m_ui->tableWidget->setContextMenuPolicy( Qt::ContextMenuPolicy::CustomContextMenu ) ;
+ 
+-	connect( m_ui->tableWidget,&QTableWidget::customContextMenuRequested,[ this ]( const QPoint& ){
++	connectFunctorPoint( m_ui->tableWidget,SIGNAL( customContextMenuRequested( QPoint ) ),m_ui->tableWidget,[ this ]( const QPoint& ){
+ 
+ 		QMenu m ;
+ 
+@@ -545,7 +546,7 @@ favorites2::favorites2( QWidget * parent,
+ 		m.exec( QCursor::pos() ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidget,&QTableWidget::itemClicked,[ this ]( QTableWidgetItem * item ){
++	connectFunctorTableItem( m_ui->tableWidget,SIGNAL( itemClicked( QTableWidgetItem* ) ),m_ui->tableWidget,[ this ]( QTableWidgetItem * item ){
+ 
+ 		const auto& volumes = favorites::instance().readFavorites() ;
+ 
+@@ -559,7 +560,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidget,&QTableWidget::currentItemChanged,[]( QTableWidgetItem * x,QTableWidgetItem * y ){
++	connectFunctorTableItems( m_ui->tableWidget,SIGNAL( currentItemChanged( QTableWidgetItem*,QTableWidgetItem* ) ),m_ui->tableWidget,[]( QTableWidgetItem * x,QTableWidgetItem * y ){
+ 
+ 		tablewidget::selectRow( x,y ) ;
+ 	} ) ;
+@@ -567,7 +568,7 @@ favorites2::favorites2( QWidget * parent,
+ 	m_ui->labelPassword->setVisible( false ) ;
+ 	m_ui->pbVisiblePassword->setVisible( false ) ;
+ 
+-	connect( m_ui->pbVisiblePassword,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbVisiblePassword,SIGNAL( clicked() ),m_ui->pbVisiblePassword,[ this ](){
+ 
+ 		m_ui->labelPassword->clear() ;
+ 		m_ui->labelPassword->setVisible( false ) ;
+@@ -588,7 +589,7 @@ favorites2::favorites2( QWidget * parent,
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->pbChangeWalletPassword,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbChangeWalletPassword,SIGNAL( clicked() ),m_ui->pbChangeWalletPassword,[ this ](){
+ 
+ 		auto a = m_settings.walletName() ;
+ 		auto b = m_settings.applicationName() ;
+@@ -651,7 +652,7 @@ favorites2::favorites2( QWidget * parent,
+ 
+ 		ac->setShortcuts( { Qt::Key_Enter,Qt::Key_Return,Qt::Key_Menu } ) ;
+ 
+-		connect( ac,&QAction::triggered,[ this ](){
++		connectFunctor( ac,SIGNAL( triggered() ),ac,[ this ](){
+ 
+ 			this->shortcutPressed() ;
+ 		} ) ;
+@@ -674,28 +675,28 @@ void favorites2::setMenu( QMenu& m )
+ {
+ 	m.setFont( this->font() ) ;
+ 
+-	connect( m.addAction( tr( "Toggle AutoMount" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Toggle AutoMount" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		this->toggleAutoMount() ;
+ 	} ) ;
+ 
+ 	m.addSeparator() ;
+ 
+-	connect( m.addAction( tr( "Edit" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Edit" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		this->edit() ;
+ 	} ) ;
+ 
+ 	m.addSeparator() ;
+ 
+-	connect( m.addAction( tr( "Remove Selected Entry" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Remove Selected Entry" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		this->removeEntryFromFavoriteList() ;
+ 	} ) ;
+ 
+ 	m.addSeparator() ;
+ 
+-	connect( m.addAction( tr( "Add Entry To Default Wallet" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Add Entry To Default Wallet" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		auto table = m_ui->tableWidget ;
+ 
+@@ -810,7 +811,7 @@ void favorites2::showContextMenu( QTableWidgetItem * item,bool itemClicked )
+ {
+ 	QMenu m ;
+ 
+-	connect( m.addAction( tr( "Delete Entry" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Delete Entry" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		auto table = m_ui->tableWidgetWallet ;
+ 
+@@ -824,7 +825,7 @@ void favorites2::showContextMenu( QTableWidgetItem * item,bool itemClicked )
+ 		}
+ 	} ) ;
+ 
+-	connect( m.addAction( tr( "Show Password" ) ),&QAction::triggered,[ this ](){
++	connectFunctor( m.addAction( tr( "Show Password" ) ),SIGNAL( triggered() ),&m,[ this ](){
+ 
+ 		auto table = m_ui->tableWidgetWallet ;
+ 
+diff --git a/src/filemanager.cpp b/src/filemanager.cpp
+index 067a9e9..dd59e6b 100644
+--- a/src/filemanager.cpp
++++ b/src/filemanager.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "filemanager.h"
++#include "functorslot.h"
+ #include "ui_filemanager.h"
+ 
+ #include "utility.h"
+@@ -31,7 +32,7 @@ fileManager::fileManager( QWidget * parent,QString& e,bool s ) :
+ {
+ 	m_ui->setupUi( this ) ;
+ 
+-	connect( m_ui->pushButton,&QPushButton::clicked,this,&fileManager::set ) ;
++	connectFunctor( m_ui->pushButton,SIGNAL( clicked() ),this,[ this ](){ this->set() ; } ) ;
+ 
+ 	this->setFixedSize( this->size() ) ;
+ 	this->setFont( parent->font() ) ;
+diff --git a/src/functorslot.cpp b/src/functorslot.cpp
+index bbfeab3..0789be8 100644
+--- a/src/functorslot.cpp
++++ b/src/functorslot.cpp
+@@ -19,8 +19,31 @@
+ 
+ #include "functorslot.h"
+ 
++#include <QMetaType>
+ #include <QTimer>
+ 
++static void _registerProcessMetaTypes()
++{
++#if QT_VERSION < QT_VERSION_CHECK( 5,5,0 )
++	/*
++	 * A queued connection resolves the argument types of the signal through
++	 * QMetaType::type() and refuses to deliver anything it can not resolve.
++	 * Qt only started registering the QProcess enums with the meta type
++	 * system when Q_ENUM replaced Q_ENUMS in Qt 5.5,before that they have
++	 * to be registered by hand.
++	 */
++	static bool done = false ;
++
++	if( !done ){
++
++		done = true ;
++
++		qRegisterMetaType< QProcess::ProcessError >( "QProcess::ProcessError" ) ;
++		qRegisterMetaType< QProcess::ExitStatus >( "QProcess::ExitStatus" ) ;
++	}
++#endif
++}
++
+ QObject * connectFunctor( QObject * sender,
+ 			  const char * signal,
+ 			  QObject * context,
+@@ -144,6 +167,8 @@ QObject * connectFunctorProcessError( QObject * sender,
+ 				      std::function< void( QProcess::ProcessError ) > function,
+ 				      Qt::ConnectionType type )
+ {
++	_registerProcessMetaTypes() ;
++
+ 	auto s = new functorSlot::ProcessError( context,std::move( function ) ) ;
+ 
+ 	QObject::connect( sender,signal,s,SLOT( invoke( QProcess::ProcessError ) ),type ) ;
+@@ -157,6 +182,8 @@ QObject * connectFunctorProcessFinished( QObject * sender,
+ 					 std::function< void( int,QProcess::ExitStatus ) > function,
+ 					 Qt::ConnectionType type )
+ {
++	_registerProcessMetaTypes() ;
++
+ 	auto s = new functorSlot::ProcessFinished( context,std::move( function ) ) ;
+ 
+ 	QObject::connect( sender,signal,s,SLOT( invoke( int,QProcess::ExitStatus ) ),type ) ;
+diff --git a/src/keydialog.cpp b/src/keydialog.cpp
+index 1a7f35b..9f1a27a 100644
+--- a/src/keydialog.cpp
++++ b/src/keydialog.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "keydialog.h"
++#include "functorslot.h"
+ #include "ui_keydialog.h"
+ 
+ #include <QCloseEvent>
+@@ -235,19 +236,19 @@ void keyDialog::setUpInitUI()
+ 		this->keyDialog::cbMountReadOnlyStateChanged( s ) ;
+ 	} ) ;
+ 
+-	connect( m_ui->pbCancel,&QPushButton::clicked,this,&keyDialog::pbCancel ) ;
+-	connect( m_ui->pbOpen,&QPushButton::clicked,this,&keyDialog::pbOpen ) ;
+-	connect( m_ui->pbkeyOption,&QPushButton::clicked,this,&keyDialog::pbkeyOption ) ;
+-	connect( m_ui->pbOpenFolderPath,&QPushButton::clicked,this,&keyDialog::pbFolderPath ) ;
+-	connect( m_ui->pbMountPoint,&QPushButton::clicked,this,&keyDialog::pbMountPointPath ) ;
+-	connect( m_ui->pbOK,&QPushButton::clicked,this,&keyDialog::pbOK ) ;
+-	connect( m_ui->tbVisibleKey,&QToolButton::clicked,this,&keyDialog::cbVisibleKeyclicked ) ;
+-	connect( m_ui->pbOptions,&QPushButton::clicked,this,&keyDialog::pbOptions ) ;
+-	connect( m_ui->pbSetKeyKeyFile,&QPushButton::clicked,this,&keyDialog::pbSetKeyKeyFile ) ;
+-	connect( m_ui->pbSetKey,&QPushButton::clicked,this,&keyDialog::pbSetKey ) ;
+-	connect( m_ui->pbSetKeyCancel,&QPushButton::clicked,this,&keyDialog::pbSetKeyCancel ) ;
++	connectFunctor( m_ui->pbCancel,SIGNAL( clicked() ),this,[ this ](){ this->pbCancel() ; } ) ;
++	connectFunctor( m_ui->pbOpen,SIGNAL( clicked() ),this,[ this ](){ this->pbOpen() ; } ) ;
++	connectFunctor( m_ui->pbkeyOption,SIGNAL( clicked() ),this,[ this ](){ this->pbkeyOption() ; } ) ;
++	connectFunctor( m_ui->pbOpenFolderPath,SIGNAL( clicked() ),this,[ this ](){ this->pbFolderPath() ; } ) ;
++	connectFunctor( m_ui->pbMountPoint,SIGNAL( clicked() ),this,[ this ](){ this->pbMountPointPath() ; } ) ;
++	connectFunctor( m_ui->pbOK,SIGNAL( clicked() ),this,[ this ](){ this->pbOK() ; } ) ;
++	connectFunctor( m_ui->tbVisibleKey,SIGNAL( clicked() ),this,[ this ](){ this->cbVisibleKeyclicked() ; } ) ;
++	connectFunctor( m_ui->pbOptions,SIGNAL( clicked() ),this,[ this ](){ this->pbOptions() ; } ) ;
++	connectFunctor( m_ui->pbSetKeyKeyFile,SIGNAL( clicked() ),this,[ this ](){ this->pbSetKeyKeyFile() ; } ) ;
++	connectFunctor( m_ui->pbSetKey,SIGNAL( clicked() ),this,[ this ](){ this->pbSetKey() ; } ) ;
++	connectFunctor( m_ui->pbSetKeyCancel,SIGNAL( clicked() ),this,[ this ](){ this->pbSetKeyCancel() ; } ) ;
+ 
+-	connect( m_ui->pbMountPoint_1,&QPushButton::clicked,[ this ](){
++	connectFunctor( m_ui->pbMountPoint_1,SIGNAL( clicked() ),m_ui->pbMountPoint_1,[ this ](){
+ 
+ 		auto msg = tr( "Select A Folder To Create A Mount Point In." ) ;
+ 		auto e = utility::getExistingDirectory( this,msg,m_settings.homePath() ) ;
+@@ -267,8 +268,10 @@ void keyDialog::setUpInitUI()
+ 
+ 		m_ui->pbMountPoint_1->setVisible( false ) ;
+ 
+-		connect( m_ui->lineEditMountPoint,&QLineEdit::textChanged,
+-			 this,&keyDialog::textChanged ) ;
++		connectFunctorString( m_ui->lineEditMountPoint,
++				      SIGNAL( textChanged( QString ) ),
++				      this,
++				      [ this ]( const QString& e ){ this->textChanged( e ) ; } ) ;
+ 
+ 		m_ui->pbOpen->setText( tr( "&Create" ) ) ;
+ 
+@@ -319,8 +322,10 @@ void keyDialog::setUpInitUI()
+ 
+ 		if( m_keyStrength ){
+ 
+-			connect( m_ui->lineEditKey,&QLineEdit::textChanged,
+-				 this,&keyDialog::passWordTextChanged ) ;
++			connectFunctorString( m_ui->lineEditKey,
++					      SIGNAL( textChanged( QString ) ),
++					      this,
++					      [ this ]( const QString& e ){ this->passWordTextChanged( e ) ; } ) ;
+ 		}
+ 
+ 		m_ui->lineEditMountPoint->setFocus() ;
+@@ -603,7 +608,7 @@ void keyDialog::setUpVolumeProperties( const keyDialog::entry& ee )
+ 
+ 		_addAction( tr( "Options" ),"Options",true ) ;
+ 
+-		connect( m,&QMenu::triggered,[ this ]( QAction * ac ){
++		connectFunctorAction( m,SIGNAL( triggered( QAction* ) ),m,[ this ]( QAction * ac ){
+ 
+ 			if( ac->objectName() == "Options" ){
+ 
+@@ -2184,9 +2189,10 @@ void keyDialog::keyType::keyOptions( QComboBox * s,keyDialog * object,void( keyD
+ 
+ 	this->setAsKey() ;
+ 
+-	auto m = static_cast< void( QComboBox::* )( int ) >( &QComboBox::currentIndexChanged ) ;
+-
+-	connect( m_comboBox,m,[ this,object,method ]( int e ){
++	connectFunctorInt( m_comboBox,
++			   SIGNAL( currentIndexChanged( int ) ),
++			   m_comboBox,
++			   [ this,object,method ]( int e ){
+ 
+ 		if( e >= 0 && e < static_cast< int >( m_entries.size() ) ){
+ 
+diff --git a/src/keydialog.h b/src/keydialog.h
+index b88348e..4ef1244 100644
+--- a/src/keydialog.h
++++ b/src/keydialog.h
+@@ -21,6 +21,7 @@
+ #define KEYDIALOG_H
+ 
+ #include <QDialog>
++#include "functorslot.h"
+ #include <QString>
+ #include <QStringList>
+ #include <QTimer>
+@@ -54,7 +55,7 @@ class cryfsWarning : public QObject
+ public:
+ 	cryfsWarning()
+ 	{
+-		connect( &m_timer,&QTimer::timeout,[ this ](){
++		connectFunctor( &m_timer,SIGNAL( timeout() ),&m_timer,[ this ](){
+ 
+ 			this->update() ;
+ 		} ) ;
+diff --git a/src/mountinfo.cpp b/src/mountinfo.cpp
+index e191f83..cdb26fd 100644
+--- a/src/mountinfo.cpp
++++ b/src/mountinfo.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "mountinfo.h"
++#include "functorslot.h"
+ #include "utility.h"
+ #include "siritask.h"
+ #include "task.hpp"
+@@ -199,7 +200,11 @@ mountinfo::mountinfo( QObject * parent,
+ 	m_oldMountList( _unlocked_volumes() ),
+ 	m_dbusMonitor( [ this ]( const QString& e ){ emit this->autoMount( e ) ; },m_debug )
+ {
+-	connect( this,&mountinfo::updateVolume,this,&mountinfo::volumeUpdate,Qt::QueuedConnection ) ;
++	connectFunctor( this,
++			SIGNAL( updateVolume() ),
++			this,
++			[ this ](){ this->volumeUpdate() ; },
++			Qt::QueuedConnection ) ;
+ 
+ 	if( utility::platformIsWindows() || utility::platformIsFlatPak() ){
+ 
+diff --git a/src/oneinstance.cpp b/src/oneinstance.cpp
+index e02b7ee..08d488b 100644
+--- a/src/oneinstance.cpp
++++ b/src/oneinstance.cpp
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "oneinstance.h"
++#include "functorslot.h"
+ #include <QDebug>
+ #include "utility.h"
+ #include <memory>
+@@ -35,7 +36,7 @@ oneinstance::oneinstance( QObject * parent,
+ {
+ 	if( QFile::exists( m_serverPath ) ){
+ 
+-		connect( &m_localSocket,&QLocalSocket::connected,this,[ this ](){
++		connectFunctor( &m_localSocket,SIGNAL( connected() ),this,[ this ](){
+ 
+ 			utility::debug() << tr( "There seem to be another instance running,exiting this one" ) ;
+ 
+@@ -51,24 +52,17 @@ oneinstance::oneinstance( QObject * parent,
+ 		} ) ;
+ 
+ #if QT_VERSION < QT_VERSION_CHECK( 5,15,0 )
+-		using cs = void( QLocalSocket::* )( QLocalSocket::LocalSocketError ) ;
+-
+-		connect( &m_localSocket,static_cast< cs >( &QLocalSocket::error ),[ this ]( QLocalSocket::LocalSocketError e ){
+-
+-			Q_UNUSED( e )
+-			utility::debug() << tr( "Previous instance seem to have crashed,trying to clean up before starting" ) ;
+-			QFile::remove( m_serverPath ) ;
+-			this->start() ;
+-		} ) ;
++		auto errorSignal = SIGNAL( error( QLocalSocket::LocalSocketError ) ) ;
+ #else
+-		connect( &m_localSocket,&QLocalSocket::errorOccurred,[ this ]( QLocalSocket::LocalSocketError e ){
++		auto errorSignal = SIGNAL( errorOccurred( QLocalSocket::LocalSocketError ) ) ;
++#endif
++		connectFunctor( &m_localSocket,errorSignal,this,[ this ](){
+ 
+-			Q_UNUSED( e )
+ 			utility::debug() << tr( "Previous instance seem to have crashed,trying to clean up before starting" ) ;
+ 			QFile::remove( m_serverPath ) ;
+ 			this->start() ;
+ 		} ) ;
+-#endif
++
+ 		m_localSocket.connectToServer( m_serverPath ) ;
+ 	}else{
+ 		this->start() ;
+@@ -79,7 +73,7 @@ void oneinstance::start()
+ {
+ 	m_callbacks.start( m_argument ) ;
+ 
+-	connect( &m_localServer,&QLocalServer::newConnection,[ this ](){
++	connectFunctor( &m_localServer,SIGNAL( newConnection() ),&m_localServer,[ this ](){
+ 
+ 		std::unique_ptr< QLocalSocket > s( m_localServer.nextPendingConnection() ) ;
+ 
+diff --git a/src/plugin.cpp b/src/plugin.cpp
+index 0121db3..bb2ab7f 100644
+--- a/src/plugin.cpp
++++ b/src/plugin.cpp
+@@ -19,6 +19,7 @@
+ 
+ 
+ #include "plugin.h"
++#include "functorslot.h"
+ #include "plugins.h"
+ #include "crypto.h"
+ #include "ui_plugin.h"
+@@ -55,9 +56,9 @@ plugin::plugin( QWidget * parent,
+ 	this->setFixedSize( this->size() ) ;
+ 	this->setFont( parent->font() ) ;
+ 
+-	connect( m_ui->pbSetKey,&QPushButton::clicked,this,&plugin::pbSetKey ) ;
+-	connect( m_ui->pbCancel,&QPushButton::clicked,this,&plugin::pbClose ) ;
+-	connect( m_ui->pbKeyFile,&QPushButton::clicked,this,&plugin::pbSelectKeyFile ) ;
++	connectFunctor( m_ui->pbSetKey,SIGNAL( clicked() ),this,[ this ](){ this->pbSetKey() ; } ) ;
++	connectFunctor( m_ui->pbCancel,SIGNAL( clicked() ),this,[ this ](){ this->pbClose() ; } ) ;
++	connectFunctor( m_ui->pbKeyFile,SIGNAL( clicked() ),this,[ this ](){ this->pbSelectKeyFile() ; } ) ;
+ 
+     m_ui->pbKeyFile->setIcon( QIcon( ":/icons/file.png" ) ) ;
+ 
+diff --git a/src/readonlywarning.cpp b/src/readonlywarning.cpp
+index 28e6d60..c9e83e1 100644
+--- a/src/readonlywarning.cpp
++++ b/src/readonlywarning.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "readonlywarning.h"
++#include "functorslot.h"
+ #include "ui_readonlywarning.h"
+ 
+ #include "utility.h"
+@@ -41,8 +42,12 @@ readOnlyWarning::readOnlyWarning( QWidget * parent,bool checked ) :
+ 	this->setFont( parent->font() ) ;
+ 	this->setFixedSize( this->size() ) ;
+ 
+-	connect( m_ui->PbOK,&QPushButton::clicked,this,&readOnlyWarning::pbOK ) ;
+-	connect( m_ui->checkBox,&QCheckBox::clicked,this,&readOnlyWarning::checkBoxChecked ) ;
++	connectFunctor( m_ui->PbOK,SIGNAL( clicked() ),this,[ this ](){ this->pbOK() ; } ) ;
++
++	connectFunctorBool( m_ui->checkBox,
++			    SIGNAL( clicked( bool ) ),
++			    this,
++			    [ this ]( bool e ){ this->checkBoxChecked( e ) ; } ) ;
+ 
+ 	this->installEventFilter( this ) ;
+ 
+diff --git a/src/sirikali.cpp b/src/sirikali.cpp
+index 9c5d883..86fbcaa 100644
+--- a/src/sirikali.cpp
++++ b/src/sirikali.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "sirikali.h"
++#include "functorslot.h"
+ #include "ui_sirikali.h"
+ #include <QDebug>
+ 
+@@ -258,26 +259,26 @@ sirikali::sirikali( const QStringList& args,QApplication& app ) :
+ 	m_argumentList( args )
+ {
+ 	connect( &m_trayIcon,
+-		 &QSystemTrayIcon::activated,
++		 SIGNAL( activated( QSystemTrayIcon::ActivationReason ) ),
+ 		 this,
+-		 &sirikali::trayClicked ) ;
++		 SLOT( trayClicked( QSystemTrayIcon::ActivationReason ) ) ) ;
+ 
+-	connect( &m_checkUpdates,
+-		 &checkUpdates::doneCheckingUpdates,
+-		 this,
+-		 &sirikali::setCreateMenu ) ;
++	connectFunctor( &m_checkUpdates,
++			SIGNAL( doneCheckingUpdates() ),
++			this,
++			[ this ](){ this->setCreateMenu() ; } ) ;
+ 
+-	connect( &m_mountInfo,
+-		 &mountinfo::pbUpdate,
+-		 this,
+-		 &sirikali::pbUpdate,
+-		 Qt::QueuedConnection ) ;
++	connectFunctor( &m_mountInfo,
++			SIGNAL( pbUpdate() ),
++			this,
++			[ this ](){ this->pbUpdate() ; },
++			Qt::QueuedConnection ) ;
+ 
+-	connect( &m_mountInfo,
+-		 &mountinfo::autoMount,
+-		 this,
+-		 &sirikali::autoMountFavoritesOnAvailable,
+-		 Qt::QueuedConnection ) ;
++	connectFunctorString( &m_mountInfo,
++			      SIGNAL( autoMount( QString ) ),
++			      this,
++			      [ this ]( const QString& e ){ this->autoMountFavoritesOnAvailable( e ) ; },
++			      Qt::QueuedConnection ) ;
+ 
+ 	utility::miscOptions::instance().setMainQtWidget( this ) ;
+ }
+@@ -407,7 +408,7 @@ void sirikali::setUpApp( const QString& volume )
+ 
+ 	//m_ui->tableWidget->horizontalHeader()->setStretchLastSection( true ) ;
+ 
+-	connect( m_ui->tableWidget,&QTableWidget::customContextMenuRequested,[ this ]( QPoint s ){
++	connectFunctorPoint( m_ui->tableWidget,SIGNAL( customContextMenuRequested( QPoint ) ),m_ui->tableWidget,[ this ]( QPoint s ){
+ 
+ 		Q_UNUSED( s )
+ 
+@@ -419,14 +420,20 @@ void sirikali::setUpApp( const QString& volume )
+ 		}
+ 	} ) ;
+ 
+-	connect( m_ui->tableWidget,
+-		 &QTableWidget::currentItemChanged,
+-		 this,
+-		 &sirikali::slotCurrentItemChanged ) ;
++	connectFunctorTableItems( m_ui->tableWidget,
++				  SIGNAL( currentItemChanged( QTableWidgetItem*,QTableWidgetItem* ) ),
++				  this,
++				  [ this ]( QTableWidgetItem * c,QTableWidgetItem * p ){
++
++		this->slotCurrentItemChanged( c,p ) ;
++	} ) ;
+ 
+-	connect( m_ui->pbupdate,&QPushButton::clicked,this,&sirikali::pbUpdate ) ;
++	connectFunctor( m_ui->pbupdate,SIGNAL( clicked() ),this,[ this ](){ this->pbUpdate() ; } ) ;
+ 
+-	connect( m_ui->tableWidget,&QTableWidget::itemClicked,this,&sirikali::itemClicked ) ;
++	connectFunctorTableItem( m_ui->tableWidget,
++				 SIGNAL( itemClicked( QTableWidgetItem* ) ),
++				 this,
++				 [ this ]( QTableWidgetItem * e ){ this->itemClicked( e ) ; } ) ;
+ 
+ 	if( engines::instance().atLeastOneDealsWithFiles() ){
+ 
+@@ -437,7 +444,7 @@ void sirikali::setUpApp( const QString& volume )
+ 			auto ac = m->addAction( a ) ;
+ 			m_actionPair.emplace_back( ac,b ) ;
+ 
+-			connect( ac,&QAction::triggered,[ this,c ](){
++			connectFunctor( ac,SIGNAL( triggered() ),ac,[ this,c ](){
+ 
+ 				this->unlockVolume( c ) ;
+ 			} ) ;
+@@ -449,7 +456,7 @@ void sirikali::setUpApp( const QString& volume )
+ 
+ 		m_ui->pbunlockvolume->setMenu( m ) ;
+ 	}else{
+-		connect( m_ui->pbunlockvolume,&QPushButton::clicked,[ this ](){
++		connectFunctor( m_ui->pbunlockvolume,SIGNAL( clicked() ),m_ui->pbunlockvolume,[ this ](){
+ 
+ 			this->unlockVolume( true ) ;
+ 		} ) ;
+@@ -488,7 +495,7 @@ void sirikali::setUpApp( const QString& volume )
+ 
+ 		auto s = new QTimer( this ) ;
+ 
+-		connect( s,&QTimer::timeout,[ this,e ](){
++		connectFunctor( s,SIGNAL( timeout() ),s,[ this,e ](){
+ 
+ 			this->runIntervalCustomCommand( e ) ;
+ 		} ) ;
+@@ -1098,7 +1105,10 @@ void sirikali::setCreateMenu()
+ {
+ 	auto m = new QMenu( this ) ;
+ 
+-	connect( m,&QMenu::triggered,this,&sirikali::createVolume ) ;
++	connectFunctorAction( m,
++			      SIGNAL( triggered( QAction* ) ),
++			      this,
++			      [ this ]( QAction * ac ){ this->createVolume( ac ) ; } ) ;
+ 
+ 	for( const auto& it : engines::instance().supportedEngines() ){
+ 
+@@ -2223,12 +2233,12 @@ void sirikali::updateFavoritesInContextMenu()
+ 
+ 		m_context_menu = new QMenu( this ) ;
+ 
+-		connect( m_context_menu,&QMenu::aboutToShow,[ this ](){
++		connectFunctor( m_context_menu,SIGNAL( aboutToShow() ),m_context_menu,[ this ](){
+ 
+ 			this->updateAgainFavoritesInContextMenu() ;
+ 		} ) ;
+ 
+-		connect( m_context_menu,&QMenu::triggered,[ this ]( QAction * ac ){
++		connectFunctorAction( m_context_menu,SIGNAL( triggered( QAction* ) ),m_context_menu,[ this ]( QAction * ac ){
+ 
+ 			if( ac->isCheckable() ){
+ 
+diff --git a/src/sirikali.h b/src/sirikali.h
+index c41aa25..fe47d51 100644
+--- a/src/sirikali.h
++++ b/src/sirikali.h
+@@ -21,6 +21,7 @@
+ #define MAINWINDOW_H
+ 
+ #include <QObject>
++#include "functorslot.h"
+ #include <QWidget>
+ #include <QString>
+ #include <QStringList>
+@@ -72,6 +73,15 @@ private:
+ class sirikali : public QMainWindow
+ {
+ 	Q_OBJECT
++private slots:
++	/*
++	 * A string based connection needs the slot argument types to spell out
++	 * the same as the signal ones,so this one is a real slot instead of a
++	 * connectFunctor*() carrier(there is no carrier taking a
++	 * QSystemTrayIcon::ActivationReason and it is the only signal in the
++	 * project needing one).
++	 */
++	void trayClicked( QSystemTrayIcon::ActivationReason ) ;
+ public:
+ 	static int run( const QStringList&,int argc,char * argv[] ) ;
+ 	static int unlockVolume( const QStringList&,secrets& ) ;
+@@ -127,7 +137,6 @@ private:
+ 	void pbUpdate() ;
+ 	void itemClicked( QTableWidgetItem * ) ;
+ 
+-	void trayClicked( QSystemTrayIcon::ActivationReason ) ;
+ 	void trayClickedq() ;
+ 	void createVolume( QAction * ) ;
+ 
+@@ -251,14 +260,17 @@ private:
+ 
+ 		ac->setFont( this->font() ) ;
+ 
+-		connect( ac,&QAction::triggered,this,s ) ;
++		connectFunctor( ac,SIGNAL( triggered() ),this,[ this,s ](){ ( this->*s )() ; } ) ;
+ 
+ 		return ac ;
+ 	}
+ 
+ 	void addAction( QMenu& m,const QString& txt,sirikali::cbVoid s )
+ 	{
+-		connect( m.addAction( txt ),&QAction::triggered,this,s ) ;
++		connectFunctor( m.addAction( txt ),
++				SIGNAL( triggered() ),
++				this,
++				[ this,s ](){ ( this->*s )() ; } ) ;
+ 	}
+ 
+ 	QAction * addAction( std::initializer_list< QKeySequence > s,sirikali::cbVoid m )
+@@ -267,7 +279,7 @@ private:
+ 
+ 		ac->setShortcuts( s ) ;
+ 
+-		connect( ac,&QAction::triggered,this,m ) ;
++		connectFunctor( ac,SIGNAL( triggered() ),this,[ this,m ](){ ( this->*m )() ; } ) ;
+ 
+ 		return ac ;
+ 	}
+@@ -280,9 +292,12 @@ private:
+ 
+ 		e->setFont( this->font() ) ;
+ 
+-		connect( e,&QMenu::triggered,this,t ) ;
++		connectFunctorAction( e,
++				      SIGNAL( triggered( QAction* ) ),
++				      this,
++				      [ this,t ]( QAction * ac ){ ( this->*t )( ac ) ; } ) ;
+ 
+-		connect( e,&QMenu::aboutToShow,this,s ) ;
++		connectFunctor( e,SIGNAL( aboutToShow() ),this,[ this,s ](){ ( this->*s )() ; } ) ;
+ 
+ 		return e ;
+ 	}
+@@ -384,7 +399,7 @@ public:
+ 	{
+ 		auto m = Qt::QueuedConnection ;
+ 
+-		connect( this,&starter::getStarted,this,&starter::start,m ) ;
++		connectFunctor( this,SIGNAL( getStarted() ),this,[ this ](){ this->start() ; },m ) ;
+ 
+ 		emit this->getStarted() ;
+ 	}
+diff --git a/src/sirikali_cppcryptfs/CMakeLists.txt b/src/sirikali_cppcryptfs/CMakeLists.txt
+index 83f722a..ca6f1c0 100644
+--- a/src/sirikali_cppcryptfs/CMakeLists.txt
++++ b/src/sirikali_cppcryptfs/CMakeLists.txt
+@@ -16,15 +16,16 @@ endif()
+ if(BUILD_WITH_QT4)
+         find_package( Qt4 4.8.0 COMPONENTS QtCore REQUIRED )
+         include_directories( ${QT_INCLUDES} )
+-        add_executable(sirikali_cppcryptfs  main.cpp )
++        QT4_WRAP_CPP( MOC ../functorslot.h )
++        add_executable(sirikali_cppcryptfs  main.cpp ../functorslot.cpp ${MOC} )
+         target_link_libraries(sirikali_cppcryptfs ${QT_LIBRARIES})
+ elseif(BUILD_WITH_QT6)
+         find_package( Qt6 COMPONENTS Core  REQUIRED )
+-        add_executable(sirikali_cppcryptfs  main.cpp )
++        add_executable(sirikali_cppcryptfs  main.cpp ../functorslot.cpp ../functorslot.h )
+         target_link_libraries(sirikali_cppcryptfs Qt6::Core)
+ else()
+         find_package( Qt5 COMPONENTS Core REQUIRED )
+-        add_executable(sirikali_cppcryptfs  main.cpp )
++        add_executable(sirikali_cppcryptfs  main.cpp ../functorslot.cpp ../functorslot.h )
+         target_link_libraries(sirikali_cppcryptfs Qt5::Core)
+ endif()
+ 
+diff --git a/src/sirikali_cppcryptfs/main.cpp b/src/sirikali_cppcryptfs/main.cpp
+index 948642d..c6f9d07 100644
+--- a/src/sirikali_cppcryptfs/main.cpp
++++ b/src/sirikali_cppcryptfs/main.cpp
+@@ -24,6 +24,8 @@
+ #include <QThread>
+ #include <QDir>
+ 
++#include "../functorslot.h"
++
+ #include <fileapi.h>
+ 
+ #include <array>
+@@ -263,7 +265,7 @@ private:
+ template< typename Function,typename Ctx >
+ static void _run_delayed( int waitTime,Ctx& ctx,Function function )
+ {
+-	QTimer::singleShot( waitTime,[ &ctx,function = std::move( function ) ](){
++	singleShotFunctor( waitTime,nullptr,[ &ctx,function = std::move( function ) ](){
+ 
+ 		function( ctx ) ;
+ 	} ) ;
+@@ -284,7 +286,11 @@ static void _runInBgThread( BackGroundTask bgt,UiThreadResult fgt )
+ 			m_bgt( std::move( bgt ) ),
+ 			m_fgt( std::move( fgt ) )
+ 		{
+-			connect( this,&QThread::finished,this,&Thread::then,Qt::QueuedConnection ) ;
++			connectFunctor( this,SIGNAL( finished() ),this,[ this ](){
++
++				this->then() ;
++
++			},Qt::QueuedConnection ) ;
+ 
+ 			this->start() ;
+ 		}
+@@ -324,17 +330,16 @@ static void _run( const QString& exe,const QStringList& args,const QByteArray& p
+ 
+ 	if( !password.isEmpty() ){
+ 
+-		QObject::connect( cmd,&QProcess::started,[ cmd,password ](){
++		connectFunctor( cmd,SIGNAL( started() ),cmd,[ cmd,password ](){
+ 
+ 			cmd->write( password ) ;
+ 		} ) ;
+ 	}
+ 
+-	using cc = void( QProcess::* )( int,QProcess::ExitStatus ) ;
+-
+-	auto s = static_cast< cc >( &QProcess::finished ) ;
+-
+-	QObject::connect( cmd,s,[ cmd,result = std::move( result ) ]( int,QProcess::ExitStatus ){
++	connectFunctorProcessFinished( cmd,
++				       SIGNAL( finished( int,QProcess::ExitStatus ) ),
++				       cmd,
++				       [ cmd,result = std::move( result ) ]( int,QProcess::ExitStatus ){
+ 
+ 		result( *cmd ) ;
+ 
+diff --git a/src/siripolkit/CMakeLists.txt b/src/siripolkit/CMakeLists.txt
+index df48e6b..fb9059c 100644
+--- a/src/siripolkit/CMakeLists.txt
++++ b/src/siripolkit/CMakeLists.txt
+@@ -32,6 +32,7 @@ set( sirikali.pkexecSRC
+ if(BUILD_WITH_QT4)
+ 	find_package( Qt4 4.8.0 COMPONENTS QtCore QtNetwork REQUIRED )
+ 	include_directories( ${QT_INCLUDES} )
++	QT4_WRAP_CPP( sirikali.pkexecMOC zulupolkit.h )
+ elseif(BUILD_WITH_QT6)
+ 	find_package( Qt6 COMPONENTS Core Network REQUIRED )
+ else()
+diff --git a/src/siripolkit/main.cpp b/src/siripolkit/main.cpp
+index 8448e55..df20e60 100644
+--- a/src/siripolkit/main.cpp
++++ b/src/siripolkit/main.cpp
+@@ -48,18 +48,7 @@ int main( int argc,char * argv[] )
+ 	}else{
+ 		zuluPolkit e( s ) ;
+ 
+-		auto m = new QTimer() ;
+-
+-		m->setSingleShot( true ) ;
+-
+-		QObject::connect( m,&QTimer::timeout,[ & ](){
+-
+-			e.start() ;
+-
+-			m->deleteLater() ;
+-		} ) ;
+-
+-		m->start( 100 ) ;
++		QTimer::singleShot( 100,&e,SLOT( start() ) ) ;
+ 
+ 		return a.exec() ;
+ 	}
+diff --git a/src/siripolkit/zulupolkit.cpp b/src/siripolkit/zulupolkit.cpp
+index 6768435..5a102b6 100644
+--- a/src/siripolkit/zulupolkit.cpp
++++ b/src/siripolkit/zulupolkit.cpp
+@@ -87,10 +87,7 @@ static bool _terminalEchoOff( struct termios * old,struct termios * current )
+ 
+ zuluPolkit::zuluPolkit( const QStringList& s ) : m_arguments( s )
+ {
+-	connect( &m_server,&QLocalServer::newConnection,[ this ](){
+-
+-		this->gotConnection() ;
+-	} ) ;
++	connect( &m_server,SIGNAL( newConnection() ),this,SLOT( gotConnection() ) ) ;
+ }
+ 
+ zuluPolkit::~zuluPolkit()
+diff --git a/src/siripolkit/zulupolkit.h b/src/siripolkit/zulupolkit.h
+index f8c3640..896b695 100644
+--- a/src/siripolkit/zulupolkit.h
++++ b/src/siripolkit/zulupolkit.h
+@@ -28,12 +28,15 @@
+ 
+ class zuluPolkit : public QObject
+ {
++	Q_OBJECT
+ public:
+ 	zuluPolkit( const QStringList& ) ;
+-	void start() ;
+ 	~zuluPolkit() ;
+-private:
++public slots:
++	void start() ;
++private slots:
+ 	void gotConnection() ;
++private:
+ 	bool passSanityCheck( const QString& cmd,const QStringList& s ) ;
+ 	QStringList m_arguments ;
+ 	QString readStdin() ;
+diff --git a/src/systemsignalhandler.cpp b/src/systemsignalhandler.cpp
+index 8b222b0..d1ddec3 100644
+--- a/src/systemsignalhandler.cpp
++++ b/src/systemsignalhandler.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "qt4compat.h"
+ #include "settings.h"
++#include "functorslot.h"
+ #include "systemsignalhandler.h"
+ #include <memory>
+ 
+@@ -123,9 +124,12 @@ void systemSignalHandler::addSignal( systemSignalHandler::signal SIG )
+ 
+ 	auto mm = new QSocketNotifier( e.reader(),QSocketNotifier::Read,sHandler.parent ) ;
+ 
+-	QObject::connect( mm,&QSocketNotifier::activated,[ SIG,mm ]( int s ){
+-
+-		Q_UNUSED( s )
++#if QT_VERSION < QT_VERSION_CHECK( 6,0,0 )
++	auto activated = SIGNAL( activated( int ) ) ;
++#else
++	auto activated = SIGNAL( activated( QSocketDescriptor,QSocketNotifier::Type ) ) ;
++#endif
++	connectFunctor( mm,activated,mm,[ SIG,mm ](){
+ 
+ 		auto& signalHandler = signalHandler::instance() ;
+ 
+diff --git a/src/utility.cpp b/src/utility.cpp
+index a45370b..f33c10e 100644
+--- a/src/utility.cpp
++++ b/src/utility.cpp
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "flatpak.h"
++#include "functorslot.h"
+ 
+ #include "utility.h"
+ 
+@@ -1302,7 +1303,7 @@ static void _setWindowsMountMountOptions( QWidget * obj,E e,QPushButton * s )
+ 		actions.append( ac ) ;
+ 	}
+ 
+-	QObject::connect( menu,&QMenu::triggered,[ e ]( QAction * ac ){
++	connectFunctorAction( menu,SIGNAL( triggered( QAction * ) ),menu,[ e ]( QAction * ac ){
+ 
+ 		e->setText( ac->objectName() ) ;
+ 	} ) ;
+diff --git a/src/utility.h b/src/utility.h
+index a238ac7..e882919 100644
+--- a/src/utility.h
++++ b/src/utility.h
+@@ -59,6 +59,7 @@
+ #include <unistd.h>
+ 
+ #include "cmd.hpp"
++#include "functorslot.h"
+ #include "task.hpp"
+ #include "lxqt_wallet.h"
+ #include "plugins.h"
+@@ -404,7 +405,7 @@ namespace utility
+ 			{
+ 				auto timer = new QTimer() ;
+ 
+-				QObject::connect( timer,&QTimer::timeout,[ timer,this ](){
++				connectFunctor( timer,SIGNAL( timeout() ),timer,[ timer,this ](){
+ 
+ 					m_counter++ ;
+ 
+@@ -616,12 +617,15 @@ namespace utility
+ 	void connectQCheckBox( QCheckBox * cb,Function function )
+ 	{
+ 		#if QT_VERSION < QT_VERSION_CHECK( 6,7,0 )
+-			QObject::connect( cb,&QCheckBox::stateChanged,[ function ]( int s ){
++			connectFunctorInt( cb,SIGNAL( stateChanged( int ) ),cb,[ function ]( int s ){
+ 
+ 				function( s == static_cast< int >( Qt::CheckState::Checked ) ) ;
+ 			} ) ;
+ 		#else
+-			QObject::connect( cb,&QCheckBox::checkStateChanged,[ function ]( Qt::CheckState s ){
++			connectFunctorCheckState( cb,
++						  SIGNAL( checkStateChanged( Qt::CheckState ) ),
++						  cb,
++						  [ function ]( Qt::CheckState s ){
+ 
+ 				function( s == Qt::CheckState::Checked ) ;
+ 			} ) ;
+diff --git a/src/utils/network_access_manager.hpp b/src/utils/network_access_manager.hpp
+index 91e6db1..8dc8347 100644
+--- a/src/utils/network_access_manager.hpp
++++ b/src/utils/network_access_manager.hpp
+@@ -29,6 +29,8 @@
+ 
+ #include <memory>
+ 
++#include "../functorslot.h"
++
+ namespace utils
+ {
+ 	namespace network
+@@ -160,8 +162,23 @@ namespace utils
+ 				}
+ 				void result( bool timeOut )
+ 				{
+-					QObject::disconnect( m_networkConn ) ;
+-					QObject::disconnect( m_timerConn ) ;
++					/*
++					 * Deleting the object that carries the lambda breaks the
++					 * connection.  It has to be deferred because this method
++					 * runs from inside one of them.
++					 */
++					if( m_networkConn ){
++
++						m_networkConn->deleteLater() ;
++						m_networkConn = nullptr ;
++					}
++
++					if( m_timerConn ){
++
++						m_timerConn->deleteLater() ;
++						m_timerConn = nullptr ;
++					}
++
+ 					m_timer.stop() ;
+ 					m_reply( { m_networkReply,timeOut } ) ;
+ 					m_progress( { true,timeOut,m_networkReply,0,0 } ) ;
+@@ -179,10 +196,10 @@ namespace utils
+ 
+ 					return s ;
+ 				}
+-				void start( int timeOut,QMetaObject::Connection&& nc,QMetaObject::Connection&& tc )
++				void start( int timeOut,QObject * nc,QObject * tc )
+ 				{
+-					m_networkConn = std::move( nc ) ;
+-					m_timerConn = std::move( tc ) ;
++					m_networkConn = nc ;
++					m_timerConn = tc ;
+ 					m_timer.start( timeOut ) ;
+ 				}
+ 				QNetworkReply * networkReply()
+@@ -220,29 +237,31 @@ namespace utils
+ 				Progress m_progress ;
+ 				QMutex& m_mutex ;
+ 				QNetworkReply& m_networkReply ;
+-				QMetaObject::Connection m_networkConn ;
+-				QMetaObject::Connection m_timerConn ;
++				QObject * m_networkConn = nullptr ;
++				QObject * m_timerConn = nullptr ;
+ 			} ;
+ 			template< typename Reply,typename Progress,typename Function >
+ 			void setupReply( QNetworkReply * s,Reply&& reply,Progress&& progress,Function&& function ) const
+ 			{
+ 				auto hdl = std::make_shared< handle< Reply,Progress > >( std::move( reply ),std::move( progress ),*s,m_mutex ) ;
+ 
+-				QObject::connect( s,&QNetworkReply::downloadProgress,[ &h = *hdl,function = std::move( function ) ]( qint64 r,qint64 t ){
++				connectFunctorProgress( s,SIGNAL( downloadProgress( qint64,qint64 ) ),s,
++							[ &h = *hdl,function = std::move( function ) ]( qint64 r,qint64 t ){
+ 
+ 					h.stopTimer() ;
+ 
+ 					function( h,r,t ) ;
+ 				} ) ;
+ 
+-				hdl->start( m_timeOut,QObject::connect( hdl->networkReply(),&QNetworkReply::finished,[ hdl ](){
++				auto nc = connectFunctor( hdl->networkReply(),SIGNAL( finished() ),hdl->networkReply(),[ hdl ](){
+ 
+ 					if( hdl->firstSeen() ){
+ 
+ 						hdl->result( false ) ;
+ 					}
++				} ) ;
+ 
+-				} ),QObject::connect( hdl->timer(),&QTimer::timeout,[ hdl ](){
++				auto tc = connectFunctor( hdl->timer(),SIGNAL( timeout() ),hdl->timer(),[ hdl ](){
+ 
+ 					if( hdl->firstSeen() ){
+ 
+@@ -250,7 +269,9 @@ namespace utils
+ 
+ 						hdl->networkReply()->abort() ;
+ 					}
+-				} ) ) ;
++				} ) ;
++
++				hdl->start( m_timeOut,nc,tc ) ;
+ 			}
+ 			template< typename Reply,typename Progress >
+ 			void setupReply( QNetworkReply * s,Reply&& reply,Progress&& progress ) const
+diff --git a/src/utils/qprocess.hpp b/src/utils/qprocess.hpp
+index 5af3cca..e22abe2 100644
+--- a/src/utils/qprocess.hpp
++++ b/src/utils/qprocess.hpp
+@@ -21,6 +21,8 @@
+ #include <QByteArray>
+ #include <QString>
+ 
++#include "../functorslot.h"
++
+ #pragma once
+ 
+ namespace utils
+@@ -58,32 +60,53 @@ namespace utils
+ 				{
+ 					m_events.whenCreated( m_exe ) ;
+ 
+-					using cc = void( QProcess::* )( int,QProcess::ExitStatus ) ;					
++					auto conn = Qt::QueuedConnection ;
++
++					connectFunctorProcessError( &m_exe,
++								    this->errorSignal(),
++								    this,
++								    [ this ]( QProcess::ProcessError err ){
+ 
+-					auto a = this->errorSignal() ;
+-					auto b = &QProcess::started ;
+-					auto c = &QProcess::readyReadStandardOutput ;
+-					auto d = &QProcess::readyReadStandardError ;
+-					auto e = static_cast< cc >( &QProcess::finished ) ;
++						this->withError( err ) ;
+ 
+-					auto conn = Qt::QueuedConnection ;
++					},conn ) ;
++
++					connectFunctor( &m_exe,SIGNAL( started() ),this,[ this ](){
++
++						this->whenStarted() ;
++
++					},conn ) ;
++
++					connectFunctor( &m_exe,SIGNAL( readyReadStandardOutput() ),this,[ this ](){
++
++						this->withStdOut() ;
++
++					},conn ) ;
++
++					connectFunctor( &m_exe,SIGNAL( readyReadStandardError() ),this,[ this ](){
++
++						this->withStdError() ;
++
++					},conn ) ;
++
++					connectFunctorProcessFinished( &m_exe,
++								       SIGNAL( finished( int,QProcess::ExitStatus ) ),
++								       this,
++								       [ this ]( int e,QProcess::ExitStatus ss ){
++
++						this->whenDone( e,ss ) ;
+ 
+-					QObject::connect( &m_exe,a,this,&process::withError,conn ) ;
+-					QObject::connect( &m_exe,b,this,&process::whenStarted,conn ) ;
+-					QObject::connect( &m_exe,c,this,&process::withStdOut,conn ) ;
+-					QObject::connect( &m_exe,d,this,&process::withStdError,conn ) ;
+-					QObject::connect( &m_exe,e,this,&process::whenDone,conn ) ;
++					},conn ) ;
+ 
+ 					m_exe.start( cmd,args ) ;
+ 				}
+ 			private:
+-				auto errorSignal()
++				static const char * errorSignal()
+ 				{
+ 				#if QT_VERSION >= QT_VERSION_CHECK( 5,6,0 )
+-					return &QProcess::errorOccurred ;
++					return SIGNAL( errorOccurred( QProcess::ProcessError ) ) ;
+ 				#else
+-					using aa = void( QProcess::* )( QProcess::ProcessError ) ;
+-					return static_cast< aa >( &QProcess::error ) ;
++					return SIGNAL( error( QProcess::ProcessError ) ) ;
+ 				#endif
+ 				}
+ 				void withError( QProcess::ProcessError err )
+diff --git a/src/utils/single_instance.hpp b/src/utils/single_instance.hpp
+index 890c3e5..636efb0 100644
+--- a/src/utils/single_instance.hpp
++++ b/src/utils/single_instance.hpp
+@@ -26,6 +26,7 @@
+ #include <QString>
+ #include <QFile>
+ #include "../qt4compat.h"
++#include "../functorslot.h"
+ #include <QLocalServer>
+ #include <QLocalSocket>
+ 
+@@ -35,38 +36,19 @@ namespace utils
+ 	{
+ 		namespace details
+ 		{
+-			#if QT_VERSION < QT_VERSION_CHECK( 5,4,0 )
+-			class exec : public QObject
+-			{
+-				Q_OBJECT
+-			public:
+-				exec( std::function< void() > function ) : m_function( std::move( function ) )
+-				{
+-					QTimer::singleShot( 0,this,SLOT( run() ) ) ;
+-				}
+-			private slots:
+-				void run()
+-				{
+-					m_function() ;
+-				}
+-			private:
+-				std::function< void() > m_function ;
+-			} ;
+-#else
+ 			class exec
+ 			{
+ 			public:
+ 				template< typename Function >
+ 				exec( Function function )
+ 				{
+-					QTimer::singleShot( 0,[ function = std::move( function ) ]{
++					singleShotFunctor( 0,nullptr,[ function = std::move( function ) ](){
+ 
+ 						function() ;
+ 					} ) ;
+ 				}
+ 			private:
+ 			} ;
+-#endif
+ 		}
+ 		template< typename Type,typename TypeArgs >
+ 		struct appInfo
+@@ -154,7 +136,7 @@ namespace utils
+ 			{
+ 				if( QFile::exists( m_info.socketPath ) ){
+ 
+-					QObject::connect( &m_localSocket,&QLocalSocket::connected,[ this ](){
++					connectFunctor( &m_localSocket,SIGNAL( connected() ),&m_localSocket,[ this ](){
+ 
+ 						if( !m_info.data.isEmpty() ){
+ 
+@@ -172,22 +154,17 @@ namespace utils
+ 					} ) ;
+ 
+ 				#if QT_VERSION < QT_VERSION_CHECK( 5,15,0 )
+-					using cs = void( QLocalSocket::* )( QLocalSocket::LocalSocketError ) ;
+-
+-					QObject::connect( &m_localSocket,static_cast< cs >( &QLocalSocket::error ),[ this ]( QLocalSocket::LocalSocketError ){
+-
+-						m_iargs.otherInstanceCrashed() ;
+-						QFile::remove( m_info.socketPath ) ;
+-						this->start() ;
+-					} ) ;
++					auto errorSignal = SIGNAL( error( QLocalSocket::LocalSocketError ) ) ;
+ 				#else
+-					QObject::connect( &m_localSocket,&QLocalSocket::errorOccurred,[ this ]( QLocalSocket::LocalSocketError ){
++					auto errorSignal = SIGNAL( errorOccurred( QLocalSocket::LocalSocketError ) ) ;
++				#endif
++					connectFunctor( &m_localSocket,errorSignal,&m_localSocket,[ this ](){
+ 
+ 						m_iargs.otherInstanceCrashed() ;
+ 						QFile::remove( m_info.socketPath ) ;
+ 						this->start() ;
+ 					} ) ;
+-				#endif
++
+ 					m_localSocket.connectToServer( m_info.socketPath ) ;
+ 				}else{
+ 					this->start() ;
+@@ -199,11 +176,11 @@ namespace utils
+ 
+ 				m_mainApp->start( std::move( m_info.data ) ) ;
+ 
+-				QObject::connect( &m_localServer,&QLocalServer::newConnection,[ this ](){
++				connectFunctor( &m_localServer,SIGNAL( newConnection() ),&m_localServer,[ this ](){
+ 
+ 					auto s = m_localServer.nextPendingConnection() ;
+ 
+-					QObject::connect( s,&QLocalSocket::readyRead,[ this,s ]{
++					connectFunctor( s,SIGNAL( readyRead() ),s,[ this,s ](){
+ 
+ 						m_mainApp->hasEvent( s->readAll() ) ;
+ 						s->deleteLater() ;
+diff --git a/src/utils/threads.hpp b/src/utils/threads.hpp
+index d77be67..07b20fa 100644
+--- a/src/utils/threads.hpp
++++ b/src/utils/threads.hpp
+@@ -22,6 +22,8 @@
+ 
+ #include <type_traits>
+ 
++#include "../functorslot.h"
++
+ #pragma once
+ 
+ namespace utils
+@@ -52,7 +54,11 @@ namespace utils
+ 					m_bgt( std::move( bgt ) ),
+ 					m_fgt( std::move( fgt ) )
+ 				{
+-					connect( this,&QThread::finished,this,&Thread::then,Qt::QueuedConnection ) ;
++					connectFunctor( this,SIGNAL( finished() ),this,[ this ](){
++
++						this->then() ;
++
++					},Qt::QueuedConnection ) ;
+ 
+ 					this->start() ;
+ 				}
+-- 
+2.43.0
+
