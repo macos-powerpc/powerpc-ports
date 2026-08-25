@@ -1,0 +1,170 @@
+configure.ac used to hard-abort configure on any platform where
+time_t is smaller than 8 bytes (e.g. 32-bit time_t, still found on
+some Darwin/PowerPC and other legacy or embedded targets). That
+avoided a real bug rather than fixing it: x509_get_time() converted
+ASN1_TIME to time_t via timegm(3), whose overflow behaviour for
+RFC 5280 calendar dates (years 0000-9999) that don't fit in time_t
+is unspecified by POSIX and varies by libc - some silently wrap
+instead of failing, which could make a certificate/CRL/manifest with
+a far-future date appear to expire at a bogus nearby time. The same
+problem existed for the -P evaluation-time override in main.c.
+
+Do the ASN1_TIME -> epoch-seconds conversion in int64_t (wide enough
+for the full RFC 5280 range) instead of relying on timegm(3)'s return
+type, and clamp the result into whatever range time_t can actually
+represent on the target platform. A date that doesn't fit is now
+treated as "as far in that direction as representable" rather than
+wrapping into an unrelated date - notably, this ensures a certificate
+that is not actually expired is never clamped into appearing expired.
+
+configure.ac downgrades the sizeof(time_t) < 8 check from a hard
+error to a warning accordingly.
+---
+ src/usr.sbin/rpki-client/extern.h |  2 +
+ src/usr.sbin/rpki-client/main.c   | 17 +++++--
+ src/usr.sbin/rpki-client/x509.c   | 63 +++++++++++++++++++++++--
+ 3 files changed, 74 insertions(+), 8 deletions(-)
+
+diff --git src/usr.sbin/rpki-client/extern.h src/usr.sbin/rpki-client/extern.h
+--- src/extern.h
++++ src/extern.h
+@@ -1000,6 +1000,8 @@
+ 
+ void		 x509_init_oid(void);
+ char		*x509_pubkey_get_ski(X509_PUBKEY *, const char *);
++time_t		 time_t_max(void);
++time_t		 time_t_min(void);
+ int		 x509_get_time(const ASN1_TIME *, time_t *);
+ int		 x509_get_generalized_time(const char *, const char *,
+ 		    const ASN1_TIME *, time_t *);
+diff --git src/usr.sbin/rpki-client/main.c src/usr.sbin/rpki-client/main.c
+--- src/main.c
++++ src/main.c
+@@ -151,9 +151,22 @@
+ time_t
+ get_current_time(void)
+ {
+-	if (evaluation_time > X509_TIME_MIN)
+-		return (time_t)evaluation_time;
+-	return time(NULL);
++	int64_t t = evaluation_time;
++
++	if (t <= X509_TIME_MIN)
++		return time(NULL);
++
++	/*
++	 * evaluation_time (-P) accepts any RFC 5280 calendar date, which
++	 * can exceed what a narrower-than-64-bit time_t can hold; clamp
++	 * instead of letting the cast below silently wrap.
++	 */
++	if (t > (int64_t)time_t_max())
++		t = (int64_t)time_t_max();
++	else if (t < (int64_t)time_t_min())
++		t = (int64_t)time_t_min();
++
++	return (time_t)t;
+ }
+ 
+ void
+diff --git src/usr.sbin/rpki-client/x509.c src/usr.sbin/rpki-client/x509.c
+--- src/x509.c
++++ src/x509.c
+@@ -19,6 +19,7 @@
+ 
+ #include <assert.h>
+ #include <err.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -283,6 +284,56 @@
+ }
+ 
+ /*
++ * Largest and smallest values representable in a time_t, computed without
++ * assuming its width or signedness at compile time.
++ */
++time_t
++time_t_max(void)
++{
++	if ((time_t)-1 > 0)
++		return (time_t)-1;	/* unsigned time_t */
++	return (time_t)(((uintmax_t)1 << (sizeof(time_t) * 8 - 1)) - 1);
++}
++
++time_t
++time_t_min(void)
++{
++	if ((time_t)-1 > 0)
++		return (time_t)0;	/* unsigned time_t */
++	return -time_t_max() - 1;
++}
++
++/*
++ * Convert a normalized struct tm, as produced by ASN1_TIME_to_tm(), into
++ * seconds since the Epoch. RFC 5280 calendar dates range over the years
++ * 0000-9999, which can overflow a time_t narrower than 64 bits (such as
++ * the 32-bit time_t still found on some platforms). timegm(3) returns a
++ * time_t itself, so on those platforms it cannot represent - and per
++ * POSIX is not required to detect - such an overflow; some implementa-
++ * tions wrap silently instead of failing. Do the conversion in int64_t,
++ * which is wide enough for the entire RFC 5280 range, and let the caller
++ * clamp the result into whatever time_t can actually hold.
++ */
++static int64_t
++tm_to_epoch(const struct tm *tm)
++{
++	int64_t	y = (int64_t)tm->tm_year + 1900;
++	int64_t	m = tm->tm_mon + 1;
++	int64_t	d = tm->tm_mday;
++	int64_t	era, yoe, doy, doe, days;
++
++	y -= (m <= 2);
++	era = (y >= 0 ? y : y - 399) / 400;
++	yoe = y - era * 400;				/* [0, 399] */
++	doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;	/* [0, 365] */
++	doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;	/* [0, 146096] */
++	days = era * 146097 + doe - 719468;		/* since 1970-01-01 */
++
++	return days * 86400 + (int64_t)tm->tm_hour * 3600 +
++	    (int64_t)tm->tm_min * 60 + tm->tm_sec;
++}
++
++/*
+  * Convert passed ASN1_TIME to time_t *t.
+  * Returns 1 on success and 0 on failure.
+  */
+@@ -290,6 +341,7 @@
+ x509_get_time(const ASN1_TIME *at, time_t *t)
+ {
+ 	struct tm	 tm;
++	int64_t		 epoch;
+ 
+ 	*t = 0;
+ 	memset(&tm, 0, sizeof(tm));
+@@ -298,9 +350,22 @@
+ 		return 0;
+ 	if (!ASN1_TIME_to_tm(at, &tm))
+ 		return 0;
+-	tm.tm_wday = -1;	/* sentinel for error */
+-	if ((*t = timegm(&tm)) == -1 && tm.tm_wday == -1)
+-		return 0;
++
++	epoch = tm_to_epoch(&tm);
++
++	/*
++	 * Clamp rather than let the assignment below silently wrap: a
++	 * date that doesn't fit is treated as "as far in that direction
++	 * as this time_t can represent" instead of turning into a bogus
++	 * nearby date - notably a certificate that is not actually
++	 * expired must never be clamped into appearing expired.
++	 */
++	if (epoch > (int64_t)time_t_max())
++		epoch = (int64_t)time_t_max();
++	else if (epoch < (int64_t)time_t_min())
++		epoch = (int64_t)time_t_min();
++
++	*t = (time_t)epoch;
+ 	return 1;
+ }
+ 
