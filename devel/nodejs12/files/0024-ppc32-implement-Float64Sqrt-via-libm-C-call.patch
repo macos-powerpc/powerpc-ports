@@ -1,0 +1,157 @@
+From: Claude <noreply@anthropic.com>
+Date: Thu, 27 Aug 2026 02:00:00 +0000
+Subject: [PATCH] ppc32: implement Float64Sqrt/Float32Sqrt via a C call to
+ libm sqrt
+
+The RsqrtNewtonStep implementation (patch 0013) is broken by design and
+produces NaN for Math.sqrt: it hardcodes d11/d12 as scratch without
+reserving them from the register allocator (clobbering live values, and
+consuming its own operands when dst/src land on d11/d12/d13), adjusts sp
+behind the frame's back, and even on the happy path yields only ~21
+correct mantissa bits before truncating 16 more - Math.sqrt must be
+correctly rounded.
+
+Replace it with the mechanism V8 already uses for every other
+transcendental (sin/cos/log/...): route the operation through an
+ieee754 external reference and CallCFunction. libm sqrt is correctly
+rounded on all our targets. The register allocator handles clobbers via
+MarkAsCall, exactly as for the existing ieee754 unops.
+
+Float32Sqrt reuses the same opcode with a MiscField bit that appends
+frsp; rounding the correctly-rounded double result to float32 is exact
+for sqrt of any float32 input, so this stays correctly rounded too.
+
+kPPC_SqrtDouble becomes unreachable on ppc32 (it remains the fsqrt path
+on ppc64). RsqrtNewtonStep is left in the tree but no longer used.
+---
+--- a/deps/v8/src/base/ieee754.h
++++ b/deps/v8/src/base/ieee754.h
+@@ -71,6 +71,9 @@
+ // Returns the sine of |x|, where |x| is given in radians.
+ V8_BASE_EXPORT double sin(double x);
+ 
++// Returns the correctly rounded square root of |x|.
++V8_BASE_EXPORT double sqrt(double x);
++
+ // Returns the tangent of |x|, where |x| is given in radians.
+ V8_BASE_EXPORT double tan(double x);
+ 
+--- a/deps/v8/src/base/ieee754.cc
++++ b/deps/v8/src/base/ieee754.cc
+@@ -3069,6 +3069,13 @@
+   return (jx >= 0) ? z : -z;
+ }
+ 
++double sqrt(double x) {
++  // Delegate to libm, whose sqrt returns the correctly rounded result on
++  // all supported targets. Only used by architectures without a hardware
++  // sqrt instruction (ppc32).
++  return std::sqrt(x);
++}
++
+ #undef EXTRACT_WORDS
+ #undef EXTRACT_WORD64
+ #undef GET_HIGH_WORD
+--- a/deps/v8/src/codegen/external-reference.h
++++ b/deps/v8/src/codegen/external-reference.h
+@@ -139,6 +139,7 @@
+   V(ieee754_pow_function, "base::ieee754::pow")                               \
+   V(ieee754_sin_function, "base::ieee754::sin")                               \
+   V(ieee754_sinh_function, "base::ieee754::sinh")                             \
++  V(ieee754_sqrt_function, "base::ieee754::sqrt")                             \
+   V(ieee754_tan_function, "base::ieee754::tan")                               \
+   V(ieee754_tanh_function, "base::ieee754::tanh")                             \
+   V(incremental_marking_record_write_function,                                \
+--- a/deps/v8/src/codegen/external-reference.cc
++++ b/deps/v8/src/codegen/external-reference.cc
+@@ -562,6 +562,8 @@
+                              BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_sinh_function, base::ieee754::sinh,
+                              BUILTIN_FP_CALL)
++FUNCTION_REFERENCE_WITH_TYPE(ieee754_sqrt_function, base::ieee754::sqrt,
++                             BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_tan_function, base::ieee754::tan,
+                              BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_tanh_function, base::ieee754::tanh,
+--- a/deps/v8/src/compiler/backend/instruction-codes.h
++++ b/deps/v8/src/compiler/backend/instruction-codes.h
+@@ -159,6 +159,7 @@
+   V(Ieee754Float64Pow)                    \
+   V(Ieee754Float64Sin)                    \
+   V(Ieee754Float64Sinh)                   \
++  V(Ieee754Float64Sqrt)                   \
+   V(Ieee754Float64Tan)                    \
+   V(Ieee754Float64Tanh)
+ 
+--- a/deps/v8/src/compiler/backend/instruction-scheduler.cc
++++ b/deps/v8/src/compiler/backend/instruction-scheduler.cc
+@@ -271,6 +271,7 @@
+     case kIeee754Float64Pow:
+     case kIeee754Float64Sin:
+     case kIeee754Float64Sinh:
++    case kIeee754Float64Sqrt:
+     case kIeee754Float64Tan:
+     case kIeee754Float64Tanh:
+       return kNoOpcodeFlags;
+--- a/deps/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/deps/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -1324,7 +1324,14 @@
+ }
+ 
+ void InstructionSelector::VisitFloat32Sqrt(Node* node) {
++#if V8_TARGET_ARCH_PPC64
+   VisitRR(this, kPPC_SqrtDouble | MiscField::encode(1), node);
++#else
++  // No fsqrt on ppc32; call out to libm sqrt like the other ieee754 unops.
++  // The MiscField bit requests float32 rounding of the double result, which
++  // is exact for sqrt of any float32 input.
++  VisitFloat64Ieee754Unop(node, kIeee754Float64Sqrt | MiscField::encode(1));
++#endif
+ }
+ 
+ void InstructionSelector::VisitFloat64Ieee754Unop(Node* node,
+@@ -1343,7 +1350,12 @@
+ }
+ 
+ void InstructionSelector::VisitFloat64Sqrt(Node* node) {
++#if V8_TARGET_ARCH_PPC64
+   VisitRR(this, kPPC_SqrtDouble, node);
++#else
++  // No fsqrt on ppc32; call out to libm sqrt like the other ieee754 unops.
++  VisitFloat64Ieee754Unop(node, kIeee754Float64Sqrt);
++#endif
+ }
+ 
+ void InstructionSelector::VisitFloat32RoundDown(Node* node) {
+--- a/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/deps/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1643,6 +1643,14 @@
+     case kIeee754Float64Sinh:
+       ASSEMBLE_IEEE754_UNOP(sinh);
+       break;
++    case kIeee754Float64Sqrt:
++      ASSEMBLE_IEEE754_UNOP(sqrt);
++      if (MiscField::decode(instr->opcode())) {
++        // Float32Sqrt: round the double result to float32. This double
++        // rounding is exact for sqrt of any float32 input.
++        __ frsp(i.OutputDoubleRegister(), i.OutputDoubleRegister());
++      }
++      break;
+     case kIeee754Float64Cos:
+       ASSEMBLE_IEEE754_UNOP(cos);
+       break;
+@@ -1686,10 +1694,8 @@
+ #ifdef V8_TARGET_ARCH_PPC64
+       ASSEMBLE_FLOAT_UNOP_RC(fsqrt, MiscField::decode(instr->opcode()));
+ #else
+-    __ RsqrtNewtonStep(i.OutputDoubleRegister(), i.InputDoubleRegister(0), i.OutputRCBit());
+-    if (MiscField::decode(instr->opcode())) {
+-      __ frsp(i.OutputDoubleRegister(), i.OutputDoubleRegister());
+-    }
++      // Float64Sqrt/Float32Sqrt are selected as kIeee754Float64Sqrt on ppc32.
++      UNREACHABLE();
+ #endif
+       break;
+     case kPPC_FloorDouble:
+-- 
+2.39.5
