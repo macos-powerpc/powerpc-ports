@@ -1,0 +1,144 @@
+From e382c190a7f9bc3bd314bee33983e004a78dd01b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 2 Sep 2026 03:48:01 +0000
+Subject: [PATCH 10/10] Fix rclimg JSON.pm hard-require and recollindex
+ ignoring ^C on macOS
+
+rclimg: "use JSON;" sat inside "if ($opts{json})", but use is a
+compile-time directive that runs regardless of the surrounding
+runtime condition, so the script's BEGIN block aborted on every
+single image indexed (not just JSON-mode calls) unless the JSON CPAN
+module happened to be installed. Switch to JSON::PP, which is core
+since Perl 5.14 and has the same new()/encode() API, removing the
+extra dependency entirely instead of just relocating it.
+
+rclmonrcv_fsevents.cpp: RclFSEvents::startMonitoring() called
+signal(SIGINT, signalHandler) / signal(SIGTERM, signalHandler) on the
+FSEvents monitor thread. Signal disposition is process-wide, not
+per-thread, so this silently replaced the real handler installed at
+startup by rclinit.cpp's initAsyncSigs()/sigcleanup(), which sets the
+stopindexing flag that the rest of the process (e.g. rclmonprc.cpp's
+event loop) actually waits on. After that, ^C only reached this
+thread's own contextLoop.shouldExit, which just stopped its local
+CFRunLoop - the rest of recollindex never found out and hung until
+killed. Removed the competing handler; the existing once-a-second
+DummyTimerCallback now also checks the real stopindexing flag.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ddfj6DPA9L8P9ba1f3ULvn
+---
+ src/filters/rclimg               |  6 ++++--
+ src/index/rclmonrcv_fsevents.cpp | 33 +++++++++++++-------------------
+ src/index/rclmonrcv_fsevents.h   |  1 -
+ 3 files changed, 17 insertions(+), 23 deletions(-)
+
+diff --git a/src/filters/rclimg b/src/filters/rclimg
+index e13b66e1..a08a8758 100755
+--- a/src/filters/rclimg
++++ b/src/filters/rclimg
+@@ -105,8 +105,7 @@ sub imgTagsToHtml {
+         }
+     }
+     if ($opts{"json"}) {
+-        use JSON;
+-        my $json = JSON->new->allow_nonref;
++        my $json = JSON::PP->new->allow_nonref;
+         $output = $json->encode(\%hashfields);
+     } else {
+         $output = "<html>\n<head>\n";
+@@ -173,6 +172,9 @@ sub readparam {
+ #
+ use strict;
+ use Getopt::Std;
++# JSON::PP is core (since Perl 5.14), unlike the JSON wrapper module (which needs a separate
++# install, e.g. p5-json / libjson-perl), and has the same new()/encode() API used below.
++use JSON::PP;
+ 
+ # JFD: replaced the "use" call with a runtime load with error checking,
+ # for compat with the missing filter detection code.
+diff --git a/src/index/rclmonrcv_fsevents.cpp b/src/index/rclmonrcv_fsevents.cpp
+index fa473267..a574ee5c 100644
+--- a/src/index/rclmonrcv_fsevents.cpp
++++ b/src/index/rclmonrcv_fsevents.cpp
+@@ -114,6 +114,7 @@
+ #include "log.h"
+ #include "rclmon.h"
+ #include "rclinit.h"
++#include "recollindex.h"
+ #include "fstreewalk.h"
+ #include "pathut.h"
+ #include "smallut.h"
+@@ -148,7 +149,7 @@ void DummyTimerCallback(CFRunLoopTimerRef timer, void *info) {
+ 
+     // Check if the parent process is still alive
+     if(
+-        context->monitor->m_queue && 
++        context->monitor->m_queue &&
+         context->monitor->m_queue->getopt(RCLMON_NOORPHAN)
+     ) {
+         if (context->monitor->isOrphaned()) {
+@@ -156,27 +157,20 @@ void DummyTimerCallback(CFRunLoopTimerRef timer, void *info) {
+             context->shouldExit = true;
+         }
+     }
+-    
+-    
+-    // Check the exit condition
+-    if (context->shouldExit) {
++
++    // Check the exit condition. stopindexing is set by the process-wide SIGINT/SIGTERM handler
++    // installed in rclinit.cpp (initAsyncSigs()/sigcleanup()): we must not install our own
++    // signal() handler here, as that would silently replace it (signal disposition is
++    // process-wide, not per-thread) and this run loop would then be the only thing reacting to
++    // ^C, leaving the rest of the process (e.g. the rclmonprc.cpp event-processing loop, which
++    // waits on this same stopindexing) hung forever.
++    if (context->shouldExit || stopindexing) {
+         CFRunLoopStop(CFRunLoopGetCurrent());  // Stop the run loop
+     } else {
+         // Run loop is still running...
+     }
+ }
+ 
+-// Signal handler for SIGINT
+-void RclFSEvents::signalHandler(int signum) {
+-    switch(signum){    
+-    case SIGINT:
+-    case SIGTERM:
+-        LOGINFO("RclFSEvents::signalHandler: Interrupt signal (" << signum << ") received." << std::endl);
+-        contextLoop.shouldExit = true; // Set the exit flag to true
+-        break;
+-    }
+-}
+-
+ void RclFSEvents::startMonitoring(
+         RclMonEventQueue *queue,
+         RclConfig& lconfig,
+@@ -211,10 +205,9 @@ void RclFSEvents::startMonitoring(
+ 
+     CFRunLoopAddTimer(m_runLoop, dummyTimer, kCFRunLoopDefaultMode);
+ 
+-    // Register signal handler for SIGINT (CTRL-C)
+-    signal(SIGINT, signalHandler);
+-    signal(SIGTERM, signalHandler);
+-
++    // No signal() handler here on purpose: SIGINT/SIGTERM are already handled process-wide by
++    // rclinit.cpp (see the DummyTimerCallback comment above), which this run loop polls via
++    // stopindexing once a second.
+     CFRunLoopRun(); // Start the run loop
+ }
+ 
+diff --git a/src/index/rclmonrcv_fsevents.h b/src/index/rclmonrcv_fsevents.h
+index 234baf9f..60e7a591 100644
+--- a/src/index/rclmonrcv_fsevents.h
++++ b/src/index/rclmonrcv_fsevents.h
+@@ -58,7 +58,6 @@ public:
+ 
+ private:
+     int eraseWatchSubTree(CFStringRef topDirectory);
+-    static void signalHandler(int signum);
+     void releaseFSEventStream();
+     // Directory-level events mode (targets before 10.13): generate events for the entries of a
+     // changed directory which are more recent than 'since'.
+-- 
+2.43.0
+
