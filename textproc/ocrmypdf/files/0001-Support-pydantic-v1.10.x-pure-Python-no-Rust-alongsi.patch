@@ -1,0 +1,554 @@
+From ea2b461ad8d7b52b6870750f27609949ad3c907b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 4 Sep 2026 12:50:14 +0000
+Subject: [PATCH] Support pydantic v1.10.x (pure-Python, no Rust) alongside v2
+
+pydantic v1 has two semantics that no shim can hide, so the option
+models avoid them at the type-definition level:
+
+- A Union validates first-match-wins with coercion, whereas v2 tries
+  an exact type match first. PathOrIO (BinaryIO | IOBase | Path | str |
+  bytes) therefore turned the '-' stdin/stdout sentinel into a Path, and
+  plugins: Sequence[Path | str] turned plugin module names into Paths
+  that the loader then treated as files. PathOrIO now uses a validating
+  instance_of() type under v1, and the plugins union is ordered str |
+  Path (harmless under v2).
+- An Any-typed field is implicitly optional under v1, so Any is not
+  a usable fallback for the required input_file/output_file.
+
+user_words/user_patterns were typed os.PathLike, which v2 coerces from
+str but v1 treats as an arbitrary type with a strict isinstance check;
+they are now Path.
+
+The shim raises NotImplementedError for ConfigDict keys and validator
+modes it does not map, so a rebase that starts using more of the v2 API
+fails at import under v1 instead of silently degrading. pydantic v1 does
+re-run root validators on assignment under validate_assignment, so the
+mode='after' emulation also covers attribute assignment.
+
+tests/test_pydantic_compat.py pins the invariants both majors must
+satisfy; the wording of pydantic's own constraint messages differs
+between majors, so two existing tests match more loosely. The
+option-related test subset has identical pass/fail sets under pydantic
+1.10.26 and 2.13.5 on Python 3.12, and under 1.10.26 on Python 3.14.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VscjSVMm4LZYrZowXFSE5U
+---
+ pyproject.toml                                |   2 +-
+ src/ocrmypdf/_options.py                      |  36 ++-
+ src/ocrmypdf/_pydantic_compat.py              | 235 ++++++++++++++++++
+ src/ocrmypdf/builtin_plugins/ghostscript.py   |   2 +-
+ src/ocrmypdf/builtin_plugins/optimize.py      |   3 +-
+ src/ocrmypdf/builtin_plugins/tesseract_ocr.py |   2 +-
+ tests/test_ocr_image_budget.py                |   8 +-
+ tests/test_pydantic_compat.py                 |  87 +++++++
+ tests/test_rasterizer.py                      |   5 +-
+ 9 files changed, 365 insertions(+), 15 deletions(-)
+ create mode 100644 src/ocrmypdf/_pydantic_compat.py
+ create mode 100644 tests/test_pydantic_compat.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index f9c8e92..7f6bbb2 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -21,7 +21,7 @@ dependencies = [
+   "Pillow>=12",                # imageops.has_decoded_pixels() reads Image._im,
+                               # whose shape settled in 11 and is pinned by tests
+   "pluggy>=1",
+-  "pydantic>=2.12.5",
++  "pydantic>=1.10.26,<3",      # 1.10.26 is the first v1 release usable on 3.14
+   "pypdfium2>=5.0.0",
+   "rich>=13",
+   "typing-extensions>=4.12; python_version < '3.13'",
+diff --git a/src/ocrmypdf/_options.py b/src/ocrmypdf/_options.py
+index 2c24331..6f07377 100644
+--- a/src/ocrmypdf/_options.py
++++ b/src/ocrmypdf/_options.py
+@@ -16,9 +16,16 @@ from io import IOBase
+ from pathlib import Path
+ from typing import Annotated, Any, BinaryIO, Literal
+ 
+-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+-
+ from ocrmypdf._defaults import DEFAULT_LANGUAGE, DEFAULT_ROTATE_PAGES_THRESHOLD
++from ocrmypdf._pydantic_compat import (
++    PYDANTIC_V2,
++    BaseModel,
++    ConfigDict,
++    Field,
++    field_validator,
++    instance_of,
++    model_validator,
++)
+ from ocrmypdf.exceptions import BadArgsError
+ from ocrmypdf.helpers import monotonic
+ 
+@@ -31,7 +38,15 @@ log = logging.getLogger(__name__)
+ # This is populated by setup_plugin_infrastructure() after plugins are loaded
+ _plugin_option_models: dict[str, type[BaseModel]] = {}
+ 
+-PathOrIO = BinaryIO | IOBase | Path | str | bytes
++# pydantic v1 validates a Union first-match-wins with coercion, unlike v2's
++# exact-type-match-first "smart" mode, so under v1 this union would turn the
++# literal '-' stdin/stdout sentinel into a Path. (Any is no substitute: v1
++# makes Any-typed fields implicitly optional.) See _pydantic_compat.
++PathOrIO = (
++    (BinaryIO | IOBase | Path | str | bytes)
++    if PYDANTIC_V2
++    else instance_of(str, bytes, Path, IOBase)
++)
+ 
+ OutputType = Literal['auto', 'pdfa', 'pdf', 'pdfa-1', 'pdfa-2', 'pdfa-3', 'none']
+ 
+@@ -241,8 +256,15 @@ class OcrOptions(BaseModel):
+     rotate_pages_threshold: Annotated[float, Field(ge=0, le=1000)] = (
+         DEFAULT_ROTATE_PAGES_THRESHOLD
+     )
+-    user_words: os.PathLike | None = None
+-    user_patterns: os.PathLike | None = None
++    # Path rather than os.PathLike: pydantic v2 has native, str-accepting
++    # support for os.PathLike, but pydantic v1 treats it as an arbitrary type
++    # and does a strict isinstance check, which rejects the plain str that
++    # --user-words/--user-patterns actually deliver from argparse. Path is
++    # natively supported (and str-coercible) in both, and remains fspath()-able
++    # for the subprocess call and the TesseractOptions.user_words: str field
++    # this ultimately feeds.
++    user_words: Path | None = None
++    user_patterns: Path | None = None
+     fast_web_view: float = 1.0
+     continue_on_soft_render_error: bool | None = None
+ 
+@@ -264,7 +286,9 @@ class OcrOptions(BaseModel):
+     jbig2_threshold: float = 0.85
+ 
+     # Plugin system
+-    plugins: Sequence[Path | str] | None = None
++    # str before Path: pydantic v1 takes the first Union member that validates,
++    # and Path accepts any str, which would turn plugin module names into Paths.
++    plugins: Sequence[str | Path] | None = None
+ 
+     # Store any extra attributes (for plugins and dynamic options)
+     extra_attrs: dict[str, Any] = Field(
+diff --git a/src/ocrmypdf/_pydantic_compat.py b/src/ocrmypdf/_pydantic_compat.py
+new file mode 100644
+index 0000000..2986afa
+--- /dev/null
++++ b/src/ocrmypdf/_pydantic_compat.py
+@@ -0,0 +1,235 @@
++# SPDX-FileCopyrightText: 2026 James R. Barlow
++# SPDX-License-Identifier: MPL-2.0
++
++"""Compatibility shim so option models run on pydantic v1 (>=1.10) or v2.
++
++pydantic v2 requires the ``pydantic-core`` Rust extension. On platforms or
++Python versions where no ``pydantic-core`` wheel is available and there is no
++Rust toolchain to build one, only the pure-Python/Cython pydantic v1.10.x
++line can be installed. This module re-exports the small subset of the
++pydantic v2 API that :mod:`ocrmypdf._options` and the built-in plugins use,
++backed by whichever major version is actually installed, so call sites can
++import ``BaseModel``, ``ConfigDict``, ``Field``, ``field_validator`` and
++``model_validator`` from here unconditionally.
++
++Only the features actually used elsewhere in ocrmypdf are implemented, and
++anything outside that subset raises ``NotImplementedError`` at import time
++rather than silently degrading, so that a rebase onto upstream that starts
++using more of the v2 API is noticed under v1 immediately:
++
++* ``field_validator`` supports ``mode='before'`` and ``mode='after'`` with
++  the ``(cls, value)`` signature.
++* ``model_validator`` supports ``mode='before'`` (given the raw input dict,
++  same signature in both versions) and ``mode='after'`` (given ``self``,
++  must return ``self``). pydantic v1 has no ``self``-based "after"
++  validator, so one is synthesized: it is registered as a v1
++  ``root_validator(skip_on_failure=True)`` operating on the field-value
++  dict, and the wrapped function is called with a proxy object that reads
++  and writes that dict as if it were attribute access, so validator method
++  bodies written against the v2 API do not need to change. pydantic v1 also
++  re-runs root validators on assignment when ``validate_assignment`` is set,
++  so this behaves the same as v2 for ``options.x = y`` too.
++* ``ConfigDict`` accepts the keys listed in ``_CONFIG_KEYS_V2_TO_V1``.
++* ``BaseModel`` gains ``model_fields`` (class attribute), ``model_dump()``
++  and ``model_validate()``.
++
++Two pydantic v1 semantics that no shim can paper over, and that the option
++models therefore avoid at the type-definition level:
++
++* A ``Union`` is validated first-match-wins with coercion, whereas v2 tries
++  every member for an exact type match first. So ``Path | str`` turns every
++  string into a ``Path`` under v1; order such unions ``str | Path``, and use
++  :func:`instance_of` where no ordering is right.
++* A field annotated ``Any`` is implicitly optional (default ``None``) under
++  v1, whereas v2 keeps it required. So ``Any`` is not a safe stand-in for
++  a union of arbitrary types; use :func:`instance_of` instead.
++
++pydantic's own error messages ("field required" vs "Field required",
++"ensure this value is greater than 0" vs "Input should be greater than 0")
++and the ``type`` codes in ``ValidationError.errors()`` differ between the
++two majors. Messages raised by our own validators are identical, and
++``_describe_options_error`` in :mod:`ocrmypdf.__main__` handles both shapes.
++"""
++
++from __future__ import annotations
++
++import pydantic
++
++__all__ = [
++    'PYDANTIC_V2',
++    'BaseModel',
++    'ConfigDict',
++    'Field',
++    'ValidationError',
++    'field_validator',
++    'instance_of',
++    'model_validator',
++]
++
++PYDANTIC_V2 = pydantic.VERSION.startswith('2.')
++
++if PYDANTIC_V2:
++    from pydantic import (
++        BaseModel,
++        ConfigDict,
++        Field,
++        ValidationError,
++        field_validator,
++        model_validator,
++    )
++else:
++    from pydantic import BaseModel as _BaseModelV1
++    from pydantic import Field, ValidationError
++    from pydantic import root_validator as _root_validator
++    from pydantic import validator as _validator
++    from pydantic.main import ModelMetaclass as _ModelMetaclassV1
++
++    # v2 ConfigDict key -> v1 class Config attribute. Keys that mean the same
++    # thing under both names map to themselves; anything not listed here is
++    # rejected rather than silently ignored by v1.
++    _CONFIG_KEYS_V2_TO_V1 = {
++        'arbitrary_types_allowed': 'arbitrary_types_allowed',
++        'extra': 'extra',
++        'frozen': 'frozen',
++        'populate_by_name': 'allow_population_by_field_name',
++        'str_strip_whitespace': 'anystr_strip_whitespace',
++        'title': 'title',
++        'use_enum_values': 'use_enum_values',
++        'validate_assignment': 'validate_assignment',
++        'validate_default': 'validate_all',
++    }
++
++    def ConfigDict(**kwargs: object) -> dict[str, object]:
++        """Stand-in for pydantic v2's ``ConfigDict``.
++
++        Returns a plain dict of v1 config attributes; ``_CompatMetaclass``
++        below turns it into the nested ``class Config`` that pydantic v1
++        expects.
++        """
++        unknown = kwargs.keys() - _CONFIG_KEYS_V2_TO_V1.keys()
++        if unknown:
++            raise NotImplementedError(
++                f"ConfigDict keys {sorted(unknown)} have no pydantic v1 mapping "
++                "in ocrmypdf._pydantic_compat"
++            )
++        return {_CONFIG_KEYS_V2_TO_V1[k]: v for k, v in kwargs.items()}
++
++    class _CompatMetaclass(_ModelMetaclassV1):
++        """Translate v2-style config into v1's nested ``class Config``.
++
++        A ``model_config = ConfigDict(...)`` class attribute is translated
++        before pydantic v1 processes the model body, since options like
++        ``arbitrary_types_allowed`` must be in effect while fields are being
++        prepared.
++        """
++
++        def __new__(mcs, name, bases, namespace, **kwargs):
++            model_config = namespace.pop('model_config', None)
++            if model_config:
++                config_namespace = (
++                    dict(vars(namespace['Config'])) if 'Config' in namespace else {}
++                )
++                config_namespace.update(model_config)
++                namespace['Config'] = type('Config', (), config_namespace)
++            return super().__new__(mcs, name, bases, namespace, **kwargs)
++
++        @property
++        def model_fields(cls):
++            # Defined on the metaclass, not the model body, so pydantic v1's
++            # field-inference scan (which only looks at the model body's
++            # namespace) never sees this as a candidate field.
++            return cls.__fields__
++
++    class BaseModel(_BaseModelV1, metaclass=_CompatMetaclass):
++        """v1 ``BaseModel`` that also answers to a few v2 method names."""
++
++        def model_dump(self, **kwargs):
++            return self.dict(**kwargs)
++
++        @classmethod
++        def model_validate(cls, obj):
++            return cls.parse_obj(obj)
++
++    def field_validator(*fields: str, mode: str = 'after', check_fields=None):
++        """v1 equivalent of pydantic v2's ``field_validator``."""
++        if mode not in ('before', 'after'):
++            raise NotImplementedError(
++                f"field_validator(mode={mode!r}) is not supported on pydantic v1"
++            )
++        kwargs = {} if check_fields is None else {'check_fields': check_fields}
++        return _validator(*fields, pre=(mode == 'before'), allow_reuse=True, **kwargs)
++
++    class _AfterValidatorProxy:
++        """Mimics ``self`` for a v2 ``mode='after'`` validator body.
++
++        Backed by the field-value dict a v1 root validator receives.
++        """
++
++        def __init__(self, values: dict) -> None:
++            object.__setattr__(self, '_values', values)
++
++        def __getattr__(self, name):
++            try:
++                return self._values[name]
++            except KeyError as exc:
++                raise AttributeError(name) from exc
++
++        def __setattr__(self, name, value) -> None:
++            self._values[name] = value
++
++    def model_validator(*, mode: str):
++        """v1 equivalent of pydantic v2's ``model_validator``.
++
++        ``mode='before'`` maps directly onto ``root_validator(pre=True)``.
++        ``mode='after'`` is synthesized on top of
++        ``root_validator(skip_on_failure=True)`` via ``_AfterValidatorProxy``
++        so that validator bodies written for the v2 ``self``-based API work
++        unchanged.
++        """
++        if mode == 'before':
++
++            def decorator(func):
++                return _root_validator(pre=True, allow_reuse=True)(func)
++
++            return decorator
++        elif mode == 'after':
++
++            def decorator(func):
++                def _wrapper(cls, values):
++                    proxy = _AfterValidatorProxy(values)
++                    func(proxy)
++                    return proxy._values
++
++                _wrapper.__name__ = func.__name__
++                _wrapper.__qualname__ = func.__qualname__
++                return _root_validator(skip_on_failure=True, allow_reuse=True)(_wrapper)
++
++            return decorator
++        raise NotImplementedError(
++            f"model_validator(mode={mode!r}) is not supported on pydantic v1"
++        )
++
++
++def instance_of(*types: type) -> type:
++    """A field type accepting an instance of any of ``types``, passed through as-is.
++
++    For pydantic v1 only. It is the v1 counterpart of a v2 union of arbitrary
++    types under ``arbitrary_types_allowed``: an ``isinstance`` check and no
++    coercion. Neither a v1 ``Union`` (first-match-wins, coercing) nor ``Any``
++    (implicitly optional) reproduces that; see the module docstring.
++    """
++    names = ', '.join(t.__name__ for t in types)
++
++    class InstanceOf:
++        @classmethod
++        def __get_validators__(cls):
++            yield cls.validate
++
++        @classmethod
++        def validate(cls, v):
++            if not isinstance(v, types):
++                raise TypeError(f'expected {names}; got {type(v).__name__}')
++            return v
++
++    InstanceOf.__name__ = InstanceOf.__qualname__ = f'InstanceOf[{names}]'
++    return InstanceOf
+diff --git a/src/ocrmypdf/builtin_plugins/ghostscript.py b/src/ocrmypdf/builtin_plugins/ghostscript.py
+index f033f17..eba0209 100644
+--- a/src/ocrmypdf/builtin_plugins/ghostscript.py
++++ b/src/ocrmypdf/builtin_plugins/ghostscript.py
+@@ -11,11 +11,11 @@ from typing import Annotated
+ 
+ from packaging.version import Version
+ from pikepdf import Name, Pdf, Stream
+-from pydantic import BaseModel, Field
+ 
+ from ocrmypdf import hookimpl
+ from ocrmypdf._exec import ghostscript
+ from ocrmypdf._options import ProcessingMode
++from ocrmypdf._pydantic_compat import BaseModel, Field
+ from ocrmypdf.exceptions import MissingDependencyError
+ from ocrmypdf.subprocess import check_external_program
+ 
+diff --git a/src/ocrmypdf/builtin_plugins/optimize.py b/src/ocrmypdf/builtin_plugins/optimize.py
+index f9941b9..612da62 100644
+--- a/src/ocrmypdf/builtin_plugins/optimize.py
++++ b/src/ocrmypdf/builtin_plugins/optimize.py
+@@ -10,11 +10,10 @@ from collections.abc import Sequence
+ from pathlib import Path
+ from typing import Annotated
+ 
+-from pydantic import BaseModel, Field, model_validator
+-
+ from ocrmypdf import Executor, PdfContext, hookimpl
+ from ocrmypdf._exec import jbig2enc, pngquant
+ from ocrmypdf._pipeline import get_pdf_save_settings
++from ocrmypdf._pydantic_compat import BaseModel, Field, model_validator
+ from ocrmypdf.cli import numeric
+ from ocrmypdf.optimize import optimize
+ from ocrmypdf.subprocess import check_external_program
+diff --git a/src/ocrmypdf/builtin_plugins/tesseract_ocr.py b/src/ocrmypdf/builtin_plugins/tesseract_ocr.py
+index 11b81b3..6a5cf07 100644
+--- a/src/ocrmypdf/builtin_plugins/tesseract_ocr.py
++++ b/src/ocrmypdf/builtin_plugins/tesseract_ocr.py
+@@ -10,12 +10,12 @@ import os
+ from typing import Annotated
+ 
+ from PIL import Image
+-from pydantic import BaseModel, Field, field_validator, model_validator
+ 
+ from ocrmypdf import hookimpl
+ from ocrmypdf._exec import tesseract
+ from ocrmypdf._exec.tesseract import ThresholdingMethod
+ from ocrmypdf._jobcontext import PageContext
++from ocrmypdf._pydantic_compat import BaseModel, Field, field_validator, model_validator
+ from ocrmypdf.cli import numeric
+ from ocrmypdf.exceptions import BadArgsError, MissingDependencyError
+ from ocrmypdf.helpers import available_cpu_count, clamp
+diff --git a/tests/test_ocr_image_budget.py b/tests/test_ocr_image_budget.py
+index 620b761..6159de0 100644
+--- a/tests/test_ocr_image_budget.py
++++ b/tests/test_ocr_image_budget.py
+@@ -88,9 +88,11 @@ def test_max_ocr_image_mpixels_leaves_small_pages_alone(
+ @pytest.mark.parametrize('value', [0, -1])
+ def test_max_ocr_image_mpixels_must_be_positive(value):
+     """A cap of zero or less would leave no image to recognize."""
+-    with pytest.raises(
+-        ValueError, match=r"max_ocr_image_mpixels\n.*Input should be greater than 0"
+-    ):
++    # Wording of pydantic's own constraint message differs between pydantic v1
++    # ("ensure this value is greater than 0") and v2 ("Input should be greater
++    # than 0"); match on the field name and the shared "greater than 0" phrase
++    # rather than pinning one version's exact text.
++    with pytest.raises(ValueError, match=r"max_ocr_image_mpixels\n.*greater than 0"):
+         OcrOptions(input_file='a.pdf', output_file='b.pdf', max_ocr_image_mpixels=value)
+ 
+ 
+diff --git a/tests/test_pydantic_compat.py b/tests/test_pydantic_compat.py
+new file mode 100644
+index 0000000..cf8ba95
+--- /dev/null
++++ b/tests/test_pydantic_compat.py
+@@ -0,0 +1,87 @@
++# SPDX-FileCopyrightText: 2026 James R. Barlow
++# SPDX-License-Identifier: MPL-2.0
++
++"""Option-model behaviors that must hold on both pydantic v1 and v2.
++
++These pin down the places where the two pydantic majors disagree in ways that
++matter for option parsing (see ocrmypdf._pydantic_compat), so that a change to
++the option models cannot silently regress whichever major is not installed.
++"""
++
++from __future__ import annotations
++
++import io
++from pathlib import Path
++
++import pytest
++
++from ocrmypdf._options import OcrOptions
++from ocrmypdf._pydantic_compat import PYDANTIC_V2, ConfigDict
++
++
++def make(**kwargs):
++    kwargs.setdefault('input_file', 'in.pdf')
++    kwargs.setdefault('output_file', 'out.pdf')
++    return OcrOptions(**kwargs)
++
++
++@pytest.mark.parametrize(
++    'value', ['-', 'in.pdf', b'in.pdf', Path('in.pdf'), io.BytesIO(b'')]
++)
++def test_file_arguments_keep_their_type(value):
++    """A str must stay a str: '-' is the stdin/stdout sentinel, not a Path."""
++    opts = OcrOptions(input_file=value, output_file=value, sidecar=value)
++    assert type(opts.input_file) is type(value)
++    assert type(opts.output_file) is type(value)
++    assert type(opts.sidecar) is type(value)
++
++
++@pytest.mark.parametrize('value', [None, 42, ['in.pdf']])
++def test_file_arguments_reject_other_types(value):
++    with pytest.raises(ValueError, match='input_file'):
++        OcrOptions(input_file=value, output_file='out.pdf')
++
++
++def test_file_arguments_are_required():
++    with pytest.raises(ValueError, match='output_file'):
++        OcrOptions(input_file='in.pdf')
++    with pytest.raises(ValueError, match='input_file'):
++        OcrOptions(output_file='out.pdf')
++
++
++def test_plugins_keep_str_and_path():
++    """Module names must stay str, or the plugin loader treats them as files."""
++    plugins = ['my_plugin_module', 'file_plugin.py', Path('p.py')]
++    opts = make(plugins=plugins)
++    # str != Path even for equal text, so equality also checks the types
++    assert opts.plugins == plugins
++
++    # ...including across the JSON round trip that ships options to workers
++    opts2 = OcrOptions.model_validate_json_safe(opts.model_dump_json_safe())
++    assert opts2.plugins == plugins
++
++
++def test_user_words_accepts_str():
++    assert make(user_words='w.txt').user_words == Path('w.txt')
++
++
++def test_assignment_is_validated():
++    opts = make()
++    opts.clean_final = True
++    assert opts.clean, "after-model validator did not re-run on assignment"
++    with pytest.raises(ValueError, match='jobs'):
++        opts.jobs = -1
++    opts.deskew = True
++    with pytest.raises(ValueError, match='redo'):
++        opts.mode = 'redo'
++
++
++def test_model_fields_is_a_class_attribute():
++    assert 'input_file' in OcrOptions.model_fields
++    assert 'extra_attrs' in OcrOptions.model_fields
++
++
++@pytest.mark.skipif(PYDANTIC_V2, reason='pydantic v1 shim only')
++def test_unmapped_config_key_fails_loudly():
++    with pytest.raises(NotImplementedError, match='json_schema_extra'):
++        ConfigDict(extra='forbid', json_schema_extra={})
+diff --git a/tests/test_rasterizer.py b/tests/test_rasterizer.py
+index 2ebb935..72f743c 100644
+--- a/tests/test_rasterizer.py
++++ b/tests/test_rasterizer.py
+@@ -68,7 +68,10 @@ class TestRasterizerOption:
+ 
+     def test_rasterizer_invalid(self):
+         """Test that an invalid rasterizer value is rejected."""
+-        with pytest.raises(ValueError, match=r"rasterizer\n.*Input should be"):
++        # Wording of pydantic's own enum-constraint message differs between
++        # pydantic v1 ("unexpected value; permitted: ...") and v2 ("Input
++        # should be ..."); match on the field name only.
++        with pytest.raises(ValueError, match=r"rasterizer"):
+             OcrOptions(
+                 input_file='test.pdf', output_file='out.pdf', rasterizer='invalid'
+             )
