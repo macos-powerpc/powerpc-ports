@@ -1,0 +1,134 @@
+From eb1e30d07b4b5649b647de28110e539699654979 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 6 Sep 2026 01:14:33 +0000
+Subject: [PATCH 3/3] Link libkrb5 explicitly, when it's separately findable
+
+krb5-wrapper.c calls many krb5_* functions (krb5_init_context,
+krb5_cc_new_unique, krb5_kt_get_name, krb5_get_init_creds_keytab, ...)
+directly. On a normal Unix/MIT krb5 install those symbols are defined
+by libkrb5, not by libgssapi_krb5 (which only imports them), so linking
+against -lgssapi_krb5 alone leaves them undefined. The autotools build
+passes -no-undefined for the shared library, so this reliably fails to
+link and has to be worked around by passing -lkrb5 on the command line
+by hand. Reproduced and confirmed with `ld --no-undefined`: it fails
+with -lgssapi_krb5 alone and links cleanly once -lkrb5 is added.
+
+This only applies to the portable Unix gssapi.h codepath (the
+GSS.framework path from the previous commit links Kerberos.framework
+instead, unconditionally, since it needs krb5_* symbols too but must
+not go anywhere near a generic -lkrb5 lookup).
+
+Kept as its own commit, separate from the GSS.framework and
+CommonCrypto fixes: those two just correct which header/library
+libsmb2 already tries to use for something it's already doing, so
+they're straightforward to accept. This one adds a new library to the
+link line unconditionally when with-libkrb5, which is more likely to
+need discussion (e.g. whether a bundled/vendored krb5 changes the
+picture, or whether a platform maintainer would rather solve it a
+different way), so it's separated out to be droppable or revisable
+independently.
+
+Made conditional in both build systems so it cannot regress a platform
+where the old -lgssapi_krb5-only link already worked (e.g. if some
+system bundles the krb5_* symbols into gssapi_krb5 itself):
+- configure.ac: AC_CHECK_LIB for krb5_init_context in libkrb5 before
+  adding -lkrb5 to MAYBE_LIBKRB5; falls back to the previous
+  -lgssapi_krb5-only value if the check fails.
+- cmake/Modules/FindGSSAPI.cmake: KRB5_LIBRARY is best-effort, not a
+  REQUIRED_VARS entry, so GSSAPI_FOUND can't flip to false just because
+  a standalone krb5 wasn't found; it's appended to GSSAPI_LIBRARIES only
+  when find_library actually locates it.
+
+Verified on Linux that this fixes the original bug when libkrb5 is
+found (libsmb2.so gets libkrb5.so.3 as a direct NEEDED entry), and that
+removing libkrb5 from the search path degrades cleanly to the old,
+previously-working gssapi_krb5-only behavior instead of failing.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HipnMZ4oFkNioWvpfRC64V
+---
+ CMakeLists.txt                 | 10 ++++++----
+ cmake/Modules/FindGSSAPI.cmake | 12 ++++++++++++
+ configure.ac                   | 12 +++++++++++-
+ 3 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a027b5c..b74cdbe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -90,10 +90,12 @@ endif()
+   endif()
+ 
+   # Kerberos. On Apple with GSS.framework, link only that framework (and
+-  # Kerberos.framework); otherwise every krb5_* and gss_* symbol we use
+-  # comes out of gssapi_krb5, which is also the only thing the autotools
+-  # build links in that case. See the block below for why the two paths
+-  # must not mix.
++  # Kerberos.framework); see the block below for why the two paths must
++  # not mix. Otherwise we use gss_* symbols from gssapi_krb5 and krb5_*
++  # symbols from krb5 directly (gssapi_krb5 only imports the latter, it
++  # does not define them). FindGSSAPI links krb5 too whenever it can
++  # find it separately, same as the autotools build; see its comments
++  # for why that's best-effort rather than required.
+   #
+   # This used to be probed on linux only, with ios looking for gssapi
+   # instead, so on macos and the BSDs the header check in ConfigureChecks
+diff --git a/cmake/Modules/FindGSSAPI.cmake b/cmake/Modules/FindGSSAPI.cmake
+index d9963dd..8011c19 100644
+--- a/cmake/Modules/FindGSSAPI.cmake
++++ b/cmake/Modules/FindGSSAPI.cmake
+@@ -11,6 +11,15 @@
+ 
+ find_library(GSSAPI_LIBRARY NAMES gssapi_krb5)
+ 
++# gssapi_krb5 only imports krb5_* symbols from libkrb5, it does not define
++# them, so anything that links libsmb2 with strict undefined-symbol checks
++# (e.g. the macOS linker, or -Wl,--no-undefined) needs libkrb5 linked in
++# explicitly too. This is best-effort only: a platform that bundles the
++# krb5_* symbols into gssapi_krb5 itself (so the old gssapi_krb5-only link
++# already worked) must not be broken just because a standalone libkrb5
++# isn't separately found, so KRB5_LIBRARY is never a hard requirement.
++find_library(KRB5_LIBRARY NAMES krb5)
++
+ find_path(GSSAPI_INCLUDE_DIR NAMES gssapi.h
+                                    gssapi/gssapi.h)
+ 
+@@ -24,6 +33,9 @@ endif ()
+ 
+ if(GSSAPI_FOUND)
+   set(GSSAPI_LIBRARIES ${GSSAPI_LIBRARY})
++  if(KRB5_LIBRARY)
++    list(APPEND GSSAPI_LIBRARIES ${KRB5_LIBRARY})
++  endif()
+   set(GSSAPI_INCLUDE_DIRS ${GSSAPI_INCLUDE_DIR})
+ endif()
+ 
+diff --git a/configure.ac b/configure.ac
+index 634e2b0..271cf33 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -59,10 +59,20 @@ AS_IF([test "x$with_libkrb5" != "xno"], [
+         dnl  guaranteed to match, regardless of what else -L turns up.
+         MAYBE_LIBKRB5="-framework GSS -framework Kerberos"
+     ], [
+-        MAYBE_LIBKRB5="-lgssapi_krb5"
+         AC_CHECK_HEADERS([gssapi/gssapi.h], [], [
+             AC_MSG_ERROR([You need gssapi development files to compile libsmb2.])
+         ])
++        dnl  -lgssapi_krb5 alone is not enough on a normal Unix/MIT krb5
++        dnl  install: the gssapi_krb5 library only imports krb5_* symbols
++        dnl  from libkrb5, it does not define them, so -no-undefined
++        dnl  shared library links (and static links) fail unless libkrb5
++        dnl  is linked explicitly. Only add -lkrb5 when it is actually
++        dnl  there, so this is a no-op wherever the old
++        dnl  -lgssapi_krb5-only link already worked (e.g. if a platform
++        dnl  bundles the krb5_* symbols into gssapi_krb5 itself).
++        AC_CHECK_LIB([krb5], [krb5_init_context],
++            [MAYBE_LIBKRB5="-lgssapi_krb5 -lkrb5"],
++            [MAYBE_LIBKRB5="-lgssapi_krb5"])
+     ])
+ ], [
+     MAYBE_LIBKRB5=""
+-- 
+2.43.0
+
