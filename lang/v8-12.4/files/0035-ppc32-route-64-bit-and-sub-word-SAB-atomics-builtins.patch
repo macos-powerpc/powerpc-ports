@@ -1,0 +1,156 @@
+From 15a7e4bec06b484fff377bf93a8b8af385d64dad Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Mon, 31 Aug 2026 22:56:03 +0000
+Subject: [PATCH 35/52] ppc32: route 64-bit and sub-word SAB atomics builtins
+ to the runtime
+
+12.4 re-derivation of the 9.4-series patch 0037.  The drift is larger
+than most: upstream deleted MIPS32 (taking with it the pre-R6 per-lane
+guards this patch joined at 9.4) and deleted its own plain-ARCH_PPC
+routing of compareExchange and the binop builtins when ppc32 support
+was dropped, so all of the routing is ours now:
+
+- Atomics.load / Atomics.store: 64-bit element kinds divert to
+  Runtime::kAtomicsLoad64/kAtomicsStore64 under a new ppc32-only
+  guard (no upstream 32-bit precedent remains; upstream's surviving
+  32-bit targets implement Word32AtomicPair* in their backends).
+- Atomics.exchange / Atomics.compareExchange / Atomics.{add,sub,and,
+  or,xor}: whole operation, extending the existing MIPS64 whole-op
+  guards.
+
+Rationale unchanged from 9.4 (G5 errors #10/#11): on 32-bit targets
+CSA lowers 64-bit atomic element access to Word32AtomicPair* machine
+ops, which the ppc backend does not implement (12.4 dropped even the
+remnants) and ppc32 cannot implement lock-free -- lwarx reserves a
+single word.  The sub-word exchange sequences would emit lbarx/lharx
+(ISA 2.06, absent on G3/G4/G5); libatomic's sub-word ops use
+word-masked lwarx loops instead.  runtime-atomics.cc still lists
+V8_TARGET_ARCH_PPC in its real-implementation branch (V8_CC_GNU
+__atomic path, 64-bit ops land in libatomic, which the port links).
+
+Verified by preprocessing under the ppc32 view: zero AtomicLoad64/
+AtomicStore64 CSA emissions remain in the TU, and the runtime call
+sites are active (Load64 1, Store64 1, Exchange, CompareExchange, and
+the shared binop site).  ppc64 view untouched by construction (all
+guards are ppc32-only extensions).
+
+Remaining known limitation, unchanged: runtime-compiled wasm-threads
+modules using i64 atomics would still reach the pair-op stubs (with
+0036's named-operator fatal); wasm-SIMD-style dead on this target.
+---
+ .../builtins-sharedarraybuffer-gen.cc         | 36 +++++++++++++++----
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/v8/src/builtins/builtins-sharedarraybuffer-gen.cc b/v8/src/builtins/builtins-sharedarraybuffer-gen.cc
+index a29b1ce..e5752fb 100644
+--- a/v8/src/builtins/builtins-sharedarraybuffer-gen.cc
++++ b/v8/src/builtins/builtins-sharedarraybuffer-gen.cc
+@@ -251,6 +251,19 @@ TF_BUILTIN(AtomicsLoad, SharedArrayBufferBuiltinsAssembler) {
+   BIND(&u32);
+   Return(ChangeUint32ToTagged(AtomicLoad<Uint32T>(
+       AtomicMemoryOrder::kSeqCst, backing_store, WordShl(index_word, 2))));
++// ppc32 has no 64-bit atomics (lwarx reserves a single word and the
++// backend implements no Word32AtomicPair ops), so 64-bit element kinds
++// go through the runtime.
++#if V8_TARGET_ARCH_PPC
++  BIND(&i64);
++  Goto(&u64);
++
++  BIND(&u64);
++  {
++    TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
++    Return(CallRuntime(Runtime::kAtomicsLoad64, context, array, index_number));
++  }
++#else
+   BIND(&i64);
+   Return(BigIntFromSigned64(AtomicLoad64<AtomicInt64>(
+       AtomicMemoryOrder::kSeqCst, backing_store, WordShl(index_word, 3))));
+@@ -258,6 +271,7 @@ TF_BUILTIN(AtomicsLoad, SharedArrayBufferBuiltinsAssembler) {
+   BIND(&u64);
+   Return(BigIntFromUnsigned64(AtomicLoad64<AtomicUint64>(
+       AtomicMemoryOrder::kSeqCst, backing_store, WordShl(index_word, 3))));
++#endif  // V8_TARGET_ARCH_PPC
+ 
+   // This shouldn't happen, we've already validated the type.
+   BIND(&other);
+@@ -347,6 +361,15 @@ TF_BUILTIN(AtomicsStore, SharedArrayBufferBuiltinsAssembler) {
+   Return(value_integer);
+ 
+   BIND(&u64);
++// See AtomicsLoad: no 64-bit atomics on ppc32, the runtime does the
++// BigInt conversion and the store.
++#if V8_TARGET_ARCH_PPC
++  {
++    TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
++    Return(CallRuntime(Runtime::kAtomicsStore64, context, array, index_number,
++                       value));
++  }
++#else
+   // 4. If arrayTypeName is "BigUint64Array" or "BigInt64Array",
+   //    let v be ? ToBigInt(value).
+   TNode<BigInt> value_bigint = ToBigInt(context, value);
+@@ -363,6 +386,7 @@ TF_BUILTIN(AtomicsStore, SharedArrayBufferBuiltinsAssembler) {
+   AtomicStore64(AtomicMemoryOrder::kSeqCst, backing_store,
+                 WordShl(index_word, 3), var_low.value(), high);
+   Return(value_bigint);
++#endif  // V8_TARGET_ARCH_PPC
+ 
+   // This shouldn't happen, we've already validated the type.
+   BIND(&other);
+@@ -406,7 +430,7 @@ TF_BUILTIN(AtomicsExchange, SharedArrayBufferBuiltinsAssembler) {
+   TNode<UintPtrT> index_word =
+       ValidateAtomicAccess(array, index_or_field_name, context);
+ 
+-#if V8_TARGET_ARCH_MIPS64
++#if V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+   TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
+   Return(CallRuntime(Runtime::kAtomicsExchange, context, array, index_number,
+                      value));
+@@ -506,7 +530,7 @@ TF_BUILTIN(AtomicsExchange, SharedArrayBufferBuiltinsAssembler) {
+   // This shouldn't happen, we've already validated the type.
+   BIND(&other);
+   Unreachable();
+-#endif  // V8_TARGET_ARCH_MIPS64
++#endif  // V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+ 
+   BIND(&detached_or_out_of_bounds);
+   {
+@@ -544,7 +568,7 @@ TF_BUILTIN(AtomicsCompareExchange, SharedArrayBufferBuiltinsAssembler) {
+   TNode<UintPtrT> index_word =
+       ValidateAtomicAccess(array, index_or_field_name, context);
+ 
+-#if V8_TARGET_ARCH_MIPS64
++#if V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+   TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
+   Return(CallRuntime(Runtime::kAtomicsCompareExchange, context, array,
+                      index_number, old_value, new_value));
+@@ -663,7 +687,7 @@ TF_BUILTIN(AtomicsCompareExchange, SharedArrayBufferBuiltinsAssembler) {
+   // This shouldn't happen, we've already validated the type.
+   BIND(&other);
+   Unreachable();
+-#endif  // V8_TARGET_ARCH_MIPS64
++#endif  // V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+ 
+   BIND(&detached_or_out_of_bounds);
+   {
+@@ -721,7 +745,7 @@ void SharedArrayBufferBuiltinsAssembler::AtomicBinopBuiltinCommon(
+   // 2. Let i be ? ValidateAtomicAccess(typedArray, index).
+   TNode<UintPtrT> index_word = ValidateAtomicAccess(array, index, context);
+ 
+-#if V8_TARGET_ARCH_MIPS64
++#if V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+   TNode<Number> index_number = ChangeUintPtrToTagged(index_word);
+   Return(CallRuntime(runtime_function, context, array, index_number, value));
+ #else
+@@ -811,7 +835,7 @@ void SharedArrayBufferBuiltinsAssembler::AtomicBinopBuiltinCommon(
+   // // This shouldn't happen, we've already validated the type.
+   BIND(&other);
+   Unreachable();
+-#endif  // V8_TARGET_ARCH_MIPS64
++#endif  // V8_TARGET_ARCH_MIPS64 || V8_TARGET_ARCH_PPC
+ 
+   BIND(&detached_or_out_of_bounds);
+   ThrowTypeError(context, MessageTemplate::kDetachedOperation, method_name);
+-- 
+2.43.0
+

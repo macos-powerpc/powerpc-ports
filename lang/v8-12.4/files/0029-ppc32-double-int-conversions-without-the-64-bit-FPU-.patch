@@ -1,0 +1,327 @@
+From 4c71ba4ed39a5c9c4888e7daf8491de367e2f9ae Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Mon, 31 Aug 2026 02:47:46 +0000
+Subject: [PATCH 29/52] ppc32: double<->int conversions without the 64-bit FPU
+ (G3/G4 support)
+
+12.4 re-derivation of the 9.4-series patch 0025 (same design and
+mostly the same hunks; TurboAssembler merged into MacroAssembler):
+
+- int32/uint32 -> double/float: ConvertIntToDoubleNoFPU64, the classic
+  exponent-bias trick (build 2^52 + value' as raw words, subtract the
+  bias; exact in all steps, frsp for the float variants), replacing
+  MovIntToDouble+fcfid and superseding the interim fcfid+frsp form of
+  the fcfids patch.
+- TryInlineTruncateDoubleToI and the Generate_DoubleToI fast path:
+  fctiwz via new ConvertDoubleToInt32 with an FPSCR[VXCVI] validity
+  check (mtfsb0/mcrfs); invalid inputs fall through to the existing
+  bit-twiddling slow path.
+- kPPC_DoubleToInt32 needs NOTHING at 12.4: upstream's own
+  DOUBLE_TO_INT32(fctiwz) macro plus the isel-fallback patch already
+  produce exactly the 9.4 semantics (fctiwz, VXCVI -> zero result).
+- kPPC_DoubleToUint32: upstream's DOUBLE_TO_INT32(fctiwuz) emits an
+  ISA 2.06 instruction that sweep64 cannot see through the macro
+  parameter (the known token-pasting blind spot); replaced on 32-bit
+  with the proven two-range sequence ([0,2^31) direct; [2^31,2^32)
+  converts input-2^31 and restores the top bit).
+- kPPC_DoubleToInt64: the case is now PPC64-only.  Unlike 9.4 (which
+  kept a dead fctidz case) an emission on 32-bit fails loudly in the
+  code generator, consistent with the generic-selector UNSUPPORTED
+  philosophy; 64-bit machine ops do not exist in 32-bit graphs
+  (Int64Lowering / C-call wrappers replace them).
+---
+ v8/src/builtins/ppc/builtins-ppc.cc           |  22 ++--
+ v8/src/codegen/ppc/macro-assembler-ppc.cc     | 101 ++++++++++++++----
+ v8/src/codegen/ppc/macro-assembler-ppc.h      |  15 +++
+ .../backend/ppc/code-generator-ppc.cc         |  38 +++++--
+ 4 files changed, 141 insertions(+), 35 deletions(-)
+
+diff --git a/v8/src/builtins/ppc/builtins-ppc.cc b/v8/src/builtins/ppc/builtins-ppc.cc
+index 5d138cf..0b9f01e 100644
+--- a/v8/src/builtins/ppc/builtins-ppc.cc
++++ b/v8/src/builtins/ppc/builtins-ppc.cc
+@@ -3442,19 +3442,23 @@ void Builtins::Generate_DoubleToI(MacroAssembler* masm) {
+   __ lfd(double_scratch, MemOperand(sp, argument_offset));
+ 
+   // Do fast-path convert from double to int.
+-  __ ConvertDoubleToInt64(double_scratch,
+-#if !V8_TARGET_ARCH_PPC64
+-                          scratch,
+-#endif
+-                          result_reg, d0);
+-
+-// Test for overflow
+ #if V8_TARGET_ARCH_PPC64
++  __ ConvertDoubleToInt64(double_scratch, result_reg, d0);
++
++  // Test for overflow
+   __ TestIfInt32(result_reg, r0);
++  __ beq(&fastpath_done);
+ #else
+-  __ TestIfInt32(scratch, result_reg, r0);
++  // fctiwz (every PowerPC FPU) instead of fctidz (64-bit FPU, absent on
++  // G3/G4).  Take the fast path only when FPSCR[VXCVI] stays clear, i.e.
++  // the input fit int32; otherwise fall through to the bit-twiddling
++  // slow path below.
++  __ mtfsb0(VXCVI);  // clear the sticky invalid-conversion bit
++  __ ConvertDoubleToInt32(double_scratch, result_reg, d0);
++  __ mcrfs(cr7, VXCVI);
++  __ bc(__ branch_offset(&fastpath_done), BF,
++        Assembler::encode_crbit(cr7, static_cast<CRBit>(VXCVI % CRWIDTH)));
+ #endif
+-  __ beq(&fastpath_done);
+ 
+   __ Push(scratch_high, scratch_low);
+   // Account for saved regs.
+diff --git a/v8/src/codegen/ppc/macro-assembler-ppc.cc b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+index c780003..f526f1b 100644
+--- a/v8/src/codegen/ppc/macro-assembler-ppc.cc
++++ b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+@@ -1247,36 +1247,79 @@ void MacroAssembler::CanonicalizeNaN(const DoubleRegister dst,
+   fsub(dst, src, kDoubleRegZero);
+ }
+ 
++#if !V8_TARGET_ARCH_PPC64
++void MacroAssembler::ConvertIntToDoubleNoFPU64(Register src,
++                                               DoubleRegister dst,
++                                               bool src_is_unsigned) {
++  // fcfid belongs to the optional 64-bit FPU, absent on G3/G4.  Use the
++  // classic exponent-bias trick instead: build the raw double
++  // 2^52 + value' as integer words on the stack, load it, and subtract
++  // the bias.  Every step is exact, so the result is correctly rounded.
++  //   signed:   value' = src + 2^31 (via src ^ 0x80000000), bias 2^52 + 2^31
++  //   unsigned: value' = src,                               bias 2^52
++  Register scratch = r0;
++  DoubleRegister double_scratch = kScratchDoubleReg;
++  DCHECK(dst != double_scratch);
++  subi(sp, sp, Operand(2 * kDoubleSize));
++  mov(scratch, Operand(0x43300000));
++  stw(scratch, MemOperand(sp, Register::kExponentOffset));
++  stw(scratch, MemOperand(sp, kDoubleSize + Register::kExponentOffset));
++  if (src_is_unsigned) {
++    stw(src, MemOperand(sp, Register::kMantissaOffset));
++    li(scratch, Operand::Zero());
++    stw(scratch, MemOperand(sp, kDoubleSize + Register::kMantissaOffset));
++  } else {
++    xoris(scratch, src, Operand(0x8000));
++    stw(scratch, MemOperand(sp, Register::kMantissaOffset));
++    mov(scratch, Operand(static_cast<intptr_t>(0x80000000)));
++    stw(scratch, MemOperand(sp, kDoubleSize + Register::kMantissaOffset));
++  }
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp, 0));
++  lfd(double_scratch, MemOperand(sp, kDoubleSize));
++  addi(sp, sp, Operand(2 * kDoubleSize));
++  fsub(dst, dst, double_scratch);
++}
++#endif
++
+ void MacroAssembler::ConvertIntToDouble(Register src, DoubleRegister dst) {
++#if V8_TARGET_ARCH_PPC64
+   MovIntToDouble(dst, src, r0);
+   fcfid(dst, dst);
++#else
++  ConvertIntToDoubleNoFPU64(src, dst, false);
++#endif
+ }
+ 
+ void MacroAssembler::ConvertUnsignedIntToDouble(Register src,
+                                                 DoubleRegister dst) {
++#if V8_TARGET_ARCH_PPC64
+   MovUnsignedIntToDouble(dst, src, r0);
+   fcfid(dst, dst);
++#else
++  ConvertIntToDoubleNoFPU64(src, dst, true);
++#endif
+ }
+ 
+ void MacroAssembler::ConvertIntToFloat(Register src, DoubleRegister dst) {
+-  MovIntToDouble(dst, src, r0);
+ #if V8_TARGET_ARCH_PPC64
++  MovIntToDouble(dst, src, r0);
+   fcfids(dst, dst);
+ #else
+-  // fcfids is ISA 2.06 (POWER7+), absent on G4/G5. fcfid is exact for any
+-  // int32, and frsp then rounds once to single precision -- same result.
+-  fcfid(dst, dst);
++  // int32 -> double is exact; frsp then rounds once to single precision,
++  // which equals a direct correctly rounded int32 -> float32 conversion.
++  ConvertIntToDoubleNoFPU64(src, dst, false);
+   frsp(dst, dst);
+ #endif
+ }
+ 
+ void MacroAssembler::ConvertUnsignedIntToFloat(Register src,
+                                                DoubleRegister dst) {
+-  MovUnsignedIntToDouble(dst, src, r0);
+ #if V8_TARGET_ARCH_PPC64
++  MovUnsignedIntToDouble(dst, src, r0);
+   fcfids(dst, dst);
+ #else
+-  fcfid(dst, dst);
++  ConvertIntToDoubleNoFPU64(src, dst, true);
+   frsp(dst, dst);
+ #endif
+ }
+@@ -1307,6 +1350,25 @@ void MacroAssembler::ConvertInt64ToFloat(Register src,
+ }
+ #endif
+ 
++#if !V8_TARGET_ARCH_PPC64
++void MacroAssembler::ConvertDoubleToInt32(const DoubleRegister double_input,
++                                          const Register dst,
++                                          const DoubleRegister double_dst,
++                                          FPRoundingMode rounding_mode) {
++  // fctiwz/fctiw exist on every PowerPC FPU (unlike fctidz/fctid, which
++  // need the optional 64-bit FPU).  Out-of-range inputs set FPSCR[VXCVI].
++  if (rounding_mode == kRoundToZero) {
++    fctiwz(double_dst, double_input);
++  } else {
++    SetRoundingMode(rounding_mode);
++    fctiw(double_dst, double_input);
++    ResetRoundingMode();
++  }
++
++  MovDoubleLowToInt(dst, double_dst);
++}
++#endif
++
+ void MacroAssembler::ConvertDoubleToInt64(const DoubleRegister double_input,
+ #if !V8_TARGET_ARCH_PPC64
+                                           const Register dst_hi,
+@@ -2363,23 +2425,24 @@ void MacroAssembler::TryInlineTruncateDoubleToI(Register result,
+                                                 DoubleRegister double_input,
+                                                 Label* done) {
+   DoubleRegister double_scratch = kScratchDoubleReg;
+-#if !V8_TARGET_ARCH_PPC64
+-  Register scratch = ip;
+-#endif
+-
+-  ConvertDoubleToInt64(double_input,
+-#if !V8_TARGET_ARCH_PPC64
+-                       scratch,
+-#endif
+-                       result, double_scratch);
+-
+-// Test for overflow
+ #if V8_TARGET_ARCH_PPC64
++  ConvertDoubleToInt64(double_input, result, double_scratch);
++
++  // Test for overflow
+   TestIfInt32(result, r0);
++  beq(done);
+ #else
+-  TestIfInt32(scratch, result, r0);
++  // fctiwz (every PowerPC FPU) instead of fctidz (64-bit FPU, absent on
++  // G3/G4).  FPSCR[VXCVI] tells us whether the value fit int32; only take
++  // the inline result when it did, otherwise fall through so the caller
++  // invokes the DoubleToI stub, which implements the modulo-2^32
++  // semantics.
++  mtfsb0(VXCVI);  // clear the sticky invalid-conversion bit
++  ConvertDoubleToInt32(double_input, result, double_scratch);
++  mcrfs(cr7, VXCVI);
++  bc(branch_offset(done), BF,
++     Assembler::encode_crbit(cr7, static_cast<CRBit>(VXCVI % CRWIDTH)));
+ #endif
+-  beq(done);
+ }
+ 
+ namespace {
+diff --git a/v8/src/codegen/ppc/macro-assembler-ppc.h b/v8/src/codegen/ppc/macro-assembler-ppc.h
+index f1d7ace..054c95c 100644
+--- a/v8/src/codegen/ppc/macro-assembler-ppc.h
++++ b/v8/src/codegen/ppc/macro-assembler-ppc.h
+@@ -78,6 +78,21 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   void ConvertInt64ToDouble(Register src, DoubleRegister double_dst);
+   void ConvertUnsignedInt64ToFloat(Register src, DoubleRegister double_dst);
+   void ConvertUnsignedInt64ToDouble(Register src, DoubleRegister double_dst);
++#else
++  // Converts the (unsigned) integer in |src| to a double in |dst| without
++  // fcfid, which belongs to the optional 64-bit FPU (absent on G3/G4).
++  // Clobbers r0 and kScratchDoubleReg.
++  void ConvertIntToDoubleNoFPU64(Register src, DoubleRegister dst,
++                                 bool src_is_unsigned);
++
++  // Converts double_input to an int32 via fctiwz/fctiw (available on every
++  // PowerPC FPU).  Upon return double_dst holds the fixed point
++  // representation, whose low word is the result.  FPSCR[VXCVI] is set if
++  // the input did not fit; callers wanting to test it should clear the
++  // sticky bit with mtfsb0(VXCVI) first and read it back with mcrfs.
++  void ConvertDoubleToInt32(const DoubleRegister double_input,
++                            const Register dst, const DoubleRegister double_dst,
++                            FPRoundingMode rounding_mode = kRoundToZero);
+ #endif
+ 
+   // Converts the double_input to an integer.  Note that, upon return,
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 60b9201..1b6bf23 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1987,22 +1987,46 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       DOUBLE_TO_INT32(fctiwz)
+       break;
+     }
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_DoubleToUint32: {
+       DOUBLE_TO_INT32(fctiwuz)
+       break;
+     }
++#else
++    case kPPC_DoubleToUint32: {
++      // fctiwuz is ISA 2.06 (POWER7+), absent on G3/G4/G5.  Inputs in
++      // [0, 2^31) convert directly; [2^31, 2^32) convert as input - 2^31
++      // and restore the top bit afterwards.  Out-of-range or NaN inputs
++      // produce a garbage value that the consumer's round-trip check
++      // rejects (wasm inserts its own range checks before this).
++      Label above31, done_u;
++      __ LoadDoubleLiteral(kScratchDoubleReg, base::Double(2147483648.0),
++                           kScratchReg);
++      __ fcmpu(i.InputDoubleRegister(0), kScratchDoubleReg);
++      __ bge(&above31);
++      __ ConvertDoubleToInt32(i.InputDoubleRegister(0), i.OutputRegister(0),
++                              kScratchDoubleReg);
++      __ b(&done_u);
++      __ bind(&above31);
++      __ fsub(kScratchDoubleReg, i.InputDoubleRegister(0), kScratchDoubleReg);
++      __ ConvertDoubleToInt32(kScratchDoubleReg, i.OutputRegister(0),
++                              kScratchDoubleReg);
++      __ xoris(i.OutputRegister(0), i.OutputRegister(0), Operand(0x8000));
++      __ bind(&done_u);
++      DCHECK_EQ(LeaveRC, i.OutputRCBit());
++      break;
++    }
++#endif
+ #undef DOUBLE_TO_INT32
+-    case kPPC_DoubleToInt64: {
+ #if V8_TARGET_ARCH_PPC64
++    // 64-bit machine ops do not exist in 32-bit graphs (Int64Lowering /
++    // C-call wrappers replace them); an emission on 32-bit falls to the
++    // switch default and fails loudly.
++    case kPPC_DoubleToInt64: {
+       bool check_conversion = i.OutputCount() > 1;
+       __ mtfsb0(VXCVI);  // clear FPSCR:VXCVI bit
+-#endif
+       __ ConvertDoubleToInt64(i.InputDoubleRegister(0),
+-#if !V8_TARGET_ARCH_PPC64
+-                              kScratchReg,
+-#endif
+                               i.OutputRegister(0), kScratchDoubleReg);
+-#if V8_TARGET_ARCH_PPC64
+         CRegister cr = cr7;
+         int crbit = v8::internal::Assembler::encode_crbit(
+             cr, static_cast<CRBit>(VXCVI % CRWIDTH));
+@@ -2027,10 +2051,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+             __ mr(i.OutputRegister(0), ip);
+           }
+         }
+-#endif
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
+     }
++#endif
+ #if V8_TARGET_ARCH_PPC64
+     case kPPC_DoubleToUint64: {
+       bool check_conversion = (i.OutputCount() > 1);
+-- 
+2.43.0
+

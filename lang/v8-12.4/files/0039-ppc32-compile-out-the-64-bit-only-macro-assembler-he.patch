@@ -1,0 +1,271 @@
+From d521648db053496667cae7a4b91a0413ef4c3ee9 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Tue, 1 Sep 2026 07:23:04 +0000
+Subject: [PATCH 39/52] ppc32: compile out the 64-bit-only macro-assembler
+ helpers
+
+G5 build error #2 of the 12.4 port (v8_base, macro-assembler-ppc.cc).
+Class: known blind spot "64-bit-only mnemonics in masm helpers" - all
+sites are macro-assembler surface that either did not exist at 9.4 or
+gained new 64-bit fast paths between 9.4 and 12.4 (the 9.4 series
+never had to touch these functions).  gcc reported the complete
+undeclared-identifier set for the TU; a preprocessor-level audit (see
+below) confirms it and finds no further sites in any other ppc TU.
+
+The 25 mnemonics declared only under V8_TARGET_ARCH_PPC64 in
+assembler-ppc.h are the audit set (clrldi clrrdi divd divdu ld ldu
+mffprd mffprwz mtfprd mtfprwa mtfprwz mulld rldcl rldic rldicl rldicr
+rldimi rotld rotldi rotrdi sldi sradi srdi std stdu).  Fixes, by
+reachability on ppc32:
+
+- MovIntToFloat / MovFloatToInt (LIVE: Float32<->Int32 bitcasts, F32x4
+  helpers): the PPC_8_PLUS direct-move fast path (mtfprd/mffprwz, ISA
+  2.07) is PPC64-gated exactly like the one in MovDoubleToInt64; the
+  stack-based path below it is the ppc32 code, unchanged.
+- DivS32 / ModS32 (LIVE: kPPC_Div32/Mod32): the trailing extsw
+  canonicalization is PPC64-gated, same shape as the neighbouring
+  AddS32/SubS32/MulS32 got in the pointer-size-lowering patch (extsw
+  parses on ppc32 - it is declared unconditionally - but is a G4
+  SIGILL at runtime; the 970 happens to implement it, which is why
+  the G5 would not have caught it).
+- DivS64 / DivU64 / ModS64 / ModU64, ByteReverseU64,
+  CountTrailingZerosU64, ClearByteU64, ReverseBitsInSingleByteU64,
+  I64x2Mul (compile-reachable, runtime-dead): PPC64 body, UNREACHABLE
+  on ppc32, the same convention as the F64x2 lane helpers.  Dead
+  because 64-bit integer ops are pair-lowered (Int64Lowering / the
+  restored pair visitors), Word32ReverseBits/Word32Ctz are not
+  advertised (SupportedMachineOperatorFlags returns kNoFlags on
+  ppc32), 64-bit SAB atomics are routed to the C++ runtime, Liftoff
+  is disabled, and wasm SIMD never validates.
+- COUNT_TRAILING_ZEROES_SLOW: the shift in the loop becomes
+  ShiftRightU64 (= srdi on ppc64, srwi on ppc32), which keeps
+  CountTrailingZerosU32's pre-P9 slow path compiling and correct on
+  ppc32.
+
+Validation: ppcheck balanced; cross-g++14 full-TU parse is OOM-killed
+on this box even at -fsyntax-only (961MB ceiling, canary static_assert
+never reached - the masm TU joins the selector TU above the local
+instantiation ceiling), so the class was verified at the preprocessor
+level instead: -E provenance-tracked scan of all 16 compiled ppc TUs
+for the 25-name set = 16 hits before this patch (exactly the G5 error
+list), 0 after, 0 in every other TU.  PPC64 -E output is
+byte-identical before/after except the two COUNT_TRAILING_ZEROES_SLOW
+expansions calling ShiftRightU64 instead of raw srdi (identical
+emission - ShiftRightU64's ppc64 body is that srdi).
+---
+ v8/src/codegen/ppc/macro-assembler-ppc.cc | 61 ++++++++++++++++++++++-
+ 1 file changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/v8/src/codegen/ppc/macro-assembler-ppc.cc b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+index 1ea4f9c..7781ce7 100644
+--- a/v8/src/codegen/ppc/macro-assembler-ppc.cc
++++ b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+@@ -3418,12 +3418,16 @@ void MacroAssembler::MovDoubleToInt64(
+ 
+ void MacroAssembler::MovIntToFloat(DoubleRegister dst, Register src,
+                                    Register scratch) {
++#if V8_TARGET_ARCH_PPC64
++  // mtfprd is a 64-bit direct-move (ISA 2.07); on ppc32 PPC_8_PLUS is
++  // never set and the mnemonic is not declared, so keep the memory path.
+   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
+     ShiftLeftU64(scratch, src, Operand(32));
+     mtfprd(dst, scratch);
+     xscvspdpn(dst, dst);
+     return;
+   }
++#endif
+   subi(sp, sp, Operand(kFloatSize));
+   stw(src, MemOperand(sp, 0));
+   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
+@@ -3433,11 +3437,14 @@ void MacroAssembler::MovIntToFloat(DoubleRegister dst, Register src,
+ 
+ void MacroAssembler::MovFloatToInt(Register dst, DoubleRegister src,
+                                    DoubleRegister scratch) {
++#if V8_TARGET_ARCH_PPC64
++  // mffprwz is a direct-move (ISA 2.07); same story as MovIntToFloat.
+   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
+     xscvdpspn(scratch, src);
+     mffprwz(dst, scratch);
+     return;
+   }
++#endif
+   subi(sp, sp, Operand(kFloatSize));
+   stfs(src, MemOperand(sp, 0));
+   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
+@@ -3548,18 +3555,30 @@ void MacroAssembler::MulS32(Register dst, Register src, Register value, OEBit s,
+ 
+ void MacroAssembler::DivS64(Register dst, Register src, Register value, OEBit s,
+                             RCBit r) {
++#if V8_TARGET_ARCH_PPC64
+   divd(dst, src, value, s, r);
++#else
++  // 64-bit integer ops are pair-lowered on ppc32 (Int64Lowering) and
++  // Liftoff bails out, so the 64-bit divide helpers are never reached.
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::DivU64(Register dst, Register src, Register value, OEBit s,
+                             RCBit r) {
++#if V8_TARGET_ARCH_PPC64
+   divdu(dst, src, value, s, r);
++#else
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::DivS32(Register dst, Register src, Register value, OEBit s,
+                             RCBit r) {
+   divw(dst, src, value, s, r);
++#if V8_TARGET_ARCH_PPC64
+   extsw(dst, dst);
++#endif
+ }
+ void MacroAssembler::DivU32(Register dst, Register src, Register value, OEBit s,
+                             RCBit r) {
+@@ -3568,6 +3587,7 @@ void MacroAssembler::DivU32(Register dst, Register src, Register value, OEBit s,
+ }
+ 
+ void MacroAssembler::ModS64(Register dst, Register src, Register value) {
++#if V8_TARGET_ARCH_PPC64
+   if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+     modsd(dst, src, value);
+   } else {
+@@ -3578,9 +3598,13 @@ void MacroAssembler::ModS64(Register dst, Register src, Register value) {
+     sub(dst, src, scratch);
+     Pop(scratch);
+   }
++#else
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::ModU64(Register dst, Register src, Register value) {
++#if V8_TARGET_ARCH_PPC64
+   if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+     modud(dst, src, value);
+   } else {
+@@ -3591,6 +3615,9 @@ void MacroAssembler::ModU64(Register dst, Register src, Register value) {
+     sub(dst, src, scratch);
+     Pop(scratch);
+   }
++#else
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::ModS32(Register dst, Register src, Register value) {
+@@ -3604,7 +3631,9 @@ void MacroAssembler::ModS32(Register dst, Register src, Register value) {
+     sub(dst, src, scratch);
+     Pop(scratch);
+   }
++#if V8_TARGET_ARCH_PPC64
+   extsw(dst, dst);
++#endif
+ }
+ void MacroAssembler::ModU32(Register dst, Register src, Register value) {
+   if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+@@ -4810,6 +4839,7 @@ void MacroAssembler::I64x2Mul(Simd128Register dst, Simd128Register src1,
+                               Simd128Register src2, Register scratch1,
+                               Register scratch2, Register scratch3,
+                               Simd128Register scratch4) {
++#if V8_TARGET_ARCH_PPC64
+   constexpr int lane_width_in_bytes = 8;
+   if (CpuFeatures::IsSupported(PPC_10_PLUS)) {
+     vmulld(dst, src1, src2);
+@@ -4831,6 +4861,12 @@ void MacroAssembler::I64x2Mul(Simd128Register dst, Simd128Register src1,
+     }
+     mtvsrdd(dst, scratch1, scratch2);
+   }
++#else
++  // The non-P10 fallback multiplies the lanes in GPRs (mfvsrd/mulld) —
++  // 64-bit only. Wasm SIMD never validates on ppc32 (SupportsWasmSimd128
++  // is false) and Liftoff bails out, so this helper is never reached.
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::I16x8Mul(Simd128Register dst, Simd128Register src1,
+@@ -5689,6 +5725,7 @@ void MacroAssembler::ByteReverseU32(Register dst, Register val,
+ }
+ 
+ void MacroAssembler::ByteReverseU64(Register dst, Register val, Register) {
++#if V8_TARGET_ARCH_PPC64
+   if (CpuFeatures::IsSupported(PPC_10_PLUS)) {
+     brd(dst, val);
+     return;
+@@ -5697,6 +5734,12 @@ void MacroAssembler::ByteReverseU64(Register dst, Register val, Register) {
+   std(val, MemOperand(sp));
+   ldbrx(dst, MemOperand(r0, sp));
+   addi(sp, sp, Operand(kSystemPointerSize));
++#else
++  // A u64 lives in a register pair on ppc32; the only callers (64-bit
++  // atomics codegen, Liftoff, ReverseBitsU64) are all compiled but
++  // unreachable there (0035-class runtime routing, Liftoff disabled).
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::JumpIfEqual(Register x, int32_t y, Label* dest) {
+@@ -5925,7 +5968,7 @@ void MacroAssembler::CountLeadingZerosU64(Register dst, Register src, RCBit r) {
+   bind(&loop); /* while ((src & 1) == 0) */                       \
+   andi(scratch2, scratch1, Operand(1));                           \
+   bne(&done, cr0);                                                \
+-  srdi(scratch1, scratch1, Operand(1)); /* src >>= 1;*/           \
++  ShiftRightU64(scratch1, scratch1, Operand(1)); /* src >>= 1;*/  \
+   addi(dst, dst, Operand(1));           /* dst++ */               \
+   bdnz(&loop);                                                    \
+   bind(&done);
+@@ -5942,19 +5985,27 @@ void MacroAssembler::CountTrailingZerosU32(Register dst, Register src,
+ void MacroAssembler::CountTrailingZerosU64(Register dst, Register src,
+                                            Register scratch1, Register scratch2,
+                                            RCBit r) {
++#if V8_TARGET_ARCH_PPC64
+   if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+     cnttzd(dst, src, r);
+   } else {
+     COUNT_TRAILING_ZEROES_SLOW(64, scratch1, scratch2);
+   }
++#else
++  UNREACHABLE();
++#endif
+ }
+ #undef COUNT_TRAILING_ZEROES_SLOW
+ 
+ void MacroAssembler::ClearByteU64(Register dst, int byte_idx) {
++#if V8_TARGET_ARCH_PPC64
+   CHECK(0 <= byte_idx && byte_idx <= 7);
+   int shift = byte_idx*8;
+   rldicl(dst, dst, shift, 8);
+   rldicl(dst, dst, 64-shift, 0);
++#else
++  UNREACHABLE();
++#endif
+ }
+ 
+ void MacroAssembler::ReverseBitsU64(Register dst, Register src,
+@@ -5978,6 +6029,7 @@ void MacroAssembler::ReverseBitsInSingleByteU64(Register dst, Register src,
+                                                 Register scratch1,
+                                                 Register scratch2,
+                                                 int byte_idx) {
++#if V8_TARGET_ARCH_PPC64
+   CHECK(0 <= byte_idx && byte_idx <= 7);
+   int j = byte_idx;
+   // zero all bits of scratch1
+@@ -5998,6 +6050,13 @@ void MacroAssembler::ReverseBitsInSingleByteU64(Register dst, Register src,
+   // clear jth byte of dst and insert jth byte of scratch2
+   ClearByteU64(dst, j);
+   orx(dst, dst, scratch2);
++#else
++  // rldicl/rldicr are 64-bit rotates. Both callers (ReverseBitsU64,
++  // ReverseBitsU32) are unreachable on ppc32: Word32ReverseBits is not
++  // advertised (SupportedMachineOperatorFlags returns kNoFlags) and
++  // Word64 ops never reach the backend.
++  UNREACHABLE();
++#endif
+ }
+ 
+ // Calls an API function.  Allocates HandleScope, extracts returned value
+-- 
+2.43.0
+

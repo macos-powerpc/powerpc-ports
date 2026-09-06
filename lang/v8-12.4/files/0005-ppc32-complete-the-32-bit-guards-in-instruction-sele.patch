@@ -1,0 +1,394 @@
+From b48c9a31e761219853549c93d62aa2534aeef19d Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Mon, 31 Aug 2026 01:29:46 +0000
+Subject: [PATCH 05/52] ppc32: complete the 32-bit guards in instruction
+ selector and code generator
+
+12.4 re-derivation of the 9.4-series patch 0002, adapted to the
+templated (Adapter-split) selector.  The duplicate-definition landscape
+changed since 9.4: the generic selector's 32-bit VISIT_UNSUPPORTED_OP
+list grew to 54 ops plus the Word64Atomic* and wasm I64x2 lane blocks,
+and because the templated members are weak symbols, an unguarded ppc
+definition no longer breaks the link - it silently races the generic
+UNSUPPORTED stub at symbol coalescing time.  Every overlapping ppc
+definition is therefore PPC64-gated so the generic stub is the single
+definition on 32-bit and stray 64-bit nodes fail loudly:
+
+selector:
+- VisitLoadCommon: uncompressed tagged loads are pointer-sized, route
+  to kPPC_LoadWordU32 on 32-bit; kWord64 -> UNREACHABLE
+- VisitStoreCommon: kWord64 -> UNREACHABLE on 32-bit
+- PPC64-gate VisitWord64Rol, Int64MulHigh, Uint64MulHigh, the five
+  Word64Atomic* visitors, VisitWord64AtomicBinaryOperation, and the
+  Word64 half of VISIT_ATOMIC_BINOP (split into a 32-bit macro and a
+  PPC64-only VISIT_ATOMIC_BINOP64)
+- I64x2Splat out of SIMD_UNOP_LIST into a PPC64-gated emission;
+  SIMD_VISIT_EXTRACT_LANE(I64x2)/REPLACE_LANE likewise gated (the
+  generic selector defines the I64x2 lane visitors on 32-bit)
+
+code generator:
+- kPPC_Add32: trailing extsw canonicalization escaped the PPC64 guard
+- kPPC_ByteRev32: extsw -> mr on 32-bit in both the brw and rlwimi
+  paths; kPPC_ByteRev64: gate the case (rldicl/rldicr are declared
+  only under V8_TARGET_ARCH_PPC64)
+- kPPC_Float32ToInt32/kPPC_Float32ToUint32 saturating variants and the
+  DOUBLE_TO_INT32 macro emitted isel unconditionally (ISA 2.03, absent
+  on G3/G4/G5); add the IsSupported(PPC_7_PLUS)-with-branch-fallback
+  idiom that 12.4's own AssembleArchBoolean already uses
+
+Verified on the linux box with the cross-g++14 preprocessor name-set
+audit (both TUs -E'd under the ppc32 define set; ppc definition set vs
+the generic 32-bit definition set intersects only in the benign
+VisitStackPointerGreaterThan overload pair) and ppcheck/sweep64; the
+remaining sweep64 hits are IsSupported-guarded isel/modsw/moduw with
+correct fallbacks, the wasm-only atomic-macro extsw sites the 9.4
+series also shipped (retired for JS by the 0037-class runtime routing,
+later in this series), and kPPC_Float32ToUint32's fctiwuz (the
+0027-class item).  9.4's kPPC_I64x2Mul mulld guard is obsolete here:
+12.4 moved the multiply into the I64x2Mul masm helper.
+
+Not in this commit: the Int32Pair/Word32Pair/BitcastWord32PairToFloat64
+visitors that upstream deleted from this backend (their codegen cases
+and kPPC_DoubleConstruct survived) - restored separately.
+---
+ .../backend/ppc/code-generator-ppc.cc         | 47 +++++++++---
+ .../backend/ppc/instruction-selector-ppc.cc   | 71 ++++++++++++++++---
+ 2 files changed, 101 insertions(+), 17 deletions(-)
+
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 93d4748..b65544f 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1431,8 +1431,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+           __ AddS64(i.OutputRegister(), i.InputRegister(0), i.InputImmediate(1),
+                     r0, LeaveOE, i.OutputRCBit());
+         }
+-        __ extsw(i.OutputRegister(), i.OutputRegister());
+ #if V8_TARGET_ARCH_PPC64
++        __ extsw(i.OutputRegister(), i.OutputRegister());
+       }
+ #endif
+       break;
+@@ -1895,7 +1895,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         __ li(kScratchReg, Operand(1));
+         __ ShiftLeftU64(kScratchReg, kScratchReg,
+                         Operand(31));  // generate INT32_MIN.
+-        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
++          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        } else {
++          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++          __ mr(i.OutputRegister(0), kScratchReg);
++        }
+       }
+       break;
+     }
+@@ -1913,8 +1918,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         int crbit = v8::internal::Assembler::encode_crbit(
+             cr, static_cast<CRBit>(VXCVI % CRWIDTH));
+         __ mcrfs(cr, VXCVI);  // extract FPSCR field containing VXCVI into cr7
+-        __ li(kScratchReg, Operand::Zero());
+-        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
++          __ li(kScratchReg, Operand::Zero());
++          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        } else {
++          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++          __ li(i.OutputRegister(0), Operand::Zero());
++        }
+       }
+       break;
+     }
+@@ -1928,11 +1938,24 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+   __ op(kScratchDoubleReg, i.InputDoubleRegister(0));                      \
+   __ MovDoubleLowToInt(i.OutputRegister(0), kScratchDoubleReg);            \
+   __ mcrfs(cr, VXCVI); /* extract FPSCR field containing VXCVI into cr7 */ \
+-  if (check_conversion) {                                                  \
+-    __ li(i.OutputRegister(1), Operand(1));                                \
+-    __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);         \
++  if (CpuFeatures::IsSupported(PPC_7_PLUS)) {                              \
++    if (check_conversion) {                                                \
++      __ li(i.OutputRegister(1), Operand(1));                              \
++      __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);       \
++    } else {                                                               \
++      __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);       \
++    }                                                                      \
+   } else {                                                                 \
+-    __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);         \
++    if (check_conversion) {                                                \
++      __ li(i.OutputRegister(1), Operand::Zero());                         \
++      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
++      __ li(i.OutputRegister(1), Operand(1));                              \
++    } else {                                                               \
++      __ mr(ip, i.OutputRegister(0));                                      \
++      __ li(i.OutputRegister(0), Operand::Zero());                         \
++      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
++      __ mr(i.OutputRegister(0), ip);                                      \
++    }                                                                      \
+   }
+     case kPPC_DoubleToInt32: {
+       DOUBLE_TO_INT32(fctiwz)
+@@ -2234,13 +2257,19 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register temp1 = r0;
+       if (CpuFeatures::IsSupported(PPC_10_PLUS)) {
+         __ brw(output, input);
++#if V8_TARGET_ARCH_PPC64
+         __ extsw(output, output);
++#endif
+         break;
+       }
+       __ rotlwi(temp1, input, 8);
+       __ rlwimi(temp1, input, 24, 0, 7);
+       __ rlwimi(temp1, input, 24, 16, 23);
++#if V8_TARGET_ARCH_PPC64
+       __ extsw(output, temp1);
++#else
++      __ mr(output, temp1);
++#endif
+       break;
+     }
+     case kPPC_LoadByteRev32: {
+@@ -2251,6 +2280,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       ASSEMBLE_STORE_INTEGER_RR(stwbrx);
+       break;
+     }
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_ByteRev64: {
+       Register input = i.InputRegister(0);
+       Register output = i.OutputRegister();
+@@ -2272,6 +2302,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ orx(output, temp2, temp3);
+       break;
+     }
++#endif
+     case kPPC_LoadByteRev64: {
+       ASSEMBLE_LOAD_INTEGER_RR(ldbrx);
+       break;
+diff --git a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+index b9a2ced..a2a89ab 100644
+--- a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -267,11 +267,21 @@ static void VisitLoadCommon(InstructionSelectorT<Adapter>* selector,
+ #else
+       case MachineRepresentation::kTaggedSigned:   // Fall through.
+       case MachineRepresentation::kTaggedPointer:  // Fall through.
+-      case MachineRepresentation::kTagged:         // Fall through.
++      case MachineRepresentation::kTagged:
++#if !V8_TARGET_ARCH_PPC64
++        // Uncompressed tagged values are pointer-sized.
++        opcode = kPPC_LoadWordU32;
++        break;
++#endif
++        // Fall through on 64-bit.
+ #endif
+       case MachineRepresentation::kWord64:
++#if V8_TARGET_ARCH_PPC64
+         opcode = kPPC_LoadWord64;
+         if (mode != kInt34Imm) mode = kInt16Imm_4ByteAligned;
++#else
++        UNREACHABLE();
++#endif
+         break;
+       case MachineRepresentation::kSimd128:
+         opcode = kPPC_LoadSimd128;
+@@ -446,6 +456,9 @@ void VisitStoreCommon(InstructionSelectorT<Adapter>* selector,
+         opcode = kPPC_StoreCompressTagged;
+         break;
+       case MachineRepresentation::kWord64: {
++#if !V8_TARGET_ARCH_PPC64
++        UNREACHABLE();
++#else
+         opcode = kPPC_StoreWord64;
+         if (mode != kInt34Imm) mode = kInt16Imm_4ByteAligned;
+         bool is_w64_reverse_bytes = false;
+@@ -463,6 +476,7 @@ void VisitStoreCommon(InstructionSelectorT<Adapter>* selector,
+           mode = kNoImmediate;
+         }
+         break;
++#endif
+       }
+       case MachineRepresentation::kSimd128:
+         opcode = kPPC_StoreSimd128;
+@@ -1384,10 +1398,13 @@ void InstructionSelectorT<Adapter>::VisitWord32Rol(node_t node) {
+     UNREACHABLE();
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord64Rol(node_t node) {
+   UNREACHABLE();
+ }
++#endif
+ 
+ // TODO(mbrandy): Absorb logical-and into rlwinm?
+ template <typename Adapter>
+@@ -1695,6 +1712,8 @@ void InstructionSelectorT<Adapter>::VisitUint32MulHigh(node_t node) {
+          g.UseRegister(this->input_at(node, 1)));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitInt64MulHigh(node_t node) {
+     PPCOperandGeneratorT<Adapter> g(this);
+@@ -1710,6 +1729,7 @@ void InstructionSelectorT<Adapter>::VisitUint64MulHigh(node_t node) {
+          g.UseRegister(this->input_at(node, 0)),
+          g.UseRegister(this->input_at(node, 1)));
+ }
++#endif
+ 
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitInt32Div(node_t node) {
+@@ -2948,6 +2968,8 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicLoad(node_t node) {
+   VisitLoadCommon(this, node, load_rep);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord64AtomicLoad(node_t node) {
+   OperandGeneratorT<Adapter> g(this);
+@@ -2955,6 +2977,7 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicLoad(node_t node) {
+   LoadRepresentation load_rep = load.loaded_rep();
+   VisitLoadCommon(this, node, load_rep);
+ }
++#endif
+ 
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord32AtomicStore(node_t node) {
+@@ -2967,6 +2990,8 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicStore(node_t node) {
+                    store_params.order());
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord64AtomicStore(node_t node) {
+   auto store = this->store_view(node);
+@@ -2977,6 +3002,7 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicStore(node_t node) {
+   VisitStoreCommon(this, node, store_params.store_representation(),
+                    store_params.order());
+ }
++#endif
+ 
+ template <typename Adapter>
+ void VisitAtomicExchange(InstructionSelectorT<Adapter>* selector,
+@@ -3039,6 +3065,8 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicExchange(node_t node) {
+   VisitAtomicExchange(this, node, opcode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord64AtomicExchange(node_t node) {
+   ArchOpcode opcode;
+@@ -3072,6 +3100,7 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicExchange(node_t node) {
+   }
+   VisitAtomicExchange(this, node, opcode);
+ }
++#endif
+ 
+ template <typename Adapter>
+ void VisitAtomicCompareExchange(InstructionSelectorT<Adapter>* selector,
+@@ -3142,6 +3171,8 @@ void InstructionSelectorT<Adapter>::VisitWord32AtomicCompareExchange(
+   VisitAtomicCompareExchange(this, node, opcode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64 visitors.
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord64AtomicCompareExchange(
+     node_t node) {
+@@ -3176,6 +3207,7 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicCompareExchange(
+   }
+   VisitAtomicCompareExchange(this, node, opcode);
+ }
++#endif
+ 
+ template <typename Adapter>
+ void VisitAtomicBinaryOperation(InstructionSelectorT<Adapter>* selector,
+@@ -3278,7 +3310,17 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicBinaryOperation(
+           kPPC_Atomic##op##Int16, kPPC_Atomic##op##Uint16,                 \
+           kPPC_Atomic##op##Int32, kPPC_Atomic##op##Uint32,                 \
+           kPPC_Atomic##op##Int64, kPPC_Atomic##op##Uint64);                \
+-  }                                                                        \
++  }
++VISIT_ATOMIC_BINOP(Add)
++VISIT_ATOMIC_BINOP(Sub)
++VISIT_ATOMIC_BINOP(And)
++VISIT_ATOMIC_BINOP(Or)
++VISIT_ATOMIC_BINOP(Xor)
++#undef VISIT_ATOMIC_BINOP
++
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64Atomic* visitors.
++#define VISIT_ATOMIC_BINOP64(op)                                           \
+   template <typename Adapter>                                              \
+   void InstructionSelectorT<Adapter>::VisitWord64Atomic##op(node_t node) { \
+       VisitAtomicBinaryOperation(                                          \
+@@ -3287,12 +3329,13 @@ void InstructionSelectorT<Adapter>::VisitWord64AtomicBinaryOperation(
+           kPPC_Atomic##op##Int32, kPPC_Atomic##op##Uint32,                 \
+           kPPC_Atomic##op##Int64, kPPC_Atomic##op##Uint64);                \
+   }
+-VISIT_ATOMIC_BINOP(Add)
+-VISIT_ATOMIC_BINOP(Sub)
+-VISIT_ATOMIC_BINOP(And)
+-VISIT_ATOMIC_BINOP(Or)
+-VISIT_ATOMIC_BINOP(Xor)
+-#undef VISIT_ATOMIC_BINOP
++VISIT_ATOMIC_BINOP64(Add)
++VISIT_ATOMIC_BINOP64(Sub)
++VISIT_ATOMIC_BINOP64(And)
++VISIT_ATOMIC_BINOP64(Or)
++VISIT_ATOMIC_BINOP64(Xor)
++#undef VISIT_ATOMIC_BINOP64
++#endif
+ 
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitInt32AbsWithOverflow(node_t node) {
+@@ -3458,7 +3501,6 @@ void InstructionSelectorT<Adapter>::VisitInt64AbsWithOverflow(node_t node) {
+   V(I64x2AllTrue)              \
+   V(I64x2BitMask)              \
+   V(I32x4Neg)                  \
+-  V(I64x2Splat)                \
+   V(I32x4Abs)                  \
+   V(I32x4SConvertF32x4)        \
+   V(I32x4UConvertF32x4)        \
+@@ -3512,7 +3554,10 @@ void InstructionSelectorT<Adapter>::VisitInt64AbsWithOverflow(node_t node) {
+   }
+ SIMD_VISIT_EXTRACT_LANE(F64x2, F, , 64)
+ SIMD_VISIT_EXTRACT_LANE(F32x4, F, , 32)
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the I64x2 lane visitors.
+ SIMD_VISIT_EXTRACT_LANE(I64x2, I, , 64)
++#endif
+ SIMD_VISIT_EXTRACT_LANE(I32x4, I, , 32)
+ SIMD_VISIT_EXTRACT_LANE(I16x8, I, U, 16)
+ SIMD_VISIT_EXTRACT_LANE(I16x8, I, S, 16)
+@@ -3538,7 +3583,10 @@ SIMD_VISIT_EXTRACT_LANE(I8x16, I, S, 8)
+   }
+ SIMD_VISIT_REPLACE_LANE(F64x2, F, 64)
+ SIMD_VISIT_REPLACE_LANE(F32x4, F, 32)
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the I64x2 lane visitors.
+ SIMD_VISIT_REPLACE_LANE(I64x2, I, 64)
++#endif
+ SIMD_VISIT_REPLACE_LANE(I32x4, I, 32)
+ SIMD_VISIT_REPLACE_LANE(I16x8, I, 16)
+ SIMD_VISIT_REPLACE_LANE(I8x16, I, 8)
+@@ -3565,6 +3613,11 @@ SIMD_BINOP_LIST(SIMD_VISIT_BINOP)
+          g.UseRegister(this->input_at(node, 0)));                  \
+   }
+ SIMD_UNOP_LIST(SIMD_VISIT_UNOP)
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines VisitI64x2Splat; it is
++// therefore kept out of SIMD_UNOP_LIST and emitted here.
++SIMD_VISIT_UNOP(I64x2Splat)
++#endif
+ #undef SIMD_VISIT_UNOP
+ #undef SIMD_UNOP_LIST
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,113 @@
+From e29a91e7b01bda0695599b18b3a39628965d31b2 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Wed, 2 Sep 2026 08:49:16 +0000
+Subject: [PATCH 48/52] ppc32: generic wasm-to-JS wrapper conventions for a
+ big-endian 32-bit target
+
+G5 parade #8 of the 12.4 port, and the first RUNTIME item: mksnapshot
+linked and ran, then died while compiling a CSA builtin:
+
+  # Fatal error in , line 0
+  # Unsupported operator: TruncateInt64ToInt32
+  ... InstructionSelectorT<TurbofanAdapter>::VisitNode
+  ... BuildWithCodeStubAssemblerCS / SetupBuiltinsInternal
+
+(The text is patch 0036's VISIT_UNSUPPORTED_OP diagnostic: a Word64
+node reached the 32-bit instruction selector.)
+
+The builtin is WasmToJsWrapperCSA, the Torque half of the generic
+wasm-to-JS wrapper (new since 9.4, src/builtins/wasm-to-js.tq).  It
+reads its parameters back from the register/stack slots that the ASM
+half (Generate_WasmToJsWrapperAsm) pushed, steered by three constexpr
+bools from wasm-linkage.h.  Two of them encode "big-endian implies
+64-bit", because upstream's only big-endian targets (ppc64, s390x) are:
+
+  kIsBigEndian (= V8_TARGET_BIG_ENDIAN): an i32 parameter is read as
+    TruncateInt64ToInt32(*RefCast<int64>(slot)) and an f32 return is
+    written `<< 32` into its slot - a 32-bit value sits in the
+    upper-address half of an 8-byte slot there.  On ppc32 the slots are
+    kSystemPointerSize = 4 bytes and the value fills them, so the
+    little-endian slot code is the correct one.  The Int64 load and the
+    truncation are what landed in the builtin's graph.
+
+  kIsFpAlwaysDouble (= V8_TARGET_ARCH_PPC64): an f32 parameter that
+    arrived in an FP register is read as float64 and rounded, an f32
+    return goes out as float64, because the PowerPC FPU holds every
+    value as a double and the ASM half spills the FPRs with stfd
+    (MultiPushDoubles).  That is FPU behaviour, not pointer size, and
+    ppc32 shares it (same kFpParamRegisters, same spill); with the
+    constant false the wrapper would read the top half of the spilled
+    double as the float.
+
+Fix both at the definition site: kIsFpAlwaysDouble for PPC || PPC64,
+kIsBigEndian for V8_TARGET_BIG_ENDIAN && V8_TARGET_ARCH_64_BIT (which
+v8config.h derives as 32_BIT for V8_TARGET_ARCH_PPC).  Torque wraps the
+untaken `if constexpr` blocks in `if (block.is_used())`
+(csa-generator.cc), so the Word64 nodes are no longer emitted.  No C++
+consumes either constant (grep: the definitions plus the generated
+wasm-to-js-tq-csa.cc only), so the object code of every other TU that
+includes wasm-linkage.h is unchanged.
+
+Rest of the wrapper contract checked for ppc32: StackAlignmentInBytes()
+is one slot off arm64, so numFixedSlots = 3 = the stub's pushes and
+kSignatureOffset scales; 6 GP slots of kSystemPointerSize then 8
+8-byte FPR slots with no padding (the allocator's 32-bit padding term is
+0 for 24 GP bytes); i64 params/returns take two GP slots low-word-first,
+exactly as Int64Lowering numbers them (ia32's eax/edx pairing); stack
+f32 params are stfs'd at the slot start by kPPC_Push on both widths;
+returns go to r3/r4 (intptr) and d1/d2 (float64) through the builtin's
+own descriptor.  The generic JS-to-wasm wrapper is not used on ppc
+(CanUseGenericJsToWasmWrapper is x64/arm64/ia32/arm only,
+Generate_JSToWasmWrapperAsm traps); js-to-wasm.tq has no kIsBigEndian
+use and compiles under Is64() guards alone.
+
+NEW CLASS for this port: "big-endian implies 64-bit" - code under
+V8_TARGET_BIG_ENDIAN may assume 8-byte slots or 64-bit instructions.
+Sweep (scratchpad besites.py, endian-gated sites in the compiled tree,
+diffed against the 9.4 sources where mksnapshot and d8 ran on the G5):
+154 sites, 142 present at 9.4; of the new ones this is the ONLY one in
+CSA/Torque land, i.e. in what mksnapshot compiles.  The rest are
+runtime paths: bigint.cc (de)serialization and turboshaft opmasks.h
+generalize by digit type / byte offset; the ppc macro-assembler's *LE
+memory helpers DO carry the assumption (LoadU64LE/StoreU64LE via
+ldbrx/stdbrx, ISA 2.06; LoadF32LE's sp+4 after a 4-byte push) but are
+reached only from Liftoff (off on ppc32, patch 0030) and the SIMD
+S128Load64Lane codegen (SIMD rejected) - wasm memory endianness on ppc32
+goes through the graph-level BuildChangeEndiannessLoad/Store.  Noted as
+a d8-smoke watch item, not changed here.
+---
+ v8/src/wasm/wasm-linkage.h | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/v8/src/wasm/wasm-linkage.h b/v8/src/wasm/wasm-linkage.h
+index 5570874..1800cab 100644
+--- a/v8/src/wasm/wasm-linkage.h
++++ b/v8/src/wasm/wasm-linkage.h
+@@ -130,14 +130,21 @@ constexpr DoubleRegister kFpReturnRegisters[] = {};
+ 
+ #endif
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_PPC
+ // Platforms where a Floating Point value is represented in Double Precision
+-// format in a FP register.
++// format in a FP register.  A property of the PowerPC FPU, not of the pointer
++// size: the ASM half of the generic wasm-to-JS wrapper spills the FP parameter
++// registers with stfd on ppc32 too.
+ constexpr bool kIsFpAlwaysDouble = true;
+ #else
+ constexpr bool kIsFpAlwaysDouble = false;
+ #endif
+-#if V8_TARGET_BIG_ENDIAN
++// The generic wrappers take kIsBigEndian to mean that a 32-bit value occupies
++// the upper-address half of its pointer-sized slot, which presumes 8-byte
++// slots: they read the slot as an int64 and truncate.  On a big-endian 32-bit
++// target (ppc32) the slot is 4 bytes and the value fills it, so the
++// little-endian slot handling is the correct one.
++#if V8_TARGET_BIG_ENDIAN && V8_TARGET_ARCH_64_BIT
+ constexpr bool kIsBigEndian = true;
+ #else
+ constexpr bool kIsBigEndian = false;
+-- 
+2.43.0
+

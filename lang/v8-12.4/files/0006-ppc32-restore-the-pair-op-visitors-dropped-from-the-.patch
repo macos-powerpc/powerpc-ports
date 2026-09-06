@@ -1,0 +1,194 @@
+From bad4cbb9dc4db294961cd01d61b32c2cc30b72d6 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Mon, 31 Aug 2026 01:53:07 +0000
+Subject: [PATCH 06/52] ppc32: restore the pair-op visitors dropped from the
+ instruction selector
+
+Upstream deleted the ppc32 pair-op selector visitors somewhere between
+9.4 and 12.4 while leaving their whole downstream intact: the
+kPPC_AddPair/SubPair/MulPair/ShiftLeftPair/ShiftRightPair/
+ShiftRightAlgPair code-generator cases still compile under
+!V8_TARGET_ARCH_PPC64, and kPPC_DoubleConstruct kept its 32-bit
+MovInt64ToDouble branch.  On 32-bit targets the generic selector only
+provides these visitors under V8_TARGET_ARCH_64_BIT (as UNSUPPORTED
+stubs), so without backend definitions the dispatch references are
+unresolvable and Int64Lowering output cannot be selected.
+
+- VisitInt32PairAdd/Sub/Mul and VisitWord32PairShl/Shr/Sar: the 9.4
+  bodies (which match the surviving codegen operand contracts: inputs
+  low/high/low/high, MulPair's two temps, the 1-vs-2-output shift shape
+  with a temp for the dropped high word) rewritten against the adapter
+  API in the exact shape of arm's 12.4 templated versions
+  (FindProjection/valid/input_at/is_integer_constant).
+- VisitBitcastWord32PairToFloat64: new op since 9.4, Turboshaft-only
+  (Turbofan splits it into Float64InsertLow/HighWord32, which this
+  backend already implements); emit kPPC_DoubleConstruct with (high,
+  low) inputs per its 32-bit codegen branch, mirroring arm's
+  kArmVmovF64U32U32 version.
+
+Verified: ppcheck balanced; cross-g++14 -E name-set audit shows all
+seven defined under the ppc32 view with the ppc-vs-generic definition
+overlap still empty; -fsyntax-only parses the TU with zero errors in
+this file (full template instantiation remains blocked by the
+interface-descriptors.h register-macro and macro-assembler-ppc.h
+assert errors - the 0008-class and 0013-class ladder items).
+---
+ .../backend/ppc/instruction-selector-ppc.cc   | 142 ++++++++++++++++++
+ 1 file changed, 142 insertions(+)
+
+diff --git a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+index a2a89ab..ad5c5bd 100644
+--- a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -1393,6 +1393,148 @@ void InstructionSelectorT<Adapter>::VisitWord64Sar(node_t node) {
+ }
+ #endif
+ 
++#if !V8_TARGET_ARCH_PPC64
++namespace {
++// Shared routine for multiple pair binary operations.
++template <typename Adapter>
++void VisitPairBinop(InstructionSelectorT<Adapter>* selector,
++                    InstructionCode opcode, InstructionCode opcode2,
++                    typename Adapter::node_t node) {
++  PPCOperandGeneratorT<Adapter> g(selector);
++
++  typename Adapter::node_t projection1 = selector->FindProjection(node, 1);
++  if (selector->valid(projection1)) {
++    // We use UseUniqueRegister here to avoid register sharing with the output
++    // registers.
++    InstructionOperand inputs[] = {
++        g.UseRegister(selector->input_at(node, 0)),
++        g.UseUniqueRegister(selector->input_at(node, 1)),
++        g.UseRegister(selector->input_at(node, 2)),
++        g.UseUniqueRegister(selector->input_at(node, 3))};
++
++    InstructionOperand outputs[] = {g.DefineAsRegister(node),
++                                    g.DefineAsRegister(projection1)};
++
++    selector->Emit(opcode, 2, outputs, 4, inputs);
++  } else {
++    // The high word of the result is not used, so we emit the standard 32 bit
++    // instruction.
++    selector->Emit(opcode2, g.DefineSameAsFirst(node),
++                   g.UseRegister(selector->input_at(node, 0)),
++                   g.UseRegister(selector->input_at(node, 2)));
++  }
++}
++}  // namespace
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitInt32PairAdd(node_t node) {
++  VisitPairBinop(this, kPPC_AddPair, kPPC_Add32, node);
++}
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitInt32PairSub(node_t node) {
++  VisitPairBinop(this, kPPC_SubPair, kPPC_Sub, node);
++}
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitInt32PairMul(node_t node) {
++  PPCOperandGeneratorT<Adapter> g(this);
++  node_t projection1 = this->FindProjection(node, 1);
++  if (this->valid(projection1)) {
++    InstructionOperand inputs[] = {
++        g.UseUniqueRegister(this->input_at(node, 0)),
++        g.UseUniqueRegister(this->input_at(node, 1)),
++        g.UseUniqueRegister(this->input_at(node, 2)),
++        g.UseUniqueRegister(this->input_at(node, 3))};
++
++    InstructionOperand outputs[] = {g.DefineAsRegister(node),
++                                    g.DefineAsRegister(projection1)};
++
++    InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
++
++    Emit(kPPC_MulPair, 2, outputs, 4, inputs, 2, temps);
++  } else {
++    // The high word of the result is not used, so we emit the standard 32 bit
++    // instruction.
++    Emit(kPPC_Mul32, g.DefineSameAsFirst(node),
++         g.UseRegister(this->input_at(node, 0)),
++         g.UseRegister(this->input_at(node, 2)));
++  }
++}
++
++namespace {
++// Shared routine for multiple pair shift operations.
++template <typename Adapter>
++void VisitPairShift(InstructionSelectorT<Adapter>* selector,
++                    InstructionCode opcode, typename Adapter::node_t node) {
++  PPCOperandGeneratorT<Adapter> g(selector);
++  // We use g.UseUniqueRegister here to guarantee that there is
++  // no register aliasing of input registers with output registers.
++  InstructionOperand shift_operand;
++  typename Adapter::node_t shift_by = selector->input_at(node, 2);
++  if (selector->is_integer_constant(shift_by)) {
++    shift_operand = g.UseImmediate(shift_by);
++  } else {
++    shift_operand = g.UseUniqueRegister(shift_by);
++  }
++
++  InstructionOperand inputs[] = {
++      g.UseUniqueRegister(selector->input_at(node, 0)),
++      g.UseUniqueRegister(selector->input_at(node, 1)), shift_operand};
++
++  typename Adapter::node_t projection1 = selector->FindProjection(node, 1);
++
++  InstructionOperand outputs[2];
++  InstructionOperand temps[1];
++  int32_t output_count = 0;
++  int32_t temp_count = 0;
++
++  outputs[output_count++] = g.DefineAsRegister(node);
++  if (selector->valid(projection1)) {
++    outputs[output_count++] = g.DefineAsRegister(projection1);
++  } else {
++    temps[temp_count++] = g.TempRegister();
++  }
++
++  selector->Emit(opcode, output_count, outputs, 3, inputs, temp_count, temps);
++}
++}  // namespace
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitWord32PairShl(node_t node) {
++  VisitPairShift(this, kPPC_ShiftLeftPair, node);
++}
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitWord32PairShr(node_t node) {
++  VisitPairShift(this, kPPC_ShiftRightPair, node);
++}
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitWord32PairSar(node_t node) {
++  VisitPairShift(this, kPPC_ShiftRightAlgPair, node);
++}
++
++template <typename Adapter>
++void InstructionSelectorT<Adapter>::VisitBitcastWord32PairToFloat64(
++    node_t node) {
++  if constexpr (Adapter::IsTurbofan) {
++    // The Turbofan implementation is split across VisitFloat64InsertLowWord32
++    // and VisitFloat64InsertHighWord32.
++    UNREACHABLE();
++  } else {
++    using namespace turboshaft;  // NOLINT(build/namespaces)
++    PPCOperandGeneratorT<TurboshaftAdapter> g(this);
++    const BitcastWord32PairToFloat64Op& cast_op =
++        this->Get(node).template Cast<BitcastWord32PairToFloat64Op>();
++    // kPPC_DoubleConstruct takes (high, low) on 32-bit.
++    Emit(kPPC_DoubleConstruct, g.DefineAsRegister(node),
++         g.UseRegister(cast_op.high_word32()),
++         g.UseRegister(cast_op.low_word32()));
++  }
++}
++#endif  // !V8_TARGET_ARCH_PPC64
++
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitWord32Rol(node_t node) {
+     UNREACHABLE();
+-- 
+2.43.0
+

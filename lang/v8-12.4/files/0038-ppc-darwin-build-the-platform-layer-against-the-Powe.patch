@@ -1,0 +1,153 @@
+From ab9e1b346db28fdfbfbdeb52e5e57f93bcad4288 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Tue, 1 Sep 2026 00:15:47 +0000
+Subject: [PATCH 38/52] ppc/darwin: build the platform layer against the
+ PowerPC-era SDK
+
+G5 build error #1 of the 12.4 port (first error of the expected
+parade; v8_libbase at 11%).  Class: Darwin APIs younger than the
+PowerPC-era SDKs, all in the platform layer, all newly-arrived
+between 9.4 and 12.4 (platform-darwin.cc itself is the 12.4 successor
+of platform-macos.cc).  The G5 compiler parsed both TUs to the end,
+so the reported set is the complete undeclared-identifier set; a
+sweep of src/base for the class found no further live sites
+(pthread_jit_write_protect_np is V8_HAS_PTHREAD_JIT_WRITE_PROTECT =
+arm64-only, platform-ios.cc is not compiled).
+
+- GetSharedLibraryAddresses: choose the getsectiondata call by
+  V8_HOST_ARCH_32_BIT.  Upstream gates the mach_header* form on
+  V8_HOST_ARCH_I32, a macro that does not exist anywhere (the real
+  one is V8_HOST_ARCH_IA32), so every host took the mach_header_64
+  branch; the old getsect.h declares only the mach_header* form.
+- OS::RemapPages / AddressSpaceReservation::AllocateShared: the SDK
+  predates VM_FLAGS_OVERWRITE, and remap-on-top cannot be requested
+  without it.  Both APIs are documented fallible -> return false
+  (#ifndef-gated); the RemapPages caller (embedded-builtins
+  remapping, code-range.cc) falls back to copying.
+- GetFlagsForMemoryPermission: MAP_JIT compiled out when the SDK
+  lacks it.  RWX mappings need no special flag before the hardened
+  runtime existed - upstream's own 'retry without MAP_JIT ... old
+  OS X' path in CreateAddressSpaceReservation assumes exactly this.
+- ThreadEntry: the QoS API (10.10+) compiled out; the thread
+  priority stays an unapplied hint.
+- SetPermissions' rwx->none madvise workaround gated on
+  MADV_FREE_REUSABLE existing (belt-and-braces alongside the same
+  gating the platform-posix patch already applies further down).
+
+ppcheck: both files balanced under the ppc32 view; the QoS #elif
+chain falls through to no branch on old Darwin.
+---
+ v8/src/base/platform/platform-darwin.cc | 18 +++++++++++++++++-
+ v8/src/base/platform/platform-posix.cc  | 18 +++++++++++++-----
+ 2 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/v8/src/base/platform/platform-darwin.cc b/v8/src/base/platform/platform-darwin.cc
+index c563693..8e9a6a2 100644
+--- a/v8/src/base/platform/platform-darwin.cc
++++ b/v8/src/base/platform/platform-darwin.cc
+@@ -87,7 +87,10 @@ std::vector<OS::SharedLibraryAddress> OS::GetSharedLibraryAddresses() {
+     const mach_header* header = _dyld_get_image_header(i);
+     if (header == nullptr) continue;
+     unsigned long size;
+-#if V8_HOST_ARCH_I32
++#if V8_HOST_ARCH_32_BIT
++    // On 32-bit hosts the image headers are mach_header, and getsectiondata
++    // takes mach_header* (the old SDKs declare only that form).  Upstream
++    // spelled this V8_HOST_ARCH_I32, a macro that does not exist.
+     uint8_t* code_ptr = getsectiondata(header, SEG_TEXT, SECT_TEXT, &size);
+ #else
+     const mach_header_64* header64 =
+@@ -183,6 +186,12 @@ void* OS::AllocateShared(void* hint, size_t size, MemoryPermission access,
+ // static
+ bool OS::RemapPages(const void* address, size_t size, void* new_address,
+                     MemoryPermission access) {
++#ifndef VM_FLAGS_OVERWRITE
++  // The PowerPC-era SDKs predate VM_FLAGS_OVERWRITE: remapping on top of an
++  // existing mapping cannot be requested.  This API is documented fallible;
++  // the caller (embedded-builtins remapping) falls back to copying.
++  return false;
++#else
+   DCHECK(IsAligned(reinterpret_cast<uintptr_t>(address), AllocatePageSize()));
+   DCHECK(
+       IsAligned(reinterpret_cast<uintptr_t>(new_address), AllocatePageSize()));
+@@ -205,6 +214,7 @@ bool OS::RemapPages(const void* address, size_t size, void* new_address,
+   CHECK_EQ(new_address, reinterpret_cast<void*>(target));
+ 
+   return true;
++#endif  // VM_FLAGS_OVERWRITE
+ }
+ 
+ bool AddressSpaceReservation::AllocateShared(void* address, size_t size,
+@@ -213,6 +223,11 @@ bool AddressSpaceReservation::AllocateShared(void* address, size_t size,
+                                              uint64_t offset) {
+   DCHECK(Contains(address, size));
+ 
++#ifndef VM_FLAGS_OVERWRITE
++  // See OS::RemapPages: no VM_FLAGS_OVERWRITE in the PowerPC-era SDKs, and
++  // this too is a documented-fallible API.
++  return false;
++#else
+   vm_prot_t prot = GetVMProtFromMemoryPermission(access);
+   mach_vm_address_t addr = reinterpret_cast<mach_vm_address_t>(address);
+   mach_port_t shared_mem_port = MachMemoryEntryFromSharedMemoryHandle(handle);
+@@ -220,6 +235,7 @@ bool AddressSpaceReservation::AllocateShared(void* address, size_t size,
+       mach_vm_map_wrapper(&addr, size, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                           shared_mem_port, offset, prot);
+   return kr == KERN_SUCCESS;
++#endif  // VM_FLAGS_OVERWRITE
+ }
+ 
+ // See platform-ios.cc for the iOS implementation.
+diff --git a/v8/src/base/platform/platform-posix.cc b/v8/src/base/platform/platform-posix.cc
+index ccc209d..fe19fea 100644
+--- a/v8/src/base/platform/platform-posix.cc
++++ b/v8/src/base/platform/platform-posix.cc
+@@ -151,15 +151,18 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access,
+     flags |= MAP_LAZY;
+ #endif  // V8_OS_QNX
+   }
+-#if V8_OS_DARWIN
++#if V8_OS_DARWIN && defined(MAP_JIT)
+   // MAP_JIT is required to obtain writable and executable pages when the
+   // hardened runtime/memory protection is enabled, which is optional (via code
+   // signing) on Intel-based Macs but mandatory on Apple silicon ones. See also
+   // https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon.
++  // The PowerPC-era SDKs predate MAP_JIT and the hardened runtime; RWX
++  // mappings need no special flag there (this is the same situation as the
++  // "old OS X" retry in CreateAddressSpaceReservation below).
+   if (access == OS::MemoryPermission::kNoAccessWillJitLater) {
+     flags |= MAP_JIT;
+   }
+-#endif  // V8_OS_DARWIN
++#endif  // V8_OS_DARWIN && defined(MAP_JIT)
+   return flags;
+ }
+ 
+@@ -504,8 +507,10 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
+   if (ret != 0) CHECK_EQ(ENOMEM, errno);
+ 
+   // MacOS 11.2 on Apple Silicon refuses to switch permissions from
+-  // rwx to none. Just use madvise instead.
+-#if defined(V8_OS_DARWIN)
++  // rwx to none. Just use madvise instead.  (Compiled out on the
++  // PowerPC-era SDKs, which predate MADV_FREE_REUSABLE along with the
++  // problem this works around.)
++#if defined(V8_OS_DARWIN) && defined(MADV_FREE_REUSABLE)
+   if (ret != 0 && access == OS::MemoryPermission::kNoAccess) {
+     ret = madvise(address, size, MADV_FREE_REUSABLE);
+     return ret == 0;
+@@ -1177,7 +1182,10 @@ static void* ThreadEntry(void* arg) {
+   // one).
+   { MutexGuard lock_guard(&thread->data()->thread_creation_mutex_); }
+   SetThreadName(thread->name());
+-#if V8_OS_DARWIN
++// The QoS API appeared in 10.10; on the PowerPC-era SDKs the priority stays
++// an unapplied hint (there is no per-thread setpriority on Darwin, and the
++// scheduler works fine without it).
++#if V8_OS_DARWIN && defined(QOS_CLASS_BACKGROUND)
+   switch (thread->priority()) {
+     case Thread::Priority::kBestEffort:
+       pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+-- 
+2.43.0
+
