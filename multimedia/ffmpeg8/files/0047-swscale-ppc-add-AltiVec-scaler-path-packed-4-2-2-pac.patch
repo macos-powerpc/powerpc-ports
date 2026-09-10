@@ -1,0 +1,531 @@
+From 855ebe9a17bd4d44904f811dbe7c26b71a66c2c2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 04:25:59 +0000
+Subject: [PATCH] swscale/ppc: add AltiVec scaler-path packed 4:2:2 packers
+
+Add yuv2packed1/2/X AltiVec kernels for yuyv422/yvyu422/uyvy422 to
+libswscale/ppc/yuv2yuv_altivec.c, registered from a new
+ff_sws_init_yuv2packed422_ppc() entry point called by
+ff_sws_init_swscale_ppc(). This is the general scaler's packed-output
+path (libswscale/output.c's yuv2422_{1,2,X}_c_template), distinct from
+the unscaled planar->packed converters already in this file.
+
+Design, verified in the new file comment: the C references only clip
+(and only then match true 8-bit saturation) when the pre-clip int is in
+[-256, 511]; outside that window they store the low byte of an
+unclamped value that nothing sane depends on. Every AltiVec step that
+could overflow uses a genuinely saturating op (vec_adds for the _1
+luma/chroma "+64" step, vec_packs/vec_packsu for the final narrowing),
+so the kernels equal the C reference everywhere the reference is
+well-defined -- hence no SWS_BITEXACT/SWS_FULL_CHR_H_INT/needAlpha gate
+on registration, exactly mirroring the C dispatch
+(output.c:3800-3813). One av_always_inline template per variant (_1,
+_2, _X) takes the target format as a compile-time-constant parameter,
+each with 3 thin wrappers, following the existing
+planar_to_packed422_altivec/output.c pattern.
+
+Per call: pairs = (dstW+1)>>1, an 8-pairs-per-iteration vector loop
+(16 luma + 8 chroma samples -> 32 output bytes via two store16 calls),
+then a scalar tail that is the C body verbatim including the "& 0x100"
+clip idiom. Byte assembly reuses the sub-task-1 kernel's proven order:
+pack luma to u8 (already Y1,Y2,... order, since that is simply buf0's
+own element order), pack U,V together, interleave via vec_sld+vec_mergeh
+into u0,v0,u1,v1,... (or v-first for YVYU), then interleave with luma in
+the target's byte order. _1's chroma branches once per call on
+uvalpha < 2048 (mirroring the C); _2's per-line blend coefficients and
+_X's per-tap accumulation both use the vec_mule/vec_mulo + mergeh/mergel
+"restore order" idiom already used by yuv2planeX_8 in swscale_altivec.c
+for the same reason (no mixed even/odd multiply on classic AltiVec).
+
+Validated with tests/checkasm/sw_yuv2yuv.c's new check_yuv2packed422_1/2/X
+(previous commit): seeds 1, 42, 777, 5, 99 all pass; --bench --duration=100
+lists _altivec rows for all 9 (format x variant) names (45 individual
+parameter rows) alongside the still-present sub-task-1 names. Both
+touched files were also compiled standalone in the plain and
+-D_ARCH_PWR4 shapes with -Wall -Wextra: no new warnings (the few
+warnings present pre-exist in code this patch does not touch).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Xix7Wn4UbWrKRBNAMUVpRR
+---
+ libswscale/ppc/swscale_altivec.c |   2 +
+ libswscale/ppc/yuv2yuv_altivec.c | 417 +++++++++++++++++++++++++++++++
+ libswscale/swscale_internal.h    |   9 +
+ 3 files changed, 428 insertions(+)
+
+diff --git a/libswscale/ppc/swscale_altivec.c b/libswscale/ppc/swscale_altivec.c
+index 3112c6c..2a26dac 100644
+--- a/libswscale/ppc/swscale_altivec.c
++++ b/libswscale/ppc/swscale_altivec.c
+@@ -238,6 +238,8 @@ av_cold void ff_sws_init_swscale_ppc(SwsInternal *c)
+     if (!(av_get_cpu_flags() & AV_CPU_FLAG_ALTIVEC))
+         return;
+ 
++    ff_sws_init_yuv2packed422_ppc(c);
++
+ #if HAVE_BIGENDIAN
+     if (c->srcBpc == 8 && c->dstBpc <= 14) {
+         c->hyScale = c->hcScale = hScale_real_altivec;
+diff --git a/libswscale/ppc/yuv2yuv_altivec.c b/libswscale/ppc/yuv2yuv_altivec.c
+index 2da4535..85e8d5c 100644
+--- a/libswscale/ppc/yuv2yuv_altivec.c
++++ b/libswscale/ppc/yuv2yuv_altivec.c
+@@ -25,7 +25,10 @@
+ 
+ #include "config.h"
+ #include "libavutil/attributes.h"
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
+ #include "libavutil/cpu.h"
++#include "libavutil/mem_internal.h"
+ #include "libswscale/swscale.h"
+ #include "libswscale/swscale_internal.h"
+ 
+@@ -218,6 +221,384 @@ static int yuv422ptouyvy_unscaled_altivec(SwsInternal *c, const uint8_t *const s
+                                        dstParam, dstStride_a, 1, 1);
+ }
+ 
++/*
++ * Scaler-path packed 4:2:2 output packers (yuv2packed1/2/X for yuyv422,
++ * yvyu422 and uyvy422 -- the C references are yuv2422_{1,2,X}_c_template
++ * plus the output_pixels macro in libswscale/output.c). Unlike the unscaled
++ * converters above, these run inside the general horizontal/vertical scaler
++ * and are registered unconditionally for these three dst formats (no
++ * SWS_BITEXACT / SWS_FULL_CHR_H_INT / needAlpha gate), exactly mirroring the
++ * C dispatch (output.c:3800-3813) -- so this file's comment there about
++ * "the following list of supported dstFormat values" does not apply to
++ * these three.
++ *
++ * Bit-exactness argument: the C references clip with
++ * `if ((Y1|Y2|U|V) & 0x100) { clip each to uint8 }`, i.e. they only clip
++ * (and only then match true 8-bit saturation) when the pre-clip value is in
++ * [-256, 511]; outside that window bit 8 can be clear even though the true
++ * saturated result would differ, and the C stores the raw low byte of an
++ * unclamped int instead -- a value nobody relying on correct output can be
++ * seeing. The AltiVec kernels below use genuine saturating operations
++ * (vec_adds, vec_packs, vec_packsu) everywhere a corresponding C step could
++ * overflow, so kernel output equals the C reference on the whole
++ * well-defined window; checkasm's synthetic inputs (tests/checkasm/
++ * sw_yuv2yuv.c, check_yuv2packed422_1/2/X) are deliberately kept inside that
++ * window, exactly as this argument requires.
++ *
++ * Byte assembly is shared with the sub-task-1 kernel above: pack luma to
++ * u8 first (already in Y1,Y2,Y1,Y2,... order because that is simply the
++ * natural order of lumSrc/buf0/buf1), pack U and V together into one
++ * vector (u0..7,v0..7), then interleave via vec_sld+vec_mergeh to get
++ * u0,v0,u1,v1,... (or v0,u0,... for YVYU), and finally interleave that
++ * with the luma vector in the byte order the target format wants.
++ */
++static av_always_inline vec_s16 load_s16(const int16_t *p, int elem_off)
++{
++    int off = elem_off << 1;
++    return vec_perm(vec_ld(off, p), vec_ld(off + 15, p), vec_lvsl(off, p));
++}
++
++/* Splat filter[j] (a value that is only ever 2-byte aligned) across all 8
++ * lanes: a single aligned load of the 16-byte block containing it, rotated
++ * in place so that value reaches lane 0, then vec_splat. Same idiom as
++ * LOAD_FILTER in swscale_altivec.c. */
++static av_always_inline vec_s16 load_filter_splat(const int16_t *filt, int j)
++{
++    int off = j << 1;
++    vec_u8 perm0 = vec_lvsl(off, filt);
++    vec_s16 vf   = vec_ld(off, filt);
++    vf = vec_perm(vf, vf, perm0);
++    return vec_splat(vf, 0);
++}
++
++static av_always_inline void store_pixel_pair(uint8_t *d, int Y1, int U, int Y2, int V,
++                                              enum AVPixelFormat target)
++{
++    if (target == AV_PIX_FMT_YUYV422) {
++        d[0] = Y1; d[1] = U;  d[2] = Y2; d[3] = V;
++    } else if (target == AV_PIX_FMT_YVYU422) {
++        d[0] = Y1; d[1] = V;  d[2] = Y2; d[3] = U;
++    } else { /* AV_PIX_FMT_UYVY422 */
++        d[0] = U;  d[1] = Y1; d[2] = V;  d[3] = Y2;
++    }
++}
++
++static av_always_inline void store_packed422_block(vec_s16 Ylo, vec_s16 Yhi,
++                                                    vec_s16 U, vec_s16 V,
++                                                    uint8_t *dst, int dst_aligned,
++                                                    enum AVPixelFormat target)
++{
++    vec_u8 Yb  = vec_packsu(Ylo, Yhi);
++    vec_u8 uv  = vec_packsu(U, V);
++    vec_u8 uvS = vec_sld(uv, uv, 8);
++    vec_u8 out0, out1;
++
++    if (target == AV_PIX_FMT_YUYV422) {
++        vec_u8 uvi = vec_mergeh(uv, uvS);
++        out0 = vec_mergeh(Yb, uvi);
++        out1 = vec_mergel(Yb, uvi);
++    } else if (target == AV_PIX_FMT_UYVY422) {
++        vec_u8 uvi = vec_mergeh(uv, uvS);
++        out0 = vec_mergeh(uvi, Yb);
++        out1 = vec_mergel(uvi, Yb);
++    } else { /* AV_PIX_FMT_YVYU422: v before u */
++        vec_u8 uvi = vec_mergeh(uvS, uv);
++        out0 = vec_mergeh(Yb, uvi);
++        out1 = vec_mergel(Yb, uvi);
++    }
++
++    store16(out0, dst,      dst_aligned);
++    store16(out1, dst + 16, dst_aligned);
++}
++
++static av_always_inline void yuv2422_1_altivec_template(SwsInternal *c,
++                                                        const int16_t *buf0,
++                                                        const int16_t *ubuf[2],
++                                                        const int16_t *vbuf[2],
++                                                        const int16_t *abuf0,
++                                                        uint8_t *dest, int dstW,
++                                                        int uvalpha, int y,
++                                                        enum AVPixelFormat target)
++{
++    const int16_t *ubuf0 = ubuf[0], *vbuf0 = vbuf[0];
++    const int pairs = (dstW + 1) >> 1;
++    const int dst_aligned = !((uintptr_t)dest & 15);
++    const vec_s16 c64 = (vec_s16) { 64, 64, 64, 64, 64, 64, 64, 64 };
++    const vec_u16 sh7 = vec_splat_u16(7);
++    int p = 0;
++
++    (void)c;
++    (void)abuf0;
++    (void)y;
++
++    if (uvalpha < 2048) {
++        for (; p + 8 <= pairs; p += 8) {
++            vec_s16 y0 = load_s16(buf0, 2 * p);
++            vec_s16 y1 = load_s16(buf0, 2 * p + 8);
++            vec_s16 u  = load_s16(ubuf0, p);
++            vec_s16 v  = load_s16(vbuf0, p);
++            vec_s16 Y0 = vec_sra(vec_adds(y0, c64), sh7);
++            vec_s16 Y1 = vec_sra(vec_adds(y1, c64), sh7);
++            vec_s16 U  = vec_sra(vec_adds(u,  c64), sh7);
++            vec_s16 V  = vec_sra(vec_adds(v,  c64), sh7);
++            store_packed422_block(Y0, Y1, U, V, dest + 4 * p, dst_aligned, target);
++        }
++
++        for (; p < pairs; p++) {
++            int Y1 = (buf0[p * 2]     + 64) >> 7;
++            int Y2 = (buf0[p * 2 + 1] + 64) >> 7;
++            int U  = (ubuf0[p]        + 64) >> 7;
++            int V  = (vbuf0[p]        + 64) >> 7;
++            if ((Y1 | Y2 | U | V) & 0x100) {
++                Y1 = av_clip_uint8(Y1);
++                Y2 = av_clip_uint8(Y2);
++                U  = av_clip_uint8(U);
++                V  = av_clip_uint8(V);
++            }
++            store_pixel_pair(dest + 4 * p, Y1, U, Y2, V, target);
++        }
++    } else {
++        const int16_t *ubuf1 = ubuf[1], *vbuf1 = vbuf[1];
++        const vec_s16 ones   = vec_splat_s16(1);
++        const vec_s32 rnd128 = (vec_s32) { 128, 128, 128, 128 };
++        const vec_u32 sh8    = vec_splat_u32(8);
++
++        for (; p + 8 <= pairs; p += 8) {
++            vec_s16 y0 = load_s16(buf0, 2 * p);
++            vec_s16 y1 = load_s16(buf0, 2 * p + 8);
++            vec_s16 u0 = load_s16(ubuf0, p);
++            vec_s16 u1 = load_s16(ubuf1, p);
++            vec_s16 v0 = load_s16(vbuf0, p);
++            vec_s16 v1 = load_s16(vbuf1, p);
++            vec_s16 Y0 = vec_sra(vec_adds(y0, c64), sh7);
++            vec_s16 Y1 = vec_sra(vec_adds(y1, c64), sh7);
++            vec_s32 uAccLo = vec_msum(vec_mergeh(u0, u1), ones, rnd128);
++            vec_s32 uAccHi = vec_msum(vec_mergel(u0, u1), ones, rnd128);
++            vec_s32 vAccLo = vec_msum(vec_mergeh(v0, v1), ones, rnd128);
++            vec_s32 vAccHi = vec_msum(vec_mergel(v0, v1), ones, rnd128);
++            vec_s16 U = vec_packs(vec_sra(uAccLo, sh8), vec_sra(uAccHi, sh8));
++            vec_s16 V = vec_packs(vec_sra(vAccLo, sh8), vec_sra(vAccHi, sh8));
++            store_packed422_block(Y0, Y1, U, V, dest + 4 * p, dst_aligned, target);
++        }
++
++        for (; p < pairs; p++) {
++            int Y1 = (buf0[p * 2]      + 64) >> 7;
++            int Y2 = (buf0[p * 2 + 1]  + 64) >> 7;
++            int U  = (ubuf0[p] + ubuf1[p] + 128) >> 8;
++            int V  = (vbuf0[p] + vbuf1[p] + 128) >> 8;
++            if ((Y1 | Y2 | U | V) & 0x100) {
++                Y1 = av_clip_uint8(Y1);
++                Y2 = av_clip_uint8(Y2);
++                U  = av_clip_uint8(U);
++                V  = av_clip_uint8(V);
++            }
++            store_pixel_pair(dest + 4 * p, Y1, U, Y2, V, target);
++        }
++    }
++}
++
++static av_always_inline void yuv2422_2_altivec_template(SwsInternal *c,
++                                                        const int16_t *buf[2],
++                                                        const int16_t *ubuf[2],
++                                                        const int16_t *vbuf[2],
++                                                        const int16_t *abuf[2],
++                                                        uint8_t *dest, int dstW,
++                                                        int yalpha, int uvalpha, int y,
++                                                        enum AVPixelFormat target)
++{
++    const int16_t *buf0  = buf[0],  *buf1  = buf[1];
++    const int16_t *ubuf0 = ubuf[0], *ubuf1 = ubuf[1];
++    const int16_t *vbuf0 = vbuf[0], *vbuf1 = vbuf[1];
++    const int yalpha1  = 4096 - yalpha;
++    const int uvalpha1 = 4096 - uvalpha;
++    const int pairs = (dstW + 1) >> 1;
++    const int dst_aligned = !((uintptr_t)dest & 15);
++    DECLARE_ALIGNED(16, int16_t, coefYbuf)[8];
++    DECLARE_ALIGNED(16, int16_t, coefCbuf)[8];
++    vec_s16 coefY, coefC;
++    const vec_s32 zero32 = (vec_s32) { 0, 0, 0, 0 };
++    const vec_u32 sh19   = vec_add(vec_splat_u32(10), vec_splat_u32(9));
++    int p = 0, i;
++
++    (void)c;
++    (void)abuf;
++    (void)y;
++
++    av_assert2(yalpha  <= 4096U);
++    av_assert2(uvalpha <= 4096U);
++
++    for (i = 0; i < 8; i += 2) {
++        coefYbuf[i]     = yalpha1;
++        coefYbuf[i + 1] = yalpha;
++        coefCbuf[i]     = uvalpha1;
++        coefCbuf[i + 1] = uvalpha;
++    }
++    coefY = vec_ld(0, coefYbuf);
++    coefC = vec_ld(0, coefCbuf);
++
++    for (; p + 8 <= pairs; p += 8) {
++        vec_s16 la0 = load_s16(buf0, 2 * p),     la1 = load_s16(buf1, 2 * p);
++        vec_s16 lb0 = load_s16(buf0, 2 * p + 8), lb1 = load_s16(buf1, 2 * p + 8);
++        vec_s16 ua0 = load_s16(ubuf0, p), ua1 = load_s16(ubuf1, p);
++        vec_s16 va0 = load_s16(vbuf0, p), va1 = load_s16(vbuf1, p);
++        vec_s32 accYlo0, accYlo1, accYhi0, accYhi1;
++        vec_s32 accU0, accU1, accV0, accV1;
++        vec_s16 Ylo, Yhi, U, V;
++
++        accYlo0 = vec_msum(vec_mergeh(la0, la1), coefY, zero32);
++        accYlo1 = vec_msum(vec_mergel(la0, la1), coefY, zero32);
++        accYhi0 = vec_msum(vec_mergeh(lb0, lb1), coefY, zero32);
++        accYhi1 = vec_msum(vec_mergel(lb0, lb1), coefY, zero32);
++        Ylo = vec_packs(vec_sra(accYlo0, sh19), vec_sra(accYlo1, sh19));
++        Yhi = vec_packs(vec_sra(accYhi0, sh19), vec_sra(accYhi1, sh19));
++
++        accU0 = vec_msum(vec_mergeh(ua0, ua1), coefC, zero32);
++        accU1 = vec_msum(vec_mergel(ua0, ua1), coefC, zero32);
++        accV0 = vec_msum(vec_mergeh(va0, va1), coefC, zero32);
++        accV1 = vec_msum(vec_mergel(va0, va1), coefC, zero32);
++        U = vec_packs(vec_sra(accU0, sh19), vec_sra(accU1, sh19));
++        V = vec_packs(vec_sra(accV0, sh19), vec_sra(accV1, sh19));
++
++        store_packed422_block(Ylo, Yhi, U, V, dest + 4 * p, dst_aligned, target);
++    }
++
++    for (; p < pairs; p++) {
++        int Y1 = (buf0[p * 2]     * yalpha1  + buf1[p * 2]     * yalpha)  >> 19;
++        int Y2 = (buf0[p * 2 + 1] * yalpha1  + buf1[p * 2 + 1] * yalpha)  >> 19;
++        int U  = (ubuf0[p]        * uvalpha1 + ubuf1[p]        * uvalpha) >> 19;
++        int V  = (vbuf0[p]        * uvalpha1 + vbuf1[p]        * uvalpha) >> 19;
++        if ((Y1 | Y2 | U | V) & 0x100) {
++            Y1 = av_clip_uint8(Y1);
++            Y2 = av_clip_uint8(Y2);
++            U  = av_clip_uint8(U);
++            V  = av_clip_uint8(V);
++        }
++        store_pixel_pair(dest + 4 * p, Y1, U, Y2, V, target);
++    }
++}
++
++static av_always_inline void yuv2422_X_altivec_template(SwsInternal *c,
++                                                        const int16_t *lumFilter,
++                                                        const int16_t **lumSrc,
++                                                        int lumFilterSize,
++                                                        const int16_t *chrFilter,
++                                                        const int16_t **chrUSrc,
++                                                        const int16_t **chrVSrc,
++                                                        int chrFilterSize,
++                                                        const int16_t **alpSrc,
++                                                        uint8_t *dest, int dstW, int y,
++                                                        enum AVPixelFormat target)
++{
++    const int pairs = (dstW + 1) >> 1;
++    const int dst_aligned = !((uintptr_t)dest & 15);
++    const vec_s32 bias = (vec_s32) { 1 << 18, 1 << 18, 1 << 18, 1 << 18 };
++    const vec_u32 sh19 = vec_add(vec_splat_u32(10), vec_splat_u32(9));
++    int p = 0, j;
++
++    (void)c;
++    (void)alpSrc;
++    (void)y;
++
++    for (; p + 8 <= pairs; p += 8) {
++        vec_s32 accEvenLo = bias, accOddLo = bias, accEvenHi = bias, accOddHi = bias;
++        vec_s32 accUEven  = bias, accUOdd  = bias, accVEven  = bias, accVOdd  = bias;
++        vec_s16 Ylo, Yhi, U, V;
++
++        for (j = 0; j < lumFilterSize; j++) {
++            vec_s16 lf  = load_filter_splat(lumFilter, j);
++            vec_s16 lLo = load_s16(lumSrc[j], 2 * p);
++            vec_s16 lHi = load_s16(lumSrc[j], 2 * p + 8);
++            accEvenLo = vec_add(accEvenLo, vec_mule(lLo, lf));
++            accOddLo  = vec_add(accOddLo,  vec_mulo(lLo, lf));
++            accEvenHi = vec_add(accEvenHi, vec_mule(lHi, lf));
++            accOddHi  = vec_add(accOddHi,  vec_mulo(lHi, lf));
++        }
++        for (j = 0; j < chrFilterSize; j++) {
++            vec_s16 cf = load_filter_splat(chrFilter, j);
++            vec_s16 us = load_s16(chrUSrc[j], p);
++            vec_s16 vs = load_s16(chrVSrc[j], p);
++            accUEven = vec_add(accUEven, vec_mule(us, cf));
++            accUOdd  = vec_add(accUOdd,  vec_mulo(us, cf));
++            accVEven = vec_add(accVEven, vec_mule(vs, cf));
++            accVOdd  = vec_add(accVOdd,  vec_mulo(vs, cf));
++        }
++
++        Ylo = vec_packs(vec_sra(vec_mergeh(accEvenLo, accOddLo), sh19),
++                        vec_sra(vec_mergel(accEvenLo, accOddLo), sh19));
++        Yhi = vec_packs(vec_sra(vec_mergeh(accEvenHi, accOddHi), sh19),
++                        vec_sra(vec_mergel(accEvenHi, accOddHi), sh19));
++        U   = vec_packs(vec_sra(vec_mergeh(accUEven, accUOdd), sh19),
++                        vec_sra(vec_mergel(accUEven, accUOdd), sh19));
++        V   = vec_packs(vec_sra(vec_mergeh(accVEven, accVOdd), sh19),
++                        vec_sra(vec_mergel(accVEven, accVOdd), sh19));
++
++        store_packed422_block(Ylo, Yhi, U, V, dest + 4 * p, dst_aligned, target);
++    }
++
++    for (; p < pairs; p++) {
++        int Y1 = 1 << 18, Y2 = 1 << 18, U = 1 << 18, V = 1 << 18;
++
++        for (j = 0; j < lumFilterSize; j++) {
++            Y1 += lumSrc[j][p * 2]     * (unsigned)lumFilter[j];
++            Y2 += lumSrc[j][p * 2 + 1] * (unsigned)lumFilter[j];
++        }
++        for (j = 0; j < chrFilterSize; j++) {
++            U += chrUSrc[j][p] * (unsigned)chrFilter[j];
++            V += chrVSrc[j][p] * (unsigned)chrFilter[j];
++        }
++        Y1 >>= 19; Y2 >>= 19; U >>= 19; V >>= 19;
++        if ((Y1 | Y2 | U | V) & 0x100) {
++            Y1 = av_clip_uint8(Y1);
++            Y2 = av_clip_uint8(Y2);
++            U  = av_clip_uint8(U);
++            V  = av_clip_uint8(V);
++        }
++        store_pixel_pair(dest + 4 * p, Y1, U, Y2, V, target);
++    }
++}
++
++#define YUV2PACKED422_WRAPPERS(fmt, TARGET)                                   \
++static void yuv2 ## fmt ## _1_altivec(SwsInternal *c, const int16_t *buf0,     \
++                                      const int16_t *ubuf[2],                  \
++                                      const int16_t *vbuf[2],                  \
++                                      const int16_t *abuf0, uint8_t *dest,     \
++                                      int dstW, int uvalpha, int y)            \
++{                                                                              \
++    yuv2422_1_altivec_template(c, buf0, ubuf, vbuf, abuf0, dest, dstW,         \
++                               uvalpha, y, TARGET);                            \
++}                                                                              \
++static void yuv2 ## fmt ## _2_altivec(SwsInternal *c, const int16_t *buf[2],   \
++                                      const int16_t *ubuf[2],                  \
++                                      const int16_t *vbuf[2],                  \
++                                      const int16_t *abuf[2], uint8_t *dest,   \
++                                      int dstW, int yalpha, int uvalpha,       \
++                                      int y)                                   \
++{                                                                              \
++    yuv2422_2_altivec_template(c, buf, ubuf, vbuf, abuf, dest, dstW,           \
++                               yalpha, uvalpha, y, TARGET);                    \
++}                                                                              \
++static void yuv2 ## fmt ## _X_altivec(SwsInternal *c,                         \
++                                      const int16_t *lumFilter,                \
++                                      const int16_t **lumSrc,                  \
++                                      int lumFilterSize,                       \
++                                      const int16_t *chrFilter,                \
++                                      const int16_t **chrUSrc,                 \
++                                      const int16_t **chrVSrc,                 \
++                                      int chrFilterSize,                       \
++                                      const int16_t **alpSrc, uint8_t *dest,   \
++                                      int dstW, int y)                         \
++{                                                                              \
++    yuv2422_X_altivec_template(c, lumFilter, lumSrc, lumFilterSize,            \
++                               chrFilter, chrUSrc, chrVSrc, chrFilterSize,     \
++                               alpSrc, dest, dstW, y, TARGET);                 \
++}
++
++YUV2PACKED422_WRAPPERS(yuyv422, AV_PIX_FMT_YUYV422)
++YUV2PACKED422_WRAPPERS(yvyu422, AV_PIX_FMT_YVYU422)
++YUV2PACKED422_WRAPPERS(uyvy422, AV_PIX_FMT_UYVY422)
++
++#undef YUV2PACKED422_WRAPPERS
++
+ #endif /* HAVE_ALTIVEC */
+ 
+ av_cold void ff_get_unscaled_swscale_ppc(SwsInternal *c)
+@@ -256,3 +637,39 @@ av_cold void ff_get_unscaled_swscale_ppc(SwsInternal *c)
+     }
+ #endif /* HAVE_ALTIVEC */
+ }
++
++/*
++ * Registers the scaler-path packed 4:2:2 packers (yuv2packed1/2/X) defined
++ * above. Mirrors the C dispatch in libswscale/output.c:3800-3813 exactly:
++ * no SWS_BITEXACT / SWS_FULL_CHR_H_INT / needAlpha gate, because the
++ * bit-exactness argument in the file comment above holds unconditionally.
++ * Called from ff_sws_init_swscale_ppc() (swscale_altivec.c) after that
++ * function's own cpu-flags check, so no separate check is done here beyond
++ * the compile-time HAVE_ALTIVEC/HAVE_BIGENDIAN gate (this project's only
++ * target, 32-bit big-endian G4/G5, always has HAVE_BIGENDIAN true; the
++ * extra check only guards a hypothetical little-endian PPC build, which
++ * this codebase's own classic-AltiVec element-order assumptions -- shared
++ * with every other kernel in this file -- would not survive either).
++ */
++av_cold void ff_sws_init_yuv2packed422_ppc(SwsInternal *c)
++{
++#if HAVE_ALTIVEC && HAVE_BIGENDIAN
++    switch (c->opts.dst_format) {
++    case AV_PIX_FMT_YUYV422:
++        c->yuv2packed1 = yuv2yuyv422_1_altivec;
++        c->yuv2packed2 = yuv2yuyv422_2_altivec;
++        c->yuv2packedX = yuv2yuyv422_X_altivec;
++        break;
++    case AV_PIX_FMT_YVYU422:
++        c->yuv2packed1 = yuv2yvyu422_1_altivec;
++        c->yuv2packed2 = yuv2yvyu422_2_altivec;
++        c->yuv2packedX = yuv2yvyu422_X_altivec;
++        break;
++    case AV_PIX_FMT_UYVY422:
++        c->yuv2packed1 = yuv2uyvy422_1_altivec;
++        c->yuv2packed2 = yuv2uyvy422_2_altivec;
++        c->yuv2packedX = yuv2uyvy422_X_altivec;
++        break;
++    }
++#endif /* HAVE_ALTIVEC && HAVE_BIGENDIAN */
++}
+diff --git a/libswscale/swscale_internal.h b/libswscale/swscale_internal.h
+index 9a822cb..9ac8e30 100644
+--- a/libswscale/swscale_internal.h
++++ b/libswscale/swscale_internal.h
+@@ -1012,6 +1012,15 @@ int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
+  */
+ void ff_get_unscaled_swscale(SwsInternal *c);
+ void ff_get_unscaled_swscale_ppc(SwsInternal *c);
++
++/**
++ * Set c->yuv2packed1/2/X to the AltiVec scaler-path packed 4:2:2 packers
++ * for yuyv422/yvyu422/uyvy422, if c->opts.dst_format matches one of them.
++ * Defined in libswscale/ppc/yuv2yuv_altivec.c; no-op when
++ * !HAVE_ALTIVEC || !HAVE_BIGENDIAN.
++ */
++void ff_sws_init_yuv2packed422_ppc(SwsInternal *c);
++
+ void ff_get_unscaled_swscale_arm(SwsInternal *c);
+ void ff_get_unscaled_swscale_aarch64(SwsInternal *c);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,311 @@
+From 632dfe413afb0cec848858d6bccdd7e12de19532 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 04:29:22 +0000
+Subject: [PATCH] swscale/ppc: add AltiVec 16-bit-source
+ hScale16To15/hScale16To19
+
+Add hScale16To15_altivec/hScale16To19_altivec (libswscale/swscale.c:69-126
+are the C references) and register them in ff_sws_init_swscale_ppc()
+mirroring swscale.c's own dispatch: "if (c->srcBpc != 8) c->hyScale =
+c->hcScale = c->dstBpc > 14 ? hScale16To19_altivec : hScale16To15_altivec;"
+as the else of the existing 8-bit assignment, unconditional on cpu
+flags beyond the function's own AltiVec check already done above it.
+
+The product is u16 (src) x s16 (filter); classic AltiVec has no
+mixed-sign multiply-sum. Uses vmsumuhm (vec_msum on unsigned shorts,
+filter reinterpreted as unsigned) which computes sum(src*f) + 65536 *
+(sum of src at negative-filter lanes) mod 2^32, with a second
+accumulator (masked 0/1 vec_msum) tracking that correction term,
+subtracted at the end -- exact because the true signed total (which the
+caller's filter-design contract guarantees fits in int32, same as the
+scalar C's own "int val") survives the mod-2^32 round trip bit for bit.
+Vectorizes filterSize % 8 == 0 (8-wide taps, ALIGNED filter-row loads --
+rows are 2*filterSize*i bytes into an at-least-16-aligned base, so every
+8-tap step of such a row stays aligned) and filterSize == 4 (PPC's other
+producible size: the row's 4 taps are copied into a zero-padded 8-short
+local buffer, sidestepping the row's real alignment entirely, at the
+cost of an intentional harmless over-read of 4 source samples --
+already an accepted pattern here, see hScale_real_altivec's own
+filterSize == 4 case). Any other filterSize (never produced by this PPC
+build; checkasm's synthetic filterSize=12 exercises it) falls back to a
+scalar loop identical to the C, correctness-only. Four outputs are
+processed per iteration, each with its own corrected accumulator, then
+one mergeh/mergel transpose gathers all four totals into a single
+vector -- avoiding the per-output store-then-scalar-read idiom the
+existing 8-bit hScale_real_altivec uses (a known-marginal pattern on
+7450 per its own comment). store16 (byte-precise store for any dst
+alignment) is duplicated from yuv2yuv_altivec.c into this file, the two
+being independent translation units.
+
+Validated with tests/checkasm/sw_scale.c's extended check_hscale
+(two commits back): seeds 1, 42, 777, 5, 99 all pass (existing 8-bit
+ALTIVEC hscale rows, yuv2yuv1/X, yuv2nv12cX, and the new 16-bit rows);
+--bench --duration=100 shows an _altivec counterpart for every one of
+the 144 hscale_16_* names (filterSize 4/8/16/32/40 genuinely vectorized;
+filterSize 12 registered but running the scalar-fallback path
+internally, as intended). Full suite (`checkasm 7777`, no --test): 1268
+tests, all passed, reconciling exactly against the stated baseline of
+1079 plus the 189 new named checks added by the first commit (45
+yuv2packed422_1/2/X + 144 hscale_16_*); stages 2 and 3 add AltiVec
+counterparts for existing names, not new names, so they don't change
+this count. Both touched files (this one; yuv2yuv_altivec.c and
+swscale_altivec.c from the previous commit) were compiled standalone in
+the plain and -D_ARCH_PWR4 shapes with -Wall -Wextra: no new warnings.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Xix7Wn4UbWrKRBNAMUVpRR
+---
+ libswscale/ppc/swscale_altivec.c | 216 +++++++++++++++++++++++++++++++
+ 1 file changed, 216 insertions(+)
+
+diff --git a/libswscale/ppc/swscale_altivec.c b/libswscale/ppc/swscale_altivec.c
+index 2a26dac..089cd80 100644
+--- a/libswscale/ppc/swscale_altivec.c
++++ b/libswscale/ppc/swscale_altivec.c
+@@ -22,13 +22,16 @@
+  */
+ 
+ #include <inttypes.h>
++#include <string.h>
+ 
+ #include "config.h"
+ #include "libswscale/swscale.h"
+ #include "libswscale/swscale_internal.h"
+ #include "libavutil/attributes.h"
++#include "libavutil/common.h"
+ #include "libavutil/cpu.h"
+ #include "libavutil/intfloat.h"
++#include "libavutil/mem_internal.h"
+ #include "yuv2rgb_altivec.h"
+ #include "libavutil/ppc/util_altivec.h"
+ 
+@@ -106,6 +109,215 @@
+ 
+ #undef vzero
+ 
++/*
++ * 16-byte store to a dst of any alignment that writes exactly the 16
++ * payload bytes and nothing else -- see the identical helper (and its full
++ * rationale) in libswscale/ppc/yuv2yuv_altivec.c. Duplicated here rather
++ * than shared because the two files are independent translation units and
++ * this is the only piece of that file this one needs.
++ */
++static av_always_inline void store16(vec_u8 v, uint8_t *p, int aligned)
++{
++    if (aligned) {
++        vec_st(v, 0, p);
++    } else {
++        const vec_u8 r = vec_perm(v, v, vec_lvsr(0, p));
++        if (!((uintptr_t)p & 3)) {
++            vec_ste((vec_u32)r, 0,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 4,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 8,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 12, (uint32_t *)p);
++        } else {
++            int k;
++            for (k = 0; k < 16; k++)
++                vec_ste(r, k, p);
++        }
++    }
++}
++
++/*
++ * AltiVec hScale16To15/hScale16To19 (libswscale/swscale.c:69-126 are the C
++ * references). The product is u16 (src) x s16 (filter): classic AltiVec has
++ * no mixed-sign multiply-sum, so vmsumuhm (vec_msum on unsigned shorts) is
++ * used with the filter reinterpreted as unsigned, which computes
++ * sum(src*f) + 65536 * (sum of src at lanes where f < 0), mod 2^32; a
++ * second accumulator sums src at exactly those negative-filter lanes (via a
++ * 0/1 mask) and the correction is subtracted at the end. The true signed
++ * total (which the caller's filter-design contract guarantees fits in
++ * int32, exactly as the scalar C's "int val" does) survives this mod-2^32
++ * round trip bit-for-bit, matching the C reference's own "val" (also
++ * accumulated mod 2^32 per the unsigned-cast multiply in the C source).
++ *
++ * Only filterSize % 8 == 0 (the only sizes this ever vectorizes with 8-wide
++ * ALIGNED filter-row loads -- rows are 2*filterSize*i bytes into a filter
++ * array whose base is at least 16-aligned, so every 8-tap step of such a
++ * row stays 16-aligned) and filterSize == 4 (the other size PPC's
++ * filterAlign actually produces, handled by copying the row's 4 taps into
++ * a zero-padded 8-short local buffer -- always 16-aligned, and sidesteps
++ * needing to know the real row's alignment at all) are vectorized; any
++ * other filterSize (never produced by this PPC build; the checkasm
++ * synthetic filterSize=12 exercises this) falls back to a whole-line
++ * scalar loop identical to the C. Source reads always use the per-access
++ * unaligned splice (filterPos sweeps every residue); the filterSize == 4
++ * case reads a full 8-element vector even though only 4 taps are real,
++ * exactly like this file's existing hScale_real_altivec's own filterSize
++ * == 4 case (unaligned_load reading a full 16 bytes for a 4-tap 8-bit
++ * filter) -- an already-established, accepted over-read for small filters,
++ * safe here because the extra 4 filter taps are the zero padding, so the
++ * corresponding 4 extra source samples are multiplied by zero.
++ *
++ * Four outputs are processed per iteration: each gets its own acc/accn
++ * pair (corrected individually), then a single transpose-add gathers all
++ * four corrected totals into one vector (mergeh/mergel twice, exactly the
++ * 4x4 transpose used to sum each accumulator's lanes and distribute the
++ * four sums back into one vector -- see the comment on hscale16_grp4_altivec
++ * below) instead of reducing each accumulator to a scalar individually and
++ * bouncing it through memory the way the existing 8-bit hScale_real does
++ * (a store-then-scalar-read pattern that is a known-bad idiom on 7450).
++ */
++static av_always_inline vec_s32 hscale16_grp4_altivec(const uint16_t *src,
++                                                       const int32_t *filterPos,
++                                                       const int16_t *filter,
++                                                       int filterSize, int i,
++                                                       vec_u32 vsh, vec_s32 vclip)
++{
++    const vec_u16 negmask1 = vec_splat_u16(1);
++    const vec_s16 zero_s16 = vec_splat_s16(0);
++    const vec_u32 sh16     = (vec_u32) { 16, 16, 16, 16 };
++    vec_u32 acc[4];
++    int k;
++
++    for (k = 0; k < 4; k++) {
++        int srcPos = filterPos[i + k];
++        const int16_t *filtRow = filter + (ptrdiff_t)filterSize * (i + k);
++        vec_u32 a  = (vec_u32) vec_splat_s32(0);
++        vec_u32 an = (vec_u32) vec_splat_s32(0);
++
++        if (filterSize % 8 == 0) {
++            int j;
++            for (j = 0; j < filterSize; j += 8) {
++                int off      = 2 * (srcPos + j);
++                vec_u16 s    = vec_perm(vec_ld(off, src), vec_ld(off + 15, src),
++                                        vec_lvsl(off, src));
++                vec_s16 f    = vec_ld(0, filtRow + j);
++                vec_u16 mask = vec_and(negmask1, (vec_u16) vec_cmplt(f, zero_s16));
++                a  = vec_msum(s, (vec_u16) f, a);
++                an = vec_msum(s, mask, an);
++            }
++        } else {
++            /* filterSize == 4, guaranteed by the caller. */
++            DECLARE_ALIGNED(16, int16_t, fbuf)[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++            int off = 2 * srcPos;
++            vec_u16 s, mask;
++            vec_s16 f;
++
++            memcpy(fbuf, filtRow, 4 * sizeof(int16_t));
++            s    = vec_perm(vec_ld(off, src), vec_ld(off + 15, src), vec_lvsl(off, src));
++            f    = vec_ld(0, fbuf);
++            mask = vec_and(negmask1, (vec_u16) vec_cmplt(f, zero_s16));
++            a  = vec_msum(s, (vec_u16) f, a);
++            an = vec_msum(s, mask, an);
++        }
++
++        acc[k] = vec_sub(a, vec_sl(an, sh16));
++    }
++
++    /*
++     * acc[0..3] each hold, in their 4 lanes, a partial (uncorrected-no-more)
++     * sum for ONE output; summing a given acc's 4 lanes gives that output's
++     * true total. mergeh/mergel-then-add is a modular (non-saturating,
++     * unlike vec_sums) horizontal reduction: s0 = [acc0_0+acc0_2, acc2_0+acc2_2,
++     * acc0_1+acc0_3, acc2_1+acc2_3] (from acc[0] and acc[2]), s1 likewise
++     * from acc[1] and acc[3]; a second mergeh/mergel-then-add combines s0
++     * and s1 the same way, leaving lane k of the result equal to the full
++     * 4-lane sum of acc[k] -- i.e. tot = [sum(acc0), sum(acc1), sum(acc2),
++     * sum(acc3)], the four outputs' totals gathered in one vector without
++     * ever bouncing a scalar through memory.
++     */
++    {
++        vec_u32 s0  = vec_add(vec_mergeh(acc[0], acc[2]), vec_mergel(acc[0], acc[2]));
++        vec_u32 s1  = vec_add(vec_mergeh(acc[1], acc[3]), vec_mergel(acc[1], acc[3]));
++        vec_u32 tot = vec_add(vec_mergeh(s0, s1), vec_mergel(s0, s1));
++        return vec_min(vec_sra((vec_s32) tot, vsh), vclip);
++    }
++}
++
++static void hScale16To15_altivec(SwsInternal *c, int16_t *dst, int dstW,
++                                 const uint8_t *_src, const int16_t *filter,
++                                 const int32_t *filterPos, int filterSize)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(c->opts.src_format);
++    const uint16_t *src = (const uint16_t *) _src;
++    int sh = desc->comp[0].depth - 1;
++    int i = 0;
++
++    if (sh < 15) {
++        sh = isAnyRGB(c->opts.src_format) || c->opts.src_format == AV_PIX_FMT_PAL8 ?
++             13 : (desc->comp[0].depth - 1);
++    } else if (desc->flags & AV_PIX_FMT_FLAG_FLOAT) {
++        sh = 16 - 1;
++    }
++
++    if (filterSize % 8 == 0 || filterSize == 4) {
++        DECLARE_ALIGNED(16, uint32_t, shbuf)[4] = { sh, sh, sh, sh };
++        vec_u32 vsh          = vec_ld(0, shbuf);
++        const vec_s32 vclip  = (vec_s32) { 32767, 32767, 32767, 32767 };
++        const int dst_aligned = !((uintptr_t) dst & 15);
++
++        for (; i + 8 <= dstW; i += 8) {
++            vec_s32 g0 = hscale16_grp4_altivec(src, filterPos, filter, filterSize, i,     vsh, vclip);
++            vec_s32 g1 = hscale16_grp4_altivec(src, filterPos, filter, filterSize, i + 4, vsh, vclip);
++            vec_s16 packed = vec_pack(g0, g1);
++            store16((vec_u8) packed, (uint8_t *)(dst + i), dst_aligned);
++        }
++    }
++
++    for (; i < dstW; i++) {
++        int j, srcPos = filterPos[i], val = 0;
++        for (j = 0; j < filterSize; j++)
++            val += src[srcPos + j] * filter[filterSize * i + j];
++        dst[i] = FFMIN(val >> sh, (1 << 15) - 1);
++    }
++}
++
++static void hScale16To19_altivec(SwsInternal *c, int16_t *_dst, int dstW,
++                                 const uint8_t *_src, const int16_t *filter,
++                                 const int32_t *filterPos, int filterSize)
++{
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(c->opts.src_format);
++    int32_t *dst        = (int32_t *) _dst;
++    const uint16_t *src = (const uint16_t *) _src;
++    int bits = desc->comp[0].depth - 1;
++    int sh   = bits - 4;
++    int i = 0;
++
++    if ((isAnyRGB(c->opts.src_format) || c->opts.src_format == AV_PIX_FMT_PAL8) &&
++        desc->comp[0].depth < 16) {
++        sh = 9;
++    } else if (desc->flags & AV_PIX_FMT_FLAG_FLOAT) {
++        sh = 16 - 1 - 4;
++    }
++
++    if (filterSize % 8 == 0 || filterSize == 4) {
++        DECLARE_ALIGNED(16, uint32_t, shbuf)[4] = { sh, sh, sh, sh };
++        vec_u32 vsh          = vec_ld(0, shbuf);
++        const vec_s32 vclip  = (vec_s32) { (1 << 19) - 1, (1 << 19) - 1, (1 << 19) - 1, (1 << 19) - 1 };
++        const int dst_aligned = !((uintptr_t) dst & 15);
++
++        for (; i + 4 <= dstW; i += 4) {
++            vec_s32 g = hscale16_grp4_altivec(src, filterPos, filter, filterSize, i, vsh, vclip);
++            store16((vec_u8) g, (uint8_t *)(dst + i), dst_aligned);
++        }
++    }
++
++    for (; i < dstW; i++) {
++        int j, srcPos = filterPos[i], val = 0;
++        for (j = 0; j < filterSize; j++)
++            val += src[srcPos + j] * filter[filterSize * i + j];
++        dst[i] = FFMIN(val >> sh, (1 << 19) - 1);
++    }
++}
++
+ #endif /* HAVE_BIGENDIAN */
+ 
+ #define SHIFT  3
+@@ -244,6 +456,10 @@ av_cold void ff_sws_init_swscale_ppc(SwsInternal *c)
+     if (c->srcBpc == 8 && c->dstBpc <= 14) {
+         c->hyScale = c->hcScale = hScale_real_altivec;
+     }
++    if (c->srcBpc != 8) {
++        c->hyScale = c->hcScale = c->dstBpc > 14 ? hScale16To19_altivec
++                                                 : hScale16To15_altivec;
++    }
+     if (!is16BPS(dstFormat) && !isNBPS(dstFormat) && !isSemiPlanarYUV(dstFormat) && !isDataInHighBits(dstFormat) &&
+         dstFormat != AV_PIX_FMT_GRAYF32BE && dstFormat != AV_PIX_FMT_GRAYF32LE &&
+         !c->needAlpha) {
+-- 
+2.43.0
+

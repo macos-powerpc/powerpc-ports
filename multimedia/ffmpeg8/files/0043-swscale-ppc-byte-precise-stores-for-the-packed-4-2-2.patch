@@ -1,0 +1,210 @@
+From 75ca220c3be47a233af406d39dded869e45b87da Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 02:29:44 +0000
+Subject: [PATCH] swscale/ppc: byte-precise stores for the packed 4:2:2
+ converters, real C reference at all widths
+
+Review-gate follow-up to the previous three commits.
+
+Kernel: the unaligned-dst store path was the lvsl/lvsr read-modify-write
+splice borrowed from vp8dsp's unaligned_store16. That splice reads and
+rewrites the two aligned words around every 16-byte slot, i.e. up to 15
+bytes of the neighbouring row at both ends of every row whenever dst or
+dstStride is not 16-aligned. With slice threading those bytes belong to
+the row another thread is writing at the same time, so the rewrite can
+lose that thread's bytes; it also needs slack past the row. Replace it
+with store16(): plain vec_st when dst is 16-aligned (mpv, and any
+av_frame_get_buffer() frame -- the common case, unchanged cost); else
+rotate the payload with vec_lvsr and issue four stvewx word stores
+(stvewx picks the stored word from the target address, so after the
+rotation each store lands exactly payload bytes 4n..4n+3 -- the
+qpel8_store idiom from h264qpel_template.c widened to a full vector);
+a dst that is not even 4-aligned falls back to sixteen byte stores. No
+loads, nothing outside [dst, dst+16) touched, no RMW anywhere in the
+file now. Same no-RMW rule the qpel8 and emulated_edge_mc stores follow.
+
+Test: build the contexts with SWS_POINT instead of SWS_FAST_BILINEAR.
+sws_init_context() silently rewrites SWS_FAST_BILINEAR to SWS_BILINEAR
+for srcW < 8 || dstW <= 8, which removed the C LQ wrapper at widths 2
+and 8 for yuv420p/yuva420p and left the AltiVec function as its own
+(vacuous) reference there; SWS_POINT is never rewritten, and the C
+wrapper selection accepts either flag. Add one 2-mod-4 dst offset
+scenario (odd strides, unaligned src) for the byte-store fallback.
+
+Validated (qemu-ppc-static -cpu 7400, incremental -j1 build,
+warning-free): --test=sw_yuv2yuv seeds 5/99/31337 "all 66 tests
+passed" (was 58 real + 8 vacuous); --bench lists all 66 named checks
+as _altivec; full suite seed 7777: 963 = 897 + 66, exact.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BWSAHaJhssb1i1iMizrWV
+---
+ libswscale/ppc/yuv2yuv_altivec.c | 80 +++++++++++++++++---------------
+ tests/checkasm/sw_yuv2yuv.c      | 16 +++++--
+ 2 files changed, 54 insertions(+), 42 deletions(-)
+
+diff --git a/libswscale/ppc/yuv2yuv_altivec.c b/libswscale/ppc/yuv2yuv_altivec.c
+index 79fdba7..2da4535 100644
+--- a/libswscale/ppc/yuv2yuv_altivec.c
++++ b/libswscale/ppc/yuv2yuv_altivec.c
+@@ -33,26 +33,41 @@
+ #include "libavutil/ppc/util_altivec.h"
+ 
+ /*
+- * Unaligned 16-byte store via a read-modify-write splice: dst is truncated
+- * to its containing 16-byte boundary by a plain vec_st, which is wrong
+- * whenever dst isn't itself 16-aligned (checkasm's own dst buffers, and any
+- * real caller after e.g. a crop filter, don't guarantee that). Copied from
+- * unaligned_store16 in libavcodec/ppc/vp8dsp_altivec.c -- same lvsl/lvsr
+- * splice h264qpel.c and vp8dsp use for the same reason. Two consecutive
+- * calls into adjacent 16-byte slots are correct because each one re-reads
+- * memory rather than relying on the other's write.
++ * 16-byte store to a dst of any alignment that writes exactly the 16
++ * payload bytes and nothing else. A plain vec_st truncates its address to
++ * the containing 16-byte boundary, so it is only usable when dst is
++ * 16-aligned (checkasm's dst buffers, and any real caller after e.g. a
++ * crop filter, don't guarantee that). Otherwise the payload is rotated so
++ * that byte k lands in lane (k + (dst & 15)) & 15 and stored with element
++ * stores: stvewx selects the stored word by the target address
++ * ((EA >> 2) & 3) and truncates EA to a word boundary, so after the lvsr
++ * rotation the four word stores at dst, dst+4, dst+8, dst+12 each pick up
++ * exactly payload bytes 4n..4n+3; a dst that is not even 4-aligned falls
++ * back to sixteen byte stores. This is qpel8_store from
++ * libavcodec/ppc/h264qpel_template.c widened to a full vector. No load and
++ * no read-modify-write anywhere: nothing outside [dst, dst+16) is touched,
++ * so the neighbouring rows of a slice-threaded frame are never read or
++ * rewritten and no slack beyond the row is needed (the lvsl/lvsr splice
++ * used by vp8dsp's unaligned_store16 would read and rewrite up to 15 bytes
++ * of the adjacent row at both ends of every row).
+  */
+-static av_always_inline void store16_unaligned(vec_u8 v, uint8_t *p)
++static av_always_inline void store16(vec_u8 v, uint8_t *p, int aligned)
+ {
+-    vec_u8 tmp1  = vec_ld(0, p);
+-    vec_u8 mask  = vec_lvsl(0, p);
+-    vec_u8 tmp2  = vec_ld(15, p);
+-    vec_u8 edges = vec_perm(tmp2, tmp1, mask);
+-    vec_u8 align = vec_lvsr(0, p);
+-    tmp2 = vec_perm(v, edges, align);
+-    tmp1 = vec_perm(edges, v, align);
+-    vec_st(tmp2, 15, p);
+-    vec_st(tmp1, 0, p);
++    if (aligned) {
++        vec_st(v, 0, p);
++    } else {
++        const vec_u8 r = vec_perm(v, v, vec_lvsr(0, p));
++        if (!((uintptr_t)p & 3)) {
++            vec_ste((vec_u32)r, 0,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 4,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 8,  (uint32_t *)p);
++            vec_ste((vec_u32)r, 12, (uint32_t *)p);
++        } else {
++            int k;
++            for (k = 0; k < 16; k++)
++                vec_ste(r, k, p);
++        }
++    }
+ }
+ 
+ /*
+@@ -74,10 +89,11 @@ static av_always_inline void store16_unaligned(vec_u8 v, uint8_t *p)
+  * or stride-separated pointers -- ysrc/usrc/vsrc's alignment mod 16 is not
+  * assumed constant) and only ever touches the aligned words that hold the
+  * bytes actually needed (the second vec_ld of every pair is at
+- * offset + bytes_needed - 1, never a full word past that). Each row picks
+- * an aligned or unaligned-splice store path once, valid for every store in
+- * that row since every store offset within a row is a multiple of 16 (so
+- * dst's 16-byte alignment residue is constant across the whole row).
++ * offset + bytes_needed - 1, never a full word past that). Every store
++ * writes exactly its 16 payload bytes (store16 above): each row decides
++ * once whether dst is 16-aligned, valid for every store in that row since
++ * every store offset within a row is a multiple of 16 (so dst's 16-byte
++ * alignment residue is constant across the whole row).
+  *
+  * Row structure, matching the C reference's per-row byte count exactly
+  * (4 * (width >> 1) bytes, nothing more, nothing less):
+@@ -125,17 +141,10 @@ static av_always_inline int planar_to_packed422_altivec(SwsInternal *c,
+             vector unsigned char v_out1 = uyvy ? vec_mergel(v_uv_a, v_y1) : vec_mergel(v_y1, v_uv_a);
+             vector unsigned char v_out2 = uyvy ? vec_mergeh(v_uv_b, v_y2) : vec_mergeh(v_y2, v_uv_b);
+             vector unsigned char v_out3 = uyvy ? vec_mergel(v_uv_b, v_y2) : vec_mergel(v_y2, v_uv_b);
+-            if (dst_aligned) {
+-                vec_st(v_out0, (i << 1), dst);
+-                vec_st(v_out1, (i << 1) + 16, dst);
+-                vec_st(v_out2, (i << 1) + 32, dst);
+-                vec_st(v_out3, (i << 1) + 48, dst);
+-            } else {
+-                store16_unaligned(v_out0, dst + (i << 1));
+-                store16_unaligned(v_out1, dst + (i << 1) + 16);
+-                store16_unaligned(v_out2, dst + (i << 1) + 32);
+-                store16_unaligned(v_out3, dst + (i << 1) + 48);
+-            }
++            store16(v_out0, dst + (i << 1),      dst_aligned);
++            store16(v_out1, dst + (i << 1) + 16, dst_aligned);
++            store16(v_out2, dst + (i << 1) + 32, dst_aligned);
++            store16(v_out3, dst + (i << 1) + 48, dst_aligned);
+         }
+ 
+         for (; i + 8 <= (width & ~1); i += 8) {
+@@ -145,10 +154,7 @@ static av_always_inline int planar_to_packed422_altivec(SwsInternal *c,
+             vector unsigned char v_v    = vec_perm(vec_ld(j, vsrc), vec_ld(j + 3, vsrc), vec_lvsl(j, vsrc));
+             vector unsigned char v_uv   = vec_mergeh(v_u, v_v);
+             vector unsigned char v_out  = uyvy ? vec_mergeh(v_uv, v_y) : vec_mergeh(v_y, v_uv);
+-            if (dst_aligned)
+-                vec_st(v_out, (i << 1), dst);
+-            else
+-                store16_unaligned(v_out, dst + (i << 1));
++            store16(v_out, dst + (i << 1), dst_aligned);
+         }
+ 
+         for (; i < (width & ~1); i += 2) {
+diff --git a/tests/checkasm/sw_yuv2yuv.c b/tests/checkasm/sw_yuv2yuv.c
+index 74a5517..6a03801 100644
+--- a/tests/checkasm/sw_yuv2yuv.c
++++ b/tests/checkasm/sw_yuv2yuv.c
+@@ -133,17 +133,22 @@ static void check_semiplanar(int dst_pix_fmt)
+  *
+  * The C reference for yuv420p/yuva420p (planarToYuy2Wrapper/
+  * planarToUyvyWrapper) is only selected under SWS_FAST_BILINEAR|SWS_POINT,
+- * so the context MUST be built with SWS_FAST_BILINEAR or the C side is the
++ * so the context MUST be built with one of those or the C side is the
+  * full scaler (a different computation) and convert_unscaled ends up NULL
+  * for the C cpu-flags pass, which check_func() treats as "no reference" and
+- * skips -- a vacuous pass. The yuv422p wrappers are flag-independent.
++ * skips -- the AltiVec function then becomes its own reference, a vacuous
++ * pass. SWS_POINT is used rather than SWS_FAST_BILINEAR because
++ * sws_init_context() silently rewrites SWS_FAST_BILINEAR to SWS_BILINEAR
++ * when srcW < 8 || dstW <= 8, which would drop the C reference at widths 2
++ * and 8. The yuv422p wrappers are flag-independent.
+  *
+  * Exercises: widths spanning the AltiVec kernel's 32-wide main loop, 16-wide
+  * (checkasm's own choice, no bearing on the fix) and byte tail, and several
+  * widths that are not multiples of 16; two stride sets (16-aligned and
+  * 8-mod-16 "odd"); several src/dst base byte offsets (some 16-aligned, some
+- * not, dst offsets always a multiple of 4 since the C reference stores
+- * 32-bit words); and one sliced call (srcSliceY/H) with the source planes
++ * not; dst offsets are multiples of 4 as the C reference stores 32-bit
++ * words, plus one 2-mod-4 scenario for the kernel's byte-store fallback);
++ * and one sliced call (srcSliceY/H) with the source planes
+  * pre-shifted the way the real caller (run_legacy_unscaled) does. Each
+  * scenario fills both destination arenas with 0x55 and memcmp()s the WHOLE
+  * arena afterwards, so a write that lands outside the row it should touch
+@@ -181,6 +186,7 @@ static void check_packed422(int src_pix_fmt, int dst_pix_fmt)
+         { "odd+unaligned", LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 8, 4,  8, 0 },
+         { "unaligned-dst", LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 0, 0,  4, 0 },
+         { "odd+dst-off",   LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 0, 0, 12, 0 },
++        { "odd+dst-off2",  LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 5, 1,  6, 0 },
+         { "slice",         LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 0, 0,  0, 1 },
+     };
+ 
+@@ -208,7 +214,7 @@ static void check_packed422(int src_pix_fmt, int dst_pix_fmt)
+         av_log_set_level(AV_LOG_ERROR);
+         sws = sws_getContext(width, NUM_LINES, src_pix_fmt,
+                              width, NUM_LINES, dst_pix_fmt,
+-                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
++                             SWS_POINT, NULL, NULL, NULL);
+         av_log_set_level(log_level);
+         if (!sws) {
+             fail();
+-- 
+2.43.0
+

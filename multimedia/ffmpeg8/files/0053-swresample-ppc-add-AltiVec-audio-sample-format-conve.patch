@@ -1,0 +1,538 @@
+From afc57ea06654f0a93915a89d0d731d29859726e0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 06:06:06 +0000
+Subject: [PATCH] swresample/ppc: add AltiVec audio sample format converters
+
+New libswresample/ppc/audio_convert.c with swri_audio_convert_init_ppc
+(declared in swresample_internal.h, dispatched from swri_audio_convert_alloc
+under ARCH_PPC next to the x86/arm/aarch64 inits). HAVE_ALTIVEC &&
+HAVE_BIGENDIAN gated, PPC_ALTIVEC runtime check.
+
+16 kernels, chosen for the conversions a float-decoding player actually
+hits on this target (planar decoder output -> interleaved float or s16 AO,
+s16 PCM sources -> float internal):
+- same-layout (planar->planar or packed->packed, one plane per call):
+  int16<->float, int32<->float, int16<->int32
+- 2-channel planar<->packed: int32/float no-op pairs (vec_mergeh/l and
+  even/odd word permutes), int16 (halfword permutes), and the mixed
+  fltp->s16 / s16p->flt / flt->s16p / s16->fltp pack/unpack kernels
+- 6-channel planar<->packed for 4-byte samples (FLTP<->FLT, S32P<->S32):
+  pairwise merges plus three word permutes per 4 frames
+
+Numerics are bit-exact with audioconvert.c's C converters: int->float is
+vec_ctf with the 2^-15 / 2^-31 scale in the instruction (one rounding,
+same as (float)i * (1.0f / (1 << N))); float->int scales by 2^15 / 2^31
+(exact), rounds with vec_round (vrfin, round-to-nearest-even like lrintf
+in the default FP mode -- the ac3dsp float_to_fixed24 idiom, which real
+G4/G5 checkasm runs have already confirmed) and converts with the
+saturating vec_cts, plus vec_packs for int16, which reproduces
+av_clip_int16 / av_clipl_int32 exactly; int16<->int32 are 16-bit shifts.
+
+Alignment: the kernels are registered with in/out_simd_align_mask = 15 (as
+the ARM/AArch64 inits do), so swri_audio_convert only calls them when every
+plane is 16-byte aligned and falls back to the C converters otherwise; with
+its len & ~15 contract that means plain vec_ld/vec_st and no tails. The
+library's own buffers are always aligned; only user buffers handed in at odd
+offsets take the C path.
+
+Validated under the qemu -cpu 7400 harness: standalone sweep against
+scalar references (lengths 16..256, random plus exact-tie and full-scale
+inputs, guard bytes) 0 mismatches; checkasm swr_audio_convert (new, two
+commits back) shows real ALTIVEC dispatch for every registered pair,
+mutation-checked; full suite green. Real-G4/G5 --bench pending.
+
+Not covered (x86 has them, low value here): the 2ch int32<->float and
+6/8-channel mixed-type packers, 8-channel packing, and unpack_6ch for
+int16.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VY6bhpLDBYqo84Hbm2ewdh
+---
+ libswresample/audioconvert.c        |   2 +
+ libswresample/ppc/Makefile          |   3 +-
+ libswresample/ppc/audio_convert.c   | 436 ++++++++++++++++++++++++++++
+ libswresample/swresample_internal.h |   4 +
+ 4 files changed, 444 insertions(+), 1 deletion(-)
+ create mode 100644 libswresample/ppc/audio_convert.c
+
+diff --git a/libswresample/audioconvert.c b/libswresample/audioconvert.c
+index f8bac98..6f0bded 100644
+--- a/libswresample/audioconvert.c
++++ b/libswresample/audioconvert.c
+@@ -182,6 +182,8 @@ AudioConvert *swri_audio_convert_alloc(enum AVSampleFormat out_fmt,
+     swri_audio_convert_init_arm(ctx, out_fmt, in_fmt, channels);
+ #elif ARCH_AARCH64
+     swri_audio_convert_init_aarch64(ctx, out_fmt, in_fmt, channels);
++#elif ARCH_PPC
++    swri_audio_convert_init_ppc(ctx, out_fmt, in_fmt, channels);
+ #endif
+ 
+     return ctx;
+diff --git a/libswresample/ppc/Makefile b/libswresample/ppc/Makefile
+index fb78d04..a8c44d7 100644
+--- a/libswresample/ppc/Makefile
++++ b/libswresample/ppc/Makefile
+@@ -1,2 +1,3 @@
+-OBJS += ppc/rematrix.o                       \
++OBJS += ppc/audio_convert.o                  \
++        ppc/rematrix.o                       \
+         ppc/resample.o                       \
+diff --git a/libswresample/ppc/audio_convert.c b/libswresample/ppc/audio_convert.c
+new file mode 100644
+index 0000000..7217aaf
+--- /dev/null
++++ b/libswresample/ppc/audio_convert.c
+@@ -0,0 +1,436 @@
++/*
++ * AltiVec audio sample format conversion
++ * Copyright (c) 2006 Michael Niedermayer <michaelni@gmx.at>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config.h"
++
++#include <stdint.h>
++
++#include "libavutil/attributes.h"
++#include "libavutil/cpu.h"
++#include "libavutil/ppc/cpu.h"
++#include "libavutil/ppc/util_altivec.h"
++#include "libavutil/samplefmt.h"
++#include "libswresample/swresample_internal.h"
++#include "libswresample/audioconvert.h"
++
++#if HAVE_ALTIVEC && HAVE_BIGENDIAN
++
++/*
++ * Contract (see swri_audio_convert()): every kernel is registered together
++ * with in/out_simd_align_mask = 15, so the library only calls it when every
++ * input and output plane is 16-byte aligned, and it passes len & ~15 -- a
++ * multiple of 16 elements (same-layout conversions: per plane, elements =
++ * samples, or samples*channels for packed) or 16 frames (pack/unpack), never
++ * 0.  Hence plain vec_ld/vec_st and no tails; misaligned calls fall back to
++ * the C converters in the library.
++ *
++ * Numerics, all bit-exact with audioconvert.c's CONV_FUNC expressions:
++ *  - int -> float is vec_ctf with the scale in the instruction (2^-15 / 2^-31),
++ *    one rounding, identical to C's (float)i * (1.0f / (1 << N)).
++ *  - float -> int is scale by 2^15 / 2^31 (exact), vec_round (vrfin, round
++ *    to nearest even -- what lrintf/llrintf do in the default FP mode; the
++ *    ac3dsp float_to_fixed24 idiom), then the saturating vec_cts and, for
++ *    int16, the saturating vec_packs: av_clip_int16 / av_clipl_int32 for free.
++ *  - int16 <-> int32 are shifts by 16.
++ */
++
++/* --- per-element converters: N input elements -> the same N output elements */
++
++/* 8 x int16 -> 2 vectors of float */
++static av_always_inline void s16_to_flt8(vec_s16 v, vec_f *lo, vec_f *hi)
++{
++    *lo = vec_ctf(vec_unpackh(v), 15);
++    *hi = vec_ctf(vec_unpackl(v), 15);
++}
++
++/* 2 vectors of float -> 8 x int16, rounded to nearest even, saturated */
++static av_always_inline vec_s16 flt8_to_s16(vec_f lo, vec_f hi)
++{
++    const vec_f zero  = (vec_f)vec_splat_u32(0);
++    const vec_f scale = vec_splats(32768.0f);
++    vec_s32 a = vec_cts(vec_round(vec_madd(lo, scale, zero)), 0);
++    vec_s32 b = vec_cts(vec_round(vec_madd(hi, scale, zero)), 0);
++    return vec_packs(a, b);
++}
++
++/* 4 x float -> 4 x int32, rounded to nearest even, saturated */
++static av_always_inline vec_s32 flt4_to_s32(vec_f v)
++{
++    const vec_f zero  = (vec_f)vec_splat_u32(0);
++    const vec_f scale = vec_splats(2147483648.0f);
++    return vec_cts(vec_round(vec_madd(v, scale, zero)), 0);
++}
++
++/* --- same-layout conversions (planar->planar or packed->packed), one plane */
++
++static void conv_int16_to_float_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *s = (const int16_t *)src[0];
++    float *d = (float *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_f lo, hi;
++        s16_to_flt8(vec_ld(0, s + i), &lo, &hi);
++        vec_st(lo,  0, d + i);
++        vec_st(hi, 16, d + i);
++    }
++}
++
++static void conv_float_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const float *s = (const float *)src[0];
++    int16_t *d = (int16_t *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8)
++        vec_st(flt8_to_s16(vec_ld(0, s + i), vec_ld(16, s + i)), 0, d + i);
++}
++
++static void conv_int32_to_float_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int32_t *s = (const int32_t *)src[0];
++    float *d = (float *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_st(vec_ctf(vec_ld(0,  s + i), 31),  0, d + i);
++        vec_st(vec_ctf(vec_ld(16, s + i), 31), 16, d + i);
++    }
++}
++
++static void conv_float_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const float *s = (const float *)src[0];
++    int32_t *d = (int32_t *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_st(flt4_to_s32(vec_ld(0,  s + i)),  0, d + i);
++        vec_st(flt4_to_s32(vec_ld(16, s + i)), 16, d + i);
++    }
++}
++
++static void conv_int16_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *s = (const int16_t *)src[0];
++    int32_t *d = (int32_t *)dst[0];
++    const vec_u32 sh16 = vec_splat_u32(-16);   /* 5-bit immediate: -16 == 16 */
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 v = vec_ld(0, s + i);
++        vec_st(vec_sl(vec_unpackh(v), sh16),  0, d + i);
++        vec_st(vec_sl(vec_unpackl(v), sh16), 16, d + i);
++    }
++}
++
++static void conv_int32_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int32_t *s = (const int32_t *)src[0];
++    int16_t *d = (int16_t *)dst[0];
++    const vec_u32 sh16 = vec_splat_u32(-16);
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s32 a = vec_sra(vec_ld(0,  s + i), sh16);
++        vec_s32 b = vec_sra(vec_ld(16, s + i), sh16);
++        vec_st(vec_pack(a, b), 0, d + i);
++    }
++}
++
++/* --- 2-channel planar <-> packed, len = frames -------------------------- */
++
++/* 4-byte samples, no value conversion (float<->float, int32<->int32) */
++static void pack_2ch_int32_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const uint32_t *a = (const uint32_t *)src[0];
++    const uint32_t *b = (const uint32_t *)src[1];
++    uint32_t *d = (uint32_t *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 4) {
++        vec_u32 va = vec_ld(0, a + i);
++        vec_u32 vb = vec_ld(0, b + i);
++        vec_st(vec_mergeh(va, vb),  0, d + 2 * i);
++        vec_st(vec_mergel(va, vb), 16, d + 2 * i);
++    }
++}
++
++static void unpack_2ch_int32_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const uint32_t *s = (const uint32_t *)src[0];
++    uint32_t *a = (uint32_t *)dst[0];
++    uint32_t *b = (uint32_t *)dst[1];
++    const vec_u8 even = vcprm(0, 2, s0, s2);
++    const vec_u8 odd  = vcprm(1, 3, s1, s3);
++    int i;
++
++    for (i = 0; i < len; i += 4) {
++        vec_u32 v0 = vec_ld(0,  s + 2 * i);   /* a0 b0 a1 b1 */
++        vec_u32 v1 = vec_ld(16, s + 2 * i);   /* a2 b2 a3 b3 */
++        vec_st(vec_perm(v0, v1, even), 0, a + i);
++        vec_st(vec_perm(v0, v1, odd),  0, b + i);
++    }
++}
++
++/* halfword de-interleave permutes: even/odd halfwords of the 32-byte pair */
++#define HW_EVEN (const vec_u8){ 0x00, 0x01, 0x04, 0x05, 0x08, 0x09, 0x0c, 0x0d, \
++                                0x10, 0x11, 0x14, 0x15, 0x18, 0x19, 0x1c, 0x1d }
++#define HW_ODD  (const vec_u8){ 0x02, 0x03, 0x06, 0x07, 0x0a, 0x0b, 0x0e, 0x0f, \
++                                0x12, 0x13, 0x16, 0x17, 0x1a, 0x1b, 0x1e, 0x1f }
++
++static void pack_2ch_int16_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *a = (const int16_t *)src[0];
++    const int16_t *b = (const int16_t *)src[1];
++    int16_t *d = (int16_t *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 va = vec_ld(0, a + i);
++        vec_s16 vb = vec_ld(0, b + i);
++        vec_st(vec_mergeh(va, vb),  0, d + 2 * i);
++        vec_st(vec_mergel(va, vb), 16, d + 2 * i);
++    }
++}
++
++static void unpack_2ch_int16_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *s = (const int16_t *)src[0];
++    int16_t *a = (int16_t *)dst[0];
++    int16_t *b = (int16_t *)dst[1];
++    const vec_u8 even = HW_EVEN, odd = HW_ODD;
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 v0 = vec_ld(0,  s + 2 * i);   /* a0 b0 .. a3 b3 */
++        vec_s16 v1 = vec_ld(16, s + 2 * i);   /* a4 b4 .. a7 b7 */
++        vec_st(vec_perm(v0, v1, even), 0, a + i);
++        vec_st(vec_perm(v0, v1, odd),  0, b + i);
++    }
++}
++
++/* FLTP -> S16 interleaved: convert each plane's 8 floats, then interleave */
++static void pack_2ch_float_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const float *a = (const float *)src[0];
++    const float *b = (const float *)src[1];
++    int16_t *d = (int16_t *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 va = flt8_to_s16(vec_ld(0, a + i), vec_ld(16, a + i));
++        vec_s16 vb = flt8_to_s16(vec_ld(0, b + i), vec_ld(16, b + i));
++        vec_st(vec_mergeh(va, vb),  0, d + 2 * i);
++        vec_st(vec_mergel(va, vb), 16, d + 2 * i);
++    }
++}
++
++/* S16P -> FLT interleaved: interleave the int16 first (order-preserving),
++ * then widen each 8-halfword vector into two float vectors */
++static void pack_2ch_int16_to_float_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *a = (const int16_t *)src[0];
++    const int16_t *b = (const int16_t *)src[1];
++    float *d = (float *)dst[0];
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 va = vec_ld(0, a + i);
++        vec_s16 vb = vec_ld(0, b + i);
++        vec_f f0, f1, f2, f3;
++        s16_to_flt8(vec_mergeh(va, vb), &f0, &f1);   /* a0 b0 a1 b1 | a2 b2 a3 b3 */
++        s16_to_flt8(vec_mergel(va, vb), &f2, &f3);   /* a4 b4 a5 b5 | a6 b6 a7 b7 */
++        vec_st(f0,  0, d + 2 * i);
++        vec_st(f1, 16, d + 2 * i);
++        vec_st(f2, 32, d + 2 * i);
++        vec_st(f3, 48, d + 2 * i);
++    }
++}
++
++/* FLT interleaved -> S16P: de-interleave the floats, then convert per plane */
++static void unpack_2ch_float_to_int16_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const float *s = (const float *)src[0];
++    int16_t *a = (int16_t *)dst[0];
++    int16_t *b = (int16_t *)dst[1];
++    const vec_u8 even = vcprm(0, 2, s0, s2);
++    const vec_u8 odd  = vcprm(1, 3, s1, s3);
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_f v0 = vec_ld(0,  s + 2 * i);   /* a0 b0 a1 b1 */
++        vec_f v1 = vec_ld(16, s + 2 * i);   /* a2 b2 a3 b3 */
++        vec_f v2 = vec_ld(32, s + 2 * i);   /* a4 b4 a5 b5 */
++        vec_f v3 = vec_ld(48, s + 2 * i);   /* a6 b6 a7 b7 */
++        vec_st(flt8_to_s16(vec_perm(v0, v1, even), vec_perm(v2, v3, even)), 0, a + i);
++        vec_st(flt8_to_s16(vec_perm(v0, v1, odd),  vec_perm(v2, v3, odd)),  0, b + i);
++    }
++}
++
++/* S16 interleaved -> FLTP: de-interleave the halfwords, then widen per plane */
++static void unpack_2ch_int16_to_float_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const int16_t *s = (const int16_t *)src[0];
++    float *a = (float *)dst[0];
++    float *b = (float *)dst[1];
++    const vec_u8 even = HW_EVEN, odd = HW_ODD;
++    int i;
++
++    for (i = 0; i < len; i += 8) {
++        vec_s16 v0 = vec_ld(0,  s + 2 * i);
++        vec_s16 v1 = vec_ld(16, s + 2 * i);
++        vec_f lo, hi;
++        s16_to_flt8(vec_perm(v0, v1, even), &lo, &hi);
++        vec_st(lo,  0, a + i);
++        vec_st(hi, 16, a + i);
++        s16_to_flt8(vec_perm(v0, v1, odd), &lo, &hi);
++        vec_st(lo,  0, b + i);
++        vec_st(hi, 16, b + i);
++    }
++}
++
++/* --- 6-channel planar <-> packed, 4-byte samples, len = frames ----------- */
++
++/*
++ * 4 frames per iteration: one vector per plane (a..f = channels 0..5) in,
++ * six interleaved vectors out:
++ *   [a0 b0 c0 d0] [e0 f0 a1 b1] [c1 d1 e1 f1] [a2 b2 c2 d2] [e2 f2 a3 b3] [c3 d3 e3 f3]
++ * built from the pairwise merges ab = [a0 b0 a1 b1], cd, ef (h: frames 0-1,
++ * l: frames 2-3).
++ */
++static void pack_6ch_int32_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const uint32_t *a = (const uint32_t *)src[0];
++    const uint32_t *b = (const uint32_t *)src[1];
++    const uint32_t *c = (const uint32_t *)src[2];
++    const uint32_t *d = (const uint32_t *)src[3];
++    const uint32_t *e = (const uint32_t *)src[4];
++    const uint32_t *f = (const uint32_t *)src[5];
++    uint32_t *o = (uint32_t *)dst[0];
++    const vec_u8 p01s01 = vcprm(0, 1, s0, s1);
++    const vec_u8 p01s23 = vcprm(0, 1, s2, s3);
++    const vec_u8 p23s23 = vcprm(2, 3, s2, s3);
++    int i;
++
++    for (i = 0; i < len; i += 4) {
++        vec_u32 va = vec_ld(0, a + i), vb = vec_ld(0, b + i);
++        vec_u32 vc = vec_ld(0, c + i), vd = vec_ld(0, d + i);
++        vec_u32 ve = vec_ld(0, e + i), vf = vec_ld(0, f + i);
++        vec_u32 abh = vec_mergeh(va, vb), abl = vec_mergel(va, vb);
++        vec_u32 cdh = vec_mergeh(vc, vd), cdl = vec_mergel(vc, vd);
++        vec_u32 efh = vec_mergeh(ve, vf), efl = vec_mergel(ve, vf);
++        uint32_t *p = o + 6 * i;
++
++        vec_st(vec_perm(abh, cdh, p01s01),  0, p);   /* a0 b0 c0 d0 */
++        vec_st(vec_perm(efh, abh, p01s23), 16, p);   /* e0 f0 a1 b1 */
++        vec_st(vec_perm(cdh, efh, p23s23), 32, p);   /* c1 d1 e1 f1 */
++        vec_st(vec_perm(abl, cdl, p01s01), 48, p);   /* a2 b2 c2 d2 */
++        vec_st(vec_perm(efl, abl, p01s23), 64, p);   /* e2 f2 a3 b3 */
++        vec_st(vec_perm(cdl, efl, p23s23), 80, p);   /* c3 d3 e3 f3 */
++    }
++}
++
++static void unpack_6ch_int32_to_int32_altivec(uint8_t **dst, const uint8_t **src, int len)
++{
++    const uint32_t *s = (const uint32_t *)src[0];
++    uint32_t *a = (uint32_t *)dst[0];
++    uint32_t *b = (uint32_t *)dst[1];
++    uint32_t *c = (uint32_t *)dst[2];
++    uint32_t *d = (uint32_t *)dst[3];
++    uint32_t *e = (uint32_t *)dst[4];
++    uint32_t *f = (uint32_t *)dst[5];
++    const vec_u8 p01s23 = vcprm(0, 1, s2, s3);
++    const vec_u8 p23s01 = vcprm(2, 3, s0, s1);
++    const vec_u8 even   = vcprm(0, 2, s0, s2);
++    const vec_u8 odd    = vcprm(1, 3, s1, s3);
++    int i;
++
++    for (i = 0; i < len; i += 4) {
++        const uint32_t *p = s + 6 * i;
++        vec_u32 v0 = vec_ld( 0, p);   /* a0 b0 c0 d0 */
++        vec_u32 v1 = vec_ld(16, p);   /* e0 f0 a1 b1 */
++        vec_u32 v2 = vec_ld(32, p);   /* c1 d1 e1 f1 */
++        vec_u32 v3 = vec_ld(48, p);   /* a2 b2 c2 d2 */
++        vec_u32 v4 = vec_ld(64, p);   /* e2 f2 a3 b3 */
++        vec_u32 v5 = vec_ld(80, p);   /* c3 d3 e3 f3 */
++        vec_u32 abh = vec_perm(v0, v1, p01s23);   /* a0 b0 a1 b1 */
++        vec_u32 cdh = vec_perm(v0, v2, p23s01);   /* c0 d0 c1 d1 */
++        vec_u32 efh = vec_perm(v1, v2, p01s23);   /* e0 f0 e1 f1 */
++        vec_u32 abl = vec_perm(v3, v4, p01s23);   /* a2 b2 a3 b3 */
++        vec_u32 cdl = vec_perm(v3, v5, p23s01);   /* c2 d2 c3 d3 */
++        vec_u32 efl = vec_perm(v4, v5, p01s23);   /* e2 f2 e3 f3 */
++
++        vec_st(vec_perm(abh, abl, even), 0, a + i);
++        vec_st(vec_perm(abh, abl, odd),  0, b + i);
++        vec_st(vec_perm(cdh, cdl, even), 0, c + i);
++        vec_st(vec_perm(cdh, cdl, odd),  0, d + i);
++        vec_st(vec_perm(efh, efl, even), 0, e + i);
++        vec_st(vec_perm(efh, efl, odd),  0, f + i);
++    }
++}
++
++#endif /* HAVE_ALTIVEC && HAVE_BIGENDIAN */
++
++av_cold void swri_audio_convert_init_ppc(struct AudioConvert *ac,
++                                         enum AVSampleFormat out_fmt,
++                                         enum AVSampleFormat in_fmt,
++                                         int channels)
++{
++#if HAVE_ALTIVEC && HAVE_BIGENDIAN
++    simd_func_type *f = NULL;
++
++    if (!PPC_ALTIVEC(av_get_cpu_flags()))
++        return;
++
++#define PAIR(o, i) (out_fmt == AV_SAMPLE_FMT_##o && in_fmt == AV_SAMPLE_FMT_##i)
++
++    /* same layout, planar or packed */
++    if (PAIR(FLT, S16) || PAIR(FLTP, S16P)) f = conv_int16_to_float_altivec;
++    if (PAIR(S16, FLT) || PAIR(S16P, FLTP)) f = conv_float_to_int16_altivec;
++    if (PAIR(FLT, S32) || PAIR(FLTP, S32P)) f = conv_int32_to_float_altivec;
++    if (PAIR(S32, FLT) || PAIR(S32P, FLTP)) f = conv_float_to_int32_altivec;
++    if (PAIR(S32, S16) || PAIR(S32P, S16P)) f = conv_int16_to_int32_altivec;
++    if (PAIR(S16, S32) || PAIR(S16P, S32P)) f = conv_int32_to_int16_altivec;
++
++    if (channels == 2) {
++        if (PAIR(FLT,  FLTP) || PAIR(S32,  S32P)) f = pack_2ch_int32_to_int32_altivec;
++        if (PAIR(FLTP, FLT)  || PAIR(S32P, S32))  f = unpack_2ch_int32_to_int32_altivec;
++        if (PAIR(S16,  S16P))                     f = pack_2ch_int16_to_int16_altivec;
++        if (PAIR(S16P, S16))                      f = unpack_2ch_int16_to_int16_altivec;
++        if (PAIR(S16,  FLTP))                     f = pack_2ch_float_to_int16_altivec;
++        if (PAIR(FLT,  S16P))                     f = pack_2ch_int16_to_float_altivec;
++        if (PAIR(S16P, FLT))                      f = unpack_2ch_float_to_int16_altivec;
++        if (PAIR(FLTP, S16))                      f = unpack_2ch_int16_to_float_altivec;
++    }
++    if (channels == 6) {
++        if (PAIR(FLT,  FLTP) || PAIR(S32,  S32P)) f = pack_6ch_int32_to_int32_altivec;
++        if (PAIR(FLTP, FLT)  || PAIR(S32P, S32))  f = unpack_6ch_int32_to_int32_altivec;
++    }
++#undef PAIR
++
++    if (f) {
++        ac->simd_f = f;
++        ac->in_simd_align_mask = ac->out_simd_align_mask = 15;
++    }
++#endif
++}
+diff --git a/libswresample/swresample_internal.h b/libswresample/swresample_internal.h
+index 3da4823..0efc23d 100644
+--- a/libswresample/swresample_internal.h
++++ b/libswresample/swresample_internal.h
+@@ -229,5 +229,9 @@ void swri_audio_convert_init_x86(struct AudioConvert *ac,
+                                  enum AVSampleFormat out_fmt,
+                                  enum AVSampleFormat in_fmt,
+                                  int channels);
++void swri_audio_convert_init_ppc(struct AudioConvert *ac,
++                                 enum AVSampleFormat out_fmt,
++                                 enum AVSampleFormat in_fmt,
++                                 int channels);
+ 
+ #endif
+-- 
+2.43.0
+

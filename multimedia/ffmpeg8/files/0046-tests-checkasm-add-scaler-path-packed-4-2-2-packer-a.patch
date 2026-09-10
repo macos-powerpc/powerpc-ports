@@ -1,0 +1,577 @@
+From b79fa1e2638460ee40b3a9a0bfd08ddec9f2fc70 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 04:19:15 +0000
+Subject: [PATCH] tests/checkasm: add scaler-path packed 4:2:2 packer and
+ 16-bit hscale coverage
+
+Add check_yuv2packed422_1/2/X to sw_yuv2yuv.c, oracling the scaler-path
+yuv2packed1/2/X kernels for yuyv422/uyvy422/yvyu422 (libswscale/output.c's
+yuv2422_{1,2,X}_c_template, registered unconditionally for these three
+dst formats). These differ from the existing check_packed422 oracle in
+this file: that one covers the *unscaled* planar->packed converters,
+these cover the general scaler's packed-output path (used whenever an
+AltiVec kernel for it exists, gated only by dst format). The context is
+built with SWS_BITEXACT so no unscaled special converter intercepts
+convert_unscaled, ff_sws_init_scale() is called explicitly to defend
+against sws_init_context()'s early-return-on-unscaled-converter path,
+and the three pointers are asserted non-NULL. Inputs are kept inside the
+C reference's clip window (documented in the new file comment): the
+"(Y1|Y2|U|V) & 0x100" clip test only fires, and only then matches true
+saturation, when the pre-clip result is in [-256, 511], so _1/_2 use the
+full int16 range and _X masks to non-negative 15-bit. Widths, per-line
+src offsets and dst byte offsets are swept per combination, comparing
+the whole 0x55-filled destination arena so an over/under-run fails too.
+Before any AltiVec counterpart exists these are C-only ("no tests to
+perform"); verified clean on seeds 1/42/777 plus a --bench listing
+showing all 45 new C names driven.
+
+Also extend sw_scale.c's check_hscale to real high-depth source formats
+(yuv420p10/yuv420p16) so hScale16To15_c/hScale16To19_c's depth-derived
+shift is actually exercised (their C reference reads
+c->opts.src_format's pixdesc depth; the previous test only ever built
+contexts with the default yuv420p src format regardless of the
+srcBpc/dstBpc override). This exposed a latent bug in the existing test
+harness: hScale16To15_c/hScale16To19_c dereference c->opts.src_format,
+but check_hscale's call_ref/call_new passed a literal NULL for that
+argument -- harmless for the 8-bit-src C refs (which never touch it),
+but a NULL-pointer segfault once a 16-bit row actually reached that
+code path. Fixed by passing the real context throughout (harmless for
+the 8-bit rows). Verified: existing 8-bit ALTIVEC hscale rows still
+pass, the new 16-bit rows run and pass as C-only (144 new hscale_16_*
+names, split evenly across yuv420p10be/yuv420p16be), seeds 1/42/777.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Xix7Wn4UbWrKRBNAMUVpRR
+---
+ tests/checkasm/sw_scale.c   |  96 +++++++---
+ tests/checkasm/sw_yuv2yuv.c | 338 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 413 insertions(+), 21 deletions(-)
+
+diff --git a/tests/checkasm/sw_scale.c b/tests/checkasm/sw_scale.c
+index 3c33785..cf3456e 100644
+--- a/tests/checkasm/sw_scale.c
++++ b/tests/checkasm/sw_scale.c
+@@ -23,6 +23,7 @@
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/mem_internal.h"
++#include "libavutil/pixdesc.h"
+ 
+ #include "libswscale/swscale.h"
+ #include "libswscale/swscale_internal.h"
+@@ -359,21 +360,39 @@ static void check_hscale(void)
+ #define FILTER_SIZES 6
+     static const int filter_sizes[FILTER_SIZES] = { 4, 8, 12, 16, 32, 40 };
+ 
+-#define HSCALE_PAIRS 2
+-    static const int hscale_pairs[HSCALE_PAIRS][2] = {
+-        { 8, 14 },
+-        { 8, 18 },
++    /*
++     * (srcBpc, dstBpc, src_format, src value mask). The 16-bit rows use real
++     * high-depth source formats (rather than the default yuv420p) because
++     * hScale16To15_c/hScale16To19_c (libswscale/swscale.c:69-126) derive
++     * their shift from c->opts.src_format's pixdesc depth: yuv420p10 sweeps
++     * the mpv 10-bit HEVC -> uyvy path's shift values (9 and 5), yuv420p16
++     * sweeps the full-range 16-bit path (shifts 15 and 11) including source
++     * values >= 32768, which a signed-multiply implementation would get
++     * wrong.
++     */
++#define HSCALE_ROWS 6
++    static const struct {
++        int srcBpc, dstBpc;
++        enum AVPixelFormat src_fmt;
++        unsigned mask;
++    } hscale_rows[HSCALE_ROWS] = {
++        {  8, 14, AV_PIX_FMT_YUV420P,   0xFF   },
++        {  8, 18, AV_PIX_FMT_YUV420P,   0xFF   },
++        { 16, 14, AV_PIX_FMT_YUV420P10, 0x03FF },
++        { 16, 18, AV_PIX_FMT_YUV420P10, 0x03FF },
++        { 16, 14, AV_PIX_FMT_YUV420P16, 0xFFFF },
++        { 16, 18, AV_PIX_FMT_YUV420P16, 0xFFFF },
+     };
+ 
+ #define LARGEST_INPUT_SIZE 512
+     static const int input_sizes[] = {8, 24, 128, 144, 256, 512};
+ 
+     int i, j, fsi, hpi, width, dstWi;
+-    SwsContext *sws;
+-    SwsInternal *c;
+ 
+-    // padded
++    // padded, 8-bit source
+     LOCAL_ALIGNED_32(uint8_t, src, [FFALIGN(SRC_PIXELS + MAX_FILTER_WIDTH - 1, 4)]);
++    // padded, 16-bit source
++    LOCAL_ALIGNED_32(uint16_t, src16, [SRC_PIXELS + MAX_FILTER_WIDTH - 1]);
+     LOCAL_ALIGNED_32(uint32_t, dst0, [SRC_PIXELS]);
+     LOCAL_ALIGNED_32(uint32_t, dst1, [SRC_PIXELS]);
+ 
+@@ -389,20 +408,35 @@ static void check_hscale(void)
+                  const uint8_t *src, const int16_t *filter,
+                  const int32_t *filterPos, int filterSize);
+ 
+-    sws = sws_alloc_context();
+-    if (sws_init_context(sws, NULL, NULL) < 0)
+-        fail();
+-
+-    c = sws_internal(sws);
+     randomize_buffers(src, SRC_PIXELS + MAX_FILTER_WIDTH - 1);
++    randomize_buffers((uint8_t *)src16, (SRC_PIXELS + MAX_FILTER_WIDTH - 1) * sizeof(uint16_t));
++
++    for (hpi = 0; hpi < HSCALE_ROWS; hpi++) {
++        SwsContext *sws;
++        SwsInternal *c;
++        const uint8_t *srcbuf;
++
++        sws = sws_alloc_context();
++        sws->src_format = hscale_rows[hpi].src_fmt;
++        if (sws_init_context(sws, NULL, NULL) < 0)
++            fail();
++
++        c = sws_internal(sws);
++
++        if (hscale_rows[hpi].srcBpc == 8) {
++            srcbuf = src;
++        } else {
++            for (i = 0; i < SRC_PIXELS + MAX_FILTER_WIDTH - 1; i++)
++                src16[i] &= hscale_rows[hpi].mask;
++            srcbuf = (const uint8_t *) src16;
++        }
+ 
+-    for (hpi = 0; hpi < HSCALE_PAIRS; hpi++) {
+         for (fsi = 0; fsi < FILTER_SIZES; fsi++) {
+             for (dstWi = 0; dstWi < FF_ARRAY_ELEMS(input_sizes); dstWi++) {
+                 width = filter_sizes[fsi];
+ 
+-                c->srcBpc = hscale_pairs[hpi][0];
+-                c->dstBpc = hscale_pairs[hpi][1];
++                c->srcBpc = hscale_rows[hpi].srcBpc;
++                c->dstBpc = hscale_rows[hpi].dstBpc;
+                 c->hLumFilterSize = c->hChrFilterSize = width;
+ 
+                 for (i = 0; i < SRC_PIXELS; i++) {
+@@ -421,6 +455,12 @@ static void check_hscale(void)
+                     //
+                     // The coefficients sum to the 1.0 point for the hscale
+                     // functions (1 << 14).
++                    //
++                    // Overflow check (both 8- and 16-bit src, see the file
++                    // comment above the table): the largest product is
++                    // 32767 * 65535 = 2147385345 < 2^31, and every partial
++                    // sum is a subset sum of the full one, so accumulating
++                    // in a 32-bit int is never UB for this filter design.
+ 
+                     for (j = 0; j < width; j++) {
+                         filter[i * width + j] = -((1 << 14) / (width - 1));
+@@ -441,20 +481,34 @@ static void check_hscale(void)
+                 ff_shuffle_filter_coefficients(c, filterPosAvx, width, filterAvx2, sws->dst_w);
+ 
+                 av_assert0(c->hyScale == c->hcScale);
+-                if (check_func(c->hcScale, "hscale_%d_to_%d__fs_%d_dstW_%d", c->srcBpc, c->dstBpc + 1, width, sws->dst_w)) {
++                if (check_func(c->hcScale, "hscale_%d_to_%d__fs_%d_dstW_%d_%s", c->srcBpc, c->dstBpc + 1, width, sws->dst_w,
++                               av_get_pix_fmt_name(hscale_rows[hpi].src_fmt))) {
++                    /* dstBpc+1 > 15 means the 19-bit (int32_t) output path;
++                     * comparing dst_w*4 bytes there and dst_w*2 bytes
++                     * otherwise matches the real element size exactly (the
++                     * original dst_w*sizeof(uint32_t) over-compared zeroed
++                     * slack for the 15-bit path -- harmless, but this is
++                     * tighter without reducing coverage). */
++                    size_t cmp_bytes = sws->dst_w * (c->dstBpc > 14 ? 4 : 2);
++
+                     memset(dst0, 0, SRC_PIXELS * sizeof(dst0[0]));
+                     memset(dst1, 0, SRC_PIXELS * sizeof(dst1[0]));
+ 
+-                    call_ref(NULL, (int16_t *)dst0, sws->dst_w, src, filter, filterPos, width);
+-                    call_new(NULL, (int16_t *)dst1, sws->dst_w, src, filterAvx2, filterPosAvx, width);
+-                    if (memcmp(dst0, dst1, sws->dst_w * sizeof(dst0[0])))
++                    /* NULL was safe here for the 8-bit-src C refs (they never
++                     * touch it), but hScale16To15_c/hScale16To19_c dereference
++                     * c->opts.src_format to derive the shift -- pass the real
++                     * context for every row (harmless for the 8-bit rows). */
++                    call_ref(c, (int16_t *)dst0, sws->dst_w, srcbuf, filter, filterPos, width);
++                    call_new(c, (int16_t *)dst1, sws->dst_w, srcbuf, filterAvx2, filterPosAvx, width);
++                    if (memcmp(dst0, dst1, cmp_bytes))
+                         fail();
+-                    bench_new(NULL, (int16_t *)dst0, sws->dst_w, src, filter, filterPosAvx, width);
++                    bench_new(c, (int16_t *)dst0, sws->dst_w, srcbuf, filter, filterPosAvx, width);
+                 }
+             }
+         }
++        sws_freeContext(sws);
+     }
+-    sws_freeContext(sws);
++#undef HSCALE_ROWS
+ }
+ 
+ void checkasm_check_sw_scale(void)
+diff --git a/tests/checkasm/sw_yuv2yuv.c b/tests/checkasm/sw_yuv2yuv.c
+index 6a03801..fcc0c87 100644
+--- a/tests/checkasm/sw_yuv2yuv.c
++++ b/tests/checkasm/sw_yuv2yuv.c
+@@ -18,6 +18,7 @@
+ 
+ #include <string.h>
+ 
++#include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem_internal.h"
+@@ -269,6 +270,326 @@ static void check_packed422(int src_pix_fmt, int dst_pix_fmt)
+ #undef DST_SIZE
+ }
+ 
++/*
++ * Oracle for the AltiVec scaler-path packed 4:2:2 packers (yuv2packed1/2/X
++ * for yuyv422/uyvy422/yvyu422, libswscale/ppc/yuv2yuv_altivec.c).
++ *
++ * Unlike check_packed422 above, these three functions are picked from the
++ * *scaled* dispatch table (libswscale/output.c, registered unconditionally
++ * for these three dst formats, no SWS_BITEXACT/SWS_FULL_CHR_H_INT/needAlpha
++ * gate -- see libswscale/output.c:3800-3813). The context is built with
++ * SWS_BITEXACT so that no unscaled special converter (C or the sub-task-1
++ * AltiVec one) is selected for convert_unscaled, which would otherwise
++ * short-circuit sws_init_context() before it reaches ff_sws_init_scale()
++ * (see utils.c:1623-1637); ff_sws_init_scale() is also called explicitly
++ * here to defend against that early-return in general (as check_yuv2yuvX in
++ * sw_scale.c already does), and the pointers are asserted non-NULL.
++ *
++ * The C references clip only when bit 8 of the pre-clip result is set
++ * (`(Y1|Y2|U|V) & 0x100`), i.e. only when the true saturating result would
++ * be in [-256, 511]; outside that window the C stores the low byte of an
++ * unclamped int and is not a meaningful oracle. Inputs are therefore kept
++ * inside that window per variant:
++ *   - _1 and _2: any int16_t value is safe (verified range [-256, 256] and
++ *     [-256, 255] respectively for the formulas involved).
++ *   - _X: inputs are masked to non-negative 15-bit (& 0x7FFF) -- the test
++ *     filter has one tap of 8191 and the rest -(4096/(n-1)), which for
++ *     negative inputs could push the pre-shift sum outside the window.
++ */
++static void p422_design_filter(int16_t *filt, int n)
++{
++    if (n == 1) {
++        filt[0] = 4096;
++        return;
++    }
++    for (int i = 0; i < n; i++)
++        filt[i] = -(4096 / (n - 1));
++    filt[rnd() % n] = 8191;
++}
++
++#define P422_MAXW      1920
++#define P422_LUM_N     (P422_MAXW + 1 + 8 + 32)
++#define P422_CHR_N     ((P422_MAXW + 1) / 2 + 8 + 32)
++#define P422_DST_N     4096
++#define P422_MAX_LINES 16
++
++static const int p422_widths[] = {
++    2, 8, 16, 17, 31, 32, 33, 48, 63, 64, 640, 853, 854, 1080, 1366, 1919, 1920
++};
++static const int p422_src_offsets[] = { 0, 1, 3, 5 };
++static const int p422_dst_offsets[] = { 0, 4, 6, 8, 12 };
++
++static SwsInternal *p422_get_context(enum AVPixelFormat dst_fmt, SwsContext **swsp)
++{
++    SwsContext *sws = sws_alloc_context();
++    SwsInternal *c;
++
++    sws->src_format = AV_PIX_FMT_YUV420P;
++    sws->dst_format = dst_fmt;
++    sws->flags      = SWS_BILINEAR | SWS_BITEXACT | SWS_ACCURATE_RND;
++    sws->src_w = sws->dst_w = sws->src_h = sws->dst_h = 64;
++
++    if (sws_init_context(sws, NULL, NULL) < 0) {
++        fail();
++        sws_freeContext(sws);
++        *swsp = NULL;
++        return NULL;
++    }
++
++    c = sws_internal(sws);
++    ff_sws_init_scale(c);
++    av_assert0(c->yuv2packed1 && c->yuv2packed2 && c->yuv2packedX);
++
++    *swsp = sws;
++    return c;
++}
++
++static void check_yuv2packed422_1(enum AVPixelFormat dst_fmt)
++{
++    static const int uvalphas[] = { 0, 2048, 4096 };
++
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(dst_fmt);
++    SwsContext *sws;
++    SwsInternal *c;
++
++    declare_func(void, SwsInternal *c, const int16_t *lumSrc,
++                 const int16_t *chrUSrc[2], const int16_t *chrVSrc[2],
++                 const int16_t *alpSrc, uint8_t *dest,
++                 int dstW, int uvalpha, int y);
++
++    LOCAL_ALIGNED_16(int16_t, lum0, [P422_LUM_N]);
++    LOCAL_ALIGNED_16(int16_t, u0,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, u1,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, v0,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, v1,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst0, [P422_DST_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst1, [P422_DST_N]);
++
++    randomize_buffers((uint8_t *)lum0, P422_LUM_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)u0,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)u1,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)v0,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)v1,   P422_CHR_N * sizeof(int16_t));
++
++    c = p422_get_context(dst_fmt, &sws);
++    if (!c)
++        return;
++
++    for (int ai = 0; ai < FF_ARRAY_ELEMS(uvalphas); ai++) {
++        int uvalpha = uvalphas[ai];
++        if (check_func(c->yuv2packed1, "yuv2%s_1_%d", desc->name, uvalpha)) {
++            for (int oi = 0; oi < FF_ARRAY_ELEMS(p422_src_offsets); oi++) {
++                int off = p422_src_offsets[oi];
++                const int16_t *lumSrc  = lum0 + off;
++                const int16_t *chrU[2] = { u0 + off, u1 + off };
++                const int16_t *chrV[2] = { v0 + off, v1 + off };
++
++                for (int wi = 0; wi < FF_ARRAY_ELEMS(p422_widths); wi++) {
++                    int w = p422_widths[wi];
++
++                    for (int di = 0; di < FF_ARRAY_ELEMS(p422_dst_offsets); di++) {
++                        int doff = p422_dst_offsets[di];
++
++                        memset(dst0, 0x55, P422_DST_N);
++                        memset(dst1, 0x55, P422_DST_N);
++
++                        call_ref(c, lumSrc, chrU, chrV, NULL, dst0 + doff, w, uvalpha, 0);
++                        call_new(c, lumSrc, chrU, chrV, NULL, dst1 + doff, w, uvalpha, 0);
++
++                        if (memcmp(dst0, dst1, P422_DST_N))
++                            fail();
++                    }
++                }
++            }
++            {
++                const int16_t *chrU[2] = { u0, u1 };
++                const int16_t *chrV[2] = { v0, v1 };
++                bench_new(c, lum0, chrU, chrV, NULL, dst1, 1920, uvalpha, 0);
++            }
++        }
++    }
++
++    sws_freeContext(sws);
++}
++
++static void check_yuv2packed422_2(enum AVPixelFormat dst_fmt)
++{
++    static const int alphas[][2] = {
++        { 0, 0 }, { 2048, 2048 }, { 4096, 4096 }, { 1234, 3000 }, { 4096, 0 },
++    };
++
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(dst_fmt);
++    SwsContext *sws;
++    SwsInternal *c;
++
++    declare_func(void, SwsInternal *c, const int16_t *lumSrc[2],
++                 const int16_t *chrUSrc[2], const int16_t *chrVSrc[2],
++                 const int16_t *alpSrc[2], uint8_t *dest,
++                 int dstW, int yalpha, int uvalpha, int y);
++
++    LOCAL_ALIGNED_16(int16_t, lum0, [P422_LUM_N]);
++    LOCAL_ALIGNED_16(int16_t, lum1, [P422_LUM_N]);
++    LOCAL_ALIGNED_16(int16_t, u0,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, u1,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, v0,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, v1,   [P422_CHR_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst0, [P422_DST_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst1, [P422_DST_N]);
++
++    randomize_buffers((uint8_t *)lum0, P422_LUM_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)lum1, P422_LUM_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)u0,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)u1,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)v0,   P422_CHR_N * sizeof(int16_t));
++    randomize_buffers((uint8_t *)v1,   P422_CHR_N * sizeof(int16_t));
++
++    c = p422_get_context(dst_fmt, &sws);
++    if (!c)
++        return;
++
++    for (int ai = 0; ai < FF_ARRAY_ELEMS(alphas); ai++) {
++        int yalpha = alphas[ai][0], uvalpha = alphas[ai][1];
++        if (check_func(c->yuv2packed2, "yuv2%s_2_%d_%d", desc->name, yalpha, uvalpha)) {
++            for (int oi = 0; oi < FF_ARRAY_ELEMS(p422_src_offsets); oi++) {
++                int off = p422_src_offsets[oi];
++                const int16_t *lumSrc[2] = { lum0 + off, lum1 + off };
++                const int16_t *chrU[2]   = { u0 + off, u1 + off };
++                const int16_t *chrV[2]   = { v0 + off, v1 + off };
++
++                for (int wi = 0; wi < FF_ARRAY_ELEMS(p422_widths); wi++) {
++                    int w = p422_widths[wi];
++
++                    for (int di = 0; di < FF_ARRAY_ELEMS(p422_dst_offsets); di++) {
++                        int doff = p422_dst_offsets[di];
++
++                        memset(dst0, 0x55, P422_DST_N);
++                        memset(dst1, 0x55, P422_DST_N);
++
++                        call_ref(c, lumSrc, chrU, chrV, NULL, dst0 + doff, w, yalpha, uvalpha, 0);
++                        call_new(c, lumSrc, chrU, chrV, NULL, dst1 + doff, w, yalpha, uvalpha, 0);
++
++                        if (memcmp(dst0, dst1, P422_DST_N))
++                            fail();
++                    }
++                }
++            }
++            {
++                const int16_t *lumSrc[2] = { lum0, lum1 };
++                const int16_t *chrU[2]   = { u0, u1 };
++                const int16_t *chrV[2]   = { v0, v1 };
++                bench_new(c, lumSrc, chrU, chrV, NULL, dst1, 1920, yalpha, uvalpha, 0);
++            }
++        }
++    }
++
++    sws_freeContext(sws);
++}
++
++static void check_yuv2packed422_X(enum AVPixelFormat dst_fmt)
++{
++    static const int fs_pairs[][2] = {
++        { 1, 1 }, { 2, 2 }, { 3, 1 }, { 4, 3 }, { 8, 8 }, { 16, 16 }, { 5, 16 },
++    };
++
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(dst_fmt);
++    SwsContext *sws;
++    SwsInternal *c;
++    const int16_t *lumSrc[P422_MAX_LINES];
++    const int16_t *chrU[P422_MAX_LINES];
++    const int16_t *chrV[P422_MAX_LINES];
++
++    declare_func(void, SwsInternal *c, const int16_t *lumFilter,
++                 const int16_t **lumSrc, int lumFilterSize,
++                 const int16_t *chrFilter, const int16_t **chrUSrc,
++                 const int16_t **chrVSrc, int chrFilterSize,
++                 const int16_t **alpSrc, uint8_t *dest, int dstW, int y);
++
++    LOCAL_ALIGNED_16(int16_t, lum_buf,  [P422_MAX_LINES], [P422_LUM_N]);
++    LOCAL_ALIGNED_16(int16_t, u_buf,    [P422_MAX_LINES], [P422_CHR_N]);
++    LOCAL_ALIGNED_16(int16_t, v_buf,    [P422_MAX_LINES], [P422_CHR_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst0,     [P422_DST_N]);
++    LOCAL_ALIGNED_16(uint8_t, dst1,     [P422_DST_N]);
++    LOCAL_ALIGNED_16(int16_t, lum_filt, [P422_MAX_LINES]);
++    LOCAL_ALIGNED_16(int16_t, chr_filt, [P422_MAX_LINES]);
++
++    for (int l = 0; l < P422_MAX_LINES; l++) {
++        int e;
++        randomize_buffers((uint8_t *)lum_buf[l], P422_LUM_N * sizeof(int16_t));
++        randomize_buffers((uint8_t *)u_buf[l],   P422_CHR_N * sizeof(int16_t));
++        randomize_buffers((uint8_t *)v_buf[l],   P422_CHR_N * sizeof(int16_t));
++        /* _X inputs must be non-negative 15-bit, see the file comment above. */
++        for (e = 0; e < P422_LUM_N; e++)
++            lum_buf[l][e] &= 0x7FFF;
++        for (e = 0; e < P422_CHR_N; e++) {
++            u_buf[l][e] &= 0x7FFF;
++            v_buf[l][e] &= 0x7FFF;
++        }
++    }
++
++    c = p422_get_context(dst_fmt, &sws);
++    if (!c)
++        return;
++
++    for (int fi = 0; fi < FF_ARRAY_ELEMS(fs_pairs); fi++) {
++        int lfs = fs_pairs[fi][0], cfs = fs_pairs[fi][1];
++
++        p422_design_filter(lum_filt, lfs);
++        p422_design_filter(chr_filt, cfs);
++
++        if (check_func(c->yuv2packedX, "yuv2%s_X_%d_%d", desc->name, lfs, cfs)) {
++            for (int oi = 0; oi < FF_ARRAY_ELEMS(p422_src_offsets); oi++) {
++                int off = p422_src_offsets[oi];
++                int l;
++
++                for (l = 0; l < lfs; l++)
++                    lumSrc[l] = lum_buf[l] + off;
++                for (l = 0; l < cfs; l++) {
++                    chrU[l] = u_buf[l] + off;
++                    chrV[l] = v_buf[l] + off;
++                }
++
++                for (int wi = 0; wi < FF_ARRAY_ELEMS(p422_widths); wi++) {
++                    int w = p422_widths[wi];
++
++                    for (int di = 0; di < FF_ARRAY_ELEMS(p422_dst_offsets); di++) {
++                        int doff = p422_dst_offsets[di];
++
++                        memset(dst0, 0x55, P422_DST_N);
++                        memset(dst1, 0x55, P422_DST_N);
++
++                        call_ref(c, lum_filt, lumSrc, lfs, chr_filt, chrU, chrV, cfs,
++                                 NULL, dst0 + doff, w, 0);
++                        call_new(c, lum_filt, lumSrc, lfs, chr_filt, chrU, chrV, cfs,
++                                 NULL, dst1 + doff, w, 0);
++
++                        if (memcmp(dst0, dst1, P422_DST_N))
++                            fail();
++                    }
++                }
++            }
++            {
++                int l;
++                for (l = 0; l < lfs; l++)
++                    lumSrc[l] = lum_buf[l];
++                for (l = 0; l < cfs; l++) {
++                    chrU[l] = u_buf[l];
++                    chrV[l] = v_buf[l];
++                }
++                bench_new(c, lum_filt, lumSrc, lfs, chr_filt, chrU, chrV, cfs,
++                          NULL, dst1, 1920, 0);
++            }
++        }
++    }
++
++    sws_freeContext(sws);
++}
++
++#undef P422_MAXW
++#undef P422_LUM_N
++#undef P422_CHR_N
++#undef P422_DST_N
++#undef P422_MAX_LINES
++
+ void checkasm_check_sw_yuv2yuv(void)
+ {
+     static const int packed422_src_fmts[] = {
+@@ -276,6 +597,11 @@ void checkasm_check_sw_yuv2yuv(void)
+         AV_PIX_FMT_YUVA420P,
+         AV_PIX_FMT_YUV422P,
+     };
++    static const int packed422_dst_fmts[] = {
++        AV_PIX_FMT_YUYV422,
++        AV_PIX_FMT_UYVY422,
++        AV_PIX_FMT_YVYU422,
++    };
+ 
+     check_semiplanar(AV_PIX_FMT_YUV420P);
+     report("yuv420p");
+@@ -287,4 +613,16 @@ void checkasm_check_sw_yuv2yuv(void)
+     for (int i = 0; i < FF_ARRAY_ELEMS(packed422_src_fmts); i++)
+         check_packed422(packed422_src_fmts[i], AV_PIX_FMT_UYVY422);
+     report("uyvy422");
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(packed422_dst_fmts); i++)
++        check_yuv2packed422_1(packed422_dst_fmts[i]);
++    report("yuv2packed422_1");
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(packed422_dst_fmts); i++)
++        check_yuv2packed422_2(packed422_dst_fmts[i]);
++    report("yuv2packed422_2");
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(packed422_dst_fmts); i++)
++        check_yuv2packed422_X(packed422_dst_fmts[i]);
++    report("yuv2packed422_X");
+ }
+-- 
+2.43.0
+
