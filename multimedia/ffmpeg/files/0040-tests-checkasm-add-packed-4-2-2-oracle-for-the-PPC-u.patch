@@ -1,0 +1,238 @@
+From 72aa5ad730934de09a3d925cdd9399677de77c9c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 02:14:05 +0000
+Subject: [PATCH] tests/checkasm: add packed 4:2:2 oracle for the PPC unscaled
+ converters
+
+libswscale/ppc/yuv2yuv_altivec.c's yv12toyuy2/touyvy_unscaled_altivec
+had no checkasm coverage at all. Add check_packed422() to
+sw_yuv2yuv.c, exercising src {yuv420p, yuva420p, yuv422p} x dst
+{yuyv422, uyvy422} across widths {2,8,16,32,48,640,853,854,1080,1366,
+1920}, two stride sets (16-aligned and 8-mod-16 "odd"), several src/dst
+base byte offsets, and one sliced call with source planes pre-shifted
+the way run_legacy_unscaled() does. Each scenario fills both dst
+arenas with 0x55 and memcmp()s the whole arena, so an out-of-row write
+fails just as reliably as a wrong pixel. Contexts are built with
+SWS_FAST_BILINEAR, since the yuv420p/yuva420p C reference
+(planarToYuy2Wrapper/UyvyWrapper) is only selected under
+SWS_FAST_BILINEAR|SWS_POINT -- without it the C side is the full
+scaler and convert_unscaled is NULL for the C cpu-flags pass, making
+the AltiVec function its own (vacuous) reference.
+
+This is EXPECTED TO FAIL on the current kernel, and does: qemu -cpu
+7400, seeds 1/42/777, "10 of 10 tests failed" identically across all
+three seeds (yuv420p_{yuyv422,uyvy422}_{16,32,48,640,1920}_altivec;
+yuva420p/yuv422p and the other widths never dispatch AltiVec under the
+current width%16==0-and-YUV420P-only registration gate, so they are
+skipped rather than failing). The per-scenario matrix pins down which
+of the four known bugs each failure comes from:
+
+  - "aligned" (0,0,0, 16-aligned strides) and "slice" (srcSliceY/H with
+    pre-shifted src planes, same aligned strides): PASS everywhere --
+    the kernel's own stated assumptions hold and the slice offset math
+    is fine.
+  - "unaligned-src" (loff=1,coff=3, aligned strides): FAILS only for
+    widths 16 and 48, which have a < 32-pixel remainder that never hits
+    the main loop's per-call permute and instead vec_ld's y/u/v
+    directly (bug 2); widths 32/640/1920 (exact multiples of 32, no
+    remainder) PASS this scenario, because the main loop's yperm is
+    freshly computed from the actual (unaligned) src pointer and stays
+    valid across rows when lumStride is itself 16-aligned.
+  - "unaligned-dst" (aligned strides, dst base offset by 4): FAILS for
+    every dispatching width -- plain vec_st truncates to the 16-byte
+    boundary and corrupts neighbouring bytes whenever dst isn't
+    16-aligned (bug 3), isolated cleanly since src stays aligned here.
+  - "odd-stride" (all strides 8-mod-16, zero offsets): FAILS for every
+    width -- lumStride % 16 == 8 shifts ysrc's alignment every row, so
+    the once-per-call yperm (bug 1) goes stale from row 1 onward, and
+    dstStride % 16 == 8 hits the same vec_st truncation (bug 3) on top.
+  - "odd+unaligned" and "odd+dst-off" (odd strides combined with
+    nonzero src/dst offsets): FAIL for every width, combining the
+    above.
+
+Bug 4 (the 32-pixel block's third luma load and the chroma loads
+touching one aligned word past the last needed byte) does not surface
+as a memcmp mismatch here: the source arenas carry 64 bytes of slack
+past the last real row, so the over-read lands on defined-but-unused
+buffer content rather than corrupting a compared value. It is a real
+out-of-bounds read on tighter allocations (e.g. ASan, or a source
+plane whose slack is smaller) and is fixed anyway in the coming kernel
+rewrite, which by construction only touches aligned words that hold
+needed bytes.
+
+Validated: qemu-ppc-static -cpu 7400 -L $PPC_SYSROOT/usr/powerpc-linux-gnu
+tests/checkasm/checkasm --test=sw_yuv2yuv, seeds 1/42/777, incremental
+-j1 build in /home/sgr/barracuda/ffbuild-ppc, warning-free compile.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BWSAHaJhssb1i1iMizrWV
+---
+ tests/checkasm/sw_yuv2yuv.c | 150 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 150 insertions(+)
+
+diff --git a/tests/checkasm/sw_yuv2yuv.c b/tests/checkasm/sw_yuv2yuv.c
+index 251fdde..74a5517 100644
+--- a/tests/checkasm/sw_yuv2yuv.c
++++ b/tests/checkasm/sw_yuv2yuv.c
+@@ -127,8 +127,158 @@ static void check_semiplanar(int dst_pix_fmt)
+ #undef NUM_LINES
+ #undef MAX_LINE_SIZE
+ 
++/*
++ * Oracle for the AltiVec planar -> packed 4:2:2 unscaled converters
++ * (yv12/yuva420p/yuv422p -> yuyv422/uyvy422, libswscale/ppc/yuv2yuv_altivec.c).
++ *
++ * The C reference for yuv420p/yuva420p (planarToYuy2Wrapper/
++ * planarToUyvyWrapper) is only selected under SWS_FAST_BILINEAR|SWS_POINT,
++ * so the context MUST be built with SWS_FAST_BILINEAR or the C side is the
++ * full scaler (a different computation) and convert_unscaled ends up NULL
++ * for the C cpu-flags pass, which check_func() treats as "no reference" and
++ * skips -- a vacuous pass. The yuv422p wrappers are flag-independent.
++ *
++ * Exercises: widths spanning the AltiVec kernel's 32-wide main loop, 16-wide
++ * (checkasm's own choice, no bearing on the fix) and byte tail, and several
++ * widths that are not multiples of 16; two stride sets (16-aligned and
++ * 8-mod-16 "odd"); several src/dst base byte offsets (some 16-aligned, some
++ * not, dst offsets always a multiple of 4 since the C reference stores
++ * 32-bit words); and one sliced call (srcSliceY/H) with the source planes
++ * pre-shifted the way the real caller (run_legacy_unscaled) does. Each
++ * scenario fills both destination arenas with 0x55 and memcmp()s the WHOLE
++ * arena afterwards, so a write that lands outside the row it should touch
++ * (over- or under-run) fails the check just as reliably as a wrong pixel
++ * value.
++ */
++static void check_packed422(int src_pix_fmt, int dst_pix_fmt)
++{
++    static const int widths[] = { 2, 8, 16, 32, 48, 640, 853, 854, 1080, 1366, 1920 };
++    const AVPixFmtDescriptor *src_desc = av_pix_fmt_desc_get(src_pix_fmt);
++    const AVPixFmtDescriptor *dst_desc = av_pix_fmt_desc_get(dst_pix_fmt);
++
++#define NUM_LINES      4
++#define LUM_STRIDE_A   1920
++#define CHR_STRIDE_A    960
++#define DST_STRIDE_A   3840
++#define LUM_STRIDE_O   1928
++#define CHR_STRIDE_O    968
++#define DST_STRIDE_O   3848
++#define SLACK 64
++#define SRC_Y_SIZE (LUM_STRIDE_O * NUM_LINES + SLACK)
++#define SRC_C_SIZE (CHR_STRIDE_O * NUM_LINES + SLACK)
++#define DST_SIZE   (DST_STRIDE_O * NUM_LINES + SLACK)
++
++    struct Scenario {
++        const char *name;
++        int lstride, cstride, dstride;
++        int loff, coff, doff;
++        int slice;
++    };
++    static const struct Scenario scenarios[] = {
++        { "aligned",       LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 0, 0,  0, 0 },
++        { "odd-stride",    LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 0, 0,  0, 0 },
++        { "unaligned-src", LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 1, 3,  0, 0 },
++        { "odd+unaligned", LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 8, 4,  8, 0 },
++        { "unaligned-dst", LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 0, 0,  4, 0 },
++        { "odd+dst-off",   LUM_STRIDE_O, CHR_STRIDE_O, DST_STRIDE_O, 0, 0, 12, 0 },
++        { "slice",         LUM_STRIDE_A, CHR_STRIDE_A, DST_STRIDE_A, 0, 0,  0, 1 },
++    };
++
++    declare_func(int, SwsInternal *c, const uint8_t *const src[],
++                      const int srcStride[], int srcSliceY, int srcSliceH,
++                      uint8_t *const dstParam[], const int dstStride[]);
++
++    LOCAL_ALIGNED_16(uint8_t, src_y, [SRC_Y_SIZE]);
++    LOCAL_ALIGNED_16(uint8_t, src_u, [SRC_C_SIZE]);
++    LOCAL_ALIGNED_16(uint8_t, src_v, [SRC_C_SIZE]);
++    LOCAL_ALIGNED_16(uint8_t, dst0,  [DST_SIZE]);
++    LOCAL_ALIGNED_16(uint8_t, dst1,  [DST_SIZE]);
++
++    randomize_buffers(src_y, SRC_Y_SIZE);
++    randomize_buffers(src_u, SRC_C_SIZE);
++    randomize_buffers(src_v, SRC_C_SIZE);
++
++    for (int wi = 0; wi < FF_ARRAY_ELEMS(widths); wi++) {
++        int width = widths[wi];
++        SwsContext *sws;
++        SwsInternal *c;
++        int log_level;
++
++        log_level = av_log_get_level();
++        av_log_set_level(AV_LOG_ERROR);
++        sws = sws_getContext(width, NUM_LINES, src_pix_fmt,
++                             width, NUM_LINES, dst_pix_fmt,
++                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
++        av_log_set_level(log_level);
++        if (!sws) {
++            fail();
++            continue;
++        }
++
++        c = sws_internal(sws);
++        if (check_func(c->convert_unscaled, "%s_%s_%d",
++                       src_desc->name, dst_desc->name, width)) {
++            for (int si = 0; si < FF_ARRAY_ELEMS(scenarios); si++) {
++                const struct Scenario *sc = &scenarios[si];
++                int srcSliceY = sc->slice ? 2 : 0;
++                int srcSliceH = sc->slice ? 2 : NUM_LINES;
++                int crow_shift = srcSliceY >> src_desc->log2_chroma_h;
++                const uint8_t *src[4] = {
++                    src_y + sc->loff + (ptrdiff_t)srcSliceY * sc->lstride,
++                    src_u + sc->coff + (ptrdiff_t)crow_shift * sc->cstride,
++                    src_v + sc->coff + (ptrdiff_t)crow_shift * sc->cstride,
++                    NULL,
++                };
++                int srcStride[4] = { sc->lstride, sc->cstride, sc->cstride, 0 };
++                uint8_t *dstp0[4] = { dst0 + sc->doff, NULL, NULL, NULL };
++                uint8_t *dstp1[4] = { dst1 + sc->doff, NULL, NULL, NULL };
++                int dstStride[4]  = { sc->dstride, 0, 0, 0 };
++
++                memset(dst0, 0x55, DST_SIZE);
++                memset(dst1, 0x55, DST_SIZE);
++
++                call_ref(c, src, srcStride, srcSliceY, srcSliceH, dstp0, dstStride);
++                call_new(c, src, srcStride, srcSliceY, srcSliceH, dstp1, dstStride);
++
++                if (memcmp(dst0, dst1, DST_SIZE))
++                    fail();
++
++                if (si == 0)
++                    bench_new(c, src, srcStride, srcSliceY, srcSliceH, dstp1, dstStride);
++            }
++        }
++        sws_freeContext(sws);
++    }
++
++#undef NUM_LINES
++#undef LUM_STRIDE_A
++#undef CHR_STRIDE_A
++#undef DST_STRIDE_A
++#undef LUM_STRIDE_O
++#undef CHR_STRIDE_O
++#undef DST_STRIDE_O
++#undef SLACK
++#undef SRC_Y_SIZE
++#undef SRC_C_SIZE
++#undef DST_SIZE
++}
++
+ void checkasm_check_sw_yuv2yuv(void)
+ {
++    static const int packed422_src_fmts[] = {
++        AV_PIX_FMT_YUV420P,
++        AV_PIX_FMT_YUVA420P,
++        AV_PIX_FMT_YUV422P,
++    };
++
+     check_semiplanar(AV_PIX_FMT_YUV420P);
+     report("yuv420p");
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(packed422_src_fmts); i++)
++        check_packed422(packed422_src_fmts[i], AV_PIX_FMT_YUYV422);
++    report("yuyv422");
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(packed422_src_fmts); i++)
++        check_packed422(packed422_src_fmts[i], AV_PIX_FMT_UYVY422);
++    report("uyvy422");
+ }
+-- 
+2.43.0
+

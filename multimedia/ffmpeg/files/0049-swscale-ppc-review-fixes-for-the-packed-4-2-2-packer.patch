@@ -1,0 +1,259 @@
+From 76bb3e04b6c4b3245fb460a4de079254d8905634 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 04:39:15 +0000
+Subject: [PATCH] swscale/ppc: review fixes for the packed 4:2:2 packers and
+ 16-bit hScale
+
+Review gate over b79fa1e, 855ebe9 and 632dfe4 (all three verified
+line-by-line against output.c's yuv2422_{1,2,X}_c_template and
+swscale.c's hScale16To15_c/hScale16To19_c, and re-validated on fresh
+seeds; zero functional defects found). Four changes on top:
+
+- hScale16To15/16To19 filterSize == 4 path: the row's four taps were
+  memcpy'd into a zero-padded aligned local and reloaded with vec_ld --
+  a store-then-vector-load bounce per output, exactly the load-hit-store
+  pattern that makes the existing 8-bit hScale_real_altivec marginal on
+  the 7450. Replaced by the same two-load vec_perm splice the source
+  uses (second load on byte 7 of the row, valid for any filter base
+  alignment) plus a lane 4..7 zero mask. The source splice's second load
+  now sits on byte off+7 (the last byte the C reference reads) instead
+  of off+15, so no aligned word beyond the one holding the last needed
+  byte is touched any more; the four extra source lanes meet zero taps
+  and a zero negative-tap mask in both accumulators. Also drops the now
+  unused <string.h>.
+- yuv2yuv_altivec.c: the new packer templates and wrappers are now
+  inside #if HAVE_BIGENDIAN like their registration (a little-endian
+  AltiVec build would otherwise compile nine unused static functions).
+- tests: the new int16_t/uint16_t source arrays had odd element counts
+  while randomize_buffers() writes 4 bytes per step, running 2 bytes
+  past each array; counts are now even. check_yuv2packed422_X's 125 KB
+  of line buffers moved to the heap (the build's -Wstack-usage=122880
+  limit was exceeded). The packer test's dst residues now also cover 1,
+  2, 10 and 15 (every byte-store rotation class incl. wrap-around).
+
+Validation after these changes (S1 qemu -cpu 7400 harness): sw_yuv2yuv
+111/111 and sw_scale 332/332 on seeds 8675309/1/42/3 (plus 13/271828/
+424242 before the edits); a scratch build with dstW 13 and 37 added to
+check_hscale's sizes (392/392, seeds 3/99, 24 hscale_16 _altivec rows at
+dstW 37) exercised the kernels' scalar tails, then reverted; full suite
+1268/1268 on seeds 31337 and 2024; both kernel files compile warning-free
+(beyond pre-existing warnings) in the plain and -D_ARCH_PWR4 shapes with
+-Wall -Wextra.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Xix7Wn4UbWrKRBNAMUVpRR
+---
+ libswscale/ppc/swscale_altivec.c | 40 +++++++++++++++++---------------
+ libswscale/ppc/yuv2yuv_altivec.c | 11 ++++++---
+ tests/checkasm/sw_scale.c        |  5 ++--
+ tests/checkasm/sw_yuv2yuv.c      | 33 ++++++++++++++++++++------
+ 4 files changed, 58 insertions(+), 31 deletions(-)
+
+diff --git a/libswscale/ppc/swscale_altivec.c b/libswscale/ppc/swscale_altivec.c
+index 089cd80..c2366e0 100644
+--- a/libswscale/ppc/swscale_altivec.c
++++ b/libswscale/ppc/swscale_altivec.c
+@@ -22,7 +22,6 @@
+  */
+ 
+ #include <inttypes.h>
+-#include <string.h>
+ 
+ #include "config.h"
+ #include "libswscale/swscale.h"
+@@ -152,19 +151,18 @@ static av_always_inline void store16(vec_u8 v, uint8_t *p, int aligned)
+  * ALIGNED filter-row loads -- rows are 2*filterSize*i bytes into a filter
+  * array whose base is at least 16-aligned, so every 8-tap step of such a
+  * row stays 16-aligned) and filterSize == 4 (the other size PPC's
+- * filterAlign actually produces, handled by copying the row's 4 taps into
+- * a zero-padded 8-short local buffer -- always 16-aligned, and sidesteps
+- * needing to know the real row's alignment at all) are vectorized; any
+- * other filterSize (never produced by this PPC build; the checkasm
+- * synthetic filterSize=12 exercises this) falls back to a whole-line
+- * scalar loop identical to the C. Source reads always use the per-access
+- * unaligned splice (filterPos sweeps every residue); the filterSize == 4
+- * case reads a full 8-element vector even though only 4 taps are real,
+- * exactly like this file's existing hScale_real_altivec's own filterSize
+- * == 4 case (unaligned_load reading a full 16 bytes for a 4-tap 8-bit
+- * filter) -- an already-established, accepted over-read for small filters,
+- * safe here because the extra 4 filter taps are the zero padding, so the
+- * corresponding 4 extra source samples are multiplied by zero.
++ * filterAlign actually produces: the row's 4 taps are spliced into lanes
++ * 0..3 with the same two-load vec_perm as the source, lanes 4..7 zeroed)
++ * are vectorized; any other filterSize (never produced by this PPC build;
++ * the checkasm synthetic filterSize=12 exercises this) falls back to a
++ * whole-line scalar loop identical to the C. Every load is a per-access
++ * splice whose second vec_ld sits on the LAST NEEDED byte (filterPos
++ * sweeps every residue), so no aligned word beyond the one holding the
++ * last byte the C reference itself reads is ever touched -- in the 4-tap
++ * case the source lanes 4..7 therefore hold bytes of already-loaded
++ * aligned words, and they meet zero taps and a zero negative-tap mask in
++ * both accumulators. The taps never take a store-then-vector-load bounce
++ * through memory (a load-hit-store stall per output on the 7450).
+  *
+  * Four outputs are processed per iteration: each gets its own acc/accn
+  * pair (corrected individually), then a single transpose-add gathers all
+@@ -205,15 +203,19 @@ static av_always_inline vec_s32 hscale16_grp4_altivec(const uint16_t *src,
+                 an = vec_msum(s, mask, an);
+             }
+         } else {
+-            /* filterSize == 4, guaranteed by the caller. */
+-            DECLARE_ALIGNED(16, int16_t, fbuf)[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++            /* filterSize == 4, guaranteed by the caller: taps to lanes 0..3
++             * (two-load splice, second load on byte 7 of the row = its last
++             * byte, valid for any filter base alignment), lanes 4..7 zeroed;
++             * the source splice likewise ends on byte off+7, the last byte
++             * the C reference reads. See the block comment above. */
++            const vec_u16 low4 = (vec_u16) { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, 0 };
+             int off = 2 * srcPos;
+             vec_u16 s, mask;
+             vec_s16 f;
+ 
+-            memcpy(fbuf, filtRow, 4 * sizeof(int16_t));
+-            s    = vec_perm(vec_ld(off, src), vec_ld(off + 15, src), vec_lvsl(off, src));
+-            f    = vec_ld(0, fbuf);
++            s    = vec_perm(vec_ld(off, src), vec_ld(off + 7, src), vec_lvsl(off, src));
++            f    = vec_perm(vec_ld(0, filtRow), vec_ld(7, filtRow), vec_lvsl(0, filtRow));
++            f    = (vec_s16) vec_and((vec_u16) f, low4);
+             mask = vec_and(negmask1, (vec_u16) vec_cmplt(f, zero_s16));
+             a  = vec_msum(s, (vec_u16) f, a);
+             an = vec_msum(s, mask, an);
+diff --git a/libswscale/ppc/yuv2yuv_altivec.c b/libswscale/ppc/yuv2yuv_altivec.c
+index 85e8d5c..5bc2d27 100644
+--- a/libswscale/ppc/yuv2yuv_altivec.c
++++ b/libswscale/ppc/yuv2yuv_altivec.c
+@@ -221,6 +221,7 @@ static int yuv422ptouyvy_unscaled_altivec(SwsInternal *c, const uint8_t *const s
+                                        dstParam, dstStride_a, 1, 1);
+ }
+ 
++#if HAVE_BIGENDIAN
+ /*
+  * Scaler-path packed 4:2:2 output packers (yuv2packed1/2/X for yuyv422,
+  * yvyu422 and uyvy422 -- the C references are yuv2422_{1,2,X}_c_template
+@@ -228,9 +229,12 @@ static int yuv422ptouyvy_unscaled_altivec(SwsInternal *c, const uint8_t *const s
+  * converters above, these run inside the general horizontal/vertical scaler
+  * and are registered unconditionally for these three dst formats (no
+  * SWS_BITEXACT / SWS_FULL_CHR_H_INT / needAlpha gate), exactly mirroring the
+- * C dispatch (output.c:3800-3813) -- so this file's comment there about
+- * "the following list of supported dstFormat values" does not apply to
+- * these three.
++ * C dispatch (output.c:3800-3813) -- so the comment in swscale_altivec.c
++ * above its RGB yuv2packedX registration ("The following list of supported
++ * dstFormat values should match ...") does not apply to these three. The
++ * byte-order assumptions below (vec_perm/vec_lvsl splices, mergeh/mergel
++ * lane order) are big-endian ones, hence the HAVE_BIGENDIAN gate, which
++ * matches the registration gate in ff_sws_init_yuv2packed422_ppc().
+  *
+  * Bit-exactness argument: the C references clip with
+  * `if ((Y1|Y2|U|V) & 0x100) { clip each to uint8 }`, i.e. they only clip
+@@ -598,6 +602,7 @@ YUV2PACKED422_WRAPPERS(yvyu422, AV_PIX_FMT_YVYU422)
+ YUV2PACKED422_WRAPPERS(uyvy422, AV_PIX_FMT_UYVY422)
+ 
+ #undef YUV2PACKED422_WRAPPERS
++#endif /* HAVE_BIGENDIAN */
+ 
+ #endif /* HAVE_ALTIVEC */
+ 
+diff --git a/tests/checkasm/sw_scale.c b/tests/checkasm/sw_scale.c
+index cf3456e..0063eba 100644
+--- a/tests/checkasm/sw_scale.c
++++ b/tests/checkasm/sw_scale.c
+@@ -391,8 +391,9 @@ static void check_hscale(void)
+ 
+     // padded, 8-bit source
+     LOCAL_ALIGNED_32(uint8_t, src, [FFALIGN(SRC_PIXELS + MAX_FILTER_WIDTH - 1, 4)]);
+-    // padded, 16-bit source
+-    LOCAL_ALIGNED_32(uint16_t, src16, [SRC_PIXELS + MAX_FILTER_WIDTH - 1]);
++    // padded, 16-bit source (even element count: randomize_buffers writes
++    // 4 bytes per step, an odd uint16_t count would run 2 bytes past the end)
++    LOCAL_ALIGNED_32(uint16_t, src16, [FFALIGN(SRC_PIXELS + MAX_FILTER_WIDTH - 1, 2)]);
+     LOCAL_ALIGNED_32(uint32_t, dst0, [SRC_PIXELS]);
+     LOCAL_ALIGNED_32(uint32_t, dst1, [SRC_PIXELS]);
+ 
+diff --git a/tests/checkasm/sw_yuv2yuv.c b/tests/checkasm/sw_yuv2yuv.c
+index fcc0c87..9413ed8 100644
+--- a/tests/checkasm/sw_yuv2yuv.c
++++ b/tests/checkasm/sw_yuv2yuv.c
+@@ -21,6 +21,7 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+ #include "libavutil/intreadwrite.h"
++#include "libavutil/mem.h"
+ #include "libavutil/mem_internal.h"
+ #include "libavutil/pixdesc.h"
+ 
+@@ -308,8 +309,11 @@ static void p422_design_filter(int16_t *filt, int n)
+ }
+ 
+ #define P422_MAXW      1920
+-#define P422_LUM_N     (P422_MAXW + 1 + 8 + 32)
+-#define P422_CHR_N     ((P422_MAXW + 1) / 2 + 8 + 32)
++/* Element counts rounded to a multiple of 4 (8 bytes): randomize_buffers()
++ * writes 4 bytes per step, so an odd int16_t count would run 2 bytes past
++ * the array. */
++#define P422_LUM_N     FFALIGN(P422_MAXW + 1 + 8 + 32, 4)
++#define P422_CHR_N     FFALIGN((P422_MAXW + 1) / 2 + 8 + 32, 4)
+ #define P422_DST_N     4096
+ #define P422_MAX_LINES 16
+ 
+@@ -317,7 +321,10 @@ static const int p422_widths[] = {
+     2, 8, 16, 17, 31, 32, 33, 48, 63, 64, 640, 853, 854, 1080, 1366, 1919, 1920
+ };
+ static const int p422_src_offsets[] = { 0, 1, 3, 5 };
+-static const int p422_dst_offsets[] = { 0, 4, 6, 8, 12 };
++/* dst byte residues: 16-aligned (vec_st), 4-aligned (word element stores:
++ * 4/8/12) and every byte-store rotation class the lvsr-rotate + stvebx
++ * path can see (1/2/6/10/15 -- incl. the wrap-around cases 10 and 15). */
++static const int p422_dst_offsets[] = { 0, 1, 2, 4, 6, 8, 10, 12, 15 };
+ 
+ static SwsInternal *p422_get_context(enum AVPixelFormat dst_fmt, SwsContext **swsp)
+ {
+@@ -504,14 +511,22 @@ static void check_yuv2packed422_X(enum AVPixelFormat dst_fmt)
+                  const int16_t **chrVSrc, int chrFilterSize,
+                  const int16_t **alpSrc, uint8_t *dest, int dstW, int y);
+ 
+-    LOCAL_ALIGNED_16(int16_t, lum_buf,  [P422_MAX_LINES], [P422_LUM_N]);
+-    LOCAL_ALIGNED_16(int16_t, u_buf,    [P422_MAX_LINES], [P422_CHR_N]);
+-    LOCAL_ALIGNED_16(int16_t, v_buf,    [P422_MAX_LINES], [P422_CHR_N]);
++    /* 16 lines x 3 planes is ~125 KB: heap-allocated (av_malloc is 16-byte
++     * aligned, the row strides are 8 mod 16 so consecutive lines alternate
++     * alignment residue) to stay under the project's -Wstack-usage limit. */
++    int16_t (*lum_buf)[P422_LUM_N] = av_malloc(sizeof(*lum_buf) * P422_MAX_LINES);
++    int16_t (*u_buf)[P422_CHR_N]   = av_malloc(sizeof(*u_buf) * P422_MAX_LINES);
++    int16_t (*v_buf)[P422_CHR_N]   = av_malloc(sizeof(*v_buf) * P422_MAX_LINES);
+     LOCAL_ALIGNED_16(uint8_t, dst0,     [P422_DST_N]);
+     LOCAL_ALIGNED_16(uint8_t, dst1,     [P422_DST_N]);
+     LOCAL_ALIGNED_16(int16_t, lum_filt, [P422_MAX_LINES]);
+     LOCAL_ALIGNED_16(int16_t, chr_filt, [P422_MAX_LINES]);
+ 
++    if (!lum_buf || !u_buf || !v_buf) {
++        fail();
++        goto end;
++    }
++
+     for (int l = 0; l < P422_MAX_LINES; l++) {
+         int e;
+         randomize_buffers((uint8_t *)lum_buf[l], P422_LUM_N * sizeof(int16_t));
+@@ -528,7 +543,7 @@ static void check_yuv2packed422_X(enum AVPixelFormat dst_fmt)
+ 
+     c = p422_get_context(dst_fmt, &sws);
+     if (!c)
+-        return;
++        goto end;
+ 
+     for (int fi = 0; fi < FF_ARRAY_ELEMS(fs_pairs); fi++) {
+         int lfs = fs_pairs[fi][0], cfs = fs_pairs[fi][1];
+@@ -582,6 +597,10 @@ static void check_yuv2packed422_X(enum AVPixelFormat dst_fmt)
+     }
+ 
+     sws_freeContext(sws);
++end:
++    av_freep(&lum_buf);
++    av_freep(&u_buf);
++    av_freep(&v_buf);
+ }
+ 
+ #undef P422_MAXW
+-- 
+2.43.0
+

@@ -1,0 +1,278 @@
+From db3355895df0e1c242055079a15615242685dee6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 02:17:11 +0000
+Subject: [PATCH] swscale/ppc: fix yv12toyuy2/touyvy_unscaled_altivec alignment
+ bugs
+
+Four latent bugs, found by reading (no oracle ever ran on this file
+before the previous commit added one), all fixed without changing the
+registration gate (still yuv420p only, width % 16 == 0) or the loop
+structure/chroma-stepping/dst-offset math:
+
+  1. yperm = vec_lvsl(0, ysrc) was computed once per call and reused
+     for every row -- wrong for any row past the first whenever
+     lumStride % 16 == 8, since ysrc's byte alignment then changes
+     every row. Replaced with per-load unaligned_load() (from
+     libavutil/ppc/util_altivec.h), which recomputes its own shift
+     each call; the u/v loads already did this correctly and are
+     unchanged in spirit, just simplified to unaligned_load() too.
+  2. The <32-pixel remainder block loaded y/u/v with a plain vec_ld
+     and no permute at all -- wrong whenever a source plane pointer
+     isn't 16-aligned. Luma now uses unaligned_load() (needs the full
+     16 bytes); chroma needs only 8 bytes, so it uses
+     vec_perm(vec_ld(j), vec_ld(j+7), vec_lvsl(j)) instead of the
+     16-byte unaligned_load(), which would touch an aligned word past
+     the 8 bytes actually needed (see bug 4).
+  3. Every dst store was a plain vec_st, which truncates its target
+     address to the 16-byte boundary -- corrupts the neighbourhood
+     whenever dst or dstStride isn't 16-aligned. Fixed with a new
+     store16_unaligned() helper (the same lvsl/lvsr read-modify-write
+     splice as unaligned_store16 in libavcodec/ppc/vp8dsp_altivec.c),
+     selected per row via a single `dst_aligned = !((uintptr_t)dst &
+     15)` check -- valid for the whole row because every store offset
+     within a row is a multiple of 16, so dst's alignment residue is
+     constant across all of a row's stores.
+  4. The 32-pixel block's third luma load (vec_ld(i+32)) and the
+     chroma loads (vec_ld(j+16)) touched one aligned word beyond the
+     last needed byte -- up to 16 bytes past the row end on the last
+     row. Gone as a side effect of the unaligned_load()/vec_perm
+     rewrites above, which only ever touch the aligned words that
+     hold bytes actually needed (unaligned_load's second vec_ld is at
+     offset+15, not +16; the 8-byte chroma helper's second vec_ld is
+     at j+7, not j+16).
+
+Validated: qemu-ppc-static -cpu 7400, incremental -j1 build in
+/home/sgr/barracuda/ffbuild-ppc, warning-free compile of
+libswscale/ppc/yuv2yuv_altivec.o. --test=sw_yuv2yuv, seeds 1/42/777:
+all 10 previously-failing named checks now pass ("all 10 tests
+passed", was "10 of 10 tests failed"). Full suite once, seed 42: all
+907 tests passed (897 baseline + 10 from the new oracle).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016BWSAHaJhssb1i1iMizrWV
+---
+ libswscale/ppc/yuv2yuv_altivec.c | 143 ++++++++++++++++++++-----------
+ 1 file changed, 91 insertions(+), 52 deletions(-)
+
+diff --git a/libswscale/ppc/yuv2yuv_altivec.c b/libswscale/ppc/yuv2yuv_altivec.c
+index 3e3bbea..a85e49d 100644
+--- a/libswscale/ppc/yuv2yuv_altivec.c
++++ b/libswscale/ppc/yuv2yuv_altivec.c
+@@ -32,6 +32,29 @@
+ #if HAVE_ALTIVEC
+ #include "libavutil/ppc/util_altivec.h"
+ 
++/*
++ * Unaligned 16-byte store via a read-modify-write splice: dst is truncated
++ * to its containing 16-byte boundary by a plain vec_st, which is wrong
++ * whenever dst isn't itself 16-aligned (checkasm's own dst buffers, and any
++ * real caller after e.g. a crop filter, don't guarantee that). Copied from
++ * unaligned_store16 in libavcodec/ppc/vp8dsp_altivec.c -- same lvsl/lvsr
++ * splice h264qpel.c and vp8dsp use for the same reason. Two consecutive
++ * calls into adjacent 16-byte slots are correct because each one re-reads
++ * memory rather than relying on the other's write.
++ */
++static av_always_inline void store16_unaligned(vec_u8 v, uint8_t *p)
++{
++    vec_u8 tmp1  = vec_ld(0, p);
++    vec_u8 mask  = vec_lvsl(0, p);
++    vec_u8 tmp2  = vec_ld(15, p);
++    vec_u8 edges = vec_perm(tmp2, tmp1, mask);
++    vec_u8 align = vec_lvsr(0, p);
++    tmp2 = vec_perm(v, edges, align);
++    tmp1 = vec_perm(edges, v, align);
++    vec_st(tmp2, 15, p);
++    vec_st(tmp1, 0, p);
++}
++
+ static int yv12toyuy2_unscaled_altivec(SwsInternal *c, const uint8_t *const src[],
+                                        const int srcStride[], int srcSliceY,
+                                        int srcSliceH, uint8_t *const dstParam[],
+@@ -48,54 +71,62 @@ static int yv12toyuy2_unscaled_altivec(SwsInternal *c, const uint8_t *const src[
+     const int lumStride   = srcStride[0];
+     const int chromStride = srcStride[1];
+     const int dstStride   = dstStride_a[0];
+-    const vector unsigned char yperm = vec_lvsl(0, ysrc);
+     const int vertLumPerChroma       = 2;
+     register unsigned int y;
+ 
+     /* This code assumes:
+      *
+-     * 1) dst is 16 bytes-aligned
+-     * 2) dstStride is a multiple of 16
+-     * 3) width is a multiple of 16
+-     * 4) lum & chrom stride are multiples of 8
++     * 1) width is a multiple of 16
++     * 2) lum & chrom stride are multiples of 8
++     *
++     * dst/dstStride and the src plane pointers may have any alignment --
++     * every load/store below either recomputes its own unaligned-shift
++     * (no reuse of a permute vector across rows or stride-separated
++     * pointers) or takes the aligned fast path per row.
+      */
+ 
+     for (y = 0; y < height; y++) {
+         int i;
++        const int dst_aligned = !((uintptr_t)dst & 15);
+         for (i = 0; i < width - 31; i += 32) {
+             const unsigned int j          = i >> 1;
+-            vector unsigned char v_yA     = vec_ld(i, ysrc);
+-            vector unsigned char v_yB     = vec_ld(i + 16, ysrc);
+-            vector unsigned char v_yC     = vec_ld(i + 32, ysrc);
+-            vector unsigned char v_y1     = vec_perm(v_yA, v_yB, yperm);
+-            vector unsigned char v_y2     = vec_perm(v_yB, v_yC, yperm);
+-            vector unsigned char v_uA     = vec_ld(j, usrc);
+-            vector unsigned char v_uB     = vec_ld(j + 16, usrc);
+-            vector unsigned char v_u      = vec_perm(v_uA, v_uB, vec_lvsl(j, usrc));
+-            vector unsigned char v_vA     = vec_ld(j, vsrc);
+-            vector unsigned char v_vB     = vec_ld(j + 16, vsrc);
+-            vector unsigned char v_v      = vec_perm(v_vA, v_vB, vec_lvsl(j, vsrc));
++            vector unsigned char v_y1     = unaligned_load(i, ysrc);
++            vector unsigned char v_y2     = unaligned_load(i + 16, ysrc);
++            vector unsigned char v_u      = unaligned_load(j, usrc);
++            vector unsigned char v_v      = unaligned_load(j, vsrc);
+             vector unsigned char v_uv_a   = vec_mergeh(v_u, v_v);
+             vector unsigned char v_uv_b   = vec_mergel(v_u, v_v);
+             vector unsigned char v_yuy2_0 = vec_mergeh(v_y1, v_uv_a);
+             vector unsigned char v_yuy2_1 = vec_mergel(v_y1, v_uv_a);
+             vector unsigned char v_yuy2_2 = vec_mergeh(v_y2, v_uv_b);
+             vector unsigned char v_yuy2_3 = vec_mergel(v_y2, v_uv_b);
+-            vec_st(v_yuy2_0, (i << 1), dst);
+-            vec_st(v_yuy2_1, (i << 1) + 16, dst);
+-            vec_st(v_yuy2_2, (i << 1) + 32, dst);
+-            vec_st(v_yuy2_3, (i << 1) + 48, dst);
++            if (dst_aligned) {
++                vec_st(v_yuy2_0, (i << 1), dst);
++                vec_st(v_yuy2_1, (i << 1) + 16, dst);
++                vec_st(v_yuy2_2, (i << 1) + 32, dst);
++                vec_st(v_yuy2_3, (i << 1) + 48, dst);
++            } else {
++                store16_unaligned(v_yuy2_0, dst + (i << 1));
++                store16_unaligned(v_yuy2_1, dst + (i << 1) + 16);
++                store16_unaligned(v_yuy2_2, dst + (i << 1) + 32);
++                store16_unaligned(v_yuy2_3, dst + (i << 1) + 48);
++            }
+         }
+         if (i < width) {
+             const unsigned int j          = i >> 1;
+-            vector unsigned char v_y1     = vec_ld(i, ysrc);
+-            vector unsigned char v_u      = vec_ld(j, usrc);
+-            vector unsigned char v_v      = vec_ld(j, vsrc);
++            vector unsigned char v_y1     = unaligned_load(i, ysrc);
++            vector unsigned char v_u      = vec_perm(vec_ld(j, usrc), vec_ld(j + 7, usrc), vec_lvsl(j, usrc));
++            vector unsigned char v_v      = vec_perm(vec_ld(j, vsrc), vec_ld(j + 7, vsrc), vec_lvsl(j, vsrc));
+             vector unsigned char v_uv_a   = vec_mergeh(v_u, v_v);
+             vector unsigned char v_yuy2_0 = vec_mergeh(v_y1, v_uv_a);
+             vector unsigned char v_yuy2_1 = vec_mergel(v_y1, v_uv_a);
+-            vec_st(v_yuy2_0, (i << 1), dst);
+-            vec_st(v_yuy2_1, (i << 1) + 16, dst);
++            if (dst_aligned) {
++                vec_st(v_yuy2_0, (i << 1), dst);
++                vec_st(v_yuy2_1, (i << 1) + 16, dst);
++            } else {
++                store16_unaligned(v_yuy2_0, dst + (i << 1));
++                store16_unaligned(v_yuy2_1, dst + (i << 1) + 16);
++            }
+         }
+         if ((y & (vertLumPerChroma - 1)) == vertLumPerChroma - 1) {
+             usrc += chromStride;
+@@ -117,61 +148,69 @@ static int yv12touyvy_unscaled_altivec(SwsInternal *c, const uint8_t *const src[
+     // yv12toyuy2(src[0], src[1], src[2], dst, c->opts.src_w, srcSliceH,
+     //            srcStride[0], srcStride[1], dstStride[0]);
+     const uint8_t *ysrc              = src[0];
+-    const uint8_t *usrc              = src[1];
+-    const uint8_t *vsrc              = src[2];
++    const uint8_t *usrc               = src[1];
++    const uint8_t *vsrc               = src[2];
+     const int width                  = c->opts.src_w;
+     const int height                 = srcSliceH;
+     const int lumStride              = srcStride[0];
+     const int chromStride            = srcStride[1];
+     const int dstStride              = dstStride_a[0];
+     const int vertLumPerChroma       = 2;
+-    const vector unsigned char yperm = vec_lvsl(0, ysrc);
+     register unsigned int y;
+ 
+     /* This code assumes:
+      *
+-     * 1) dst is 16 bytes-aligned
+-     * 2) dstStride is a multiple of 16
+-     * 3) width is a multiple of 16
+-     * 4) lum & chrom stride are multiples of 8
++     * 1) width is a multiple of 16
++     * 2) lum & chrom stride are multiples of 8
++     *
++     * dst/dstStride and the src plane pointers may have any alignment --
++     * every load/store below either recomputes its own unaligned-shift
++     * (no reuse of a permute vector across rows or stride-separated
++     * pointers) or takes the aligned fast path per row.
+      */
+ 
+     for (y = 0; y < height; y++) {
+         int i;
++        const int dst_aligned = !((uintptr_t)dst & 15);
+         for (i = 0; i < width - 31; i += 32) {
+             const unsigned int j          = i >> 1;
+-            vector unsigned char v_yA     = vec_ld(i, ysrc);
+-            vector unsigned char v_yB     = vec_ld(i + 16, ysrc);
+-            vector unsigned char v_yC     = vec_ld(i + 32, ysrc);
+-            vector unsigned char v_y1     = vec_perm(v_yA, v_yB, yperm);
+-            vector unsigned char v_y2     = vec_perm(v_yB, v_yC, yperm);
+-            vector unsigned char v_uA     = vec_ld(j, usrc);
+-            vector unsigned char v_uB     = vec_ld(j + 16, usrc);
+-            vector unsigned char v_u      = vec_perm(v_uA, v_uB, vec_lvsl(j, usrc));
+-            vector unsigned char v_vA     = vec_ld(j, vsrc);
+-            vector unsigned char v_vB     = vec_ld(j + 16, vsrc);
+-            vector unsigned char v_v      = vec_perm(v_vA, v_vB, vec_lvsl(j, vsrc));
++            vector unsigned char v_y1     = unaligned_load(i, ysrc);
++            vector unsigned char v_y2     = unaligned_load(i + 16, ysrc);
++            vector unsigned char v_u      = unaligned_load(j, usrc);
++            vector unsigned char v_v      = unaligned_load(j, vsrc);
+             vector unsigned char v_uv_a   = vec_mergeh(v_u, v_v);
+             vector unsigned char v_uv_b   = vec_mergel(v_u, v_v);
+             vector unsigned char v_uyvy_0 = vec_mergeh(v_uv_a, v_y1);
+             vector unsigned char v_uyvy_1 = vec_mergel(v_uv_a, v_y1);
+             vector unsigned char v_uyvy_2 = vec_mergeh(v_uv_b, v_y2);
+             vector unsigned char v_uyvy_3 = vec_mergel(v_uv_b, v_y2);
+-            vec_st(v_uyvy_0, (i << 1), dst);
+-            vec_st(v_uyvy_1, (i << 1) + 16, dst);
+-            vec_st(v_uyvy_2, (i << 1) + 32, dst);
+-            vec_st(v_uyvy_3, (i << 1) + 48, dst);
++            if (dst_aligned) {
++                vec_st(v_uyvy_0, (i << 1), dst);
++                vec_st(v_uyvy_1, (i << 1) + 16, dst);
++                vec_st(v_uyvy_2, (i << 1) + 32, dst);
++                vec_st(v_uyvy_3, (i << 1) + 48, dst);
++            } else {
++                store16_unaligned(v_uyvy_0, dst + (i << 1));
++                store16_unaligned(v_uyvy_1, dst + (i << 1) + 16);
++                store16_unaligned(v_uyvy_2, dst + (i << 1) + 32);
++                store16_unaligned(v_uyvy_3, dst + (i << 1) + 48);
++            }
+         }
+         if (i < width) {
+             const unsigned int j          = i >> 1;
+-            vector unsigned char v_y1     = vec_ld(i, ysrc);
+-            vector unsigned char v_u      = vec_ld(j, usrc);
+-            vector unsigned char v_v      = vec_ld(j, vsrc);
++            vector unsigned char v_y1     = unaligned_load(i, ysrc);
++            vector unsigned char v_u      = vec_perm(vec_ld(j, usrc), vec_ld(j + 7, usrc), vec_lvsl(j, usrc));
++            vector unsigned char v_v      = vec_perm(vec_ld(j, vsrc), vec_ld(j + 7, vsrc), vec_lvsl(j, vsrc));
+             vector unsigned char v_uv_a   = vec_mergeh(v_u, v_v);
+             vector unsigned char v_uyvy_0 = vec_mergeh(v_uv_a, v_y1);
+             vector unsigned char v_uyvy_1 = vec_mergel(v_uv_a, v_y1);
+-            vec_st(v_uyvy_0, (i << 1), dst);
+-            vec_st(v_uyvy_1, (i << 1) + 16, dst);
++            if (dst_aligned) {
++                vec_st(v_uyvy_0, (i << 1), dst);
++                vec_st(v_uyvy_1, (i << 1) + 16, dst);
++            } else {
++                store16_unaligned(v_uyvy_0, dst + (i << 1));
++                store16_unaligned(v_uyvy_1, dst + (i << 1) + 16);
++            }
+         }
+         if ((y & (vertLumPerChroma - 1)) == vertLumPerChroma - 1) {
+             usrc += chromStride;
+-- 
+2.43.0
+
