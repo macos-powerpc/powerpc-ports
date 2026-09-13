@@ -1,0 +1,530 @@
+From de5b2ffdca938bdc4656057b6799b7ed22f8581b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 06:06:06 +0000
+Subject: [PATCH] swresample/ppc: add AltiVec rematrix mixing kernels
+
+New libswresample/ppc/rematrix.c with swri_rematrix_init_ppc (declared in
+swresample_internal.h, dispatched from swri_rematrix_init under ARCH_PPC
+exactly where the x86 init hooks in). HAVE_ALTIVEC && HAVE_BIGENDIAN gated,
+PPC_ALTIVEC runtime check, registered on every AltiVec CPU (no per-CPU
+gate: no bench data yet).
+
+Kernels:
+- mix_1_1 / mix_2_1 float (FLTP internal format): vec_madd on the
+  native_simd_matrix float table, a plain copy of native_matrix like x86.
+- mix_1_1 / mix_2_1 int16 (S16P): the same {int16 coef, int16 shift} pair
+  table x86 builds (per-row pre-scaling so the coefficient fits an int16,
+  bit-exact for every coefficient that is a multiple of the row's 2^sh --
+  i.e. always when |coef| <= 1.0, the sum-normalised default matrices).
+  Multiply-accumulate is the modular vec_msum on interleaved {in, 1} x
+  {coef, round} / {in1, in2} x {c1, c2} halfword pairs, then vec_sra and
+  the saturating vec_packs, which makes one kernel serve both the plain and
+  the _clip_s16 C variants bit-exactly (the plain variant only ever sees
+  results that fit int16). native_simd_one is set like x86 so the dither
+  path's mix_2_1_simd(..., &s->native_simd_one, 0, 0, len) call works.
+- mix6to2 / mix8to2 float: AltiVec versions of rematrix_template.c's
+  mix_any_f special cases, installed over the C pointer when the generic
+  init selected one (only the input channel count is left to tell 6 from
+  8). These are the path every DEFAULT 5.1 -> stereo and 7.1 -> stereo
+  downmix takes; mix_1_1/mix_2_1 are never called for it, so without them
+  the common downmix would have stayed scalar. Same coefficient indexing
+  and association as the C template, scalar tail for len % 4.
+
+Alignment: swri_rematrix hands these the planes of whatever AudioData it
+mixes, frequently the user's own buffers offset by arbitrary sample counts
+(postin/preout alias the user input/output whenever no format conversion is
+needed; the dither call offsets the noise plane by noise_pos), so every
+pointer is only sample-aligned. Loads splice each 16-byte window from the
+two bracketing aligned quadwords with one vec_lvsl permute per pointer (the
+window stride is 16 bytes, so the residue is constant); stores use the
+streaming vec_lvsr idiom from yuv2yuv_altivec.c's store16: middle quadwords
+are plain vec_st of vec_perm(v[k-1], v[k], lvsr), and only the partial
+first/last quadwords are written element-wise with vec_ste, so nothing
+outside [out, out+len) is touched (no read-modify-write of neighbouring
+planes). mix_1_1/mix_2_1 rely on swri_rematrix passing len & ~15 and
+finishing the tail in C, as the x86 kernels do.
+
+Validated under the qemu -cpu 7400 harness: standalone sweep (every 16-byte
+residue of every in/out pointer, lengths 16..256 for the mixers and 1..70
+for mixNto2, guard bytes around every output, int16 reference in int64 to
+avoid the C template's own int32 overflow at >2x total gain) 0 mismatches;
+checkasm swr_rematrix (new, previous commit) real ALTIVEC dispatch for all
+float/int16 mix_1_1/mix_2_1 (plain and clip) and fltp mix6to2/mix8to2,
+mutation-checked; full suite green. Real-G4/G5 --bench pending.
+
+Left on C: S32P (int64 intermediates) and DBLP (no double vector before
+VSX) mixers, and the s16 mix6to2/mix8to2 special cases (per-sample
+products of 6-8 int16 x int coefficients need 32x32 widening MACs that
+AltiVec lacks; the int16 pair-msum trick only covers two inputs per lane).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VY6bhpLDBYqo84Hbm2ewdh
+---
+ libswresample/ppc/Makefile          |   3 +-
+ libswresample/ppc/rematrix.c        | 419 ++++++++++++++++++++++++++++
+ libswresample/rematrix.c            |   2 +
+ libswresample/swresample_internal.h |   1 +
+ 4 files changed, 424 insertions(+), 1 deletion(-)
+ create mode 100644 libswresample/ppc/rematrix.c
+
+diff --git a/libswresample/ppc/Makefile b/libswresample/ppc/Makefile
+index 5f5c3f5..fb78d04 100644
+--- a/libswresample/ppc/Makefile
++++ b/libswresample/ppc/Makefile
+@@ -1 +1,2 @@
+-OBJS += ppc/resample.o
++OBJS += ppc/rematrix.o                       \
++        ppc/resample.o                       \
+diff --git a/libswresample/ppc/rematrix.c b/libswresample/ppc/rematrix.c
+new file mode 100644
+index 0000000..5ca7008
+--- /dev/null
++++ b/libswresample/ppc/rematrix.c
+@@ -0,0 +1,419 @@
++/*
++ * AltiVec rematrixing (channel mixing) kernels
++ * Copyright (C) 2011-2012 Michael Niedermayer (michaelni@gmx.at)
++ *
++ * This file is part of libswresample
++ *
++ * libswresample is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * libswresample is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with libswresample; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config.h"
++
++#include <stdint.h>
++
++#include "libavutil/attributes.h"
++#include "libavutil/common.h"
++#include "libavutil/cpu.h"
++#include "libavutil/mem.h"
++#include "libavutil/ppc/cpu.h"
++#include "libavutil/ppc/util_altivec.h"
++#include "libswresample/swresample_internal.h"
++
++#if HAVE_ALTIVEC && HAVE_BIGENDIAN
++
++/*
++ * Alignment contract.
++ *
++ * swri_rematrix() hands these kernels the channel planes of whatever
++ * AudioData it is mixing, and that is frequently the caller's own buffer
++ * (postin aliases the user input when no input conversion is needed, preout
++ * aliases the user output when no output conversion is needed), offset by an
++ * arbitrary number of samples.  So in and out are only guaranteed to be
++ * sample-aligned (4 bytes for float, 2 for int16), and every kernel here
++ * handles all 16-byte residues of every pointer independently:
++ *
++ *  - loads splice each 16-byte window out of the two bracketing aligned
++ *    quadwords with a vec_lvsl permute.  The permute is computed once per
++ *    pointer: successive windows are 16 bytes apart, so their alignment
++ *    residue never changes.  vec_ld(off + 15) never faults: it fetches the
++ *    aligned quadword containing byte in+off+15, which is inside the window
++ *    (hence inside the buffer and its page).  When in is misaligned that
++ *    quadword extends up to 15 bytes past the last window, which is the usual
++ *    AltiVec read-past-the-end and does not cross into another page.
++ *
++ *  - stores use the streaming vec_lvsr idiom (yuv2yuv_altivec.c's store16):
++ *    result vectors are rotated by the output residue r so that the k-th
++ *    aligned destination quadword is vec_perm(v[k-1], v[k], lvsr); the middle
++ *    quadwords are then plain vec_st, and only the partial first (16-r bytes)
++ *    and last (r bytes) quadwords are written element by element with
++ *    vec_ste, so no byte outside [out, out+len) is ever touched -- no
++ *    read-modify-write, no clobbering of a neighbouring plane.
++ *
++ * mix_1_1/mix_2_1 are only ever called with len a multiple of 16 samples
++ * (swri_rematrix passes len & ~15 and finishes the remainder with the C
++ * kernels), so they have no scalar tail.  mixNto2 replaces the whole-length
++ * mix_any_f C special cases and therefore does carry a 0-3 sample tail.
++ */
++
++#define LOAD_U(off, p, perm) vec_perm(vec_ld(off, p), vec_ld((off) + 15, p), perm)
++
++/* Streaming unaligned store helpers, float (word) and int16 (halfword)
++ * flavours.  out: the (arbitrarily aligned) start of the output plane;
++ * sperm = vec_lvsr(0, out); r = (uintptr_t)out & 15; end = total bytes. */
++static av_always_inline void st_head_f(vec_f v0, float *out, vec_u8 sperm, int r)
++{
++    const vec_f w = vec_perm(v0, v0, sperm);
++    int off;
++    for (off = 0; off < 16 - r; off += 4)
++        vec_ste(w, off, out);
++}
++
++static av_always_inline void st_tail_f(vec_f vl, float *out, vec_u8 sperm, int r, int end)
++{
++    const vec_f w = vec_perm(vl, vl, sperm);
++    int off;
++    for (off = end - r; off < end; off += 4)
++        vec_ste(w, off, out);
++}
++
++static av_always_inline void st_head_s16(vec_s16 v0, int16_t *out, vec_u8 sperm, int r)
++{
++    const vec_s16 w = vec_perm(v0, v0, sperm);
++    int off;
++    for (off = 0; off < 16 - r; off += 2)
++        vec_ste(w, off, out);
++}
++
++static av_always_inline void st_tail_s16(vec_s16 vl, int16_t *out, vec_u8 sperm, int r, int end)
++{
++    const vec_s16 w = vec_perm(vl, vl, sperm);
++    int off;
++    for (off = end - r; off < end; off += 2)
++        vec_ste(w, off, out);
++}
++
++/* ---------------------------------------------------------------- float */
++
++static void mix_1_1_float_altivec(void *out_, const void *in_, const void *coeffp_,
++                                  integer index, integer len)
++{
++    float *out          = out_;
++    const float *in     = in_;
++    const vec_f c       = vec_splats(((const float *)coeffp_)[index]);
++    const vec_f zero    = (vec_f)vec_splat_u32(0);
++    const vec_u8 lperm  = vec_lvsl(0, in);
++    const vec_u8 sperm  = vec_lvsr(0, out);
++    const int r         = (uintptr_t)out & 15;
++    const int end       = len * 4;
++    vec_f prev, cur;
++    int off;
++
++    prev = vec_madd(LOAD_U(0, in, lperm), c, zero);
++    st_head_f(prev, out, sperm, r);
++    for (off = 16; off < end; off += 16) {
++        cur = vec_madd(LOAD_U(off, in, lperm), c, zero);
++        vec_st(vec_perm(prev, cur, sperm), off, out);
++        prev = cur;
++    }
++    st_tail_f(prev, out, sperm, r, end);
++}
++
++static void mix_2_1_float_altivec(void *out_, const void *in1_, const void *in2_,
++                                  const void *coeffp_, integer index1, integer index2,
++                                  integer len)
++{
++    float *out          = out_;
++    const float *in1    = in1_;
++    const float *in2    = in2_;
++    const vec_f c1      = vec_splats(((const float *)coeffp_)[index1]);
++    const vec_f c2      = vec_splats(((const float *)coeffp_)[index2]);
++    const vec_f zero    = (vec_f)vec_splat_u32(0);
++    const vec_u8 lperm1 = vec_lvsl(0, in1);
++    const vec_u8 lperm2 = vec_lvsl(0, in2);
++    const vec_u8 sperm  = vec_lvsr(0, out);
++    const int r         = (uintptr_t)out & 15;
++    const int end       = len * 4;
++    vec_f prev, cur;
++    int off;
++
++    /* c1*in1 + c2*in2: the c2 product is rounded, then fused into the c1
++     * multiply-add -- one rounding more or less than the C expression
++     * depending on how the compiler contracts it, hence the ULP tolerance
++     * in the checkasm test. */
++    prev = vec_madd(LOAD_U(0, in1, lperm1), c1,
++                    vec_madd(LOAD_U(0, in2, lperm2), c2, zero));
++    st_head_f(prev, out, sperm, r);
++    for (off = 16; off < end; off += 16) {
++        cur = vec_madd(LOAD_U(off, in1, lperm1), c1,
++                       vec_madd(LOAD_U(off, in2, lperm2), c2, zero));
++        vec_st(vec_perm(prev, cur, sperm), off, out);
++        prev = cur;
++    }
++    st_tail_f(prev, out, sperm, r, end);
++}
++
++/*
++ * Whole-matrix 5.1 -> stereo and 7.1 -> stereo, replacing rematrix_template.c's
++ * mix6to2_float / mix8to2_float (the mix_any_f special cases, which bypass
++ * mix_1_1/mix_2_1 entirely and are the path every default 5.1/7.1 downmix
++ * takes).  Same coefficient indexing as the C templates:
++ *   t     = in2*c[0*N+2] + in3*c[0*N+3]                 (shared C and LFE)
++ *   out0  = t + in0*c[0*N+0] + in4*c[0*N+4] (+ in6*c[0*N+6])
++ *   out1  = t + in1*c[1*N+1] + in5*c[1*N+5] (+ in7*c[1*N+7])
++ * len is arbitrary here (whole frame count), so a scalar tail handles the
++ * last 0-3 samples with the same expressions.
++ */
++static av_always_inline void mixNto2_float_altivec(uint8_t *const *out_,
++                                                   const uint8_t *const *in_,
++                                                   const float *cf, int len,
++                                                   const int nb_in)
++{
++    const float *const *const in = (const float *const *)in_;
++    float *out0 = (float *)out_[0];
++    float *out1 = (float *)out_[1];
++    const float c02 = cf[0 * nb_in + 2], c03 = cf[0 * nb_in + 3];
++    const float c00 = cf[0 * nb_in + 0], c04 = cf[0 * nb_in + 4];
++    const float c11 = cf[1 * nb_in + 1], c15 = cf[1 * nb_in + 5];
++    const float c06 = nb_in == 8 ? cf[0 * nb_in + 6] : 0.f;
++    const float c17 = nb_in == 8 ? cf[1 * nb_in + 7] : 0.f;
++    const int end   = (len & ~3) * 4;   /* vector part, bytes */
++    int i, off;
++
++    if (end) {
++        const vec_f zero = (vec_f)vec_splat_u32(0);
++        const vec_f v02 = vec_splats(c02), v03 = vec_splats(c03);
++        const vec_f v00 = vec_splats(c00), v04 = vec_splats(c04);
++        const vec_f v11 = vec_splats(c11), v15 = vec_splats(c15);
++        const vec_f v06 = vec_splats(c06), v17 = vec_splats(c17);
++        vec_u8 lperm[8];
++        const vec_u8 sperm0 = vec_lvsr(0, out0);
++        const vec_u8 sperm1 = vec_lvsr(0, out1);
++        const int r0 = (uintptr_t)out0 & 15;
++        const int r1 = (uintptr_t)out1 & 15;
++        vec_f prev0, prev1, cur0, cur1;
++
++        for (i = 0; i < nb_in; i++)
++            lperm[i] = vec_lvsl(0, in[i]);
++
++#define MIXN_COMPUTE(o0, o1, off) do {                                       \
++        vec_f t = vec_madd(LOAD_U(off, in[2], lperm[2]), v02,               \
++                  vec_madd(LOAD_U(off, in[3], lperm[3]), v03, zero));       \
++        o0 = vec_madd(LOAD_U(off, in[4], lperm[4]), v04,                    \
++             vec_madd(LOAD_U(off, in[0], lperm[0]), v00, t));               \
++        o1 = vec_madd(LOAD_U(off, in[5], lperm[5]), v15,                    \
++             vec_madd(LOAD_U(off, in[1], lperm[1]), v11, t));               \
++        if (nb_in == 8) {                                                    \
++            o0 = vec_madd(LOAD_U(off, in[6], lperm[6]), v06, o0);           \
++            o1 = vec_madd(LOAD_U(off, in[7], lperm[7]), v17, o1);           \
++        }                                                                    \
++    } while (0)
++
++        MIXN_COMPUTE(prev0, prev1, 0);
++        st_head_f(prev0, out0, sperm0, r0);
++        st_head_f(prev1, out1, sperm1, r1);
++        for (off = 16; off < end; off += 16) {
++            MIXN_COMPUTE(cur0, cur1, off);
++            vec_st(vec_perm(prev0, cur0, sperm0), off, out0);
++            vec_st(vec_perm(prev1, cur1, sperm1), off, out1);
++            prev0 = cur0;
++            prev1 = cur1;
++        }
++        st_tail_f(prev0, out0, sperm0, r0, end);
++        st_tail_f(prev1, out1, sperm1, r1, end);
++#undef MIXN_COMPUTE
++    }
++
++    for (i = len & ~3; i < len; i++) {
++        float t = in[2][i] * c02 + in[3][i] * c03;
++        float o0 = t + in[0][i] * c00 + in[4][i] * c04;
++        float o1 = t + in[1][i] * c11 + in[5][i] * c15;
++        if (nb_in == 8) {
++            o0 += in[6][i] * c06;
++            o1 += in[7][i] * c17;
++        }
++        out0[i] = o0;
++        out1[i] = o1;
++    }
++}
++
++static void mix6to2_float_altivec(uint8_t *const *out, const uint8_t *const *in,
++                                  const void *coeffp, integer len)
++{
++    mixNto2_float_altivec(out, in, coeffp, len, 6);
++}
++
++static void mix8to2_float_altivec(uint8_t *const *out, const uint8_t *const *in,
++                                  const void *coeffp, integer len)
++{
++    mixNto2_float_altivec(out, in, coeffp, len, 8);
++}
++
++/* ---------------------------------------------------------------- int16 */
++
++/*
++ * The int16 kernels use the same coefficient table layout as the x86 SIMD
++ * path (built in swri_rematrix_init_ppc below, copied from x86): per matrix
++ * entry a {int16 coef, int16 shift} pair, with coef pre-scaled so it fits an
++ * int16 and shift = 15 - that scaling; every entry of one output row shares
++ * the shift, so index1 and index2 of mix_2_1 (same row) agree on it.
++ *
++ * out = (coef*in + (1 << (shift-1))) >> shift, saturated to int16 by
++ * vec_packs.  This is bit-exact with both C variants: copy_s16/sum2_s16 only
++ * ever see results that fit int16 (coefficient sums <= 32768 by
++ * construction), and the *_clip_s16 variants clip exactly like the pack.
++ * Multiply-accumulate is vec_msum on interleaved {in, 1} x {coef, round}
++ * (mix_1_1) or {in1, in2} x {c1, c2} + round (mix_2_1) halfword pairs -- the
++ * modular vmsumshm, which cannot wrap here: each product is below 2^30
++ * (|coef| <= 32767 after the pre-scaling, |in| <= 32768) and the rounding
++ * term below 2^15, so even the two-product sum stays under 2^31.
++ */
++static void mix_1_1_int16_altivec(void *out_, const void *in_, const void *coeffp_,
++                                  integer index, integer len)
++{
++    int16_t *out        = out_;
++    const int16_t *in   = in_;
++    const int16_t *tbl  = (const int16_t *)coeffp_ + 2 * index;
++    const int shift     = tbl[1];
++    const vec_s16 one   = vec_splat_s16(1);
++    /* {coef, round, coef, round, ...} to pair with {in, 1, in, 1, ...} */
++    const vec_s16 cpair = vec_mergeh(vec_splats(tbl[0]),
++                                     vec_splats((int16_t)((1 << shift) >> 1)));
++    const vec_u32 vsh   = vec_splats((unsigned int)shift);
++    const vec_s32 zero  = vec_splat_s32(0);
++    const vec_u8 lperm  = vec_lvsl(0, in);
++    const vec_u8 sperm  = vec_lvsr(0, out);
++    const int r         = (uintptr_t)out & 15;
++    const int end       = len * 2;
++    vec_s16 prev, cur;
++    int off;
++
++#define MIX1_S16(res, off) do {                                              \
++        vec_s16 v  = LOAD_U(off, in, lperm);                                 \
++        vec_s32 lo = vec_msum(vec_mergeh(v, one), cpair, zero);              \
++        vec_s32 hi = vec_msum(vec_mergel(v, one), cpair, zero);              \
++        res = vec_packs(vec_sra(lo, vsh), vec_sra(hi, vsh));                 \
++    } while (0)
++
++    MIX1_S16(prev, 0);
++    st_head_s16(prev, out, sperm, r);
++    for (off = 16; off < end; off += 16) {
++        MIX1_S16(cur, off);
++        vec_st(vec_perm(prev, cur, sperm), off, out);
++        prev = cur;
++    }
++    st_tail_s16(prev, out, sperm, r, end);
++#undef MIX1_S16
++}
++
++static void mix_2_1_int16_altivec(void *out_, const void *in1_, const void *in2_,
++                                  const void *coeffp_, integer index1, integer index2,
++                                  integer len)
++{
++    int16_t *out        = out_;
++    const int16_t *in1  = in1_;
++    const int16_t *in2  = in2_;
++    const int16_t *tbl1 = (const int16_t *)coeffp_ + 2 * index1;
++    const int16_t *tbl2 = (const int16_t *)coeffp_ + 2 * index2;
++    const int shift     = tbl1[1];
++    /* {c1, c2, c1, c2, ...} to pair with {in1, in2, in1, in2, ...} */
++    const vec_s16 cpair = vec_mergeh(vec_splats(tbl1[0]), vec_splats(tbl2[0]));
++    const vec_s32 vrnd  = vec_splats((int)((1 << shift) >> 1));
++    const vec_u32 vsh   = vec_splats((unsigned int)shift);
++    const vec_u8 lperm1 = vec_lvsl(0, in1);
++    const vec_u8 lperm2 = vec_lvsl(0, in2);
++    const vec_u8 sperm  = vec_lvsr(0, out);
++    const int r         = (uintptr_t)out & 15;
++    const int end       = len * 2;
++    vec_s16 prev, cur;
++    int off;
++
++#define MIX2_S16(res, off) do {                                              \
++        vec_s16 a  = LOAD_U(off, in1, lperm1);                               \
++        vec_s16 b  = LOAD_U(off, in2, lperm2);                               \
++        vec_s32 lo = vec_msum(vec_mergeh(a, b), cpair, vrnd);                \
++        vec_s32 hi = vec_msum(vec_mergel(a, b), cpair, vrnd);                \
++        res = vec_packs(vec_sra(lo, vsh), vec_sra(hi, vsh));                 \
++    } while (0)
++
++    MIX2_S16(prev, 0);
++    st_head_s16(prev, out, sperm, r);
++    for (off = 16; off < end; off += 16) {
++        MIX2_S16(cur, off);
++        vec_st(vec_perm(prev, cur, sperm), off, out);
++        prev = cur;
++    }
++    st_tail_s16(prev, out, sperm, r, end);
++#undef MIX2_S16
++}
++
++#endif /* HAVE_ALTIVEC && HAVE_BIGENDIAN */
++
++av_cold int swri_rematrix_init_ppc(struct SwrContext *s)
++{
++#if HAVE_ALTIVEC && HAVE_BIGENDIAN
++    int nb_in  = s->used_ch_layout.nb_channels;
++    int nb_out = s->out.ch_count;
++    int num    = nb_in * nb_out;
++    int i, j;
++
++    s->mix_1_1_simd = NULL;
++    s->mix_2_1_simd = NULL;
++
++    if (!PPC_ALTIVEC(av_get_cpu_flags()))
++        return 0;
++
++    if (s->midbuf.fmt == AV_SAMPLE_FMT_S16P) {
++        s->mix_1_1_simd = mix_1_1_int16_altivec;
++        s->mix_2_1_simd = mix_2_1_int16_altivec;
++        /* {coef, shift} int16 pairs, identical to swri_rematrix_init_x86 */
++        s->native_simd_matrix = av_calloc(num, 2 * sizeof(int16_t));
++        if (!s->native_simd_matrix)
++            return AVERROR(ENOMEM);
++
++        for (i = 0; i < nb_out; i++) {
++            int sh = 0;
++            for (j = 0; j < nb_in; j++)
++                sh = FFMAX(sh, FFABS(((int *)s->native_matrix)[i * nb_in + j]));
++            sh = FFMAX(av_log2(sh) - 14, 0);
++            for (j = 0; j < nb_in; j++) {
++                ((int16_t *)s->native_simd_matrix)[2 * (i * nb_in + j) + 1] = 15 - sh;
++                ((int16_t *)s->native_simd_matrix)[2 * (i * nb_in + j)] =
++                    ((((int *)s->native_matrix)[i * nb_in + j]) + (1 << sh >> 1)) >> sh;
++            }
++        }
++        s->native_simd_one.i16[1] = 14;
++        s->native_simd_one.i16[0] = 16384;
++    } else if (s->midbuf.fmt == AV_SAMPLE_FMT_FLTP) {
++        s->mix_1_1_simd = mix_1_1_float_altivec;
++        s->mix_2_1_simd = mix_2_1_float_altivec;
++        s->native_simd_matrix = av_calloc(num, sizeof(float));
++        if (!s->native_simd_matrix)
++            return AVERROR(ENOMEM);
++        memcpy(s->native_simd_matrix, s->native_matrix, num * sizeof(float));
++        s->native_simd_one.f = s->native_one.f;
++
++        /* The generic init already picked the mix6to2/mix8to2 C special case
++         * when the layouts and matrix have that shape; only the input channel
++         * count is left to tell the two apart. */
++        if (s->mix_any_f && nb_out == 2) {
++            if (nb_in == 6)
++                s->mix_any_f = mix6to2_float_altivec;
++            else if (nb_in == 8)
++                s->mix_any_f = mix8to2_float_altivec;
++        }
++    }
++#endif
++    return 0;
++}
+diff --git a/libswresample/rematrix.c b/libswresample/rematrix.c
+index 6f4c16e..27ebe5a 100644
+--- a/libswresample/rematrix.c
++++ b/libswresample/rematrix.c
+@@ -571,6 +571,8 @@ av_cold int swri_rematrix_init(SwrContext *s){
+ 
+ #if ARCH_X86 && HAVE_X86ASM
+     return swri_rematrix_init_x86(s);
++#elif ARCH_PPC
++    return swri_rematrix_init_ppc(s);
+ #endif
+ 
+     return 0;
+diff --git a/libswresample/swresample_internal.h b/libswresample/swresample_internal.h
+index ca2e0d7..3da4823 100644
+--- a/libswresample/swresample_internal.h
++++ b/libswresample/swresample_internal.h
+@@ -210,6 +210,7 @@ int swri_rematrix_init(SwrContext *s);
+ void swri_rematrix_free(SwrContext *s);
+ int swri_rematrix(SwrContext *s, AudioData *out, AudioData *in, int len, int mustcopy);
+ int swri_rematrix_init_x86(struct SwrContext *s);
++int swri_rematrix_init_ppc(struct SwrContext *s);
+ 
+ av_warn_unused_result
+ int swri_get_dither(SwrContext *s, void *dst, int len, unsigned seed, enum AVSampleFormat noise_fmt);
+-- 
+2.43.0
+
