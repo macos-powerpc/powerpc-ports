@@ -1,0 +1,841 @@
+From ff563e2d3e5d0deeefaa7c7d60fc4bd15eb3445e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 06:06:06 +0000
+Subject: [PATCH] tests/checkasm: add swr_rematrix and swr_audio_convert
+ coverage
+
+swresample's rematrix mixers and sample format converters had no checkasm
+oracle (only FATE end-to-end), so their SIMD paths could never be checked
+in isolation. Two new tests, both built on REAL library contexts like
+swr_resample.c so the function pointers, coefficient tables and calling
+contract are the library's own:
+
+swr_rematrix: an SwrContext per case (same in/out rate, internal_sample_fmt
+pinned to S16P or FLTP, custom matrix via swr_set_matrix before swr_init)
+and the kernel taken off s->mix_1_1_simd / mix_2_1_simd when the arch init
+set one, else the C mix_1_1_f / mix_2_1_f; call_ref gets native_matrix and
+call_new native_simd_matrix, since the two tables differ by design (x86 and
+PPC pre-scale the int16 coefficients per row). Cases: mix_1_1 and mix_2_1
+with plain (|coef| < 1) and clip (>1 gain, the *_clip_s16 C variant)
+matrices whose coefficients are k/2^m so the pre-scaled table is exact,
+plus the mix6to2 / mix8to2 whole-matrix special cases (default 5.1/7.1 ->
+stereo, off s->mix_any_f, any length 1..100). Every pointer is swept over
+all 16-byte residues -- real callers hand these kernels user buffers at
+arbitrary sample offsets -- and every output plane sits between random
+guard bytes that are compared afterwards, so out-of-window writes fail.
+S16P is compared bit-exactly, FLTP within 1e-6 (SIMD may contract the
+two-product sum differently from the compiler's C).
+
+swr_audio_convert: AudioConvert contexts for every ordered pair of
+{S16,S16P,S32,S32P,FLT,FLTP} at 1, 2 and 6 channels (planar only at 1,
+where the library forces planar). ctx->simd_f has no C twin, so a
+test-local reference with the simd signature replays swri_audio_convert()'s
+per-channel conv_f calls and is registered in the C pass; a SIMD pass
+registers ctx->simd_f, and pairs without a kernel skip automatically. The
+same-layout pairs are called per plane with the element count the library
+passes (frames, or frames*channels when packed), pack/unpack once with the
+full NULL-terminated pointer arrays, frames a multiple of 16 (the library's
+len & ~15). Aligned buffers only (kernels may set the simd_align_mask).
+Everything is compared bit-exactly with guards, except float->int16 on
+ARM/AArch64 where the existing NEON kernel is known to round differently
+from lrintf (truncate to 31-bit fixed then round-half-up narrowing) and
+gets a +-1 LSB tolerance.
+
+Written for the PPC AltiVec kernels that follow, but arch-neutral: on x86
+they exercise the existing SSE/AVX rematrix and audio_convert asm.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VY6bhpLDBYqo84Hbm2ewdh
+---
+ tests/checkasm/Makefile            |   4 +-
+ tests/checkasm/checkasm.c          |   2 +
+ tests/checkasm/checkasm.h          |   2 +
+ tests/checkasm/swr_audio_convert.c | 311 +++++++++++++++++++++
+ tests/checkasm/swr_rematrix.c      | 416 +++++++++++++++++++++++++++++
+ 5 files changed, 734 insertions(+), 1 deletion(-)
+ create mode 100644 tests/checkasm/swr_audio_convert.c
+ create mode 100644 tests/checkasm/swr_rematrix.c
+
+diff --git a/tests/checkasm/Makefile b/tests/checkasm/Makefile
+index 5c520e8..ae1c228 100644
+--- a/tests/checkasm/Makefile
++++ b/tests/checkasm/Makefile
+@@ -98,7 +98,9 @@ SWSCALEOBJS                             += sw_gbrp.o            \
+ CHECKASMOBJS-$(CONFIG_SWSCALE)  += $(SWSCALEOBJS)
+ 
+ # swresample tests
+-SWRESAMPLEOBJS                          += swr_resample.o
++SWRESAMPLEOBJS                          += swr_audio_convert.o     \
++                                           swr_rematrix.o          \
++                                           swr_resample.o
+ 
+ CHECKASMOBJS-$(CONFIG_SWRESAMPLE) += $(SWRESAMPLEOBJS)
+ 
+diff --git a/tests/checkasm/checkasm.c b/tests/checkasm/checkasm.c
+index 2445439..f4c7a62 100644
+--- a/tests/checkasm/checkasm.c
++++ b/tests/checkasm/checkasm.c
+@@ -299,6 +299,8 @@ static const CheckasmTest tests[] = {
+     { "sw_ops", checkasm_check_sw_ops },
+ #endif
+ #if CONFIG_SWRESAMPLE
++    { "swr_audio_convert", checkasm_check_swr_audio_convert },
++    { "swr_rematrix", checkasm_check_swr_rematrix },
+     { "swr_resample", checkasm_check_swr_resample },
+ #endif
+ #if CONFIG_AVUTIL
+diff --git a/tests/checkasm/checkasm.h b/tests/checkasm/checkasm.h
+index 17169cd..b38bf44 100644
+--- a/tests/checkasm/checkasm.h
++++ b/tests/checkasm/checkasm.h
+@@ -110,6 +110,8 @@ void checkasm_check_sw_xyz2rgb(void);
+ void checkasm_check_sw_yuv2rgb(void);
+ void checkasm_check_sw_yuv2yuv(void);
+ void checkasm_check_sw_ops(void);
++void checkasm_check_swr_audio_convert(void);
++void checkasm_check_swr_rematrix(void);
+ void checkasm_check_swr_resample(void);
+ void checkasm_check_takdsp(void);
+ void checkasm_check_utvideodsp(void);
+diff --git a/tests/checkasm/swr_audio_convert.c b/tests/checkasm/swr_audio_convert.c
+new file mode 100644
+index 0000000..4ac25d0
+--- /dev/null
++++ b/tests/checkasm/swr_audio_convert.c
+@@ -0,0 +1,311 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "checkasm.h"
++
++#include "libavutil/avassert.h"
++#include "libavutil/mem_internal.h"
++#include "libavutil/samplefmt.h"
++
++#include "libswresample/audioconvert.h"
++
++#include "config.h"
++
++#define MAX_LEN 256
++#define MAX_CHANNELS 6
++/* 64 trailing guard bytes so an out-of-window write is caught even at MAX_LEN */
++#define PLANE_BYTES  (MAX_LEN * 4 + 64)
++#define PACKED_BYTES (MAX_LEN * MAX_CHANNELS * 4 + 64)
++
++/* AudioConvert has no C twin for ctx->simd_f, so this test-local function
++ * replicates swri_audio_convert()'s per-channel conv_f calling convention
++ * and stands in as the reference implementation. */
++static AudioConvert *ref_ctx;
++static int ref_channels;
++static enum AVSampleFormat ref_in_fmt, ref_out_fmt;
++
++static void ref_convert(uint8_t **dst, const uint8_t **src, int len)
++{
++    int in_planar  = av_sample_fmt_is_planar(ref_in_fmt);
++    int out_planar = av_sample_fmt_is_planar(ref_out_fmt);
++    int ibps = av_get_bytes_per_sample(ref_in_fmt);
++    int obps = av_get_bytes_per_sample(ref_out_fmt);
++
++    if (in_planar == out_planar) {
++        ref_ctx->conv_f(dst[0], src[0], ibps, obps, dst[0] + obps * len);
++    } else {
++        int ch;
++        for (ch = 0; ch < ref_channels; ch++) {
++            int is = in_planar  ? ibps : ref_channels * ibps;
++            int os = out_planar ? obps : ref_channels * obps;
++            const uint8_t *pi = in_planar  ? src[ch] : src[0] + ch * ibps;
++            uint8_t *po       = out_planar ? dst[ch] : dst[0] + ch * obps;
++            ref_ctx->conv_f(po, pi, is, os, po + os * len);
++        }
++    }
++}
++
++static void randomize_buf(uint8_t *buf, int bytes, enum AVSampleFormat fmt)
++{
++    int i;
++
++    switch (av_get_packed_sample_fmt(fmt)) {
++    case AV_SAMPLE_FMT_S16: {
++        int16_t *p = (int16_t *)buf;
++        for (i = 0; i < bytes / 2; i++)
++            p[i] = (int16_t)(rnd() & 0xffff);
++        break;
++    }
++    case AV_SAMPLE_FMT_S32: {
++        int32_t *p = (int32_t *)buf;
++        for (i = 0; i < bytes / 4; i++)
++            p[i] = (int32_t)rnd();
++        break;
++    }
++    case AV_SAMPLE_FMT_FLT: {
++        float *p = (float *)buf;
++        for (i = 0; i < bytes / 4; i++)
++            p[i] = (float)((rnd() / (double)UINT_MAX - 0.5) * 3.0);
++        break;
++    }
++    default:
++        av_assert0(0);
++    }
++}
++
++static void randomize_words(uint8_t *buf, int bytes)
++{
++    uint32_t *p = (uint32_t *)buf;
++    int i;
++
++    for (i = 0; i < bytes / 4; i++)
++        p[i] = (uint32_t)rnd();
++}
++
++#if ARCH_ARM || ARCH_AARCH64
++static int int16_near_array(const int16_t *a, const int16_t *b, int tol, int len)
++{
++    int i;
++    for (i = 0; i < len; i++) {
++        int d = (int)a[i] - (int)b[i];
++        if (d < -tol || d > tol)
++            return 0;
++    }
++    return 1;
++}
++#endif
++
++/* Compare two total_bytes sized output buffers (a whole plane, or the whole
++ * packed frame buffer) after one ref/new call pair. Only the first
++ * active_bytes were declared as this call's output window (frames elements
++ * for the ARM/AArch64 tolerance path); anything beyond that is trailing
++ * guard and must stay byte-identical either way. */
++static void compare_out(int is_f2i16, const uint8_t *dst0, const uint8_t *dst1,
++                        int total_bytes, int active_bytes, int frames,
++                        const char *ctx)
++{
++    int post_bytes = total_bytes - active_bytes;
++    int guard_bad = memcmp(dst0 + active_bytes, dst1 + active_bytes, post_bytes) != 0;
++    int win_bad;
++
++#if ARCH_ARM || ARCH_AARCH64
++    if (is_f2i16)
++        win_bad = !int16_near_array((const int16_t *)dst0, (const int16_t *)dst1, 1, frames);
++    else
++        win_bad = memcmp(dst0, dst1, active_bytes) != 0;
++#else
++    (void)is_f2i16;
++    (void)frames;
++    win_bad = memcmp(dst0, dst1, active_bytes) != 0;
++#endif
++
++    if (guard_bad || win_bad) {
++        fail();
++        fprintf(stderr, "%s: mismatch (guard=%d window=%d)\n", ctx, guard_bad, win_bad);
++    }
++}
++
++static void run_case(enum AVSampleFormat in_fmt, enum AVSampleFormat out_fmt,
++                     int channels)
++{
++    static const int lens[] = { 16, 32, 48, 64, 256 };
++    int in_planar  = av_sample_fmt_is_planar(in_fmt);
++    int out_planar = av_sample_fmt_is_planar(out_fmt);
++    int ibps = av_get_bytes_per_sample(in_fmt);
++    int obps = av_get_bytes_per_sample(out_fmt);
++    int is_f2i16 = (av_get_packed_sample_fmt(in_fmt)  == AV_SAMPLE_FMT_FLT) &&
++                  (av_get_packed_sample_fmt(out_fmt) == AV_SAMPLE_FMT_S16);
++    DECLARE_ALIGNED(16, uint8_t, src_planes)[MAX_CHANNELS][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, src_packed)[PACKED_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst0_planes)[MAX_CHANNELS][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst1_planes)[MAX_CHANNELS][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst0_packed)[PACKED_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst1_packed)[PACKED_BYTES];
++    AudioConvert *ctx;
++    simd_func_type *fn;
++
++    if (in_fmt == out_fmt)
++        return;
++
++    ctx = swri_audio_convert_alloc(out_fmt, in_fmt, channels, NULL, 0);
++    if (!ctx)
++        return;
++
++    ref_ctx      = ctx;
++    ref_channels = channels;
++    ref_in_fmt   = in_fmt;
++    ref_out_fmt  = out_fmt;
++
++    fn = ctx->simd_f ? ctx->simd_f : ref_convert;
++
++    if (check_func(fn, "swr_convert_%s_to_%s_%dch",
++                  av_get_sample_fmt_name(in_fmt),
++                  av_get_sample_fmt_name(out_fmt), channels)) {
++        declare_func(void, uint8_t **, const uint8_t **, int);
++        int li;
++
++        for (li = 0; li < FF_ARRAY_ELEMS(lens); li++) {
++            int frames = lens[li];
++            uint8_t *dst0[SWR_CH_MAX] = { 0 }, *dst1[SWR_CH_MAX] = { 0 };
++            const uint8_t *src[SWR_CH_MAX] = { 0 };
++            int ch;
++            char ctxbuf[96];
++
++            /* Fill the whole (over-provisioned) input buffers, not just the
++             * active window: some kernels may prefetch or process in blocks
++             * wider than the requested length. */
++            if (in_planar) {
++                for (ch = 0; ch < channels; ch++)
++                    randomize_buf(src_planes[ch], PLANE_BYTES, in_fmt);
++            } else {
++                randomize_buf(src_packed, PACKED_BYTES, in_fmt);
++            }
++
++            if (out_planar) {
++                for (ch = 0; ch < channels; ch++) {
++                    randomize_words(dst0_planes[ch], PLANE_BYTES);
++                    memcpy(dst1_planes[ch], dst0_planes[ch], PLANE_BYTES);
++                }
++            } else {
++                randomize_words(dst0_packed, PACKED_BYTES);
++                memcpy(dst1_packed, dst0_packed, PACKED_BYTES);
++            }
++
++            snprintf(ctxbuf, sizeof(ctxbuf), "swr_convert_%s_to_%s_%dch: frames=%d",
++                    av_get_sample_fmt_name(in_fmt), av_get_sample_fmt_name(out_fmt),
++                    channels, frames);
++
++            if (in_planar == out_planar) {
++                int planes = out_planar ? channels : 1;
++                int count  = out_planar ? frames : frames * channels;
++                int p;
++
++                for (p = 0; p < planes; p++) {
++                    dst0[0] = out_planar ? dst0_planes[p] : dst0_packed;
++                    dst1[0] = out_planar ? dst1_planes[p] : dst1_packed;
++                    src[0]  = in_planar  ? src_planes[p]  : src_packed;
++
++                    call_ref(dst0, src, count);
++                    call_new(dst1, src, count);
++                }
++
++                if (out_planar) {
++                    for (p = 0; p < planes; p++)
++                        compare_out(is_f2i16, dst0_planes[p], dst1_planes[p],
++                                   PLANE_BYTES, frames * obps, frames, ctxbuf);
++                } else {
++                    compare_out(is_f2i16, dst0_packed, dst1_packed,
++                               PACKED_BYTES, frames * channels * obps,
++                               frames * channels, ctxbuf);
++                }
++            } else {
++                for (ch = 0; ch < channels; ch++) {
++                    dst0[ch] = out_planar ? dst0_planes[ch] : dst0_packed + ch * obps;
++                    dst1[ch] = out_planar ? dst1_planes[ch] : dst1_packed + ch * obps;
++                    src[ch]  = in_planar  ? src_planes[ch]  : src_packed  + ch * ibps;
++                }
++
++                call_ref(dst0, src, frames);
++                call_new(dst1, src, frames);
++
++                if (out_planar) {
++                    for (ch = 0; ch < channels; ch++)
++                        compare_out(is_f2i16, dst0_planes[ch], dst1_planes[ch],
++                                   PLANE_BYTES, frames * obps, frames, ctxbuf);
++                } else {
++                    compare_out(is_f2i16, dst0_packed, dst1_packed,
++                               PACKED_BYTES, frames * channels * obps,
++                               frames * channels, ctxbuf);
++                }
++            }
++        }
++
++        {
++            int frames = lens[FF_ARRAY_ELEMS(lens) - 1];
++            uint8_t *dst[SWR_CH_MAX] = { 0 };
++            const uint8_t *src[SWR_CH_MAX] = { 0 };
++            int ch;
++
++            if (in_planar == out_planar) {
++                dst[0] = out_planar ? dst1_planes[0] : dst1_packed;
++                src[0] = in_planar  ? src_planes[0]  : src_packed;
++                bench_new(dst, src, out_planar ? frames : frames * channels);
++            } else {
++                for (ch = 0; ch < channels; ch++) {
++                    dst[ch] = out_planar ? dst1_planes[ch] : dst1_packed + ch * obps;
++                    src[ch] = in_planar  ? src_planes[ch]  : src_packed  + ch * ibps;
++                }
++                bench_new(dst, src, frames);
++            }
++        }
++    }
++
++    swri_audio_convert_free(&ctx);
++}
++
++void checkasm_check_swr_audio_convert(void)
++{
++    static const enum AVSampleFormat all_fmts[] = {
++        AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_S16P,
++        AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_S32P,
++        AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
++    };
++    static const enum AVSampleFormat planar_fmts[] = {
++        AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_FLTP,
++    };
++    static const int channel_counts[] = { 1, 2, 6 };
++    int ci;
++
++    for (ci = 0; ci < FF_ARRAY_ELEMS(channel_counts); ci++) {
++        int channels = channel_counts[ci];
++        const enum AVSampleFormat *fmts = channels == 1 ? planar_fmts : all_fmts;
++        int nb_fmts = channels == 1 ? FF_ARRAY_ELEMS(planar_fmts)
++                                    : FF_ARRAY_ELEMS(all_fmts);
++        int i, j;
++
++        for (i = 0; i < nb_fmts; i++)
++            for (j = 0; j < nb_fmts; j++)
++                run_case(fmts[i], fmts[j], channels);
++    }
++
++    report("swr_audio_convert");
++}
+diff --git a/tests/checkasm/swr_rematrix.c b/tests/checkasm/swr_rematrix.c
+new file mode 100644
+index 0000000..2570079
+--- /dev/null
++++ b/tests/checkasm/swr_rematrix.c
+@@ -0,0 +1,416 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "checkasm.h"
++
++#include "libavutil/avassert.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/mem_internal.h"
++#include "libavutil/opt.h"
++#include "libavutil/samplefmt.h"
++
++#include "libswresample/swresample.h"
++#include "libswresample/swresample_internal.h"
++
++/* Every plane buffer holds GUARD_BYTES of random data on each side of the
++ * region a call may touch, so an out-of-window read can never fault and an
++ * out-of-window write is always caught by the guard comparison below.
++ * MAX_OFF is the number of distinct 16-byte residues an S16P (2 byte)
++ * sample offset can land on; FLTP (4 byte) only needs 4 of them. */
++#define GUARD_BYTES 32
++#define MAX_LEN     256
++#define MAX_OFF     8
++#define MAX_ELEM    4
++#define PLANE_BYTES (GUARD_BYTES + (MAX_OFF + MAX_LEN) * MAX_ELEM + GUARD_BYTES)
++
++static int residues(enum AVSampleFormat fmt)
++{
++    return fmt == AV_SAMPLE_FMT_S16P ? 8 : 4;
++}
++
++static int elem_size(enum AVSampleFormat fmt)
++{
++    return fmt == AV_SAMPLE_FMT_S16P ? 2 : 4;
++}
++
++static void fill_input(uint8_t *buf, int bytes, enum AVSampleFormat fmt)
++{
++    int i;
++
++    if (fmt == AV_SAMPLE_FMT_S16P) {
++        int16_t *p = (int16_t *)buf;
++        for (i = 0; i < bytes / 2; i++)
++            p[i] = (int16_t)(rnd() & 0xffff);
++    } else {
++        float *p = (float *)buf;
++        for (i = 0; i < bytes / 4; i++)
++            p[i] = (float)((rnd() / (double)UINT_MAX - 0.5) * 2);
++    }
++}
++
++static void fill_guard(uint8_t *buf, int bytes)
++{
++    uint32_t *p = (uint32_t *)buf;
++    int i;
++
++    for (i = 0; i < bytes / 4; i++)
++        p[i] = (uint32_t)rnd();
++}
++
++/* Compare two PLANE_BYTES sized output buffers after one ref/new call pair.
++ * pre_bytes is the byte offset the call's output window starts at; for S16P
++ * the whole buffer must be bit-exact, for FLTP only the window may differ
++ * (by up to 1e-6) while both guards must stay byte-identical. */
++static void compare_buffers(int is_s16p, const uint8_t *dst0, const uint8_t *dst1,
++                            int total_bytes, int pre_bytes, int window_len,
++                            const char *ctx)
++{
++    if (is_s16p) {
++        if (memcmp(dst0, dst1, total_bytes)) {
++            int i, first = -1;
++            for (i = 0; i < total_bytes; i++)
++                if (dst0[i] != dst1[i]) { first = i; break; }
++            fail();
++            fprintf(stderr, "%s: s16p mismatch at byte %d\n", ctx, first);
++        }
++    } else {
++        int window_bytes = window_len * 4;
++        int post_bytes   = total_bytes - pre_bytes - window_bytes;
++        const float *w0  = (const float *)(dst0 + pre_bytes);
++        const float *w1  = (const float *)(dst1 + pre_bytes);
++        int guard_bad = memcmp(dst0, dst1, pre_bytes) ||
++                        memcmp(dst0 + pre_bytes + window_bytes,
++                               dst1 + pre_bytes + window_bytes, post_bytes);
++        int win_bad = !float_near_abs_eps_array(w0, w1, 1e-6f, window_len);
++
++        if (guard_bad || win_bad) {
++            int i, first = -1;
++            if (win_bad)
++                for (i = 0; i < window_len; i++)
++                    if (fabsf(w0[i] - w1[i]) > 1e-6f) { first = i; break; }
++            fail();
++            fprintf(stderr, "%s: fltp mismatch (guard=%d win=%d first_idx=%d)\n",
++                    ctx, guard_bad, win_bad, first);
++        }
++    }
++}
++
++static struct SwrContext *alloc_ctx(enum AVSampleFormat fmt,
++                                    const AVChannelLayout *in_layout,
++                                    const AVChannelLayout *out_layout,
++                                    const double *matrix, int stride)
++{
++    struct SwrContext *s = swr_alloc();
++
++    if (!s)
++        return NULL;
++
++    av_opt_set_chlayout(s, "in_chlayout",  in_layout,  0);
++    av_opt_set_chlayout(s, "out_chlayout", out_layout, 0);
++    av_opt_set_sample_fmt(s, "in_sample_fmt",       fmt, 0);
++    av_opt_set_sample_fmt(s, "out_sample_fmt",      fmt, 0);
++    av_opt_set_sample_fmt(s, "internal_sample_fmt", fmt, 0);
++    av_opt_set_int(s, "in_sample_rate",  48000, 0);
++    av_opt_set_int(s, "out_sample_rate", 48000, 0);
++
++    if (matrix && swr_set_matrix(s, matrix, stride) < 0) {
++        swr_free(&s);
++        return NULL;
++    }
++
++    if (swr_init(s) < 0) {
++        swr_free(&s);
++        return NULL;
++    }
++
++    return s;
++}
++
++static void run_mix_1_1(const char *base_name, enum AVSampleFormat fmt,
++                        const char *fmt_name, const double *matrix)
++{
++    AVChannelLayout stereo_in  = AV_CHANNEL_LAYOUT_STEREO;
++    AVChannelLayout stereo_out = AV_CHANNEL_LAYOUT_STEREO;
++    static const int lens[] = { 16, 32, 64, 256 };
++    DECLARE_ALIGNED(16, uint8_t, in_planes)[2][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst0)[PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst1)[PLANE_BYTES];
++    struct SwrContext *s;
++    mix_1_1_func_type *fn;
++    const void *tab_ref, *tab_new;
++    int r, elem, is_s16p = fmt == AV_SAMPLE_FMT_S16P;
++    char name[64];
++
++    s = alloc_ctx(fmt, &stereo_in, &stereo_out, matrix, 2);
++    if (!s)
++        return;
++
++    av_assert0(s->matrix_ch[0][0] == 1);
++    av_assert0(s->matrix_ch[1][0] == 1);
++
++    fn      = s->mix_1_1_simd ? s->mix_1_1_simd : s->mix_1_1_f;
++    tab_ref = s->native_matrix;
++    tab_new = s->mix_1_1_simd ? s->native_simd_matrix : s->native_matrix;
++
++    r    = residues(fmt);
++    elem = elem_size(fmt);
++    snprintf(name, sizeof(name), "swr_rematrix_%s_%s", base_name, fmt_name);
++
++    if (check_func(fn, "%s", name)) {
++        declare_func(void, void *, const void *, const void *, integer, integer);
++        int li, oi, row;
++
++        for (li = 0; li < FF_ARRAY_ELEMS(lens); li++) {
++            int len = lens[li];
++
++            for (oi = 0; oi <= r; oi++) {
++                int out_off = oi < r ? oi           : 0;
++                int in_off  = oi < r ? (oi + 1) % r : 0;
++
++                fill_input(in_planes[0], PLANE_BYTES, fmt);
++                fill_input(in_planes[1], PLANE_BYTES, fmt);
++
++                for (row = 0; row < 2; row++) {
++                    integer index = 2 * row + row;   /* nb_in*out_i + in_i, diagonal */
++                    uint8_t *out_ref, *out_new;
++                    const uint8_t *in_ptr;
++                    char ctx[160];
++
++                    fill_guard(dst0, PLANE_BYTES);
++                    memcpy(dst1, dst0, PLANE_BYTES);
++
++                    out_ref = dst0 + GUARD_BYTES + out_off * elem;
++                    out_new = dst1 + GUARD_BYTES + out_off * elem;
++                    in_ptr  = in_planes[row] + GUARD_BYTES + in_off * elem;
++
++                    call_ref(out_ref, in_ptr, tab_ref, index, (integer)len);
++                    call_new(out_new, in_ptr, tab_new, index, (integer)len);
++
++                    snprintf(ctx, sizeof(ctx),
++                            "%s: len=%d out_off=%d in_off=%d row=%d",
++                            name, len, out_off, in_off, row);
++                    compare_buffers(is_s16p, dst0, dst1, PLANE_BYTES,
++                                   GUARD_BYTES + out_off * elem, len, ctx);
++                }
++            }
++        }
++
++        fill_input(in_planes[0], PLANE_BYTES, fmt);
++        bench_new(dst1, in_planes[0], tab_new, (integer)0, (integer)lens[FF_ARRAY_ELEMS(lens) - 1]);
++    }
++
++    swr_free(&s);
++}
++
++static void run_mix_2_1(const char *base_name, enum AVSampleFormat fmt,
++                        const char *fmt_name, const double *matrix)
++{
++    AVChannelLayout in_layout  = AV_CHANNEL_LAYOUT_STEREO;
++    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
++    static const int lens[] = { 16, 32, 64, 256 };
++    DECLARE_ALIGNED(16, uint8_t, in_planes)[2][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst0)[PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, dst1)[PLANE_BYTES];
++    struct SwrContext *s;
++    mix_2_1_func_type *fn;
++    const void *tab_ref, *tab_new;
++    int r, elem, is_s16p = fmt == AV_SAMPLE_FMT_S16P;
++    char name[64];
++
++    s = alloc_ctx(fmt, &in_layout, &out_layout, matrix, 2);
++    if (!s)
++        return;
++
++    av_assert0(s->matrix_ch[0][0] == 2);
++
++    fn      = s->mix_2_1_simd ? s->mix_2_1_simd : s->mix_2_1_f;
++    tab_ref = s->native_matrix;
++    tab_new = s->mix_2_1_simd ? s->native_simd_matrix : s->native_matrix;
++
++    r    = residues(fmt);
++    elem = elem_size(fmt);
++    snprintf(name, sizeof(name), "swr_rematrix_%s_%s", base_name, fmt_name);
++
++    if (check_func(fn, "%s", name)) {
++        declare_func(void, void *, const void *, const void *, const void *,
++                    integer, integer, integer);
++        int li, oi;
++
++        for (li = 0; li < FF_ARRAY_ELEMS(lens); li++) {
++            int len = lens[li];
++
++            for (oi = 0; oi <= r; oi++) {
++                int out_off = oi < r ? oi               : 0;
++                int in1_off = oi < r ? (oi + 1) % r     : 0;
++                int in2_off = oi < r ? (oi * 3 + 2) % r : 0;
++                uint8_t *out_ref, *out_new;
++                const uint8_t *in1_ptr, *in2_ptr;
++                char ctx[160];
++
++                fill_input(in_planes[0], PLANE_BYTES, fmt);
++                fill_input(in_planes[1], PLANE_BYTES, fmt);
++                fill_guard(dst0, PLANE_BYTES);
++                memcpy(dst1, dst0, PLANE_BYTES);
++
++                out_ref = dst0 + GUARD_BYTES + out_off * elem;
++                out_new = dst1 + GUARD_BYTES + out_off * elem;
++                in1_ptr = in_planes[0] + GUARD_BYTES + in1_off * elem;
++                in2_ptr = in_planes[1] + GUARD_BYTES + in2_off * elem;
++
++                call_ref(out_ref, in1_ptr, in2_ptr, tab_ref,
++                        (integer)0, (integer)1, (integer)len);
++                call_new(out_new, in1_ptr, in2_ptr, tab_new,
++                        (integer)0, (integer)1, (integer)len);
++
++                snprintf(ctx, sizeof(ctx),
++                        "%s: len=%d out_off=%d in1_off=%d in2_off=%d",
++                        name, len, out_off, in1_off, in2_off);
++                compare_buffers(is_s16p, dst0, dst1, PLANE_BYTES,
++                               GUARD_BYTES + out_off * elem, len, ctx);
++            }
++        }
++
++        fill_input(in_planes[0], PLANE_BYTES, fmt);
++        fill_input(in_planes[1], PLANE_BYTES, fmt);
++        bench_new(dst1, in_planes[0], in_planes[1], tab_new,
++                 (integer)0, (integer)1, (integer)lens[FF_ARRAY_ELEMS(lens) - 1]);
++    }
++
++    swr_free(&s);
++}
++
++static void run_mix_any(int nb_in, enum AVSampleFormat fmt, const char *fmt_name)
++{
++    AVChannelLayout in_layout;
++    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
++    static const int lens[] = { 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 64, 100 };
++    DECLARE_ALIGNED(16, uint8_t, in_planes)[8][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, out0)[2][PLANE_BYTES];
++    DECLARE_ALIGNED(16, uint8_t, out1)[2][PLANE_BYTES];
++    struct SwrContext *s;
++    mix_any_func_type *fn;
++    const void *table;
++    int r, elem, is_s16p = fmt == AV_SAMPLE_FMT_S16P;
++    int nb_planes = nb_in + 2;
++    char name[64];
++
++    in_layout = nb_in == 6 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1
++                          : (AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1;
++
++    s = alloc_ctx(fmt, &in_layout, &out_layout, NULL, 0);
++    if (!s)
++        return;
++
++    av_assert0(s->mix_any_f != NULL);
++
++    fn    = s->mix_any_f;
++    table = s->native_matrix;
++
++    r    = residues(fmt);
++    elem = elem_size(fmt);
++    snprintf(name, sizeof(name), "swr_rematrix_mix%dto2_%s", nb_in, fmt_name);
++
++    if (check_func(fn, "%s", name)) {
++        declare_func(void, uint8_t *const *, const uint8_t *const *, const void *, integer);
++        int li, oi, p;
++
++        for (li = 0; li < FF_ARRAY_ELEMS(lens); li++) {
++            int len = lens[li];
++
++            for (oi = 0; oi <= r; oi++) {
++                uint8_t *out_ref[2], *out_new[2];
++                const uint8_t *in_ptrs[8];
++                int off[10];
++                char ctx[160];
++
++                for (p = 0; p < nb_planes; p++)
++                    off[p] = oi < r ? (oi + p) % r : 0;
++
++                for (p = 0; p < nb_in; p++)
++                    fill_input(in_planes[p], PLANE_BYTES, fmt);
++                fill_guard(out0[0], PLANE_BYTES);
++                fill_guard(out0[1], PLANE_BYTES);
++                memcpy(out1[0], out0[0], PLANE_BYTES);
++                memcpy(out1[1], out0[1], PLANE_BYTES);
++
++                out_ref[0] = out0[0] + GUARD_BYTES + off[0] * elem;
++                out_ref[1] = out0[1] + GUARD_BYTES + off[1] * elem;
++                out_new[0] = out1[0] + GUARD_BYTES + off[0] * elem;
++                out_new[1] = out1[1] + GUARD_BYTES + off[1] * elem;
++                for (p = 0; p < nb_in; p++)
++                    in_ptrs[p] = in_planes[p] + GUARD_BYTES + off[2 + p] * elem;
++
++                call_ref(out_ref, in_ptrs, table, (integer)len);
++                call_new(out_new, in_ptrs, table, (integer)len);
++
++                snprintf(ctx, sizeof(ctx), "%s: len=%d out0_off=%d out1_off=%d",
++                        name, len, off[0], off[1]);
++                compare_buffers(is_s16p, out0[0], out1[0], PLANE_BYTES,
++                               GUARD_BYTES + off[0] * elem, len, ctx);
++                compare_buffers(is_s16p, out0[1], out1[1], PLANE_BYTES,
++                               GUARD_BYTES + off[1] * elem, len, ctx);
++            }
++        }
++
++        {
++            uint8_t *out_new[2];
++            const uint8_t *in_ptrs[8];
++
++            for (p = 0; p < nb_in; p++)
++                fill_input(in_planes[p], PLANE_BYTES, fmt);
++            out_new[0] = out1[0];
++            out_new[1] = out1[1];
++            for (p = 0; p < nb_in; p++)
++                in_ptrs[p] = in_planes[p];
++            bench_new(out_new, in_ptrs, table, (integer)lens[FF_ARRAY_ELEMS(lens) - 1]);
++        }
++    }
++
++    swr_free(&s);
++}
++
++void checkasm_check_swr_rematrix(void)
++{
++    static const struct {
++        enum AVSampleFormat fmt;
++        const char *name;
++    } formats[] = {
++        { AV_SAMPLE_FMT_S16P, "s16p" },
++        { AV_SAMPLE_FMT_FLTP, "fltp" },
++    };
++    static const double matrix_mix11[4]      = {  0.5,  0.0, 0.0, -0.75 };
++    static const double matrix_mix11_clip[4] = {  1.5,  0.0, 0.0, -1.25 };
++    static const double matrix_mix21[2]      = {  0.625, -0.25 };
++    static const double matrix_mix21_clip[2] = {  1.25,   0.5 };
++    int i;
++
++    for (i = 0; i < FF_ARRAY_ELEMS(formats); i++) {
++        run_mix_1_1("mix_1_1",      formats[i].fmt, formats[i].name, matrix_mix11);
++        run_mix_1_1("mix_1_1_clip", formats[i].fmt, formats[i].name, matrix_mix11_clip);
++        run_mix_2_1("mix_2_1",      formats[i].fmt, formats[i].name, matrix_mix21);
++        run_mix_2_1("mix_2_1_clip", formats[i].fmt, formats[i].name, matrix_mix21_clip);
++        run_mix_any(6, formats[i].fmt, formats[i].name);
++        run_mix_any(8, formats[i].fmt, formats[i].name);
++    }
++
++    report("swr_rematrix");
++}
+-- 
+2.43.0
+

@@ -1,0 +1,312 @@
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 7 Sep 2026 20:00:00 +0800
+Subject: [PATCH] parser: resolve overloads through C's implicit argument conversions
+
+Arguments were matched to parameters in two tiers: an exact match, then a
+"weak" match ignoring cv-qualifiers and address space. Neither models C's
+implicit argument conversions, so calls that C accepts were rejected, e.g.
+passing a uint to a parameter declared int.
+
+Upstream's weak_match did let any scalar match any other scalar (and any
+scalar match a vector), which accepted such calls, but unranked: every
+candidate was equally good, so distinct overloads collided as "type matching
+is ambiguous".
+
+Add a third tier that keeps both properties. conversion_cost() scores a
+conversion by how much it loses -- widening cheapest, then signedness
+changes, then integer/float crossings, then narrowing, with scalar-to-vector
+broadcast ranked above every scalar conversion -- and signature_conversion_
+cost() sums it over a signature. Resolution falls back to this tier only
+when the exact and weak tiers find nothing, then picks the cheapest
+candidate; only an exact tie in cost is ambiguous. get_arg_types() applies
+the same ranking so the parameter types it reports are those of the overload
+that was selected.
+
+User-defined functions get the same treatment in function::get_return_type:
+they are plain C functions whose arguments undergo the usual conversions.
+---
+--- a/src/parser/overloaded_builtin.h
++++ b/src/parser/overloaded_builtin.h
+@@ -51,6 +51,17 @@
+ 		static bool all_types_weak_match(const std::deque<smartptr<type> > &args, const std::deque<smartptr<type> > &sig);
+ 		static bool weak_match(const smartptr<type> &a, const smartptr<type> &b);
+ 		static bool match(const smartptr<type> &a, const smartptr<type> &b);
++	public:
++		// Cost of implicitly converting an argument of type a to a parameter of
++		// type b following C's usual argument conversions, or -1 if there is no
++		// such conversion. 0 means no conversion is needed (weak_match).
++		static int conversion_cost(const smartptr<type> &a, const smartptr<type> &b);
++		// Sum of the per-argument conversion costs, or -1 if any argument does
++		// not convert. sig is a signature deque, whose front element is the
++		// return type and is skipped.
++		static int signature_conversion_cost(const std::deque<smartptr<type> > &args,
++											 const std::deque<smartptr<type> > &sig);
++	private:
+ 	private:
+ 		std::deque<std::deque<smartptr<type> > > possible_types;
+ 		std::string name;
+--- a/src/parser/overloaded_builtin.cpp
++++ b/src/parser/overloaded_builtin.cpp
+@@ -330,6 +330,42 @@
+ 		}
+ 		if (b_multimatch)
+ 			throw std::runtime_error("type matching is ambiguous\n" + match_info.str());
++		if (match)
++			return match;
++
++		// Last resort: allow C's implicit argument conversions, picking the
++		// candidate needing the cheapest ones. Only an exact tie is ambiguous,
++		// so a candidate that merely needs an int/uint conversion no longer
++		// competes with one that would have to broadcast or narrow.
++		int best_cost = -1;
++		for(size_t i = 0 ; i < possible_types.size() ; ++i)
++		{
++			const int cost = signature_conversion_cost(arg_types, possible_types[i]);
++			if (cost < 0 || (best_cost >= 0 && cost > best_cost))
++				continue;
++			if (cost == best_cost)
++			{
++				b_multimatch = true;
++			}
++			else
++			{
++				b_multimatch = false;
++				best_cost = cost;
++				match_info.str(std::string());
++			}
++			match = possible_types[i].front();
++
++			match_info << possible_types[i].front()->get_name() << ' ' << name << '(';
++			for(size_t j = 1 ; j < possible_types[i].size() ; ++j)
++			{
++				if (j > 1)
++					match_info << ',';
++				match_info << possible_types[i][j]->get_name();
++			}
++			match_info << ')' << std::endl;
++		}
++		if (b_multimatch)
++			throw std::runtime_error("type matching is ambiguous\n" + match_info.str());
+ 
+ 		return match;
+ 	}
+@@ -360,6 +396,26 @@
+             }
+         }
+ 
++        // Same cheapest-implicit-conversion tier as get_return_type, so the
++        // parameter types reported here are those of the overload it selected.
++        int best_cost = -1;
++        size_t best = possible_types.size();
++        for(size_t i = 0 ; i < possible_types.size() ; ++i)
++        {
++            const int cost = signature_conversion_cost(param_types, possible_types[i]);
++            if (cost < 0 || (best_cost >= 0 && cost >= best_cost))
++                continue;
++            best_cost = cost;
++            best = i;
++        }
++        if (best < possible_types.size())
++        {
++            std::deque<smartptr<type> > arg_types;
++            for(size_t j = 1 ; j < possible_types[best].size() ; ++j)
++                arg_types.push_back(possible_types[best][j]);
++            return arg_types;
++        }
++
+         return std::deque<smartptr<type> >();
+     }
+ 
+@@ -426,13 +482,142 @@
+ 		const native_type *natB = b.as<native_type>();
+ 		if (natA && natB)
+ 		{
+-			return natA->get_type_id() == natB->get_type_id()
+-                    || (natA->is_scalar() && natB->is_scalar() && !natA->is_special() && !natB->is_special())
+-                    || (natA->is_scalar() && natB->is_vector() && !natA->is_special());
++			if (natA->get_type_id() == natB->get_type_id())
++				return true;
++			// Allow scalar-to-scalar weak matching only for same base type
++			// (e.g., const uint matches uint, but not int or ulong)
++			if (natA->is_scalar() && natB->is_scalar() && !natA->is_special() && !natB->is_special())
++			{
++				const native_type::type_id baseA = natA->get_scalar_type();
++				const native_type::type_id baseB = natB->get_scalar_type();
++				if (baseA == baseB)
++					return true;
++			}
++			// DO NOT allow scalar-to-vector weak matching here.
++			// Scalar broadcast to vectors should be handled during code generation,
++			// not during overload resolution. The overload should match based on
++			// the actual argument types.
+ 		}
+ 		return false;
+ 	}
+ 
++	namespace
++	{
++		// Conversion costs, ordered so that a cheaper conversion is always
++		// preferred. Anything that loses information ranks above anything that
++		// does not, and broadcasting a scalar over a vector ranks above every
++		// scalar conversion, so an overload taking scalars always wins over one
++		// that would have to splat.
++		enum
++		{
++			COST_INTEGER_WIDEN			= 1,	// int -> long
++			COST_FLOAT_WIDEN			= 2,	// float -> double
++			COST_INTEGER_WIDEN_SIGN		= 3,	// int -> ulong
++			COST_INTEGER_SIGN			= 4,	// uint -> int
++			COST_INTEGER_TO_FLOAT		= 5,	// int -> float
++			COST_INTEGER_NARROW			= 6,	// int -> short
++			COST_FLOAT_NARROW			= 7,	// double -> float
++			COST_FLOAT_TO_INTEGER		= 8,	// float -> int
++			COST_BROADCAST				= 16	// scalar -> vector
++		};
++
++		size_t scalar_size(const native_type::type_id id)
++		{
++			return native_type(id, false, type::PRIVATE).size();
++		}
++
++		bool is_floatting_id(const native_type::type_id id)
++		{
++			return native_type(id, false, type::PRIVATE).is_floatting();
++		}
++
++		bool is_signed_id(const native_type::type_id id)
++		{
++			return native_type(id, false, type::PRIVATE).is_signed();
++		}
++
++		// Cost of converting between two scalar arithmetic types.
++		int scalar_conversion_cost(const native_type::type_id from, const native_type::type_id to)
++		{
++			if (from == to)
++				return 0;
++
++			const bool f_from = is_floatting_id(from);
++			const bool f_to = is_floatting_id(to);
++			const size_t s_from = scalar_size(from);
++			const size_t s_to = scalar_size(to);
++
++			if (f_from && f_to)
++				return s_to >= s_from ? COST_FLOAT_WIDEN : COST_FLOAT_NARROW;
++			if (f_from)
++				return COST_FLOAT_TO_INTEGER;
++			if (f_to)
++				return COST_INTEGER_TO_FLOAT;
++
++			if (s_to > s_from)
++				return is_signed_id(from) == is_signed_id(to)
++						? COST_INTEGER_WIDEN
++						: COST_INTEGER_WIDEN_SIGN;
++			if (s_to == s_from)
++				return COST_INTEGER_SIGN;
++			return COST_INTEGER_NARROW;
++		}
++	}
++
++	int overloaded_builtin::conversion_cost(const smartptr<type> &a, const smartptr<type> &b)
++	{
++		if (!a || !b)
++			return -1;
++
++		const type_def *td_a = a.as<type_def>();
++		if (td_a)
++			return conversion_cost(td_a->get_type(), b);
++		const type_def *td_b = b.as<type_def>();
++		if (td_b)
++			return conversion_cost(a, td_b->get_type());
++
++		// Exact, cv-qualifier and address-space insensitive matches cost nothing.
++		if (weak_match(a, b))
++			return 0;
++
++		const native_type *natA = a.as<native_type>();
++		const native_type *natB = b.as<native_type>();
++		if (!natA || !natB)
++			return -1;
++
++		// Images, samplers, events and void never convert implicitly.
++		if (natA->is_special() || natB->is_special()
++			|| natA->get_type_id() == native_type::VOID
++			|| natB->get_type_id() == native_type::VOID)
++			return -1;
++
++		// A vector argument never converts implicitly: OpenCL C requires an
++		// explicit conversion between vector types, and a vector can never
++		// narrow to a scalar.
++		if (!natA->is_scalar())
++			return -1;
++
++		const int cost = scalar_conversion_cost(natA->get_scalar_type(), natB->get_scalar_type());
++		// A scalar broadcasts over a vector parameter, but only as a last resort.
++		return natB->is_vector() ? cost + COST_BROADCAST : cost;
++	}
++
++	int overloaded_builtin::signature_conversion_cost(const std::deque<smartptr<type> > &args,
++													  const std::deque<smartptr<type> > &sig)
++	{
++		if (args.size() + 1 != sig.size())
++			return -1;
++		int total = 0;
++		for(size_t i = 0 ; i < args.size() ; ++i)
++		{
++			const int cost = conversion_cost(args[i], sig[i + 1]);
++			if (cost < 0)
++				return -1;
++			total += cost;
++		}
++		return total;
++	}
++
+ 	bool overloaded_builtin::match(const smartptr<type> &a, const smartptr<type> &b)
+ 	{
+ 		if (*a == *b)
+--- a/src/parser/function.cpp
++++ b/src/parser/function.cpp
+@@ -18,6 +18,7 @@
+ #include "function.h"
+ #include "chunk.h"
+ #include "type.h"
++#include "pointer_type.h"
+ #include "overloaded_builtin.h"
+ 
+ namespace FreeOCL
+@@ -75,7 +76,12 @@
+ 	{
+ 		if (arg_types.size() != arg_types.size())
+ 			return (type*)NULL;
+-		if (!overloaded_builtin::all_types_weak_match(arg_types, this->arg_types))
++		// A user-defined function is a plain C function: its arguments undergo
++		// the usual implicit conversions, so accept any argument list that
++		// converts. all_types_weak_match alone would reject e.g. passing a uint
++		// where the prototype says int.
++		if (!overloaded_builtin::all_types_weak_match(arg_types, this->arg_types)
++			&& overloaded_builtin::signature_conversion_cost(arg_types, this->arg_types) < 0)
+ 			return (type*)NULL;
+ 		return return_type;
+ 	}
+@@ -118,8 +124,21 @@
+ 				|| *return_type != *f.return_type)
+ 			return false;
+ 		for(size_t i = 1 ; i < arg_types.size() ; ++i)
+-			if (*arg_types[i] != *f.arg_types[i])
++		{
++			// For pass-by-value parameters, top-level const doesn't affect
++			// function signature compatibility (C99/C11 6.7.6.3p15)
++			// Compare ignoring const for non-pointer types
++			smartptr<type> t1 = arg_types[i];
++			smartptr<type> t2 = f.arg_types[i];
++			// If both are non-pointer types, compare without const
++			if (!t1.as<pointer_type>() && !t2.as<pointer_type>())
++			{
++				t1 = t1->clone(false, t1->get_address_space());
++				t2 = t2->clone(false, t2->get_address_space());
++			}
++			if (*t1 != *t2)
+ 				return false;
++		}
+ 		return true;
+ 	}
+ }

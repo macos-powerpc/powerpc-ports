@@ -1,0 +1,301 @@
+From 112362bdcf8d4f78ad85bc68df71bcd07350e2d3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 6 Sep 2026 06:34:56 +0000
+Subject: [PATCH] styles: convert the shipped styles to host byte order at
+ build time
+
+The .dtstyle files in data/styles store every module's parameters as a
+dump of the C struct as it sits in memory, written on little-endian
+machines, so a big-endian host imports them as garbage: floats turn into
+denormals and enums into huge integers, and the styles module fills up
+with hundreds of broken camera styles.
+
+Add tools/styles_byteorder.pl, which rewrites the blobs for the opposite
+byte order from a table of struct layouts keyed by module version, with
+text fields left alone and the few 64-bit fields swapped as such. The
+table is closed: a module version it does not know aborts the run, so a
+new shipped style has to be checked against its struct before a
+big-endian build can ship it. On a big-endian host data/styles runs the
+script at build time over the copies in the build tree and installs
+those; little-endian builds are unchanged.
+
+This replaces the earlier workaround of not importing the default
+styles on big-endian hosts.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XfSsLvzPAMMJrirjDuBXbx
+---
+ data/styles/CMakeLists.txt |  31 +++++-
+ src/common/darktable.c     |   9 +-
+ tools/styles_byteorder.pl  | 193 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 224 insertions(+), 9 deletions(-)
+ create mode 100755 tools/styles_byteorder.pl
+
+diff --git data/styles/CMakeLists.txt data/styles/CMakeLists.txt
+index abc6cc0..2e4f834 100644
+--- data/styles/CMakeLists.txt
++++ data/styles/CMakeLists.txt
+@@ -2,7 +2,36 @@
+ # Install default styles
+ #
+ FILE(GLOB STYLE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/darktable*.dtstyle ${CMAKE_CURRENT_SOURCE_DIR}/examples*.dtstyle)
+-install(FILES ${STYLE_FILES} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable/styles COMPONENT DTApplication)
+ # Need to copy to have in build dir so we can run from there and have darktable find the
+ # files like after installing
+ file(COPY ${STYLE_FILES} DESTINATION ${DARKTABLE_DATADIR}/styles)
++
++# the shipped files carry module params as little-endian struct dumps, so a
++# big-endian host gets them rewritten in its own byte order at build time
++# (into the copies made above) and installs those instead
++if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
++  set(DT_HOST_BIG_ENDIAN TRUE)
++elseif(NOT CMAKE_C_BYTE_ORDER)
++  # cmake before 3.20
++  include(TestBigEndian)
++  test_big_endian(DT_HOST_BIG_ENDIAN)
++endif()
++if(DT_HOST_BIG_ENDIAN)
++  set(STYLES_BYTEORDER_SCRIPT ${CMAKE_SOURCE_DIR}/tools/styles_byteorder.pl)
++  set(STYLES_BYTEORDER_STAMP ${CMAKE_CURRENT_BINARY_DIR}/styles_byteorder.stamp)
++  add_custom_command(OUTPUT ${STYLES_BYTEORDER_STAMP}
++    COMMAND ${perl_BIN} ${STYLES_BYTEORDER_SCRIPT} --outdir ${DARKTABLE_DATADIR}/styles ${STYLE_FILES}
++    COMMAND ${CMAKE_COMMAND} -E touch ${STYLES_BYTEORDER_STAMP}
++    DEPENDS ${STYLES_BYTEORDER_SCRIPT} ${STYLE_FILES}
++    COMMENT "Converting the shipped styles to big-endian byte order"
++    VERBATIM)
++  add_custom_target(styles_byteorder ALL DEPENDS ${STYLES_BYTEORDER_STAMP})
++  set(INSTALL_STYLE_FILES)
++  foreach(f ${STYLE_FILES})
++    get_filename_component(n ${f} NAME)
++    list(APPEND INSTALL_STYLE_FILES ${DARKTABLE_DATADIR}/styles/${n})
++  endforeach()
++else()
++  set(INSTALL_STYLE_FILES ${STYLE_FILES})
++endif()
++install(FILES ${INSTALL_STYLE_FILES} DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/darktable/styles COMPONENT DTApplication)
+diff --git src/common/darktable.c src/common/darktable.c
+index da15450..9b8de7f 100644
+--- src/common/darktable.c
++++ src/common/darktable.c
+@@ -1881,10 +1881,7 @@ int dt_init(int argc,
+       dt_gui_presets_init(); // init preset db schema.
+   }
+ 
+-  // import default styles from shared directory. the shipped .dtstyle
+-  // files carry module params as little-endian struct dumps, which a
+-  // big-endian host would import as garbage, so skip them there
+-#if G_BYTE_ORDER == G_LITTLE_ENDIAN
++  // import default styles from shared directory
+   gchar *styledir = g_build_filename(sharedir, "darktable/styles", NULL);
+   if(styledir)
+   {
+@@ -1892,10 +1889,6 @@ int dt_init(int argc,
+     dt_import_default_styles(styledir);
+     g_free(styledir);
+   }
+-#else
+-  dt_print(DT_DEBUG_ALWAYS,
+-           "[init] not importing default styles: they are little-endian encoded");
+-#endif
+ 
+   // we initialize grouping early because it's needed for collection init
+   // idem for folder reachability
+diff --git tools/styles_byteorder.pl tools/styles_byteorder.pl
+new file mode 100755
+index 0000000..44355b1
+--- /dev/null
++++ tools/styles_byteorder.pl
+@@ -0,0 +1,193 @@
++#!__PREFIX__/bin/perl
++#
++#   This file is part of darktable,
++#   Copyright (C) 2026 darktable developers.
++#
++#   darktable is free software: you can redistribute it and/or modify
++#   it under the terms of the GNU General Public License as published by
++#   the Free Software Foundation, either version 3 of the License, or
++#   (at your option) any later version.
++#
++#   darktable is distributed in the hope that it will be useful,
++#   but WITHOUT ANY WARRANTY; without even the implied warranty of
++#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++#   GNU General Public License for more details.
++#
++#   You should have received a copy of the GNU General Public License
++#   along with darktable.  If not, see <http://www.gnu.org/licenses/>.
++#
++# Rewrite the module parameter blobs of .dtstyle files for a host of the
++# opposite byte order.
++#
++# A .dtstyle stores every module's parameters as a hex or gzip+base64 dump
++# of the C struct exactly as it sits in memory, so the shipped files, which
++# were written on little-endian machines, are garbage on a big-endian host.
++# The layout table below says, per module version found in the shipped
++# files, how big the struct is and which byte ranges are not 4-byte words:
++# text fields are left alone, 64-bit fields are swapped as 8-byte words,
++# everything else is swapped as 4-byte words. Reversing bytes is symmetric,
++# so the same run converts in either direction.
++#
++# The table is deliberately closed: a module version it does not know
++# stops the run, so a new shipped style is checked against its struct
++# before a big-endian build silently ships it converted wrongly.
++#
++# usage: styles_byteorder.pl --outdir DIR file.dtstyle...
++
++use strict;
++use warnings;
++use Getopt::Long;
++use File::Basename;
++use Compress::Zlib ();
++use MIME::Base64 ();
++
++# key: "<operation>:<module version>", or "blendop:<blendop version>".
++# size: sizeof(params struct) on LP64. bytes: [offset, length] ranges of
++# 8-bit data. words64: [offset, length] ranges of 64-bit data.
++my %layout = (
++  'atrous:2'          => { size => 248 },
++  'basecurve:6'       => { size => 520 },
++  'bilat:3'           => { size => 20 },
++  'blurs:1'           => { size => 36 },
++  # char aspect_text[20], pos_h_text[20], pos_v_text[20]
++  'borders:4'         => { size => 120, bytes => [ [16, 20], [48, 20], [72, 20] ] },
++  'colorbalancergb:5' => { size => 132 },
++  'colorequal:4'      => { size => 128 },
++  'diffuse:2'         => { size => 60 },
++  'enlargecanvas:1'   => { size => 20 },
++  'exposure:6'        => { size => 24 },
++  'filmicrgb:6'       => { size => 116 },
++  'hazeremoval:2'     => { size => 12 },
++  'highlights:4'      => { size => 48 },
++  # char camera[128], lens[128]
++  'lens:10'           => { size => 356, bytes => [ [36, 256] ] },
++  'lowlight:1'        => { size => 52 },
++  # char filename[1024], then size_t dummy0, dummy1 and int64_t dummy2
++  'overlay:1'         => { size => 1088, bytes => [ [40, 1024] ], words64 => [ [1064, 24] ] },
++  'primaries:1'       => { size => 32 },
++  'sigmoid:3'         => { size => 56 },
++  # char filename[64] and text[512] back to back, float color[3], char font[64]
++  'watermark:6'       => { size => 688, bytes => [ [36, 576], [624, 64] ] },
++  # dt_develop_blend_params_t: dt_dev_operation_t raster_mask_source is char[20]
++  'blendop:13'        => { size => 420, bytes => [ [388, 20] ] },
++);
++
++my $outdir;
++GetOptions('outdir=s' => \$outdir) && defined $outdir && @ARGV
++  or die "usage: $0 --outdir DIR file.dtstyle...\n";
++-d $outdir or die "$0: $outdir is not a directory\n";
++
++# split the struct into segments of (offset, length, word size); word size 1
++# means leave the bytes alone
++sub segments
++{
++  my ($key, $l) = @_;
++  my @special = map { [ $_->[0], $_->[1], 1 ] } @{ $l->{bytes} || [] };
++  push @special, map { [ $_->[0], $_->[1], 8 ] } @{ $l->{words64} || [] };
++  @special = sort { $a->[0] <=> $b->[0] } @special;
++  my @seg;
++  my $pos = 0;
++  for my $s (@special)
++  {
++    die "$key: overlapping ranges\n" if $s->[0] < $pos;
++    push @seg, [ $pos, $s->[0] - $pos, 4 ] if $s->[0] > $pos;
++    push @seg, $s;
++    $pos = $s->[0] + $s->[1];
++  }
++  die "$key: range past the end of the struct\n" if $pos > $l->{size};
++  push @seg, [ $pos, $l->{size} - $pos, 4 ] if $pos < $l->{size};
++  for my $s (@seg)
++  {
++    die "$key: segment at $s->[0] of length $s->[1] is not a whole number of $s->[2]-byte words\n"
++      if $s->[1] % $s->[2];
++  }
++  return @seg;
++}
++
++sub swap_struct
++{
++  my ($key, $blob) = @_;
++  my $l = $layout{$key} or die "no layout for $key: add it to the table after checking the struct\n";
++  die "$key: blob is " . length($blob) . " bytes, expected $l->{size}\n"
++    if length($blob) != $l->{size};
++  my $out = '';
++  for my $s (segments($key, $l))
++  {
++    my ($off, $len, $w) = @$s;
++    if($w == 1)
++    {
++      $out .= substr($blob, $off, $len);
++    }
++    else
++    {
++      for(my $i = $off; $i < $off + $len; $i += $w)
++      {
++        $out .= scalar reverse substr($blob, $i, $w);
++      }
++    }
++  }
++  return $out;
++}
++
++# the encodings of dt_exif_xmp_encode()/dt_exif_xmp_decode(): plain hex, or
++# "gz" + two-digit compression factor + base64 of a zlib stream
++sub decode
++{
++  my ($s) = @_;
++  if($s =~ /^gz\d\d/)
++  {
++    my $z = MIME::Base64::decode_base64(substr($s, 4));
++    my $d = Compress::Zlib::uncompress($z);
++    defined $d or die "cannot uncompress a blob\n";
++    return ($d, 1);
++  }
++  $s =~ /^[0-9a-f]*$/ or die "blob is neither hex nor gz\n";
++  return (pack('H*', $s), 0);
++}
++
++sub encode
++{
++  my ($d, $compressed) = @_;
++  return unpack('H*', $d) unless $compressed;
++  my $z = Compress::Zlib::compress($d);
++  defined $z or die "cannot compress a blob\n";
++  my $factor = int(length($d) / length($z)) + 1;
++  $factor = 99 if $factor > 99;
++  return sprintf('gz%02d%s', $factor, MIME::Base64::encode_base64($z, ''));
++}
++
++sub convert_blob
++{
++  my ($key, $s) = @_;
++  return $s if $s eq '';
++  my ($d, $compressed) = decode($s);
++  return encode(swap_struct($key, $d), $compressed);
++}
++
++sub convert_plugin
++{
++  my ($p) = @_;
++  my ($op) = $p =~ m{<operation>([^<]*)</operation>} or die "plugin without operation\n";
++  my ($ver) = $p =~ m{<module>([^<]*)</module>} or die "$op: plugin without module version\n";
++  my ($bver) = $p =~ m{<blendop_version>([^<]*)</blendop_version>} or die "$op: plugin without blendop version\n";
++  $p =~ s{<op_params>([^<]*)</op_params>}{'<op_params>' . convert_blob("$op:$ver", $1) . '</op_params>'}e;
++  $p =~ s{<blendop_params>([^<]*)</blendop_params>}{'<blendop_params>' . convert_blob("blendop:$bver", $1) . '</blendop_params>'}e;
++  return $p;
++}
++
++for my $file (@ARGV)
++{
++  open(my $in, '<:raw', $file) or die "cannot read $file: $!\n";
++  local $/;
++  my $xml = <$in>;
++  close($in);
++  eval
++  {
++    $xml =~ s{<plugin>(.*?)</plugin>}{'<plugin>' . convert_plugin($1) . '</plugin>'}gse;
++  };
++  die "$file: $@" if $@;
++  my $out = $outdir . '/' . basename($file);
++  open(my $o, '>:raw', $out) or die "cannot write $out: $!\n";
++  print $o $xml;
++  close($o) or die "cannot write $out: $!\n";
++}

@@ -1,0 +1,868 @@
+From ad4b677d9a761f31daed298572201ca50d305afb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 02:56:18 +0000
+Subject: [PATCH] avcodec/ppc: add AltiVec HEVC deblocking filters, luma and
+ chroma, 8 and 10-bit
+
+Deblocking was the one HEVC stage with no PowerPC path at all (neither
+upstream nor PowerVLC ever wrote one); MC, SAO and the transforms are
+covered, so it was the largest remaining scalar share of a decode on
+these machines. New libavcodec/ppc/hevcdsp_deblock_template.c, included
+from hevcdsp.c per bit depth like the SAO/inter templates, providing
+hevc_{h,v}_loop_filter_{luma,chroma} at 8 and 10 bits and registered in
+both the plain and the _c slots (the kernels honour no_p/no_q, so the
+pcm/transquant-bypass path deblocking_filter_CTB() takes is served too;
+other architectures leave the _c slots on C).
+
+Design: the eight lines of one call are the eight int16 lanes of one
+vector per tap p3..q3, lanes 0-3 the first 4-line segment (tc[0],
+no_p[0], no_q[0]) and 4-7 the second, so the whole of
+hevc_loop_filter_luma() -- the per-segment decisions from lines 0 and 3
+(d0 + d3 < beta, the six-part strong test, nd_p/nd_q), the strong and
+the weak filter of h2656_deblock_template.c -- is lane arithmetic on
+eight vectors. The two lines of a segment are brought together with two
+constant permutes (lane 0 and lane 3 of each half broadcast to the
+half), strong and weak are both always computed and merged per lane
+with vec_sel under the strong/weak/skip and no_p/no_q masks; the only
+branch is the early return when neither segment passes d0 + d3 < beta
+(or both tc are 0), in which case nothing is stored. The int16
+intermediates fit at both depths (largest strong sum 8 * 1023 + 4, weak
+delta0 numerator 12 * 1023 + 8); the pixel clip is the store's
+vec_packsu at 8 bits and a min/max pair at 10. The horizontal-edge
+filters load each tap row directly; the vertical-edge filters load one
+row per vector and transpose (8x8 bytes: the vp9dsp network; 8x8 and
+8x4 16-bit: three levels of 16-bit merges; 8x4 bytes: the first two
+levels of the byte network), filter, and transpose back to store.
+Parameters reach the vector unit through one aligned 8 x int16 block
+(tc, no_p, no_q per segment, beta) and one vec_ld, written before the
+pixel loads so the store has retired by the time it is read.
+
+Store contract as the C, NEON and x86 versions: vertical-edge stores
+write the full 8 (chroma: only the p0/q0 pair, two element stores per
+row) taps of every row back, p3/q3 unchanged, like the aarch64 version;
+horizontal-edge stores touch only rows p2..q2 (chroma p0/q0). No store
+reads memory first: a plain vec_st on a 16-aligned 10-bit row,
+otherwise a vec_lvsr rotation and stvewx/stvehx/stvebx element stores,
+so nothing outside the row's own bytes is rewritten and there is no
+read-modify-write anywhere. Loads only touch the aligned 16-byte blocks
+holding bytes actually needed (mc_load8_u8's vec_ld(0)/vec_ld(7)
+splice, a vec_ld(3) variant for the 4-byte chroma rows), alignment is
+recomputed per row, and any pix alignment and stride are handled.
+Reuses the inter template's mc_load8/mc_store8/mc_store_mode helpers.
+
+Validated (qemu-ppc-static -cpu 7400, incremental -j1 build,
+warning-free): checkasm --test=hevc_deblock seeds 42/1/777 "all 32
+tests passed" -- chroma, chroma_full, luma (strong/weak/skip),
+luma_full at 8, 10 and 12 bits (12-bit stays C), every 8/10-bit entry
+a real ALTIVEC dispatch. Real-G4/G5 --bench pending.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017pZCe229PctajyxMfguX3z
+---
+ libavcodec/ppc/hevcdsp.c                  |  22 +
+ libavcodec/ppc/hevcdsp_deblock_template.c | 732 ++++++++++++++++++++++
+ 2 files changed, 754 insertions(+)
+ create mode 100644 libavcodec/ppc/hevcdsp_deblock_template.c
+
+diff --git a/libavcodec/ppc/hevcdsp.c b/libavcodec/ppc/hevcdsp.c
+index 602a1c3..ef313cd 100644
+--- a/libavcodec/ppc/hevcdsp.c
++++ b/libavcodec/ppc/hevcdsp.c
+@@ -119,6 +119,7 @@ static void ff_hevc_idct_32x32_10_altivec(int16_t *c, int l) { idct_altivec(c, 3
+ #if HAVE_BIGENDIAN
+ #include "hevcdsp_sao_template.c"
+ #include "hevcdsp_inter_template.c"
++#include "hevcdsp_deblock_template.c"
+ #endif
+ #undef BIT_DEPTH
+ 
+@@ -127,6 +128,7 @@ static void ff_hevc_idct_32x32_10_altivec(int16_t *c, int l) { idct_altivec(c, 3
+ #if HAVE_BIGENDIAN
+ #include "hevcdsp_sao_template.c"
+ #include "hevcdsp_inter_template.c"
++#include "hevcdsp_deblock_template.c"
+ #endif
+ #undef BIT_DEPTH
+ 
+@@ -390,6 +392,24 @@ static void put_hevc_qpel_hv_altivec(int16_t *dst, const uint8_t *src,
+         }                                                                      \
+     } while (0)
+ 
++/*
++ * Deblocking: the one HEVC stage that had no PowerPC path at all. The
++ * kernels honour no_p/no_q, so they also serve the _c slots that
++ * deblocking_filter_CTB() uses when pcm_loop_filter_disabled or
++ * transquant_bypass is in effect (the other architectures leave those on C).
++ */
++#define DEBLOCK_SET(depth)                                                     \
++    do {                                                                       \
++        c->hevc_h_loop_filter_luma     = ff_hevc_h_loop_filter_luma_ ## depth ## _altivec;   \
++        c->hevc_v_loop_filter_luma     = ff_hevc_v_loop_filter_luma_ ## depth ## _altivec;   \
++        c->hevc_h_loop_filter_chroma   = ff_hevc_h_loop_filter_chroma_ ## depth ## _altivec; \
++        c->hevc_v_loop_filter_chroma   = ff_hevc_v_loop_filter_chroma_ ## depth ## _altivec; \
++        c->hevc_h_loop_filter_luma_c   = ff_hevc_h_loop_filter_luma_ ## depth ## _altivec;   \
++        c->hevc_v_loop_filter_luma_c   = ff_hevc_v_loop_filter_luma_ ## depth ## _altivec;   \
++        c->hevc_h_loop_filter_chroma_c = ff_hevc_h_loop_filter_chroma_ ## depth ## _altivec; \
++        c->hevc_v_loop_filter_chroma_c = ff_hevc_v_loop_filter_chroma_ ## depth ## _altivec; \
++    } while (0)
++
+ av_cold void ff_hevc_dsp_init_ppc(HEVCDSPContext *c, const int bit_depth)
+ {
+ #if HAVE_ALTIVEC
+@@ -437,6 +457,7 @@ av_cold void ff_hevc_dsp_init_ppc(HEVCDSPContext *c, const int bit_depth)
+             c->put_hevc_qpel[i][1][0] = put_hevc_qpel_v_altivec;
+             c->put_hevc_qpel[i][1][1] = put_hevc_qpel_hv_altivec;
+         }
++        DEBLOCK_SET(8);
+     }
+     if (bit_depth == 10) {
+         c->add_residual[1] = ff_hevc_add_residual8x8_10_altivec;
+@@ -450,6 +471,7 @@ av_cold void ff_hevc_dsp_init_ppc(HEVCDSPContext *c, const int bit_depth)
+         c->sao_edge_filter[0] = c->sao_edge_filter[1] = c->sao_edge_filter[2] =
+         c->sao_edge_filter[3] = c->sao_edge_filter[4] = ff_hevc_sao_edge_filter_10_altivec;
+         MC_SET(10);
++        DEBLOCK_SET(10);
+     }
+ #endif /* HAVE_BIGENDIAN */
+ #endif /* HAVE_ALTIVEC */
+diff --git a/libavcodec/ppc/hevcdsp_deblock_template.c b/libavcodec/ppc/hevcdsp_deblock_template.c
+new file mode 100644
+index 0000000..60cf663
+--- /dev/null
++++ b/libavcodec/ppc/hevcdsp_deblock_template.c
+@@ -0,0 +1,732 @@
++/*
++ * AltiVec-optimized HEVC deblocking filters
++ * Copyright (c) 2026 Sergey Fedorov
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Included from hevcdsp.c once per BIT_DEPTH (8 and 10), after
++ * hevcdsp_inter_template.c, whose per-depth mc_load8/mc_store8 helpers and
++ * the depth-independent mc_load8_u8/mc_store_mode/MC_ST_* it reuses.
++ *
++ * Both filters process the eight lines of one call with one int16 lane per
++ * line: lanes 0-3 are the first 4-line segment (tc[0], no_p[0], no_q[0]),
++ * lanes 4-7 the second. Every tap p3..q3 is one vector, so the whole filter
++ * -- the two per-segment decisions taken from lines 0 and 3, the strong and
++ * the weak luma filter, the pixel clip -- is straight lane arithmetic on
++ * eight such vectors, and the strong/weak/skip choice becomes a select mask
++ * per lane: both filters are always computed and merged with vec_sel, the
++ * only branch is the early return when neither segment passes the
++ * d0 + d3 < beta test (or, for chroma, both tc are zero), in which case
++ * nothing is stored.
++ *
++ * The horizontal-edge filters (hevc_h_*, taps are rows) load each tap row
++ * directly. The vertical-edge filters (hevc_v_*, taps are the 8 or 4 bytes
++ * around the edge in each row) load one row per vector and transpose so
++ * that each tap becomes a vector, then transpose back to store. The
++ * int16 intermediates fit at both depths: the largest strong-filter sum is
++ * 8 * 1023 + 4, the weak delta0 numerator 12 * 1023 + 8.
++ *
++ * Contract (same as the C and the NEON/x86 versions): the taps that the C
++ * reference never modifies (p3/q3, and chroma p1/q1) are read and written
++ * back unchanged by the transposed vertical-edge stores, exactly as the
++ * aarch64 version does; the horizontal-edge stores touch only rows
++ * p2..q2 (chroma: p0/q0). No store reads memory first: every store is a
++ * plain vec_st on a 16-aligned 10-bit row, or a vec_lvsr rotation followed
++ * by element stores (stvewx/stvehx/stvebx select the stored element from
++ * the target address), so nothing outside the row's own bytes is rewritten
++ * and no read-modify-write happens. Loads only ever touch the aligned
++ * 16-byte blocks that hold bytes actually needed. Any pix alignment and
++ * any stride are handled; alignment is recomputed per row.
++ */
++
++#if BIT_DEPTH == 8
++#   define PIXEL uint8_t
++#else
++#   define PIXEL uint16_t
++#endif
++
++#ifndef HEVC_DEBLOCK_ALTIVEC_COMMON
++#define HEVC_DEBLOCK_ALTIVEC_COMMON
++/* depth-independent part, seen once */
++
++/* bytes {2k,2k+1} of the source into int16 lanes 0-3 and {2k+2,2k+3} into
++ * lanes 4-7: spreads a per-segment pair of int16 parameters to its lanes */
++#define DBK_SEG_PAIR(k) ((const vec_u8){                                    \
++    2 * (k),     2 * (k) + 1, 2 * (k),     2 * (k) + 1,                     \
++    2 * (k),     2 * (k) + 1, 2 * (k),     2 * (k) + 1,                     \
++    2 * (k) + 2, 2 * (k) + 3, 2 * (k) + 2, 2 * (k) + 3,                     \
++    2 * (k) + 2, 2 * (k) + 3, 2 * (k) + 2, 2 * (k) + 3 })
++
++/* lane 0 to lanes 0-3, lane 4 to lanes 4-7 (line 0 of each segment) */
++static const vec_u8 dbk_seg_line0 = {  0,  1,  0,  1,  0,  1,  0,  1,
++                                       8,  9,  8,  9,  8,  9,  8,  9 };
++/* lane 3 to lanes 0-3, lane 7 to lanes 4-7 (line 3 of each segment) */
++static const vec_u8 dbk_seg_line3 = {  6,  7,  6,  7,  6,  7,  6,  7,
++                                      14, 15, 14, 15, 14, 15, 14, 15 };
++
++/* |a - b| */
++static av_always_inline vec_s16 dbk_absd(vec_s16 a, vec_s16 b)
++{
++    return vec_sub(vec_max(a, b), vec_min(a, b));
++}
++
++/* av_clip(v, lo, hi) */
++static av_always_inline vec_s16 dbk_clip(vec_s16 v, vec_s16 lo, vec_s16 hi)
++{
++    return vec_max(vec_min(v, hi), lo);
++}
++
++/* per segment, the sum of the values in its lines 0 and 3, broadcast to
++ * all four of its lanes */
++static av_always_inline vec_s16 dbk_seg03(vec_s16 v)
++{
++    return vec_add(vec_perm(v, v, dbk_seg_line0), vec_perm(v, v, dbk_seg_line3));
++}
++
++/* per segment, the AND of a per-line mask in its lines 0 and 3 */
++static av_always_inline vec_u16 dbk_seg03_and(vec_u16 m)
++{
++    return vec_and(vec_perm(m, m, dbk_seg_line0), vec_perm(m, m, dbk_seg_line3));
++}
++
++/*
++ * The parameters of one call as vectors: tc and beta already scaled to the
++ * bit depth, tc / no_p / no_q per segment. One aligned scalar-written block
++ * and one vector load is the only way a scalar reaches a vector register on
++ * AltiVec (no GPR-to-VR move); the block is written first thing so the
++ * store has retired by the time the loads below need it.
++ */
++typedef struct {
++    vec_s16 tc, beta;
++    vec_u16 okp, okq;   /* all-ones where the P (Q) side may be modified */
++} dbk_params;
++
++static av_always_inline void dbk_load_params(dbk_params *pr, const int16_t *prm)
++{
++    const vec_s16 v = vec_ld(0, prm);
++    const vec_s16 z = vec_splat_s16(0);
++    pr->tc   = vec_perm(v, v, DBK_SEG_PAIR(0));
++    pr->okp  = (vec_u16)vec_cmpeq(vec_perm(v, v, DBK_SEG_PAIR(2)), z);
++    pr->okq  = (vec_u16)vec_cmpeq(vec_perm(v, v, DBK_SEG_PAIR(4)), z);
++    pr->beta = vec_splat(v, 6);
++}
++
++/*
++ * Luma filter core on eight lines: hevc_loop_filter_luma() of
++ * libavcodec/hevc/dsp_template.c plus loop_filter_luma_strong/weak of
++ * libavcodec/h26x/h2656_deblock_template.c, as lane arithmetic. Returns 0
++ * (taps untouched) when neither segment passes d0 + d3 < beta, else 1 with
++ * p2..q2 updated. Results are NOT clipped to the pixel range: the callers'
++ * stores do that (the strong filter's results are in range by
++ * construction, the weak filter's need the av_clip_pixel).
++ */
++static av_always_inline int dbk_luma(vec_s16 p3, vec_s16 *pp2, vec_s16 *pp1,
++                                     vec_s16 *pp0, vec_s16 *pq0, vec_s16 *pq1,
++                                     vec_s16 *pq2, vec_s16 q3,
++                                     const dbk_params *pr)
++{
++    const vec_s16 z   = vec_splat_s16(0);
++    const vec_s16 c1  = vec_splat_s16(1);
++    const vec_s16 c2  = vec_splat_s16(2);
++    const vec_s16 c4  = vec_splat_s16(4);
++    const vec_s16 c8  = vec_splat_s16(8);
++    const vec_u16 sh1 = vec_splat_u16(1);
++    const vec_u16 sh2 = vec_splat_u16(2);
++    const vec_u16 sh3 = vec_splat_u16(3);
++    const vec_u16 sh4 = vec_splat_u16(4);
++    const vec_s16 p2 = *pp2, p1 = *pp1, p0 = *pp0;
++    const vec_s16 q0 = *pq0, q1 = *pq1, q2 = *pq2;
++    const vec_s16 tc = pr->tc, beta = pr->beta;
++    vec_s16 dp, dq, d, beta2, beta3, tc25, thr, tc2, ntc2, tc10, ntc, tch, ntch;
++    vec_s16 pq, t, a, b, d0, dp1, dq1;
++    vec_s16 p0s, p1s, p2s, q0s, q1s, q2s, p0w, p1w, q0w, q1w;
++    vec_u16 mf, cs, ms, ndp, ndq, mw, mP, mQ, sP, sQ, wP, wQ;
++
++    /* ---- decisions, from lines 0 and 3 of each segment ---- */
++    dp = dbk_absd(vec_add(p2, p0), vec_sl(p1, sh1));   /* |p2 - 2p1 + p0| */
++    dq = dbk_absd(vec_add(q2, q0), vec_sl(q1, sh1));   /* |q2 - 2q1 + q0| */
++    d  = vec_add(dp, dq);
++    mf = (vec_u16)vec_cmplt(dbk_seg03(d), beta);       /* d0 + d3 < beta   */
++    if (!vec_any_ne(mf, (vec_u16)z))
++        return 0;
++
++    beta3 = vec_sra(beta, sh3);
++    beta2 = vec_sra(beta, sh2);
++    tc25  = vec_sra(vec_add(vec_add(vec_sl(tc, sh2), tc), c1), sh1);  /* (5tc+1)>>1 */
++    /* strong, per line: |p3-p0|+|q3-q0| < beta_3 && |p0-q0| < tc25 && 2d < beta_2 */
++    cs = vec_and((vec_u16)vec_cmplt(vec_add(dbk_absd(p3, p0), dbk_absd(q3, q0)), beta3),
++                 (vec_u16)vec_cmplt(dbk_absd(p0, q0), tc25));
++    cs = vec_and(cs, (vec_u16)vec_cmplt(vec_sl(d, sh1), beta2));
++    ms = dbk_seg03_and(cs);                             /* both lines: strong */
++    /* weak: nd_p/nd_q = dp0 + dp3 (dq0 + dq3) < (beta + (beta >> 1)) >> 3 */
++    thr = vec_sra(vec_add(beta, vec_sra(beta, sh1)), sh3);
++    ndp = (vec_u16)vec_cmplt(dbk_seg03(dp), thr);
++    ndq = (vec_u16)vec_cmplt(dbk_seg03(dq), thr);
++
++    mP = vec_and(mf, pr->okp);
++    mQ = vec_and(mf, pr->okq);
++    sP = vec_and(ms, mP);
++    sQ = vec_and(ms, mQ);
++
++    /* ---- strong filter (clip against +-2tc) ---- */
++    tc2  = vec_sl(tc, sh1);
++    ntc2 = vec_sub(z, tc2);
++    pq   = vec_add(p0, q0);
++    /* P0 = p0 + clip(((p2 + 2p1 + 2p0 + 2q0 + q1 + 4) >> 3) - p0) */
++    t   = vec_add(vec_add(p2, q1), vec_sl(vec_add(p1, pq), sh1));
++    t   = vec_sra(vec_add(t, c4), sh3);
++    p0s = vec_add(p0, dbk_clip(vec_sub(t, p0), ntc2, tc2));
++    /* P1 = p1 + clip(((p2 + p1 + p0 + q0 + 2) >> 2) - p1) */
++    t   = vec_sra(vec_add(vec_add(vec_add(p2, p1), pq), c2), sh2);
++    p1s = vec_add(p1, dbk_clip(vec_sub(t, p1), ntc2, tc2));
++    /* P2 = p2 + clip(((2p3 + 3p2 + p1 + p0 + q0 + 4) >> 3) - p2) */
++    t   = vec_add(vec_sl(vec_add(p3, p2), sh1), vec_add(vec_add(p2, p1), pq));
++    t   = vec_sra(vec_add(t, c4), sh3);
++    p2s = vec_add(p2, dbk_clip(vec_sub(t, p2), ntc2, tc2));
++    /* Q0 = q0 + clip(((p1 + 2p0 + 2q0 + 2q1 + q2 + 4) >> 3) - q0) */
++    t   = vec_add(vec_add(p1, q2), vec_sl(vec_add(pq, q1), sh1));
++    t   = vec_sra(vec_add(t, c4), sh3);
++    q0s = vec_add(q0, dbk_clip(vec_sub(t, q0), ntc2, tc2));
++    /* Q1 = q1 + clip(((p0 + q0 + q1 + q2 + 2) >> 2) - q1) */
++    t   = vec_sra(vec_add(vec_add(vec_add(q2, q1), pq), c2), sh2);
++    q1s = vec_add(q1, dbk_clip(vec_sub(t, q1), ntc2, tc2));
++    /* Q2 = q2 + clip(((2q3 + 3q2 + q1 + q0 + p0 + 4) >> 3) - q2) */
++    t   = vec_add(vec_sl(vec_add(q3, q2), sh1), vec_add(vec_add(q2, q1), pq));
++    t   = vec_sra(vec_add(t, c4), sh3);
++    q2s = vec_add(q2, dbk_clip(vec_sub(t, q2), ntc2, tc2));
++
++    /* ---- weak filter ---- */
++    /* delta0 = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4 */
++    a  = vec_sub(q0, p0);
++    b  = vec_sub(q1, p1);
++    d0 = vec_sub(vec_add(vec_sl(a, sh3), a), vec_add(vec_sl(b, sh1), b));
++    d0 = vec_sra(vec_add(d0, c8), sh4);
++    /* abs(delta0) < 10 * tc */
++    tc10 = vec_add(vec_sl(tc, sh3), vec_sl(tc, sh1));
++    mw   = (vec_u16)vec_cmplt(dbk_absd(d0, z), tc10);
++    ntc  = vec_sub(z, tc);
++    d0   = dbk_clip(d0, ntc, tc);
++    tch  = vec_sra(tc, sh1);                           /* tc >> 1 */
++    ntch = vec_sub(z, tch);
++    /* deltap1 = clip((((p2 + p0 + 1) >> 1) - p1 + delta0) >> 1, -tc_2, tc_2) */
++    dp1 = vec_sra(vec_add(vec_sub(vec_sra(vec_add(vec_add(p2, p0), c1), sh1), p1), d0), sh1);
++    dp1 = dbk_clip(dp1, ntch, tch);
++    /* deltaq1 = clip((((q2 + q0 + 1) >> 1) - q1 - delta0) >> 1, -tc_2, tc_2) */
++    dq1 = vec_sra(vec_sub(vec_sub(vec_sra(vec_add(vec_add(q2, q0), c1), sh1), q1), d0), sh1);
++    dq1 = dbk_clip(dq1, ntch, tch);
++    p0w = vec_add(p0, d0);
++    q0w = vec_sub(q0, d0);
++    p1w = vec_add(p1, vec_and(dp1, (vec_s16)ndp));     /* only when nd_p > 1 */
++    q1w = vec_add(q1, vec_and(dq1, (vec_s16)ndq));
++
++    /* ---- merge: weak where its delta0 test passes, strong on top ---- */
++    wP = vec_and(mw, mP);
++    wQ = vec_and(mw, mQ);
++    *pp0 = vec_sel(vec_sel(p0, p0w, wP), p0s, sP);
++    *pp1 = vec_sel(vec_sel(p1, p1w, wP), p1s, sP);
++    *pp2 = vec_sel(p2, p2s, sP);
++    *pq0 = vec_sel(vec_sel(q0, q0w, wQ), q0s, sQ);
++    *pq1 = vec_sel(vec_sel(q1, q1w, wQ), q1s, sQ);
++    *pq2 = vec_sel(q2, q2s, sQ);
++    return 1;
++}
++
++/*
++ * Chroma filter core on eight lines: loop_filter_chroma_weak() of
++ * h2656_deblock_template.c. A segment with tc == 0 gets delta == 0 and so
++ * keeps its pixels, which is what the C's `if (tc > 0)` amounts to (tc is
++ * never negative: tctable and chroma_tc are non-negative). Results are not
++ * clipped to the pixel range; the callers' stores do that.
++ */
++static av_always_inline void dbk_chroma(vec_s16 p1, vec_s16 *pp0, vec_s16 *pq0,
++                                        vec_s16 q1, const dbk_params *pr)
++{
++    const vec_s16 z   = vec_splat_s16(0);
++    const vec_s16 c4  = vec_splat_s16(4);
++    const vec_u16 sh2 = vec_splat_u16(2);
++    const vec_u16 sh3 = vec_splat_u16(3);
++    const vec_s16 p0 = *pp0, q0 = *pq0;
++    vec_s16 d;
++
++    /* delta0 = clip((((q0 - p0) * 4) + p1 - q1 + 4) >> 3, -tc, tc) */
++    d = vec_add(vec_sl(vec_sub(q0, p0), sh2), vec_sub(p1, q1));
++    d = vec_sra(vec_add(d, c4), sh3);
++    d = dbk_clip(d, vec_sub(z, pr->tc), pr->tc);
++    *pp0 = vec_sel(p0, vec_add(p0, d), pr->okp);
++    *pq0 = vec_sel(q0, vec_sub(q0, d), pr->okq);
++}
++
++/*
++ * Transpose an 8x8 block of bytes held in the low 8 lanes of 8 vectors
++ * (copy of transpose_8x8_u8 in vp9dsp_altivec.c, kept in sync). Output
++ * vector k holds column k of the input in its low 8 lanes. An involution,
++ * so the same routine serves both the load->filter and filter->store
++ * directions.
++ */
++static av_always_inline void dbk_transpose_8x8_u8(vec_u8 *r0, vec_u8 *r1,
++                                                  vec_u8 *r2, vec_u8 *r3,
++                                                  vec_u8 *r4, vec_u8 *r5,
++                                                  vec_u8 *r6, vec_u8 *r7)
++{
++    vec_u8 m1_0 = vec_mergeh(*r0, *r4);
++    vec_u8 m1_1 = vec_mergeh(*r1, *r5);
++    vec_u8 m1_2 = vec_mergeh(*r2, *r6);
++    vec_u8 m1_3 = vec_mergeh(*r3, *r7);
++    vec_u8 m2_0 = vec_mergeh(m1_0, m1_2);
++    vec_u8 m2_1 = vec_mergel(m1_0, m1_2);
++    vec_u8 m2_2 = vec_mergeh(m1_1, m1_3);
++    vec_u8 m2_3 = vec_mergel(m1_1, m1_3);
++    vec_u8 c0 = vec_mergeh(m2_0, m2_2);   /* col0 | col1 */
++    vec_u8 c1 = vec_mergel(m2_0, m2_2);   /* col2 | col3 */
++    vec_u8 c2 = vec_mergeh(m2_1, m2_3);   /* col4 | col5 */
++    vec_u8 c3 = vec_mergel(m2_1, m2_3);   /* col6 | col7 */
++
++    *r0 = c0;
++    *r1 = vec_sld(c0, c0, 8);
++    *r2 = c1;
++    *r3 = vec_sld(c1, c1, 8);
++    *r4 = c2;
++    *r5 = vec_sld(c2, c2, 8);
++    *r6 = c3;
++    *r7 = vec_sld(c3, c3, 8);
++}
++
++/*
++ * 8 rows of 4 bytes (low 4 lanes of r0..r7) -> 4 columns of 8 bytes (low 8
++ * lanes of c0..c3): the first two levels of the network above, which only
++ * ever touch the low halves.
++ */
++static av_always_inline void dbk_transpose_8x4_u8(vec_u8 r0, vec_u8 r1, vec_u8 r2, vec_u8 r3,
++                                                  vec_u8 r4, vec_u8 r5, vec_u8 r6, vec_u8 r7,
++                                                  vec_u8 *c0, vec_u8 *c1, vec_u8 *c2, vec_u8 *c3)
++{
++    vec_u8 m0 = vec_mergeh(r0, r4);
++    vec_u8 m1 = vec_mergeh(r1, r5);
++    vec_u8 m2 = vec_mergeh(r2, r6);
++    vec_u8 m3 = vec_mergeh(r3, r7);
++    vec_u8 n0 = vec_mergeh(m0, m2);       /* even rows, cols 0..3 */
++    vec_u8 n1 = vec_mergeh(m1, m3);       /* odd rows,  cols 0..3 */
++    vec_u8 c01 = vec_mergeh(n0, n1);      /* col0 | col1 */
++    vec_u8 c23 = vec_mergel(n0, n1);      /* col2 | col3 */
++
++    *c0 = c01;
++    *c1 = vec_sld(c01, c01, 8);
++    *c2 = c23;
++    *c3 = vec_sld(c23, c23, 8);
++}
++
++/* Full 8x8 transpose of 16-bit elements, three levels of 16-bit merges.
++ * Output k is column k of the input; an involution. */
++static av_always_inline void dbk_transpose_8x8_u16(vec_u16 *r0, vec_u16 *r1,
++                                                   vec_u16 *r2, vec_u16 *r3,
++                                                   vec_u16 *r4, vec_u16 *r5,
++                                                   vec_u16 *r6, vec_u16 *r7)
++{
++    vec_u16 m0 = vec_mergeh(*r0, *r4), m1 = vec_mergel(*r0, *r4);
++    vec_u16 m2 = vec_mergeh(*r1, *r5), m3 = vec_mergel(*r1, *r5);
++    vec_u16 m4 = vec_mergeh(*r2, *r6), m5 = vec_mergel(*r2, *r6);
++    vec_u16 m6 = vec_mergeh(*r3, *r7), m7 = vec_mergel(*r3, *r7);
++    vec_u16 n0 = vec_mergeh(m0, m4), n1 = vec_mergel(m0, m4);  /* even rows, cols 0,1 / 2,3 */
++    vec_u16 n2 = vec_mergeh(m2, m6), n3 = vec_mergel(m2, m6);  /* odd rows,  cols 0,1 / 2,3 */
++    vec_u16 n4 = vec_mergeh(m1, m5), n5 = vec_mergel(m1, m5);  /* even rows, cols 4,5 / 6,7 */
++    vec_u16 n6 = vec_mergeh(m3, m7), n7 = vec_mergel(m3, m7);  /* odd rows,  cols 4,5 / 6,7 */
++
++    *r0 = vec_mergeh(n0, n2);
++    *r1 = vec_mergel(n0, n2);
++    *r2 = vec_mergeh(n1, n3);
++    *r3 = vec_mergel(n1, n3);
++    *r4 = vec_mergeh(n4, n6);
++    *r5 = vec_mergel(n4, n6);
++    *r6 = vec_mergeh(n5, n7);
++    *r7 = vec_mergel(n5, n7);
++}
++
++/* 8 rows of 4 16-bit elements (low 4 lanes of r0..r7) -> 4 columns of 8 */
++static av_always_inline void dbk_transpose_8x4_u16(vec_u16 r0, vec_u16 r1, vec_u16 r2, vec_u16 r3,
++                                                   vec_u16 r4, vec_u16 r5, vec_u16 r6, vec_u16 r7,
++                                                   vec_u16 *c0, vec_u16 *c1, vec_u16 *c2, vec_u16 *c3)
++{
++    vec_u16 m0 = vec_mergeh(r0, r4);
++    vec_u16 m1 = vec_mergeh(r1, r5);
++    vec_u16 m2 = vec_mergeh(r2, r6);
++    vec_u16 m3 = vec_mergeh(r3, r7);
++    vec_u16 n0 = vec_mergeh(m0, m2), n1 = vec_mergel(m0, m2);  /* even rows, cols 0,1 / 2,3 */
++    vec_u16 n2 = vec_mergeh(m1, m3), n3 = vec_mergel(m1, m3);  /* odd rows */
++
++    *c0 = vec_mergeh(n0, n2);
++    *c1 = vec_mergel(n0, n2);
++    *c2 = vec_mergeh(n1, n3);
++    *c3 = vec_mergel(n1, n3);
++}
++
++/* the 4 bytes at p in lanes 0..3 (the rest undefined); touches only the
++ * aligned blocks holding p..p+3 */
++static av_always_inline vec_u8 dbk_load4_u8(const uint8_t *p)
++{
++    return vec_perm(vec_ld(0, p), vec_ld(3, p), vec_lvsl(0, p));
++}
++
++/* Store lanes 0..7 of v at dst, nothing else: the mc_store8 element-store
++ * idiom on an already-packed payload. mode is from mc_store_mode() with
++ * want_vec == 0, so never MC_ST_VEC. */
++static av_always_inline void dbk_store8_u8(vec_u8 v, uint8_t *dst, int mode)
++{
++    const vec_u8 r = vec_perm(v, v, vec_lvsr(0, dst));
++
++    switch (mode) {
++    case MC_ST_WORD:
++        vec_ste((vec_u32)r, 0, (unsigned int *)dst);
++        vec_ste((vec_u32)r, 4, (unsigned int *)dst);
++        break;
++    case MC_ST_HALF:
++        vec_ste((vec_u16)r, 0, (unsigned short *)dst);
++        vec_ste((vec_u16)r, 2, (unsigned short *)dst);
++        vec_ste((vec_u16)r, 4, (unsigned short *)dst);
++        vec_ste((vec_u16)r, 6, (unsigned short *)dst);
++        break;
++    default: {
++        int i;
++        for (i = 0; i < 8; i++)
++            vec_ste(r, i, dst);
++        break;
++    }
++    }
++}
++
++/* Store all 16 bytes of v at dst, nothing else (mode from mc_store_mode()
++ * with want_vec == 1). */
++static av_always_inline void dbk_store16(vec_u8 v, uint8_t *dst, int mode)
++{
++    vec_u8 r;
++
++    if (mode == MC_ST_VEC) {
++        vec_st(v, 0, dst);
++        return;
++    }
++    r = vec_perm(v, v, vec_lvsr(0, dst));
++    switch (mode) {
++    case MC_ST_WORD:
++        vec_ste((vec_u32)r,  0, (unsigned int *)dst);
++        vec_ste((vec_u32)r,  4, (unsigned int *)dst);
++        vec_ste((vec_u32)r,  8, (unsigned int *)dst);
++        vec_ste((vec_u32)r, 12, (unsigned int *)dst);
++        break;
++    case MC_ST_HALF: {
++        int i;
++        for (i = 0; i < 16; i += 2)
++            vec_ste((vec_u16)r, i, (unsigned short *)dst);
++        break;
++    }
++    default: {
++        int i;
++        for (i = 0; i < 16; i++)
++            vec_ste(r, i, dst);
++        break;
++    }
++    }
++}
++
++#endif /* HEVC_DEBLOCK_ALTIVEC_COMMON */
++
++/* the parameter block: tc / no_p / no_q per segment, beta; see dbk_load_params */
++#define DBK_SET_PARAMS(prm, tc, no_p, no_q, beta)                           \
++    do {                                                                    \
++        (prm)[0] = (tc)[0] << (BIT_DEPTH - 8);                              \
++        (prm)[1] = (tc)[1] << (BIT_DEPTH - 8);                              \
++        (prm)[2] = (no_p)[0];                                               \
++        (prm)[3] = (no_p)[1];                                               \
++        (prm)[4] = (no_q)[0];                                               \
++        (prm)[5] = (no_q)[1];                                               \
++        (prm)[6] = (beta) << (BIT_DEPTH - 8);                               \
++        (prm)[7] = 0;                                                       \
++    } while (0)
++
++/* ======================================================================
++ * Luma, horizontal edge: taps are the 8 rows pix[-4*stride .. 3*stride],
++ * 8 pixels wide.
++ */
++static void FUNC(ff_hevc_h_loop_filter_luma, BIT_DEPTH)(uint8_t *_pix, ptrdiff_t stride,
++                                                        int beta, const int32_t *tc,
++                                                        const uint8_t *no_p, const uint8_t *no_q)
++{
++    DECLARE_ALIGNED(16, int16_t, prm)[8];
++    PIXEL *pix = (PIXEL *)_pix;
++    const ptrdiff_t ps = stride / sizeof(PIXEL);
++    dbk_params pr;
++    vec_s16 p3, p2, p1, p0, q0, q1, q2, q3;
++    int mode;
++
++    if (!(tc[0] | tc[1]))
++        return;
++    DBK_SET_PARAMS(prm, tc, no_p, no_q, beta);
++
++    p3 = FUNC(mc_load8, BIT_DEPTH)(pix - 4 * ps);
++    p2 = FUNC(mc_load8, BIT_DEPTH)(pix - 3 * ps);
++    p1 = FUNC(mc_load8, BIT_DEPTH)(pix - 2 * ps);
++    p0 = FUNC(mc_load8, BIT_DEPTH)(pix -     ps);
++    q0 = FUNC(mc_load8, BIT_DEPTH)(pix);
++    q1 = FUNC(mc_load8, BIT_DEPTH)(pix +     ps);
++    q2 = FUNC(mc_load8, BIT_DEPTH)(pix + 2 * ps);
++    q3 = FUNC(mc_load8, BIT_DEPTH)(pix + 3 * ps);
++
++    dbk_load_params(&pr, prm);
++    if (!dbk_luma(p3, &p2, &p1, &p0, &q0, &q1, &q2, q3, &pr))
++        return;
++
++    /* mc_store8 clips to the pixel range */
++    mode = mc_store_mode(_pix, stride, BIT_DEPTH > 8);
++    FUNC(mc_store8, BIT_DEPTH)(pix - 3 * ps, p2, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix - 2 * ps, p1, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix -     ps, p0, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix,          q0, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix +     ps, q1, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix + 2 * ps, q2, mode);
++}
++
++/* ======================================================================
++ * Luma, vertical edge: taps are pix[-4 .. 3] of each of the 8 rows. Each
++ * row is loaded as one vector, transposed into per-tap vectors, and the
++ * modified taps transposed back into rows for the store; p3 and q3 are
++ * written back unchanged with them.
++ */
++static void FUNC(ff_hevc_v_loop_filter_luma, BIT_DEPTH)(uint8_t *_pix, ptrdiff_t stride,
++                                                        int beta, const int32_t *tc,
++                                                        const uint8_t *no_p, const uint8_t *no_q)
++{
++    DECLARE_ALIGNED(16, int16_t, prm)[8];
++    uint8_t *base = _pix - 4 * sizeof(PIXEL);
++    dbk_params pr;
++    vec_s16 p3, p2, p1, p0, q0, q1, q2, q3;
++    int mode;
++#if BIT_DEPTH == 8
++    const vec_u8 zero = vec_splat_u8(0);
++    vec_u8 r0, r1, r2, r3, r4, r5, r6, r7;
++#else
++    const vec_s16 z  = vec_splat_s16(0);
++    const vec_s16 mx = mc_splat16((1 << BIT_DEPTH) - 1);
++    vec_u16 r0, r1, r2, r3, r4, r5, r6, r7;
++#endif
++
++    if (!(tc[0] | tc[1]))
++        return;
++    DBK_SET_PARAMS(prm, tc, no_p, no_q, beta);
++
++#if BIT_DEPTH == 8
++    r0 = mc_load8_u8(base);
++    r1 = mc_load8_u8(base +     stride);
++    r2 = mc_load8_u8(base + 2 * stride);
++    r3 = mc_load8_u8(base + 3 * stride);
++    r4 = mc_load8_u8(base + 4 * stride);
++    r5 = mc_load8_u8(base + 5 * stride);
++    r6 = mc_load8_u8(base + 6 * stride);
++    r7 = mc_load8_u8(base + 7 * stride);
++    dbk_transpose_8x8_u8(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
++    p3 = (vec_s16)vec_mergeh(zero, r0);
++    p2 = (vec_s16)vec_mergeh(zero, r1);
++    p1 = (vec_s16)vec_mergeh(zero, r2);
++    p0 = (vec_s16)vec_mergeh(zero, r3);
++    q0 = (vec_s16)vec_mergeh(zero, r4);
++    q1 = (vec_s16)vec_mergeh(zero, r5);
++    q2 = (vec_s16)vec_mergeh(zero, r6);
++    q3 = (vec_s16)vec_mergeh(zero, r7);
++#else
++    r0 = (vec_u16)unaligned_load(0, base);
++    r1 = (vec_u16)unaligned_load(0, base +     stride);
++    r2 = (vec_u16)unaligned_load(0, base + 2 * stride);
++    r3 = (vec_u16)unaligned_load(0, base + 3 * stride);
++    r4 = (vec_u16)unaligned_load(0, base + 4 * stride);
++    r5 = (vec_u16)unaligned_load(0, base + 5 * stride);
++    r6 = (vec_u16)unaligned_load(0, base + 6 * stride);
++    r7 = (vec_u16)unaligned_load(0, base + 7 * stride);
++    dbk_transpose_8x8_u16(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
++    p3 = (vec_s16)r0;
++    p2 = (vec_s16)r1;
++    p1 = (vec_s16)r2;
++    p0 = (vec_s16)r3;
++    q0 = (vec_s16)r4;
++    q1 = (vec_s16)r5;
++    q2 = (vec_s16)r6;
++    q3 = (vec_s16)r7;
++#endif
++
++    dbk_load_params(&pr, prm);
++    if (!dbk_luma(p3, &p2, &p1, &p0, &q0, &q1, &q2, q3, &pr))
++        return;
++
++    mode = mc_store_mode(base, stride, BIT_DEPTH > 8);
++#if BIT_DEPTH == 8
++    /* r0/r7 still hold p3/q3; vec_packsu is the av_clip_pixel */
++    r1 = vec_packsu(p2, p2);
++    r2 = vec_packsu(p1, p1);
++    r3 = vec_packsu(p0, p0);
++    r4 = vec_packsu(q0, q0);
++    r5 = vec_packsu(q1, q1);
++    r6 = vec_packsu(q2, q2);
++    dbk_transpose_8x8_u8(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
++    dbk_store8_u8(r0, base,              mode);
++    dbk_store8_u8(r1, base +     stride, mode);
++    dbk_store8_u8(r2, base + 2 * stride, mode);
++    dbk_store8_u8(r3, base + 3 * stride, mode);
++    dbk_store8_u8(r4, base + 4 * stride, mode);
++    dbk_store8_u8(r5, base + 5 * stride, mode);
++    dbk_store8_u8(r6, base + 6 * stride, mode);
++    dbk_store8_u8(r7, base + 7 * stride, mode);
++#else
++    r1 = (vec_u16)vec_min(vec_max(p2, z), mx);   /* av_clip_uintp2 */
++    r2 = (vec_u16)vec_min(vec_max(p1, z), mx);
++    r3 = (vec_u16)vec_min(vec_max(p0, z), mx);
++    r4 = (vec_u16)vec_min(vec_max(q0, z), mx);
++    r5 = (vec_u16)vec_min(vec_max(q1, z), mx);
++    r6 = (vec_u16)vec_min(vec_max(q2, z), mx);
++    dbk_transpose_8x8_u16(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
++    dbk_store16((vec_u8)r0, base,              mode);
++    dbk_store16((vec_u8)r1, base +     stride, mode);
++    dbk_store16((vec_u8)r2, base + 2 * stride, mode);
++    dbk_store16((vec_u8)r3, base + 3 * stride, mode);
++    dbk_store16((vec_u8)r4, base + 4 * stride, mode);
++    dbk_store16((vec_u8)r5, base + 5 * stride, mode);
++    dbk_store16((vec_u8)r6, base + 6 * stride, mode);
++    dbk_store16((vec_u8)r7, base + 7 * stride, mode);
++#endif
++}
++
++/* ======================================================================
++ * Chroma, horizontal edge: taps are rows pix[-2*stride .. stride], 8 wide;
++ * only p0 and q0 are stored.
++ */
++static void FUNC(ff_hevc_h_loop_filter_chroma, BIT_DEPTH)(uint8_t *_pix, ptrdiff_t stride,
++                                                          const int32_t *tc, const uint8_t *no_p,
++                                                          const uint8_t *no_q)
++{
++    DECLARE_ALIGNED(16, int16_t, prm)[8];
++    PIXEL *pix = (PIXEL *)_pix;
++    const ptrdiff_t ps = stride / sizeof(PIXEL);
++    dbk_params pr;
++    vec_s16 p1, p0, q0, q1;
++    int mode;
++
++    if (!(tc[0] | tc[1]))
++        return;
++    DBK_SET_PARAMS(prm, tc, no_p, no_q, 0);
++
++    p1 = FUNC(mc_load8, BIT_DEPTH)(pix - 2 * ps);
++    p0 = FUNC(mc_load8, BIT_DEPTH)(pix -     ps);
++    q0 = FUNC(mc_load8, BIT_DEPTH)(pix);
++    q1 = FUNC(mc_load8, BIT_DEPTH)(pix +     ps);
++
++    dbk_load_params(&pr, prm);
++    dbk_chroma(p1, &p0, &q0, q1, &pr);
++
++    mode = mc_store_mode(_pix, stride, BIT_DEPTH > 8);
++    FUNC(mc_store8, BIT_DEPTH)(pix - ps, p0, mode);
++    FUNC(mc_store8, BIT_DEPTH)(pix,      q0, mode);
++}
++
++/* ======================================================================
++ * Chroma, vertical edge: taps are pix[-2 .. 1] of each of the 8 rows. Only
++ * p0 and q0 are stored, as two element stores per row: the (p0, q0) pairs of
++ * all rows are interleaved into one vector (row r at lanes 2r, 2r+1), and
++ * each row rotates it so that its pair lands in the lanes its own address
++ * selects.
++ */
++static void FUNC(ff_hevc_v_loop_filter_chroma, BIT_DEPTH)(uint8_t *_pix, ptrdiff_t stride,
++                                                          const int32_t *tc, const uint8_t *no_p,
++                                                          const uint8_t *no_q)
++{
++    DECLARE_ALIGNED(16, int16_t, prm)[8];
++    const uint8_t *base = _pix - 2 * sizeof(PIXEL);
++    dbk_params pr;
++    vec_s16 p1, p0, q0, q1;
++    int r;
++#if BIT_DEPTH == 8
++    const vec_u8 zero = vec_splat_u8(0);
++    vec_u8 c0, c1, c2, c3, pq;
++#else
++    const vec_s16 z  = vec_splat_s16(0);
++    const vec_s16 mx = mc_splat16((1 << BIT_DEPTH) - 1);
++    vec_u16 c0, c1, c2, c3, pq_lo, pq_hi;
++#endif
++
++    if (!(tc[0] | tc[1]))
++        return;
++    DBK_SET_PARAMS(prm, tc, no_p, no_q, 0);
++
++#if BIT_DEPTH == 8
++    dbk_transpose_8x4_u8(dbk_load4_u8(base),
++                         dbk_load4_u8(base +     stride),
++                         dbk_load4_u8(base + 2 * stride),
++                         dbk_load4_u8(base + 3 * stride),
++                         dbk_load4_u8(base + 4 * stride),
++                         dbk_load4_u8(base + 5 * stride),
++                         dbk_load4_u8(base + 6 * stride),
++                         dbk_load4_u8(base + 7 * stride),
++                         &c0, &c1, &c2, &c3);
++    p1 = (vec_s16)vec_mergeh(zero, c0);
++    p0 = (vec_s16)vec_mergeh(zero, c1);
++    q0 = (vec_s16)vec_mergeh(zero, c2);
++    q1 = (vec_s16)vec_mergeh(zero, c3);
++#else
++    /* 4 samples = 8 bytes per row; vec_ld(7) touches only the blocks holding them */
++    dbk_transpose_8x4_u16((vec_u16)mc_load8_u8(base),
++                          (vec_u16)mc_load8_u8(base +     stride),
++                          (vec_u16)mc_load8_u8(base + 2 * stride),
++                          (vec_u16)mc_load8_u8(base + 3 * stride),
++                          (vec_u16)mc_load8_u8(base + 4 * stride),
++                          (vec_u16)mc_load8_u8(base + 5 * stride),
++                          (vec_u16)mc_load8_u8(base + 6 * stride),
++                          (vec_u16)mc_load8_u8(base + 7 * stride),
++                          &c0, &c1, &c2, &c3);
++    p1 = (vec_s16)c0;
++    p0 = (vec_s16)c1;
++    q0 = (vec_s16)c2;
++    q1 = (vec_s16)c3;
++#endif
++
++    dbk_load_params(&pr, prm);
++    dbk_chroma(p1, &p0, &q0, q1, &pr);
++
++#if BIT_DEPTH == 8
++    /* byte pairs of all 8 rows fit one vector: row r at lanes 2r, 2r+1 */
++    pq = vec_mergeh(vec_packsu(p0, p0), vec_packsu(q0, q0));   /* clipped */
++    for (r = 0; r < 8; r++) {
++        uint8_t *dst = _pix - 1 + r * stride;               /* p0 of row r */
++        /* lane 2r -> lane (dst & 15), lane 2r+1 -> the next one */
++        const vec_u8 v = vec_perm(pq, pq, vec_lvsr(0, dst - 2 * r));
++        vec_ste(v, 0, dst);
++        vec_ste(v, 1, dst);
++    }
++#else
++    /* 16-bit pairs: rows 0-3 come out of mergeh, rows 4-7 out of mergel */
++    c1 = (vec_u16)vec_min(vec_max(p0, z), mx);
++    c2 = (vec_u16)vec_min(vec_max(q0, z), mx);
++    pq_lo = vec_mergeh(c1, c2);
++    pq_hi = vec_mergel(c1, c2);
++    for (r = 0; r < 8; r++) {
++        uint8_t *dst = _pix - 2 + r * stride;               /* p0 of row r */
++        const vec_u16 pq = r < 4 ? pq_lo : pq_hi;
++        /* byte lane 4(r&3) -> lane (dst & 15) */
++        const vec_u16 v = vec_perm(pq, pq, vec_lvsr(0, dst - 4 * (r & 3)));
++        vec_ste(v, 0, (unsigned short *)dst);
++        vec_ste(v, 2, (unsigned short *)dst);
++    }
++#endif
++}
++
++#undef DBK_SET_PARAMS
++#undef PIXEL
+-- 
+2.43.0
+

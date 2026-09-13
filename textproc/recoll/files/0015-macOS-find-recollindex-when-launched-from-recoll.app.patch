@@ -1,0 +1,261 @@
+From b1bd6249661d08293289dec650e58cdd85a5c067 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 3 Sep 2026 09:41:41 +0000
+Subject: [PATCH 15/15] macOS: find recollindex when launched from recoll.app,
+ and fix the dead menu bar for real
+
+Two problems seen on both 10.6/PowerPC and 10.15/x86 with the Qt4 build:
+
+1. "Indexing failed" immediately when the GUI is started from the recoll.app
+   bundle (works when /opt/local/bin/recoll is run from a shell).
+
+   The bundle produced by qmake contains a *copy* of the recoll binary in
+   recoll.app/Contents/MacOS, so path_thisexecdir()/recollindex (the only
+   place the GUI looked) does not exist and the exec fails. Launchd also gives
+   the bundle a minimal PATH without the package manager's bin directory.
+
+   - qtgui/rclm_idx.cpp: findRecollindex() tries, in order, next to our own
+     executable, <PREFIX>/bin (qmake already defines PREFIX for the meson
+     build), then the PATH, and logs an error if none works.
+   - common/rclinit.cpp: on macOS, also prepend <prefix>/bin (derived from the
+     compiled-in RECOLL_DATADIR, i.e. <prefix>/share/recoll) to the PATH, so
+     the helper programs (python3, pdftotext...) are found from a bundle
+     launch regardless of whether MACPORTS/HOMEBREW is defined.
+
+2. Menu bar (and menu key equivalents such as Cmd+Q) unresponsive until the
+   user switches to another application and back, when recoll is started from
+   a shell. The previous fix (activateIgnoringOtherApps: right after
+   QApplication construction) did not work because on Cocoa the app has not
+   finished launching at that point: NSApplication's finishLaunching only runs
+   from [NSApp run], which Qt4's event dispatcher calls from inside
+   QApplication::exec(), and the activation done before that is lost. Qt4's
+   qt_init() only does TransformProcessType() and never activates; Qt5's Cocoa
+   plugin activates from applicationDidFinishLaunching, which is what works.
+
+   qtgui/macactivateapp.mm now defers the activation: on Cocoa it observes
+   NSApplicationDidFinishLaunchingNotification (Qt4's own delegate stays in
+   place), and on both backends a moc-less QObject timer activates again once
+   the Qt event loop runs (at 0 and 300 ms), which covers Carbon's
+   SetFrontProcess() and acts as a retry on Cocoa.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016H46BgfYXKFbsVGPax89bu
+---
+ src/common/rclinit.cpp      | 15 +++++++
+ src/qtgui/macactivateapp.mm | 87 +++++++++++++++++++++++++++++++++++--
+ src/qtgui/main.cpp          |  2 +
+ src/qtgui/rclm_idx.cpp      | 36 ++++++++++++++-
+ 4 files changed, 135 insertions(+), 5 deletions(-)
+
+diff --git a/src/common/rclinit.cpp b/src/common/rclinit.cpp
+index b03774e4..50cb716a 100644
+--- a/src/common/rclinit.cpp
++++ b/src/common/rclinit.cpp
+@@ -336,6 +336,21 @@ RclConfig *recollinit(
+     PATH = exedir + ":" + PATH;
+ #endif
+ 
++#ifdef RECOLL_DATADIR
++    // Package manager builds can also be launched from a .app bundle (e.g. the recoll.app that
++    // qmake produces), in which case launchd gives us a minimal PATH without the package
++    // manager's bin directory, and our own executable directory is inside the bundle, so neither
++    // recollindex nor the helper programs (python3, pdftotext, etc.) would be found. Add the bin
++    // directory of our install prefix, derived from the compiled-in data directory
++    // (<prefix>/share/recoll). This does not depend on the MACPORTS/HOMEBREW flags being set.
++    {
++        std::string prefixbin = path_cat(path_getfather(path_getfather(RECOLL_DATADIR)), "bin");
++        if (path_isdir(prefixbin) && PATH.find(prefixbin) == std::string::npos) {
++            PATH = prefixbin + ":" + PATH;
++        }
++    }
++#endif
++
+     std::string rhpp;
+     if (config->getConfParam("recollhelperpath", rhpp) && !rhpp.empty()) {
+       PATH = rhpp + ":" + PATH;
+diff --git a/src/qtgui/macactivateapp.mm b/src/qtgui/macactivateapp.mm
+index 55389905..14e64fb3 100644
+--- a/src/qtgui/macactivateapp.mm
++++ b/src/qtgui/macactivateapp.mm
+@@ -1,27 +1,108 @@
+ /* Make this process the frontmost/foreground application when launched as a bare executable
+  * outside a .app bundle (e.g. from a shell, which is how a package-manager-installed binary
+  * runs): otherwise it draws its window and menu bar but does not actually become frontmost, so
+- * the menu bar does not receive clicks until the user switches to another application and back.
++ * the menu bar does not receive clicks (and the menu key equivalents, e.g. Cmd+Q, do nothing)
++ * until the user switches to another application and back.
+  *
+  * Qt4 on macOS builds Carbon on 32-bit 10.5, and Cocoa everywhere else (64-bit 10.5, and 10.6+):
+  * QT_MAC_USE_COCOA (defined by Qt's own qconfig.h/qglobal.h, re-derived per downstream compile
+  * when Qt was configured to autodetect) tells us which, and each backend needs a different call.
++ *
++ * Timing matters: Qt4's qt_init() already does TransformProcessType(foreground) but never
++ * activates the process, and activating it right after QApplication construction (what this file
++ * did first) has no effect: on Cocoa the app has not finished launching yet (NSApplication's
++ * finishLaunching only runs from [NSApp run], i.e. from inside QApplication::exec()), and the
++ * activation state is reset when it does. Qt5's Cocoa plugin activates from
++ * applicationDidFinishLaunching, so do the same here: on Cocoa, observe
++ * NSApplicationDidFinishLaunchingNotification (Qt4's own application delegate stays in place, a
++ * notification observer does not interfere with it), and on both backends also activate from Qt
++ * timers once the event loop is running, which covers Carbon and serves as a retry on Cocoa.
+  */
+ #include <QtGlobal>
+ 
++// The system frameworks must be included before any Qt header that defines the "slots" macro
++// (qobjectdefs.h, pulled in by QObject): CALayer.h, reached from Cocoa.h, has a field named
++// slots, which the macro turns into a syntax error. QtGlobal alone is safe and is needed first
++// for QT_MAC_USE_COCOA.
+ #ifdef QT_MAC_USE_COCOA
+ #import <Cocoa/Cocoa.h>
+ #else
+ #include <ApplicationServices/ApplicationServices.h>
+ #endif
+ 
+-void macBecomeForegroundApp()
++#include <QObject>
++#include <QCoreApplication>
++#include <QTimerEvent>
++
++static void macActivateNow()
+ {
+ #ifdef QT_MAC_USE_COCOA
+     [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+ #else
+     ProcessSerialNumber psn = {0, kCurrentProcess};
+-    TransformProcessType(&psn, kProcessTransformToForegroundApplication);
+     SetFrontProcess(&psn);
+ #endif
+ }
++
++#ifdef QT_MAC_USE_COCOA
++@interface RclActivateOnLaunch : NSObject
++- (void)applicationDidFinishLaunching:(NSNotification *)note;
++@end
++
++@implementation RclActivateOnLaunch
++- (void)applicationDidFinishLaunching:(NSNotification *)note
++{
++    (void)note;
++    macActivateNow();
++    [[NSNotificationCenter defaultCenter] removeObserver:self];
++    [self autorelease];
++}
++@end
++#endif
++
++// Activates from the Qt event loop: once as soon as it runs (which, on Cocoa, is after [NSApp
++// run] has called finishLaunching), and once more a little later in case the first attempt raced
++// with the window server. Uses timerEvent() rather than a slot so that this file needs no moc run.
++class MacActivator : public QObject {
++public:
++    explicit MacActivator(QObject *parent)
++        : QObject(parent), m_first(startTimer(0)), m_second(startTimer(300)) {
++    }
++protected:
++    void timerEvent(QTimerEvent *ev) override {
++        // Not "id": that is a type name in Objective-C++.
++        int tid = ev->timerId();
++        if (tid != m_first && tid != m_second) {
++            return;
++        }
++        killTimer(tid);
++        if (tid == m_first) {
++            m_first = 0;
++        } else {
++            m_second = 0;
++        }
++        macActivateNow();
++        if (m_first == 0 && m_second == 0) {
++            deleteLater();
++        }
++    }
++private:
++    int m_first;
++    int m_second;
++};
++
++void macBecomeForegroundApp()
++{
++#ifdef QT_MAC_USE_COCOA
++    RclActivateOnLaunch *observer = [[RclActivateOnLaunch alloc] init];
++    [[NSNotificationCenter defaultCenter] addObserver:observer
++                                             selector:@selector(applicationDidFinishLaunching:)
++                                                 name:NSApplicationDidFinishLaunchingNotification
++                                               object:nil];
++#else
++    // Carbon: Qt4 does this too, but it is cheap and must happen before any window is created.
++    ProcessSerialNumber psn = {0, kCurrentProcess};
++    TransformProcessType(&psn, kProcessTransformToForegroundApplication);
++#endif
++    new MacActivator(QCoreApplication::instance());
++}
+diff --git a/src/qtgui/main.cpp b/src/qtgui/main.cpp
+index 1876d72b..22b79bdc 100644
+--- a/src/qtgui/main.cpp
++++ b/src/qtgui/main.cpp
+@@ -282,6 +282,8 @@ static std::string get_config(int argc, char **argv)
+ // draws its window and menu bar but doesn't receive menu clicks until the user switches to
+ // another app and back. Implemented in macactivateapp.mm, which picks the right call for
+ // whichever of Carbon (32-bit 10.5) or Cocoa (everywhere else) this Qt4 build actually uses.
++// The activation itself is deferred until the event loop is running (see the comments there),
++// this only sets it up, so it must be called before app.exec().
+ extern void macBecomeForegroundApp();
+ #endif
+ 
+diff --git a/src/qtgui/rclm_idx.cpp b/src/qtgui/rclm_idx.cpp
+index 7a9ffd57..4c92d158 100644
+--- a/src/qtgui/rclm_idx.cpp
++++ b/src/qtgui/rclm_idx.cpp
+@@ -42,6 +42,38 @@ using namespace std;
+ 
+ static std::string recollindex;
+ 
++// Find the recollindex executable. It is normally installed next to us (same bin directory), which
++// is where we look first because in many cases (_WIN32, appimage, macOS) we are not in the PATH.
++//
++// But on macOS, when the GUI is launched from the recoll.app bundle that qmake produces, the
++// running executable is a copy living in recoll.app/Contents/MacOS, and recollindex is not there
++// (the package manager installed it in <prefix>/bin). So fall back to the compiled-in install
++// prefix, then to the PATH (which recollinit() extends with the package manager's bin directory
++// on macOS). Only the plain name is left if all else fails, so that the error is at least
++// reported by the usual exec failure path.
++static std::string findRecollindex()
++{
++#ifdef _WIN32
++    return path_cat(path_thisexecdir(), "recollindex");
++#else
++    std::string exe;
++    if (ExecCmd::which(path_cat(path_thisexecdir(), "recollindex"), exe)) {
++        return exe;
++    }
++#ifdef PREFIX
++    if (ExecCmd::which(path_cat(path_cat(PREFIX, "bin"), "recollindex"), exe)) {
++        return exe;
++    }
++#endif
++    if (ExecCmd::which("recollindex", exe)) {
++        return exe;
++    }
++    LOGERR("Recoll: recollindex executable not found near " << path_thisexecdir() <<
++           " or in the PATH\n");
++    return "recollindex";
++#endif
++}
++
+ // This is called from periodic100 if we started an indexer, or from
+ // the rclmain idxstatus file watcher, every time the file changes.
+ // Returns true if a real time indexer is currently monitoring, false else.
+@@ -112,8 +144,8 @@ void RclMain::periodic100()
+     
+     LOGDEB2("Periodic100\n" );
+     if (recollindex.empty()) {
+-        // In many cases (_WIN32, appimage, we are not in the PATH. make recollindex a full path
+-        recollindex = path_cat(path_thisexecdir(), "recollindex");
++        recollindex = findRecollindex();
++        LOGDEB("Recoll: using indexer executable: " << recollindex << "\n");
+     }
+     if (!m_idxreasontmp || !m_idxreasontmp->ok()) {
+         // We just store the pointer and let the tempfile cleaner deal
+-- 
+2.43.0
+

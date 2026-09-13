@@ -1,0 +1,240 @@
+From 52be0c3cdfffce7a91cdb45c952499f4e9f57938 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 2 Sep 2026 01:19:06 +0000
+Subject: [PATCH 4/4] FSEvents monitor: support Mac OS X 10.5/10.6 targets (no
+ libdispatch, directory-level events)
+
+The monitor used file-level events with extended data (macOS 10.13+) delivered on a dispatch
+queue (10.6+). For deployment targets before 10.13, use the original directory-level FSEvents
+API: list the changed directory and generate events for the entries whose ctime is more recent
+than the previous callback, rescan the subtree on MustScanSubDirs/dropped flags, and purge a
+directory which disappeared. File deletions cannot be detected this way and are left to the next
+full indexing pass. For targets before 10.6, schedule the stream on the run loop which the
+monitor thread already runs, instead of a dispatch queue. No semaphore is needed: the callback
+only pushes to the mutex-protected event queue.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Voh3NXqrzFgK56iCnHqxZ2
+---
+ src/index/rclmonrcv_fsevents.cpp | 152 ++++++++++++++++++++++++++++++-
+ src/index/rclmonrcv_fsevents.h   |   7 +-
+ 2 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/src/index/rclmonrcv_fsevents.cpp b/src/index/rclmonrcv_fsevents.cpp
+index 9e941391..fa473267 100644
+--- a/src/index/rclmonrcv_fsevents.cpp
++++ b/src/index/rclmonrcv_fsevents.cpp
+@@ -118,6 +118,21 @@
+ #include "pathut.h"
+ #include "smallut.h"
+ 
++#include <time.h>
++#include <AvailabilityMacros.h>
++
++// File-level events with extended data (the event paths come as dictionaries) need macOS 10.13
++// or later at run time. Older targets use the original directory-level FSEvents API, available
++// since 10.5, see the second version of fsevents_callback() below.
++#if defined(MAC_OS_X_VERSION_MIN_REQUIRED) && (MAC_OS_X_VERSION_MIN_REQUIRED >= 101300)
++#define RCL_FSEVENTS_FILEEVENTS 1
++#endif
++// libdispatch exists from 10.6 (and is usable without blocks support in the compiler). Before
++// that, the stream is scheduled on the run loop of the monitor thread instead of a dispatch queue.
++#if defined(MAC_OS_X_VERSION_MIN_REQUIRED) && (MAC_OS_X_VERSION_MIN_REQUIRED >= 1060)
++#define RCL_FSEVENTS_DISPATCH 1
++#include <dispatch/dispatch.h>
++#endif
+ 
+ using std::string;
+ 
+@@ -215,6 +230,8 @@ bool RclFSEvents::isRecursive() const {
+     return true;
+ }
+ 
++#ifdef RCL_FSEVENTS_FILEEVENTS
++
+ void RclFSEvents::fsevents_callback(
+     ConstFSEventStreamRef streamRef,
+     void *clientCallBackInfo,
+@@ -337,6 +354,127 @@ void RclFSEvents::fsevents_callback(
+     }
+ }
+ 
++#else // !RCL_FSEVENTS_FILEEVENTS -> directory-level events (original Mac OS X 10.5 API)
++
++// Margin, in seconds, subtracted from the previous callback time when deciding which entries of a
++// changed directory are recent: the events are delivered with some latency and the file
++// timestamps have a one second resolution.
++static const time_t legacyCTimeMargin = 5;
++
++// Directory-level events: each event names a directory in which something changed, without
++// telling what. We list the directory and generate events for the entries whose inode change time
++// is more recent than the previous callback. Compared to the file-level events used on 10.13+:
++//  - deleted files are not detected (nothing is left to be listed). They are purged by the next
++//    full indexing pass (e.g. at daemon startup).
++//  - a directory moved into the tree is detected through its updated ctime (which HFS+ does set
++//    on rename). Its contents are walked like for a directory creation.
++//  - a directory which is removed after its contents changed (so that we get an event for it)
++//    generates a subtree purge.
++void RclFSEvents::fsevents_callback(
++    ConstFSEventStreamRef streamRef,
++    void *clientCallBackInfo,
++    size_t numEvents,
++    void *eventPaths,  // char ** (no kFSEventStreamCreateFlagUseCFTypes)
++    const FSEventStreamEventFlags eventFlags[],
++    const FSEventStreamEventId eventIds[]) {
++
++    RclFSEvents *self = static_cast<RclFSEvents *>(clientCallBackInfo);
++    const char *const *paths = static_cast<const char *const *>(eventPaths);
++
++    time_t now = time(nullptr);
++    time_t since = self->m_prevCallbackTime - legacyCTimeMargin;
++    self->m_prevCallbackTime = now;
++
++    for (size_t i = 0; i < numEvents; ++i) {
++        string dir(paths[i]);
++        // The directory paths usually come with a trailing slash
++        while (dir.size() > 1 && dir[dir.size() - 1] == '/') {
++            dir.erase(dir.size() - 1);
++        }
++
++        if (rclMonShouldSkip(dir, *self->m_lconfigPtr, *self->m_walkerPtr))
++            continue;
++
++        struct PathStat st;
++        if (path_fileprops(dir, &st, false) != 0 || st.pst_type != PathStat::PST_DIR) {
++            // The directory itself is gone (or is not a directory any more): purge its subtree
++            LOGINFO("RclFSEvents::fsevents_callback: Event type: DIRECTORY REMOVED:  " << dir << "\n");
++            RclMonEvent event;
++            event.m_path = dir;
++            event.m_etyp = RclMonEvent::RCLEVT_DELETE | RclMonEvent::RCLEVT_ISDIR;
++            self->m_queue->pushEvent(event);
++            continue;
++        }
++
++        if (eventFlags[i] & (kFSEventStreamEventFlagMustScanSubDirs |
++                             kFSEventStreamEventFlagUserDropped |
++                             kFSEventStreamEventFlagKernelDropped)) {
++            // Events were coalesced or dropped: rescan the whole subtree
++            LOGINFO("RclFSEvents::fsevents_callback: Event type: RESCAN SUBTREE:     " << dir << "\n");
++            if (!rclMonAddSubWatches(dir, *self->m_walkerPtr, *self->m_lconfigPtr, self,
++                                     self->m_queue)) {
++                LOGERR("RclFSEvents::fsevents_callback: error in walking dir " << dir << "\n");
++                contextLoop.shouldExit = true; // Set the exit flag to true
++                return;
++            }
++            continue;
++        }
++
++        self->legacyScanDir(dir, since);
++    }
++}
++
++// Generate events for the recently changed entries of a directory
++void RclFSEvents::legacyScanDir(const string& dir, time_t since)
++{
++    // Set up the skipped names list for this directory
++    m_lconfigPtr->setKeyDir(dir);
++    m_walkerPtr->setSkippedNames(m_lconfigPtr->getSkippedNames());
++
++    PathDirContents dc(dir);
++    if (!dc.opendir()) {
++        LOGSYSERR("RclFSEvents::legacyScanDir", "opendir", dir);
++        return;
++    }
++    const struct PathDirContents::Entry *ent;
++    while ((ent = dc.readdir()) != nullptr) {
++        if (ent->d_name == "." || ent->d_name == "..")
++            continue;
++        if (m_walkerPtr->inSkippedNames(ent->d_name))
++            continue;
++        string path = path_cat(dir, ent->d_name);
++        struct PathStat st;
++        if (path_fileprops(path, &st, false) != 0)
++            continue;
++        if (st.pst_ctime < since)
++            continue;
++
++        RclMonEvent event;
++        event.m_path = path;
++        if (st.pst_type == PathStat::PST_DIR) {
++            event.m_etyp = RclMonEvent::RCLEVT_DIRCREATE;
++            LOGINFO("RclFSEvents::legacyScanDir: Event type: DIRECTORY CREATED:  " << path << "\n");
++        } else if (st.pst_type == PathStat::PST_REGULAR || st.pst_type == PathStat::PST_SYMLINK) {
++            event.m_etyp = RclMonEvent::RCLEVT_MODIFY;
++            LOGINFO("RclFSEvents::legacyScanDir: Event type: FILE MODIFIED:      " << path << "\n");
++        } else {
++            continue;
++        }
++        m_queue->pushEvent(event);
++
++        if (event.m_etyp == RclMonEvent::RCLEVT_DIRCREATE) {
++            // New or moved-in directory: walk it, there may already be stuff inside.
++            if (!rclMonAddSubWatches(path, *m_walkerPtr, *m_lconfigPtr, this, m_queue)) {
++                LOGERR("RclFSEvents::legacyScanDir: error in walking dir " << path << "\n");
++                contextLoop.shouldExit = true; // Set the exit flag to true
++                return;
++            }
++        }
++    }
++}
++
++#endif // RCL_FSEVENTS_FILEEVENTS
++
+ bool RclFSEvents::ok() const {
+     return m_ok;
+ }
+@@ -377,7 +515,12 @@ void RclFSEvents::setupAndStartStream() {
+                                    pathsToWatch,
+                                    kFSEventStreamEventIdSinceNow,
+                                    1.0,
+-                                   kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagUseCFTypes);
++#ifdef RCL_FSEVENTS_FILEEVENTS
++                                   kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagUseCFTypes
++#else
++                                   kFSEventStreamCreateFlagNone
++#endif
++        );
+ 
+     CFRelease(pathsToWatch);
+ 
+@@ -386,8 +529,15 @@ void RclFSEvents::setupAndStartStream() {
+         return;
+     }
+ 
++#ifdef RCL_FSEVENTS_DISPATCH
+     dispatch_queue_t event_queue = dispatch_queue_create("org.recoll.fswatch", NULL);
+     FSEventStreamSetDispatchQueue(m_stream, event_queue);
++#else
++    // No libdispatch before 10.6: deliver the events on the run loop of the monitor thread,
++    // which startMonitoring() runs after calling us.
++    FSEventStreamScheduleWithRunLoop(m_stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
++#endif
++    m_prevCallbackTime = time(nullptr);
+     FSEventStreamStart(m_stream);
+ }
+ 
+diff --git a/src/index/rclmonrcv_fsevents.h b/src/index/rclmonrcv_fsevents.h
+index f0cce3e0..234baf9f 100644
+--- a/src/index/rclmonrcv_fsevents.h
++++ b/src/index/rclmonrcv_fsevents.h
+@@ -60,11 +60,16 @@ private:
+     int eraseWatchSubTree(CFStringRef topDirectory);
+     static void signalHandler(int signum);
+     void releaseFSEventStream();
++    // Directory-level events mode (targets before 10.13): generate events for the entries of a
++    // changed directory which are more recent than 'since'.
++    void legacyScanDir(const std::string& dir, time_t since);
+     RclConfig* m_lconfigPtr;
+     FsTreeWalker* m_walkerPtr;
+     bool m_ok;
+-    FSEventStreamRef m_stream;
++    FSEventStreamRef m_stream{nullptr};
+     std::string m_rootPath;    
++    // Directory-level events mode: time of the previous callback
++    time_t m_prevCallbackTime{0};
+ };
+ 
+ // Custom context for the idle loop
+-- 
+2.43.0
+

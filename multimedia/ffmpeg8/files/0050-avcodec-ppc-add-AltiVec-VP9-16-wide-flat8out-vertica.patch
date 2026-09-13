@@ -1,0 +1,318 @@
+From 31cb7f0762c8fd494e8839b69649aa767ce6302c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 10 Sep 2026 05:11:49 +0000
+Subject: [PATCH] avcodec/ppc: add AltiVec VP9 16-wide (flat8out) vertical loop
+ filter
+
+Fills loop_filter_8[2][1] and loop_filter_16[1] (8-bit, vertical
+direction). The horizontal 16-wide filters stay on C: the existing 8-wide
+horizontal kernels only benched 1.02-1.19x on the 970 and a 16-tap column
+transpose costs twice as much again.
+
+The kernel runs the shared filter_core_8 (narrow + flat8in) first, which
+now optionally exports its fm && flat8in lane mask, then ANDs in the
+flat8out test (max of the eight outer absolute differences against
+F = 1). If no lane is flat over all 16 taps it stores only p2..q2 and
+returns - the common case on real content, so the 15-tap path is skipped
+there. Otherwise the fourteen 15-tap outputs (p6..q6) come from a sliding
+window over the edge-clamped tap sequence in u16 lanes: one vmladduh plus
+eight adds for the first, then four u16 ops per output (drop leftmost tap,
+add rightmost, un-double the old centre, double the new one), rounded,
+packed and vec_sel-merged with the narrow/flat8in results before store.
+Sums peak at 16*255 so u16 lanes cannot wrap. The 16-wide entry point is
+two 8-column calls (dst, dst + 8), like the mix2 vertical wrappers.
+
+Validation: checkasm vp9dsp under qemu -cpu 7400 on seeds
+1/42/777/12345/31337/8675309/271828 (193/193); full suite 1270/1270 (was
+1268; +2 = the two new names) on seeds 424242/13; a standalone
+AltiVec-vs-C harness through the real ff_vp9dsp_init covering the
+all-lanes-not-flat16 early-out that checkasm's generator never produces
+(its columns 0-1 are always flat16): 100000 trials over five lane-pattern
+classes, strides 32/48, dst column residues 0/3/8/11/16/21, random and
+checkasm E/I/H, whole 24-row buffers compared, 0 mismatches. A
+-D_ARCH_PWR4 (G5 shape) compile adds no warnings.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DnVbcLkDkHKWpndszuPJ6Y
+---
+ libavcodec/ppc/vp9dsp_altivec.c | 215 +++++++++++++++++++++++++++++++-
+ 1 file changed, 212 insertions(+), 3 deletions(-)
+
+diff --git a/libavcodec/ppc/vp9dsp_altivec.c b/libavcodec/ppc/vp9dsp_altivec.c
+index a2d5e5e..1f463e2 100644
+--- a/libavcodec/ppc/vp9dsp_altivec.c
++++ b/libavcodec/ppc/vp9dsp_altivec.c
+@@ -1037,6 +1037,13 @@ static av_always_inline vec_s16 u8_high_to_s16(vec_u8 a)
+     return (vec_s16)vec_mergeh(zero, a);
+ }
+ 
++static av_always_inline vec_u16 u8_high_to_u16(vec_u8 a)
++{
++    const vec_u8 zero = vec_splat_u8(0);
++
++    return (vec_u16)vec_mergeh(zero, a);
++}
++
+ static av_always_inline void store_u64(vec_u8 v, uint8_t *dst)
+ {
+     uint8_t tmp[16] __attribute__((aligned(16)));
+@@ -1066,6 +1073,10 @@ static av_always_inline vec_u16 add_u8_to_u16(vec_u16 a, vec_u8 b)
+  * where the flat mask is set. This mirrors the C loop_filter() for wd 4/8
+  * and is shared by both the vertical (row-edge) and horizontal (col-edge,
+  * via transpose) entry points.
++ *
++ * out_flat (wd8 == 1 only, may be NULL) receives the fm && flat8in lane
++ * mask (0xff in the low 8 lanes where the flat8in average was applied);
++ * the 16-wide filter ANDs its flat8out test into it.
+  */
+ static av_always_inline void filter_core_8(vec_u8 p3, vec_u8 p2, vec_u8 p1,
+                                            vec_u8 p0, vec_u8 q0, vec_u8 q1,
+@@ -1073,7 +1084,8 @@ static av_always_inline void filter_core_8(vec_u8 p3, vec_u8 p2, vec_u8 p1,
+                                            int E, int I, int H, int wd8,
+                                            vec_u8 *out_p2, vec_u8 *out_p1,
+                                            vec_u8 *out_p0, vec_u8 *out_q0,
+-                                           vec_u8 *out_q1, vec_u8 *out_q2)
++                                           vec_u8 *out_q1, vec_u8 *out_q2,
++                                           vec_u8 *out_flat)
+ {
+     const vec_u8 zero = vec_splat_u8(0);
+     const vec_u8 one = vec_splat_u8(1);
+@@ -1233,6 +1245,8 @@ static av_always_inline void filter_core_8(vec_u8 p3, vec_u8 p2, vec_u8 p1,
+         q1f = vec_sel(q1f, flat_q1, flat);
+         *out_p2 = vec_sel(p2, p2f, flat);
+         *out_q2 = vec_sel(q2, q2f, flat);
++        if (out_flat)
++            *out_flat = flat;
+     }
+ 
+     *out_p1 = p1f;
+@@ -1257,7 +1271,7 @@ static av_always_inline void loop_filter_v_8w_altivec(uint8_t *dst,
+     vec_u8 o_p2, o_p1, o_p0, o_q0, o_q1, o_q2;
+ 
+     filter_core_8(p3, p2, p1, p0, q0, q1, q2, q3, E, I, H, wd8,
+-                  &o_p2, &o_p1, &o_p0, &o_q0, &o_q1, &o_q2);
++                  &o_p2, &o_p1, &o_p0, &o_q0, &o_q1, &o_q2, NULL);
+ 
+     if (wd8) {
+         store_u64(o_p2, dst - 3 * stride);
+@@ -1352,7 +1366,7 @@ static av_always_inline void loop_filter_h_8w_altivec(uint8_t *dst,
+     transpose_8x8_u8(&p3, &p2, &p1, &p0, &q0, &q1, &q2, &q3);
+ 
+     filter_core_8(p3, p2, p1, p0, q0, q1, q2, q3, E, I, H, wd8,
+-                  &o_p2, &o_p1, &o_p0, &o_q0, &o_q1, &o_q2);
++                  &o_p2, &o_p1, &o_p0, &o_q0, &o_q1, &o_q2, NULL);
+ 
+     /* Transpose the 8 tap columns (p3,p2,o_p1,o_p0,o_q0,o_q1,q2,q3 for
+      * wd8==0; p3,o_p2,o_p1,o_p0,o_q0,o_q1,o_q2,q3 for wd8==1) back to rows.
+@@ -1452,6 +1466,199 @@ static void loop_filter_h_88_16_altivec(uint8_t *dst, ptrdiff_t stride,
+     loop_filter_h_8_8_altivec(dst + 8 * stride, stride, E >> 8,   I >> 8,   H >> 8);
+ }
+ 
++/*
++ * 16-wide (flat8out) loop filter core. p7..q7 are the 16 taps of one
++ * 8-sample edge, each in the low 8 byte lanes (same layout as
++ * filter_core_8). Runs the shared 4/8-wide core first, then where the C's
++ * "wd >= 16 && flat8out && flat8in" condition holds replaces p6..q6 with
++ * the 15-tap flat filter (dst[-7..+6] in the C template; p7/q7 are never
++ * modified by any width).
++ *
++ * Returns nonzero when at least one lane took the flat8out path. When it
++ * returns zero only p2..q2 can have changed, so the caller skips the
++ * outer 8 stores (which is exactly the C leaving them untouched); the
++ * outer outputs are still valid (= the inputs) in that case. Real content
++ * is rarely flat over 16 samples, so this early-out also skips the whole
++ * 15-tap computation on most edges.
++ *
++ * The 15-tap sums are a sliding window over the edge-clamped tap sequence
++ * x = p7 p7 ... p7 p6 p5 ... q5 q6 q7 ... q7 q7: each output is
++ * (sum of the 15 taps centred on it + the centre tap again + 8) >> 4, so
++ * stepping the centre by one drops the leftmost tap, adds a new rightmost
++ * one, un-doubles the old centre and doubles the new one - four u16 ops
++ * per output instead of sixteen. Sums are at most 16 * 255, so the u16
++ * lanes never wrap. FLAT16_STEP(drop, add, oldc, newc) does one step.
++ */
++#define FLAT16_STEP(drop, add, oldc, newc)                                   \
++    s = vec_sub(vec_add(s, vec_add(add, newc)), vec_add(drop, oldc))
++#define FLAT16_OUT() pack_u16_to_u8(vec_sr(vec_add(s, eight), four))
++
++static av_always_inline int filter_core_16(vec_u8 p7, vec_u8 p6, vec_u8 p5,
++                                           vec_u8 p4, vec_u8 p3, vec_u8 p2,
++                                           vec_u8 p1, vec_u8 p0, vec_u8 q0,
++                                           vec_u8 q1, vec_u8 q2, vec_u8 q3,
++                                           vec_u8 q4, vec_u8 q5, vec_u8 q6,
++                                           vec_u8 q7, int E, int I, int H,
++                                           vec_u8 *out_p6, vec_u8 *out_p5,
++                                           vec_u8 *out_p4, vec_u8 *out_p3,
++                                           vec_u8 *out_p2, vec_u8 *out_p1,
++                                           vec_u8 *out_p0, vec_u8 *out_q0,
++                                           vec_u8 *out_q1, vec_u8 *out_q2,
++                                           vec_u8 *out_q3, vec_u8 *out_q4,
++                                           vec_u8 *out_q5, vec_u8 *out_q6)
++{
++    const vec_u8 zero = vec_splat_u8(0);
++    const vec_u8 one = vec_splat_u8(1);
++    const vec_u16 eight = vec_splat_u16(8);
++    const vec_u16 four = vec_splat_u16(4);
++    const vec_u16 seven = vec_splat_u16(7);
++    vec_u8 flat, flat16, over;
++    vec_u8 f_p6, f_p5, f_p4, f_p3, f_p2, f_p1, f_p0;
++    vec_u8 f_q0, f_q1, f_q2, f_q3, f_q4, f_q5, f_q6;
++    vec_u16 x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15;
++    vec_u16 s;
++
++    filter_core_8(p3, p2, p1, p0, q0, q1, q2, q3, E, I, H, 1,
++                  out_p2, out_p1, out_p0, out_q0, out_q1, out_q2, &flat);
++
++    /* flat8out: p7..p4 all within F = 1 of p0 and q4..q7 within 1 of q0.
++     * Max of the eight absolute differences, one compare against 1. */
++    over = vec_max(absdiff_u8(p7, p0), absdiff_u8(p6, p0));
++    over = vec_max(over, absdiff_u8(p5, p0));
++    over = vec_max(over, absdiff_u8(p4, p0));
++    over = vec_max(over, absdiff_u8(q4, q0));
++    over = vec_max(over, absdiff_u8(q5, q0));
++    over = vec_max(over, absdiff_u8(q6, q0));
++    over = vec_max(over, absdiff_u8(q7, q0));
++    flat16 = vec_andc(flat, cmpgt_u8(over, one));
++
++    if (vec_all_eq(flat16, zero)) {
++        *out_p6 = p6;
++        *out_p5 = p5;
++        *out_p4 = p4;
++        *out_p3 = p3;
++        *out_q3 = q3;
++        *out_q4 = q4;
++        *out_q5 = q5;
++        *out_q6 = q6;
++        return 0;
++    }
++
++    x0  = u8_high_to_u16(p7);
++    x1  = u8_high_to_u16(p6);
++    x2  = u8_high_to_u16(p5);
++    x3  = u8_high_to_u16(p4);
++    x4  = u8_high_to_u16(p3);
++    x5  = u8_high_to_u16(p2);
++    x6  = u8_high_to_u16(p1);
++    x7  = u8_high_to_u16(p0);
++    x8  = u8_high_to_u16(q0);
++    x9  = u8_high_to_u16(q1);
++    x10 = u8_high_to_u16(q2);
++    x11 = u8_high_to_u16(q3);
++    x12 = u8_high_to_u16(q4);
++    x13 = u8_high_to_u16(q5);
++    x14 = u8_high_to_u16(q6);
++    x15 = u8_high_to_u16(q7);
++
++    /* p6: 7*p7 + 2*p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 */
++    s = vec_mladd(x0, seven, x1);
++    s = vec_add(s, x1);
++    s = vec_add(s, x2);
++    s = vec_add(s, x3);
++    s = vec_add(s, x4);
++    s = vec_add(s, x5);
++    s = vec_add(s, x6);
++    s = vec_add(s, x7);
++    s = vec_add(s, x8);
++    f_p6 = FLAT16_OUT();
++    FLAT16_STEP(x0, x9,  x1,  x2);  f_p5 = FLAT16_OUT();
++    FLAT16_STEP(x0, x10, x2,  x3);  f_p4 = FLAT16_OUT();
++    FLAT16_STEP(x0, x11, x3,  x4);  f_p3 = FLAT16_OUT();
++    FLAT16_STEP(x0, x12, x4,  x5);  f_p2 = FLAT16_OUT();
++    FLAT16_STEP(x0, x13, x5,  x6);  f_p1 = FLAT16_OUT();
++    FLAT16_STEP(x0, x14, x6,  x7);  f_p0 = FLAT16_OUT();
++    FLAT16_STEP(x0, x15, x7,  x8);  f_q0 = FLAT16_OUT();
++    FLAT16_STEP(x1, x15, x8,  x9);  f_q1 = FLAT16_OUT();
++    FLAT16_STEP(x2, x15, x9,  x10); f_q2 = FLAT16_OUT();
++    FLAT16_STEP(x3, x15, x10, x11); f_q3 = FLAT16_OUT();
++    FLAT16_STEP(x4, x15, x11, x12); f_q4 = FLAT16_OUT();
++    FLAT16_STEP(x5, x15, x12, x13); f_q5 = FLAT16_OUT();
++    FLAT16_STEP(x6, x15, x13, x14); f_q6 = FLAT16_OUT();
++
++    *out_p6 = vec_sel(p6, f_p6, flat16);
++    *out_p5 = vec_sel(p5, f_p5, flat16);
++    *out_p4 = vec_sel(p4, f_p4, flat16);
++    *out_p3 = vec_sel(p3, f_p3, flat16);
++    *out_p2 = vec_sel(*out_p2, f_p2, flat16);
++    *out_p1 = vec_sel(*out_p1, f_p1, flat16);
++    *out_p0 = vec_sel(*out_p0, f_p0, flat16);
++    *out_q0 = vec_sel(*out_q0, f_q0, flat16);
++    *out_q1 = vec_sel(*out_q1, f_q1, flat16);
++    *out_q2 = vec_sel(*out_q2, f_q2, flat16);
++    *out_q3 = vec_sel(q3, f_q3, flat16);
++    *out_q4 = vec_sel(q4, f_q4, flat16);
++    *out_q5 = vec_sel(q5, f_q5, flat16);
++    *out_q6 = vec_sel(q6, f_q6, flat16);
++
++    return 1;
++}
++
++#undef FLAT16_STEP
++#undef FLAT16_OUT
++
++/* loop_filter_8[2][1]: one 8-column group, 16 rows around a row edge. */
++static void loop_filter_v_16_8_altivec(uint8_t *dst, ptrdiff_t stride,
++                                       int E, int I, int H)
++{
++    vec_u8 p7 = unaligned_load(-8 * stride, dst);
++    vec_u8 p6 = unaligned_load(-7 * stride, dst);
++    vec_u8 p5 = unaligned_load(-6 * stride, dst);
++    vec_u8 p4 = unaligned_load(-5 * stride, dst);
++    vec_u8 p3 = unaligned_load(-4 * stride, dst);
++    vec_u8 p2 = unaligned_load(-3 * stride, dst);
++    vec_u8 p1 = unaligned_load(-2 * stride, dst);
++    vec_u8 p0 = unaligned_load(-1 * stride, dst);
++    vec_u8 q0 = unaligned_load( 0 * stride, dst);
++    vec_u8 q1 = unaligned_load( 1 * stride, dst);
++    vec_u8 q2 = unaligned_load( 2 * stride, dst);
++    vec_u8 q3 = unaligned_load( 3 * stride, dst);
++    vec_u8 q4 = unaligned_load( 4 * stride, dst);
++    vec_u8 q5 = unaligned_load( 5 * stride, dst);
++    vec_u8 q6 = unaligned_load( 6 * stride, dst);
++    vec_u8 q7 = unaligned_load( 7 * stride, dst);
++    vec_u8 o_p6, o_p5, o_p4, o_p3, o_p2, o_p1, o_p0;
++    vec_u8 o_q0, o_q1, o_q2, o_q3, o_q4, o_q5, o_q6;
++
++    if (filter_core_16(p7, p6, p5, p4, p3, p2, p1, p0,
++                       q0, q1, q2, q3, q4, q5, q6, q7, E, I, H,
++                       &o_p6, &o_p5, &o_p4, &o_p3, &o_p2, &o_p1, &o_p0,
++                       &o_q0, &o_q1, &o_q2, &o_q3, &o_q4, &o_q5, &o_q6)) {
++        store_u64(o_p6, dst - 7 * stride);
++        store_u64(o_p5, dst - 6 * stride);
++        store_u64(o_p4, dst - 5 * stride);
++        store_u64(o_p3, dst - 4 * stride);
++        store_u64(o_q3, dst + 3 * stride);
++        store_u64(o_q4, dst + 4 * stride);
++        store_u64(o_q5, dst + 5 * stride);
++        store_u64(o_q6, dst + 6 * stride);
++    }
++    store_u64(o_p2, dst - 3 * stride);
++    store_u64(o_p1, dst - 2 * stride);
++    store_u64(o_p0, dst - 1 * stride);
++    store_u64(o_q0, dst);
++    store_u64(o_q1, dst + 1 * stride);
++    store_u64(o_q2, dst + 2 * stride);
++}
++
++/* loop_filter_16[1]: two 8-column groups side by side (C: dst, dst + 8). */
++static void loop_filter_v_16_16_altivec(uint8_t *dst, ptrdiff_t stride,
++                                        int E, int I, int H)
++{
++    loop_filter_v_16_8_altivec(dst,     stride, E, I, H);
++    loop_filter_v_16_8_altivec(dst + 8, stride, E, I, H);
++}
++
+ #define VP9_COPY_ALIGNED(W, align)                                         \
+ static void copy##W##_altivec(uint8_t *dst, ptrdiff_t dst_stride,          \
+                               const uint8_t *src, ptrdiff_t src_stride,    \
+@@ -2937,6 +3144,8 @@ static av_cold void vp9dsp_loopfilter_init_ppc(VP9DSPContext *dsp)
+     dsp->loop_filter_8[1][0] = loop_filter_h_8_8_altivec;
+     dsp->loop_filter_8[0][1] = loop_filter_v_4_8_altivec;
+     dsp->loop_filter_8[1][1] = loop_filter_v_8_8_altivec;
++    dsp->loop_filter_8[2][1] = loop_filter_v_16_8_altivec;
++    dsp->loop_filter_16[1]   = loop_filter_v_16_16_altivec;
+     dsp->loop_filter_mix2[0][0][0] = loop_filter_h_44_16_altivec;
+     dsp->loop_filter_mix2[0][1][0] = loop_filter_h_48_16_altivec;
+     dsp->loop_filter_mix2[1][0][0] = loop_filter_h_84_16_altivec;
+-- 
+2.43.0
+

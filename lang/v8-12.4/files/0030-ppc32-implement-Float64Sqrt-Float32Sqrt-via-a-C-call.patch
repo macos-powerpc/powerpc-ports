@@ -1,0 +1,185 @@
+From f705c3d63c3d251aeb58ac959b251a3ef193ed9d Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Mon, 31 Aug 2026 21:59:49 +0000
+Subject: [PATCH 30/52] ppc32: implement Float64Sqrt/Float32Sqrt via a C call
+ to libm sqrt
+
+12.4 re-derivation of the 9.4-series patch 0026, identical in design
+and content (the insertion contexts moved only slightly; the selector
+hunks are re-derived in InstructionSelectorT<Adapter> template form,
+valid for both the Turbofan and Turboshaft instantiations).
+
+fsqrt is an optional instruction first implemented by the 970, so
+G3/G4 have no hardware square root.  Route Float64Sqrt/Float32Sqrt
+through a new kIeee754Float64Sqrt opcode -> CallCFunction ->
+base::ieee754::sqrt (libm, correctly rounded; Apple libm dispatches
+per-CPU so the same binary is right on G3/G4/G5).  The MiscField bit
+requests frsp narrowing for Float32Sqrt, which is exact double
+rounding for sqrt of any float32 input.  kPPC_SqrtDouble becomes
+UNREACHABLE on ppc32.
+
+12.4 note: the only new-in-12.4 enumeration surface checked was the
+turboshaft pipeline; it funnels through the same arch visitors, and
+grep confirms no generic-code case list enumerates the Ieee754
+opcodes besides instruction-scheduler.cc.
+---
+ v8/src/base/ieee754.cc                             |  7 +++++++
+ v8/src/base/ieee754.h                              |  3 +++
+ v8/src/codegen/external-reference.cc               |  2 ++
+ v8/src/codegen/external-reference.h                |  1 +
+ v8/src/compiler/backend/instruction-codes.h        |  1 +
+ v8/src/compiler/backend/instruction-scheduler.cc   |  1 +
+ v8/src/compiler/backend/ppc/code-generator-ppc.cc  | 14 ++++++++++++++
+ .../backend/ppc/instruction-selector-ppc.cc        | 13 +++++++++++++
+ 8 files changed, 42 insertions(+)
+
+diff --git a/v8/src/base/ieee754.cc b/v8/src/base/ieee754.cc
+index e71b63f..0923ae8 100644
+--- a/v8/src/base/ieee754.cc
++++ b/v8/src/base/ieee754.cc
+@@ -2957,6 +2957,13 @@ double sinh(double x) {
+   return x * shuge;
+ }
+ 
++double sqrt(double x) {
++  // Delegate to libm, whose sqrt returns the correctly rounded result on
++  // all supported targets. Only used by architectures without a hardware
++  // sqrt instruction (ppc32).
++  return std::sqrt(x);
++}
++
+ /* Tanh(x)
+  * Return the Hyperbolic Tangent of x
+  *
+diff --git a/v8/src/base/ieee754.h b/v8/src/base/ieee754.h
+index 953b5b0..7a5f7dd 100644
+--- a/v8/src/base/ieee754.h
++++ b/v8/src/base/ieee754.h
+@@ -97,6 +97,9 @@ V8_BASE_EXPORT double cosh(double x);
+ // Returns the hyperbolic sine of |x|, where |x| is given radians.
+ V8_BASE_EXPORT double sinh(double x);
+ 
++// Returns the correctly rounded square root of |x|.
++V8_BASE_EXPORT double sqrt(double x);
++
+ // Returns the hyperbolic tangent of |x|, where |x| is given radians.
+ V8_BASE_EXPORT double tanh(double x);
+ 
+diff --git a/v8/src/codegen/external-reference.cc b/v8/src/codegen/external-reference.cc
+index ef05e9f..37180d3 100644
+--- a/v8/src/codegen/external-reference.cc
++++ b/v8/src/codegen/external-reference.cc
+@@ -979,6 +979,8 @@ FUNCTION_REFERENCE_WITH_TYPE(ieee754_log2_function, base::ieee754::log2,
+                              BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_sinh_function, base::ieee754::sinh,
+                              BUILTIN_FP_CALL)
++FUNCTION_REFERENCE_WITH_TYPE(ieee754_sqrt_function, base::ieee754::sqrt,
++                             BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_tan_function, base::ieee754::tan,
+                              BUILTIN_FP_CALL)
+ FUNCTION_REFERENCE_WITH_TYPE(ieee754_tanh_function, base::ieee754::tanh,
+diff --git a/v8/src/codegen/external-reference.h b/v8/src/codegen/external-reference.h
+index 77b77e1..6490129 100644
+--- a/v8/src/codegen/external-reference.h
++++ b/v8/src/codegen/external-reference.h
+@@ -170,6 +170,7 @@ class StatsCounter;
+   V(ieee754_pow_function, "base::ieee754::pow")                                \
+   V(ieee754_sin_function, "base::ieee754::sin")                                \
+   V(ieee754_sinh_function, "base::ieee754::sinh")                              \
++  V(ieee754_sqrt_function, "base::ieee754::sqrt")                              \
+   V(ieee754_tan_function, "base::ieee754::tan")                                \
+   V(ieee754_tanh_function, "base::ieee754::tanh")                              \
+   V(insert_remembered_set_function, "Heap::InsertIntoRememberedSetFromCode")   \
+diff --git a/v8/src/compiler/backend/instruction-codes.h b/v8/src/compiler/backend/instruction-codes.h
+index 143d211..d9fe241 100644
+--- a/v8/src/compiler/backend/instruction-codes.h
++++ b/v8/src/compiler/backend/instruction-codes.h
+@@ -174,6 +174,7 @@ inline RecordWriteMode WriteBarrierKindToRecordWriteMode(
+   V(Ieee754Float64Pow)                                                     \
+   V(Ieee754Float64Sin)                                                     \
+   V(Ieee754Float64Sinh)                                                    \
++  V(Ieee754Float64Sqrt)                                                    \
+   V(Ieee754Float64Tan)                                                     \
+   V(Ieee754Float64Tanh)                                                    \
+   COMMON_ARCH_OPCODE_WITH_MEMORY_ACCESS_MODE_LIST(V)
+diff --git a/v8/src/compiler/backend/instruction-scheduler.cc b/v8/src/compiler/backend/instruction-scheduler.cc
+index 7aba8a2..a3950c1 100644
+--- a/v8/src/compiler/backend/instruction-scheduler.cc
++++ b/v8/src/compiler/backend/instruction-scheduler.cc
+@@ -292,6 +292,7 @@ int InstructionScheduler::GetInstructionFlags(const Instruction* instr) const {
+     case kIeee754Float64Pow:
+     case kIeee754Float64Sin:
+     case kIeee754Float64Sinh:
++    case kIeee754Float64Sqrt:
+     case kIeee754Float64Tan:
+     case kIeee754Float64Tanh:
+       return kNoOpcodeFlags;
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 1b6bf23..b583198 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1626,6 +1626,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kIeee754Float64Sinh:
+       ASSEMBLE_IEEE754_UNOP(sinh);
+       break;
++    case kIeee754Float64Sqrt:
++      ASSEMBLE_IEEE754_UNOP(sqrt);
++      if (MiscField::decode(instr->opcode())) {
++        // Float32Sqrt: round the double result to float32. This double
++        // rounding is exact for sqrt of any float32 input.
++        __ frsp(i.OutputDoubleRegister(), i.OutputDoubleRegister());
++      }
++      break;
+     case kIeee754Float64Cos:
+       ASSEMBLE_IEEE754_UNOP(cos);
+       break;
+@@ -1668,7 +1676,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       ASSEMBLE_FLOAT_UNOP_RC(fabs, 0);
+       break;
+     case kPPC_SqrtDouble:
++#if V8_TARGET_ARCH_PPC64
+       ASSEMBLE_FLOAT_UNOP_RC(fsqrt, MiscField::decode(instr->opcode()));
++#else
++      // Float64Sqrt/Float32Sqrt are selected as kIeee754Float64Sqrt on
++      // ppc32 (no fsqrt on G3/G4).
++      UNREACHABLE();
++#endif
+       break;
+     case kPPC_FloorDouble:
+       ASSEMBLE_FLOAT_UNOP_RC(frim, MiscField::decode(instr->opcode()));
+diff --git a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+index 43c8edb..1a72eb6 100644
+--- a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -2278,7 +2278,15 @@ void InstructionSelectorT<Adapter>::VisitFloat64Abs(node_t node) {
+ 
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitFloat32Sqrt(node_t node) {
++#if V8_TARGET_ARCH_PPC64
+     VisitRR(this, kPPC_SqrtDouble | MiscField::encode(1), node);
++#else
++  // No fsqrt on G3/G4 (optional instruction, first implemented by the
++  // 970); call out to libm sqrt like the other ieee754 unops. The
++  // MiscField bit requests float32 rounding of the double result, which
++  // is exact for sqrt of any float32 input.
++  VisitFloat64Ieee754Unop(node, kIeee754Float64Sqrt | MiscField::encode(1));
++#endif
+ }
+ 
+ template <typename Adapter>
+@@ -2302,7 +2310,12 @@ void InstructionSelectorT<Adapter>::VisitFloat64Ieee754Binop(
+ 
+ template <typename Adapter>
+ void InstructionSelectorT<Adapter>::VisitFloat64Sqrt(node_t node) {
++#if V8_TARGET_ARCH_PPC64
+     VisitRR(this, kPPC_SqrtDouble, node);
++#else
++  // No fsqrt on G3/G4; call out to libm sqrt like the other ieee754 unops.
++  VisitFloat64Ieee754Unop(node, kIeee754Float64Sqrt);
++#endif
+ }
+ 
+ template <typename Adapter>
+-- 
+2.43.0
+

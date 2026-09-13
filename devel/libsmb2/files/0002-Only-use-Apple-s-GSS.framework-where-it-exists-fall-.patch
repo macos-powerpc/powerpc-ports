@@ -1,0 +1,313 @@
+From 2a9dde45e3cd6e8a6f0ebf2a037ce1647891cdcf Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 6 Sep 2026 01:13:14 +0000
+Subject: [PATCH 2/3] Only use Apple's GSS.framework where it exists, fall back
+ to Unix gssapi otherwise
+
+libsmb2-private.h, krb5-wrapper.h and krb5-wrapper.c unconditionally
+included <GSS/GSS.h> whenever __APPLE__ was defined, breaking builds
+where that framework header is unavailable (e.g. older SDKs, or a
+Heimdal/MIT krb5 install from a package manager rather than Xcode),
+issue #476.
+
+Add an autoconf/cmake check for GSS/GSS.h (HAVE_GSS_GSS_H) and use it,
+together with __APPLE__, to select the framework header only when it
+is actually present. Every other __APPLE__ conditional in the krb5
+wrapper that depends on which GSS implementation is in use (mechanism
+OID constants, gss_set_neg_mechs, s4u2self, keytab-based server
+credentials, the NTLMSSP capability probe) is gated the same way, so
+an Apple build without the framework follows the normal Unix codepath
+with Kerberos 5 end to end instead of only partially.
+
+When GSS.framework *is* what we compile against, link only that
+framework (and Kerberos.framework for the krb5_* API) - never
+-lgssapi_krb5/-lkrb5. Those plain library names are found by searching
+the whole library path, so on a system with a package manager
+(MacPorts, Homebrew, ...) they can resolve to a completely unrelated
+MIT/Heimdal krb5 install instead of Apple's own. That's not just untidy:
+the code above is gated on GSS.framework's specific limitations (no
+gss_set_neg_mechs, no s4u2self proxy credentials, no krb5-backed
+NTLMSSP capability probe), and running it against a different
+implementation that doesn't actually share those limitations means
+needlessly disabling features that would work fine, or worse, silently
+depending on link order for correctness. Confirmed exactly this on a
+real macOS 10.15 + MacPorts build via `otool -L`: libsmb2.dylib ended up
+linked against MacPorts' own libgssapi_krb5/libkrb5 *and*
+GSS.framework simultaneously. Frameworks are resolved via the framework
+search path, not -L, so linking only the frameworks when the framework
+header is used keeps header and implementation guaranteed to match.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HipnMZ4oFkNioWvpfRC64V
+---
+ CMakeLists.txt              | 52 +++++++++++++++++++++++++++++--------
+ cmake/ConfigureChecks.cmake |  3 +++
+ cmake/config.h.cmake        |  3 +++
+ configure.ac                | 30 ++++++++++++++++++---
+ include/libsmb2-private.h   |  7 +++--
+ lib/krb5-wrapper.c          | 19 ++++++++------
+ lib/krb5-wrapper.h          |  5 +++-
+ 7 files changed, 93 insertions(+), 26 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3972def..a027b5c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -89,8 +89,11 @@ endif()
+     endif()
+   endif()
+ 
+-  # Kerberos. Every krb5_* and gss_* symbol we use comes out of
+-  # gssapi_krb5, which is also the only thing the autotools build links.
++  # Kerberos. On Apple with GSS.framework, link only that framework (and
++  # Kerberos.framework); otherwise every krb5_* and gss_* symbol we use
++  # comes out of gssapi_krb5, which is also the only thing the autotools
++  # build links in that case. See the block below for why the two paths
++  # must not mix.
+   #
+   # This used to be probed on linux only, with ios looking for gssapi
+   # instead, so on macos and the BSDs the header check in ConfigureChecks
+@@ -100,16 +103,43 @@ endif()
+   # refuses them.
+   if(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin|.*BSD|Solaris|Android" OR IOS)
+     if(ENABLE_LIBKRB5 OR ENABLE_GSSAPI)
+-      find_package(GSSAPI)
+-      if(GSSAPI_FOUND)
+-        set(core_DEPENDS ${GSSAPI_LIBRARIES} CACHE STRING "" FORCE)
++      set(_SMB2_GSS_FRAMEWORK FALSE)
++      if(APPLE)
++        include(CheckIncludeFile)
++        check_include_file("GSS/GSS.h" HAVE_GSS_GSS_H)
++        if(HAVE_GSS_GSS_H)
++          set(_SMB2_GSS_FRAMEWORK TRUE)
++        endif()
++      endif()
++      if(_SMB2_GSS_FRAMEWORK)
++        # When GSS.framework is what we compile against, link *only* the
++        # framework (and Kerberos.framework for the krb5_* API), never
++        # -lgssapi_krb5/-lkrb5. Those plain library names are found by
++        # searching the whole library path, so on a system with a
++        # package manager (MacPorts, Homebrew, ...) they can just as
++        # easily resolve to a completely unrelated MIT/Heimdal krb5
++        # install as to Apple's own. That wouldn't just be untidy: it
++        # would run code compiled against GSS.framework's header (and
++        # gated on GSS.framework's specific limitations, e.g. no
++        # gss_set_neg_mechs, no s4u2self proxy credentials) against a
++        # different implementation that doesn't actually share those
++        # limitations. Frameworks are found via the framework search
++        # path, not -L, so this keeps header and implementation
++        # guaranteed to match, regardless of what else the library
++        # search path turns up.
++        set(core_DEPENDS "-framework GSS" "-framework Kerberos" CACHE STRING "" FORCE)
+       else()
+-        # Compiling the kerberos paths in when there is no library to link
+-        # them against only moves the failure to link time, so build
+-        # without kerberos instead.
+-        message(STATUS "gssapi_krb5 not found, building without Kerberos")
+-        set(ENABLE_LIBKRB5 OFF)
+-        set(ENABLE_GSSAPI OFF)
++        find_package(GSSAPI)
++        if(GSSAPI_FOUND)
++          set(core_DEPENDS ${GSSAPI_LIBRARIES} CACHE STRING "" FORCE)
++        else()
++          # Compiling the kerberos paths in when there is no library to link
++          # them against only moves the failure to link time, so build
++          # without kerberos instead.
++          message(STATUS "gssapi_krb5 not found, building without Kerberos")
++          set(ENABLE_LIBKRB5 OFF)
++          set(ENABLE_GSSAPI OFF)
++        endif()
+       endif()
+     endif()
+   endif()
+diff --git a/cmake/ConfigureChecks.cmake b/cmake/ConfigureChecks.cmake
+index e95c010..f36be3e 100644
+--- a/cmake/ConfigureChecks.cmake
++++ b/cmake/ConfigureChecks.cmake
+@@ -17,6 +17,9 @@ check_include_file("gssapi/gssapi.h" HAVE_GSSAPI_GSSAPI_H)
+ endif()
+ if (ENABLE_LIBKRB5)
+ check_include_file("krb5/krb5.h" HAVE_LIBKRB5)
++# Prefer Apple's GSS.framework header when present; otherwise the code
++# falls back to the normal Unix gssapi/gssapi.h codepath (issue #476).
++check_include_file("GSS/GSS.h" HAVE_GSS_GSS_H)
+ endif()
+ check_include_file("inttypes.h" HAVE_INTTYPES_H)
+ check_include_file("netdb.h" HAVE_NETDB_H)
+diff --git a/cmake/config.h.cmake b/cmake/config.h.cmake
+index 202ba38..fe08fbe 100644
+--- a/cmake/config.h.cmake
++++ b/cmake/config.h.cmake
+@@ -18,6 +18,9 @@
+ /* Define to 1 if you have the <gssapi/gssapi.h> header file. */
+ #cmakedefine HAVE_GSSAPI_GSSAPI_H "@HAVE_GSSAPI_GSSAPI_H@"
+ 
++/* Define to 1 if you have the <GSS/GSS.h> header file. */
++#cmakedefine HAVE_GSS_GSS_H "@HAVE_GSS_GSS_H@"
++
+ /* Whether we use gssapi_krb5 or not */
+ #cmakedefine HAVE_LIBKRB5 "@HAVE_LIBKRB5@"
+ 
+diff --git a/configure.ac b/configure.ac
+index 57a41d0..634e2b0 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -35,12 +35,34 @@ AC_ARG_WITH([libkrb5],
+                              NTLMSSP module for authentication instead.])])
+ 
+ AS_IF([test "x$with_libkrb5" != "xno"], [
+-    MAYBE_LIBKRB5="-lgssapi_krb5"
+     AC_DEFINE([HAVE_LIBKRB5], [1], [Whether we use gssapi_krb5 or not])
+     AC_MSG_NOTICE([Build with gssapi_krb5 support])
+-    dnl  Check for gssapi/gssapi.h
+-    AC_CHECK_HEADERS([gssapi/gssapi.h], [], [
+-        AC_MSG_ERROR([You need gssapi development files to compile libsmb2.])
++    dnl  On Apple platforms we prefer the GSS.framework header, but it is
++    dnl  not always present (e.g. older SDKs, or a Heimdal/MIT krb5 install
++    dnl  from a package manager instead of Xcode). Fall back to the normal
++    dnl  Unix gssapi/gssapi.h codepath whenever GSS/GSS.h is not available.
++    AC_CHECK_HEADERS([GSS/GSS.h])
++    AS_IF([test "x$ac_cv_header_GSS_GSS_h" = "xyes"], [
++        dnl  When GSS.framework is what we compile against, link *only*
++        dnl  the framework (and Kerberos.framework for the krb5_* API),
++        dnl  never -lgssapi_krb5/-lkrb5. Those plain -l names are found
++        dnl  by searching the whole library path, so on a system with a
++        dnl  package manager (MacPorts, Homebrew, ...) they can just as
++        dnl  easily resolve to a completely unrelated MIT/Heimdal krb5
++        dnl  install as to Apple's own. That wouldn't just be untidy: it
++        dnl  would run code compiled against GSS.framework's header (and
++        dnl  gated on GSS.framework's specific limitations, e.g. no
++        dnl  gss_set_neg_mechs, no s4u2self proxy credentials) against a
++        dnl  *different* implementation that doesn't actually share those
++        dnl  limitations. Frameworks are found via the framework search
++        dnl  path, not -L, so this keeps header and implementation
++        dnl  guaranteed to match, regardless of what else -L turns up.
++        MAYBE_LIBKRB5="-framework GSS -framework Kerberos"
++    ], [
++        MAYBE_LIBKRB5="-lgssapi_krb5"
++        AC_CHECK_HEADERS([gssapi/gssapi.h], [], [
++            AC_MSG_ERROR([You need gssapi development files to compile libsmb2.])
++        ])
+     ])
+ ], [
+     MAYBE_LIBKRB5=""
+diff --git a/include/libsmb2-private.h b/include/libsmb2-private.h
+index e3b6758..5292cbc 100644
+--- a/include/libsmb2-private.h
++++ b/include/libsmb2-private.h
+@@ -26,12 +26,15 @@ extern "C" {
+ #ifdef HAVE_LIBKRB5
+ #include <krb5/krb5.h>
+ 
+-#ifdef __APPLE__
++/* Use Apple's GSS.framework only where it actually exists (issue #476);
++ * otherwise fall back to the normal Unix gssapi/gssapi.h codepath, e.g.
++ * when linking against a Heimdal/MIT krb5 install on macOS. */
++#if defined(__APPLE__) && defined(HAVE_GSS_GSS_H)
+ #include <GSS/GSS.h>
+ #else
+ #include <gssapi/gssapi.h>
+ #include <gssapi/gssapi_ext.h>
+-#endif /* __APPLE__ */
++#endif
+ #endif /* HAVE_LIBKRB5 */
+ 
+ #ifndef MIN
+diff --git a/lib/krb5-wrapper.c b/lib/krb5-wrapper.c
+index 6b876f8..f6e2289 100644
+--- a/lib/krb5-wrapper.c
++++ b/lib/krb5-wrapper.c
+@@ -57,7 +57,10 @@
+ #include <sys/unistd.h>
+ #endif
+ 
+-#ifdef __APPLE__
++/* Use Apple's GSS.framework only where it actually exists (issue #476);
++ * otherwise fall back to the normal Unix gssapi/gssapi.h codepath, e.g.
++ * when linking against a Heimdal/MIT krb5 install on macOS. */
++#if defined(__APPLE__) && defined(HAVE_GSS_GSS_H)
+ #include <GSS/GSS.h>
+ #else
+ #include <gssapi/gssapi_krb5.h>
+@@ -265,7 +268,7 @@ krb5_negotiate_reply(struct smb2_context *smb2,
+ 
+         /* TODO: the proper mechanism (SPNEGO vs NTLM vs KRB5) should be
+          * selected based on the SMB negotiation flags */
+-        #ifdef __APPLE__
++        #if defined(__APPLE__) && defined(HAVE_GSS_GSS_H)
+         auth_data->mech_type = auth_data->use_spnego ? GSS_SPNEGO_MECHANISM : GSS_KRB5_MECHANISM;
+         #else
+         auth_data->mech_type = auth_data->use_spnego ? &gss_mech_spnego : gss_mech_krb5;
+@@ -327,7 +330,7 @@ krb5_negotiate_reply(struct smb2_context *smb2,
+                         krb5_free_auth_data(auth_data);
+                         return NULL;
+         }
+-        #ifndef __APPLE__ /* gss_set_neg_mechs is not defined on macOS/iOS. */
++        #if !defined(__APPLE__) || !defined(HAVE_GSS_GSS_H) /* gss_set_neg_mechs is not defined by Apple's GSS.framework. */
+         #ifdef SMB2_USER_KRB5_FOR_NTLLM
+         if (smb2->sec != SMB2_SEC_UNDEFINED) {
+                 gss_OID_set_desc wantMech;
+@@ -458,7 +461,7 @@ krb5_session_request(struct smb2_context *smb2,
+         return 0;
+ }
+ 
+-#ifndef __APPLE__
++#if !defined(__APPLE__) || !defined(HAVE_GSS_GSS_H)
+ static OM_uint32
+ establish_contexts(struct smb2_context *smb2,
+                       gss_OID imech,
+@@ -555,7 +558,7 @@ krb5_init_server_client_cred(struct smb2_server *server, struct smb2_context *sm
+         char *spos;
+         gss_OID mech = GSS_C_NO_OID;
+ 
+-#ifndef __APPLE__
++#if !defined(__APPLE__) || !defined(HAVE_GSS_GSS_H)
+         if (smb2->sec != SMB2_SEC_KRB5) {
+                 mech = discard_const(gss_mech_krb5);
+         } else {
+@@ -608,7 +611,7 @@ krb5_init_server_client_cred(struct smb2_server *server, struct smb2_context *sm
+         } else {
+                 cred_usage = GSS_C_ACCEPT;
+         }
+-#ifndef __APPLE__
++#if !defined(__APPLE__) || !defined(HAVE_GSS_GSS_H)
+         /*
+          * server->auth_data is private_auth_data only when a keytab was
+          * configured at server start (see krb5_init_server_credentials).
+@@ -781,7 +784,7 @@ krb5_session_reply(struct smb2_context *smb2,
+                  * the client context, so attempt an s4u2self
+                  * with user-name to get one
+                  */
+-#ifdef __APPLE__
++#if defined(__APPLE__) && defined(HAVE_GSS_GSS_H)
+                 smb2_set_error(smb2, "Apple has no way to proxy credentials");
+                 return -1;
+ #else
+@@ -1059,7 +1062,7 @@ krb5_get_output_token_buffer(struct private_auth_data *auth_data)
+ int
+ krb5_can_do_ntlmssp(void)
+ {
+-#ifndef __APPLE__
++#if !defined(__APPLE__) || !defined(HAVE_GSS_GSS_H)
+         gss_OID_set mech_attrs;
+         gss_OID_set known_mech_attrs;
+         uint32_t maj, min;
+diff --git a/lib/krb5-wrapper.h b/lib/krb5-wrapper.h
+index 19d69ff..fa00d3d 100644
+--- a/lib/krb5-wrapper.h
++++ b/lib/krb5-wrapper.h
+@@ -34,7 +34,10 @@ extern "C" {
+ 
+ #include <krb5/krb5.h>
+ 
+-#ifdef __APPLE__
++/* Use Apple's GSS.framework only where it actually exists (issue #476);
++ * otherwise fall back to the normal Unix gssapi/gssapi.h codepath, e.g.
++ * when linking against a Heimdal/MIT krb5 install on macOS. */
++#if defined(__APPLE__) && defined(HAVE_GSS_GSS_H)
+ #include <GSS/GSS.h>
+ #else
+ #include <gssapi/gssapi.h>
+-- 
+2.43.0
+
