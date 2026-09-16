@@ -1,0 +1,133 @@
+vlib/runtime/free_memory_impl_darwin.c.v already declares mach_host_self,
+host_page_size and host_statistics64, and V's `fn C.` declarations are
+program-wide, so vfetch's own declarations lose to vlib's and its call sites
+no longer typecheck. Drop the duplicates and follow the same calling
+convention vlib itself uses: a u32 page size cast to &C.vm_size_t, the info
+struct cast to &int, and a &u32 count.
+
+Using the C macros for the flavour and count also removes the hardcoded
+values, which were only correct for one SDK.
+
+This variant covers macOS 10.5 through 10.8 (Darwin < 13).
+
+10.5 has neither host_statistics64 nor vm_statistics64 -- both arrived in
+10.6, so 10.5 has no other option. But 10.6, 10.7 and 10.8 also use this
+32-bit path, even though their SDK's vm_statistics64 struct exists: vfetch's
+own copy of that struct (in the upstream source this patch replaces) is the
+24-field, 10.9+ shape with the memory-compression counters, and building it
+on an older SDK whose <mach/vm_statistics.h> only defines the 15-field
+pre-compression struct fails outright --
+  cc: ...vfetch.*.tmp.c: error: variable '_t2' has initializer but incomplete type
+  cc: ...vfetch.*.tmp.c: error: 'struct vm_statistics64' has no member named 'free_count'
+-- rather than hand-trim that struct to match each SDK (its fields are a
+mix of 32- and 64-bit types, easy to get subtly wrong), every pre-10.9
+target uses the classic 32-bit host_statistics/HOST_VM_INFO interface
+instead. That struct is unchanged from Mac OS X 10.0 through today (its
+own header comment: "you cannot add any new fields to this structure. Add
+them below in vm_statistics64"), gained purgeable_count and
+speculative_count in 10.5, and vlib does not declare host_statistics, so it
+is declared here in vlib's style. 32-bit page counts cannot overflow on
+hardware this old (a 32-bit count tops out around 16TB of RAM at a 4KB page
+size).
+
+kern.memorystatus_vm_pressure_level does not exist before 10.9 either;
+return none.
+
+--- system/memory.v.original
++++ system/memory.v
+@@ -8,40 +8,17 @@
+ #include <sys/sysctl.h>
+ #include <sys/types.h>
+ 
+-struct C.vm_statistics64 {
+-  free_count                             u64
+-  active_count                           u64
+-  inactive_count                         u64
+-  wire_count                             u64
+-  zero_fill_count                        u64
+-  reactivations                          u64
+-  pageins                                u64
+-  pageouts                               u64
+-  faults                                 u64
+-  cow_faults                             u64
+-  lookups                                u64
+-  hits                                   u64
+-  purges                                 u64
+-  purgeable_count                        u64
+-  speculative_count                      u64
+-  decompressions                         u64
+-  compressions                           u64
+-  swapins                                u64
+-  swapouts                               u64
+-  compressor_page_count                  u64
+-  throttled_count                        u64
+-  external_page_count                    u64
+-  internal_page_count                    u64
+-  total_uncompressed_pages_in_compressor u64
++struct C.vm_statistics {
++  free_count        u32
++  active_count      u32
++  inactive_count    u32
++  wire_count        u32
++  purgeable_count   u32
++  speculative_count u32
+ }
+ 
+-fn C.mach_host_self() int
+-fn C.host_page_size(host int, page_size &u64) int
+-fn C.host_statistics64(host int, flavor int, info &C.vm_statistics64, count &int) int
++fn C.host_statistics(host C.host_t, flavor i32, host_info_out &int, host_info_outCnt &u32) i32
+ fn C.sysctlbyname(name &char, oldp voidptr, oldlenp &usize, newp voidptr, newlen usize) int
+-
+-const host_vm_info64       = 4
+-const host_vm_info64_count = 38
+ 
+ const pressure_normal   = u32(1)
+ const pressure_warning  = u32(2)
+@@ -52,7 +29,7 @@
+   mut level := u32(0)
+   mut size := usize(sizeof(level))
+   if C.sysctlbyname(c'kern.memorystatus_vm_pressure_level', &level, &size, unsafe { nil }, 0) != 0 {
+-    return '?'
++    return none
+   }
+   return match level {
+     pressure_warning  { 'warning' }
+@@ -71,23 +48,25 @@
+     return failure
+   }
+ 
+-  mut page_size := u64(0)
+-  if C.host_page_size(C.mach_host_self(), &page_size) != 0 {
+-    return failure
++  host := C.mach_host_self()
++  mut page_size := u32(0)
++  mut stats := C.vm_statistics{}
++  mut count := u32(C.HOST_VM_INFO_COUNT)
++
++  unsafe {
++    if C.host_page_size(host, &C.vm_size_t(&page_size)) != 0 {
++      return failure
++    }
++    if C.host_statistics(host, C.HOST_VM_INFO, &int(&stats), &count) != 0 {
++      return failure
++    }
+   }
+ 
+-  mut stats := C.vm_statistics64{}
+-  mut count := int(host_vm_info64_count)
+-  if C.host_statistics64(C.mach_host_self(), host_vm_info64, &stats, &count) != 0 {
+-    return failure
+-  }
+-
+-  mut used := (
++  mut used := u64(
+     stats.active_count
+     + stats.inactive_count
+     + stats.speculative_count
+-    + stats.wire_count
+-    + stats.compressor_page_count - stats.purgeable_count - stats.external_page_count) * page_size
++    + stats.wire_count - stats.purgeable_count) * u64(page_size)
+ 
+   if mem_pressure := memory_pressure() {
+     return success("${human_readable_size(used)} / ${human_readable_size(total)} [${mem_pressure}]")

@@ -1,4 +1,4 @@
 fn main(){
-   println('This v installation is provided by MacPorts. To update, please run:')
-   println('sudo port selfupdate && sudo port upgrade vlang')
+   println('This v installation is provided by PowerPC Ports. To update, please run:')
+   println('sudo port upgrade vlang')
 }
