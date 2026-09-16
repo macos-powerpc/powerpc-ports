@@ -1,0 +1,228 @@
+GPU, storage and machine model all come from one shared `Machine` struct,
+populated by JSON-decoding `system_profiler ... -json`. -json was only added
+in macOS 10.15, so on every OS version this port targets that call produces
+plain text instead of JSON, json.decode() fails, get_misc() returns none,
+and all three fields are dropped -- vfetch.v skips any field whose Result is
+unsuccessful. system_profiler itself, and the plain-text format each of
+these three actions have always used, both predate 10.15 by a long way; only
+the -json flag is the problem. Replace each field with an independent,
+portable lookup instead of trying to keep the shared JSON call alive:
+
+* machine: hw.model (e.g. "MacBookPro9,2", "PowerMac3,1") via sysctlbyname,
+  the same MIB neofetch uses for "Model:" on macOS -- no marketing-name
+  lookup table, just the raw identifier.
+
+* storage: os.disk_usage('/'), V's own statvfs(3) wrapper (vlib/os/os_nix.c.v).
+  statvfs is a thin libc wrapper around statfs(2) per its own man page, so
+  this avoids hand-declaring a `struct statfs`, whose layout differs across
+  SDKs depending on _DARWIN_FEATURE_64_BIT_INODE (the same kind of mismatch
+  patch-memory-pre-10.9.diff had to work around for vm_statistics64).
+
+* gpu: `system_profiler SPDisplaysDataType -detailLevel mini` in its default
+  plain-text form (i.e. the same command with -json simply dropped), parsed
+  for the first "Chipset Model:" line -- the same field neofetch's own macOS
+  get_gpu() greps for. Kept on its own thread since it's the one field here
+  that's still a slow subprocess call; machine and storage are cheap direct
+  syscalls so they no longer need one.
+
+--- system/machine.v.original
++++ system/machine.v
+@@ -1,14 +1,17 @@
+ module system
+
++#include <sys/types.h>
++#include <sys/sysctl.h>
++
++fn C.sysctlbyname(name &char, oldp voidptr, oldlenp &usize, newp voidptr, newlen u64) int
++
+ @[inline]
+-fn get_machine(data Machine) Result {
+-	if data.hardware.len > 0 {
+-		for hardware in data.hardware {
+-			if hardware.machine.len > 0 {
+-				return success(hardware.machine)
+-			}
+-		}
+-	}
++fn get_machine() Result {
++  mut model := []u8{len: 256}
++  mut len := usize(sizeof(model))
++  if C.sysctlbyname("hw.model".str, &char(model.data), &len, 0, 0) != 0 {
++    return failure
++  }
+
+-	return failure
++  return success(model.bytestr())
+ }
+
+--- system/gpu.v.original
++++ system/gpu.v
+@@ -1,19 +1,25 @@
+ module system
+
++import os
++
+ @[inline]
+-fn get_gpu(data Machine) Result {
+-	for gpu in data.gpu {
+-		if gpu.device_type == 'spdisplays_gpu' {
+-			model := gpu.model
+-			cores := gpu.cores
++fn get_gpu() Result {
++  result := os.execute('system_profiler SPDisplaysDataType -detailLevel mini')
++  if result.exit_code != 0 {
++    return failure
++  }
+
+-			if cores == '' {
+-				return success(model)
+-			}
++  prefix := 'Chipset Model:'
+
+-			return success('${model} ${cores} cores')
+-		}
+-	}
++  for line in result.output.split_into_lines() {
++    trimmed := line.trim_space()
++    if trimmed.starts_with(prefix) {
++      model := trimmed[prefix.len..].trim_space()
++      if model.len > 0 {
++        return success(model)
++      }
++    }
++  }
+
+-	return failure
++  return failure
+ }
+
+--- system/storage.v.original
++++ system/storage.v
+@@ -1,21 +1,17 @@
+ module system
+
++import os
++
+ @[inline]
+-fn get_storage(data Machine) Result {
+-	mut used := f64(0.0)
+-	mut total := f64(0.0)
++fn get_storage() Result {
++  usage := os.disk_usage('/') or { return failure }
+
+-	for device in data.storages {
+-		if device.mount == '/' {
+-			total = f64(device.size / 1_000_000_000)
+-			used = total - f64(device.free / 1_000_000_000)
+-			break
+-		}
+-	}
++  used := usage.used / 1_000_000_000
++  total := usage.total / 1_000_000_000
+
+-	if 0.0 in [used, total] {
+-		return failure
+-	}
++  if used == 0 || total == 0 {
++    return failure
++  }
+
+-	return success('${used} / ${total} GB')
++  return success('${used} / ${total} GB')
+ }
+
+--- system/system.v.original
++++ system/system.v
+@@ -1,8 +1,5 @@
+ module system
+
+-import json
+-import os
+-
+ struct Result {
+ pub:
+ 	success bool
+@@ -15,43 +12,6 @@
+
+ const failure = Result{}
+
+-struct Display {
+-	main       string @[json: spdisplays_main]
+-	resolution string @[json: spdisplays_resolution]
+-}
+-
+-struct GPUDevice {
+-	model       string    @[json: sppci_model]
+-	cores       string    @[json: sppci_cores]
+-	device_type string    @[json: sppci_device_type]
+-	displays    []Display @[json: spdisplays_ndrvs]
+-}
+-
+-struct StorageDevice {
+-	free  u64    @[json: free_space_in_bytes]
+-	size  u64    @[json: size_in_bytes]
+-	mount string @[json: mount_point]
+-}
+-
+-struct Storage {
+-	storages []StorageDevice @[json: SPStorageDataType]
+-}
+-
+-struct HardwareDevice {
+-	machine string @[json: machine_name]
+-}
+-
+-struct Machine {
+-	hardware []HardwareDevice @[json: SPHardwareDataType]
+-	storages []StorageDevice  @[json: SPStorageDataType]
+-	gpu      []GPUDevice      @[json: SPDisplaysDataType]
+-}
+-
+-@[inline]
+-fn get_misc(str string) !Machine {
+-	return json.decode(Machine, str.trim_space())
+-}
+-
+ struct System {
+ pub mut:
+ 	user       Result
+@@ -86,21 +46,7 @@
+
+ @[inline]
+ pub fn new_system() ?&System {
+-  mut result := spawn fn () ?(Result, Result, Result) {
+-    query := unsafe {
+-      os.raw_execute(r"system_profiler SPHardwareDataType SPStorageDataType SPDisplaysDataType -detailLevel mini -json")
+-    }
+-
+-    if data := get_misc(query.output) {
+-      storage := get_storage(data)
+-      machine := get_machine(data)
+-      gpu := get_gpu(data)
+-
+-      return storage, machine, gpu
+-    }
+-
+-    return none
+-  }()
++  gpu_thread := spawn get_gpu()
+
+ 	mut sys := &System{
+     user: get_user()
+@@ -114,13 +60,11 @@
+ 		resolution: get_resolution()
+ 		bluetooth: get_bluetooth_status()
+     term: get_term()
++    storage: get_storage()
++    machine: get_machine()
+ 	}
+
+-  if storage, machine, gpu := result.wait() {
+-    sys.storage = storage
+-    sys.machine = machine
+-    sys.gpu = gpu
+-  }
++  sys.gpu = gpu_thread.wait()
+
+ 	return sys
+ }
