@@ -1,0 +1,410 @@
+cocoa: add a software window framebuffer
+
+The Cocoa driver has no native window framebuffer: SDL_GetWindowSurface()
+goes through the renderer-backed texture path, which needs an accelerated
+renderer. Without OpenGL (or when GL is broken on a given GPU), apps that
+draw through the window surface get a black window and nothing else.
+
+Keep an RGB888 buffer per window and present it with CoreGraphics:
+layer-backed views (10.8+ SDLView -wantsUpdateLayer path, everything on
+10.14+) get the CGImage as the layer contents inside a no-animation
+CATransaction; classic views are drawn into directly under
+lockFocusIfCanDraw - the AppKit way that is also valid from a secondary
+thread (mpv presents from its VO thread) - clipped to the dirty rects.
+-drawRect: only repaints the buffer on AppKit-initiated redraws and sends
+no expose event for that (an expose per present made mpv redraw in a loop).
+
+SDL's generic code still tries the texture framebuffer first and only
+falls back to this when no accelerated renderer exists (or when
+SDL_FRAMEBUFFER_ACCELERATION is "0"), so builds with OpenGL keep their
+current behavior. The state is kept in named window data and the pool
+macro falls back to @autoreleasepool, so the patch applies with or without
+0003-cocoa-legacy-macos.patch.
+The presenting thread need not be the main thread (mpv presents from its
+VO thread while its main thread runs the Cocoa runloop, which delivers
+-drawRect: repaints): a lock serializes the image swap and the buffer
+teardown against those repaints, and the swap never leaves the image
+pointer NULL.
+
+diff --git src/video/cocoa/SDL_cocoaframebuffer.h src/video/cocoa/SDL_cocoaframebuffer.h
+new file mode 100644
+index 000000000..b8c08a360
+--- /dev/null
++++ src/video/cocoa/SDL_cocoaframebuffer.h
+@@ -0,0 +1,42 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty. In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "../../SDL_internal.h"
++
++#ifndef SDL_cocoaframebuffer_h_
++#define SDL_cocoaframebuffer_h_
++
++/* A plain software framebuffer for Cocoa windows, presented with
++   CoreGraphics. SDL's generic code prefers a renderer-backed texture
++   framebuffer when an accelerated renderer (OpenGL, Metal) is available
++   and only falls back to this one when there is none - e.g. builds
++   without OpenGL - or when SDL_HINT_FRAMEBUFFER_ACCELERATION is "0". */
++
++extern int Cocoa_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format, void **pixels, int *pitch);
++extern int Cocoa_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects, int numrects);
++extern void Cocoa_DestroyWindowFramebuffer(_THIS, SDL_Window *window);
++
++/* Paints the current framebuffer image into a view drawing context, for
++   -[NSView drawRect:]. Returns SDL_FALSE if the window has no framebuffer. */
++extern SDL_bool Cocoa_DrawWindowFramebuffer(SDL_Window *window, CGContextRef context, CGRect bounds);
++
++#endif /* SDL_cocoaframebuffer_h_ */
++
++/* vi: set ts=4 sw=4 expandtab: */
+diff --git src/video/cocoa/SDL_cocoaframebuffer.m src/video/cocoa/SDL_cocoaframebuffer.m
+new file mode 100644
+index 000000000..0ba91e4d5
+--- /dev/null
++++ src/video/cocoa/SDL_cocoaframebuffer.m
+@@ -0,0 +1,283 @@
++/*
++  Simple DirectMedia Layer
++  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
++
++  This software is provided 'as-is', without any express or implied
++  warranty.  In no event will the authors be held liable for any damages
++  arising from the use of this software.
++
++  Permission is granted to anyone to use this software for any purpose,
++  including commercial applications, and to alter it and redistribute it
++  freely, subject to the following restrictions:
++
++  1. The origin of this software must not be misrepresented; you must not
++     claim that you wrote the original software. If you use this software
++     in a product, an acknowledgment in the product documentation would be
++     appreciated but is not required.
++  2. Altered source versions must be plainly marked as such, and must not be
++     misrepresented as being the original software.
++  3. This notice may not be removed or altered from any source distribution.
++*/
++#include "../../SDL_internal.h"
++
++#if SDL_VIDEO_DRIVER_COCOA
++
++#include "SDL_cocoavideo.h"
++#include "SDL_cocoaframebuffer.h"
++#include "../../events/SDL_windowevents_c.h"
++
++#include <pthread.h>
++
++#ifdef MAC_OS_X_VERSION_10_7 /* pre-10.7 SDKs don't expose the CALayer interface via Cocoa.h */
++#import <QuartzCore/QuartzCore.h>
++#endif
++
++/* Autorelease pool: the legacy (GCC) build spells pools SDL_COCOA_POOL via
++   SDL_cocoacompat.h; the stock clang build uses @autoreleasepool. */
++#ifdef SDL_COCOA_POOL
++#define COCOA_FB_POOL SDL_COCOA_POOL
++#else
++#define COCOA_FB_POOL @autoreleasepool
++#endif
++
++/* The pixels are RGB888 (XRGB, 32 bits) in host byte order, which is exactly
++   what CoreGraphics reads for kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host,
++   so the buffer is handed to CGImage without conversion.
++
++   Presentation: views that are layer-backed (10.8+ with the SDLView
++   -wantsUpdateLayer path, all views on 10.14+) get the image as the layer
++   contents; classic views are drawn into directly under lockFocusIfCanDraw,
++   the AppKit way that also works from a secondary thread (mpv presents from
++   its VO thread on the legacy builds).  -[SDLView drawRect:] only repaints
++   the buffer when AppKit asks (exposes, live resizes), via
++   Cocoa_DrawWindowFramebuffer, and sends no expose event for that: the app
++   has nothing to redraw, the buffer is what it last presented.
++
++   The state lives in named window data rather than in SDL_WindowData, so
++   this file is independent of the window data's layout.
++
++   Threads: the presenting thread need not be the main thread (mpv presents
++   from its VO thread while its main thread runs the Cocoa runloop, which
++   delivers -drawRect: repaints).  One lock serializes the image swap and
++   the buffer teardown on the presenting thread against those repaints;
++   the swap never leaves the image pointer NULL, so a repaint always has a
++   complete frame to draw. */
++
++#define COCOA_FRAMEBUFFER_DATA "SDL.internal.cocoa.framebuffer"
++
++typedef struct Cocoa_Framebuffer
++{
++    void *pixels;
++    int w;
++    int h;
++    int pitch;
++    CGImageRef image;
++} Cocoa_Framebuffer;
++
++static Cocoa_Framebuffer *Cocoa_GetFramebuffer(SDL_Window *window)
++{
++    return (Cocoa_Framebuffer *)SDL_GetWindowData(window, COCOA_FRAMEBUFFER_DATA);
++}
++
++static pthread_mutex_t framebuffer_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* caller holds framebuffer_lock */
++static void Cocoa_FreeFramebufferLocked(SDL_Window *window)
++{
++    Cocoa_Framebuffer *fb = Cocoa_GetFramebuffer(window);
++
++    if (!fb) {
++        return;
++    }
++    SDL_SetWindowData(window, COCOA_FRAMEBUFFER_DATA, NULL);
++
++#ifdef MAC_OS_X_VERSION_10_7
++    if (fb->image && window->driverdata) {
++        SDL_WindowData *data = (__bridge SDL_WindowData *)window->driverdata;
++        CALayer *layer = [data.sdlContentView layer];
++        if (layer && layer.contents == (__bridge id)fb->image) {
++            layer.contents = nil;
++        }
++    }
++#endif
++    if (fb->image) {
++        CGImageRelease(fb->image);
++    }
++    SDL_free(fb->pixels);
++    SDL_free(fb);
++}
++
++static CGImageRef Cocoa_CreateFramebufferImage(Cocoa_Framebuffer *fb)
++{
++    const size_t size = (size_t)fb->h * (size_t)fb->pitch;
++    CGDataProviderRef provider;
++    CGColorSpaceRef colorspace;
++    CGImageRef image = NULL;
++
++    /* The provider references the live pixel buffer; no copy is made here,
++       CoreGraphics reads it when the image is drawn / committed. */
++    provider = CGDataProviderCreateWithData(NULL, fb->pixels, size, NULL);
++    if (!provider) {
++        return NULL;
++    }
++    colorspace = CGColorSpaceCreateDeviceRGB();
++    if (colorspace) {
++        image = CGImageCreate((size_t)fb->w, (size_t)fb->h,
++                              8, 32, (size_t)fb->pitch, colorspace,
++                              kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host,
++                              provider, NULL, false, kCGRenderingIntentDefault);
++        CGColorSpaceRelease(colorspace);
++    }
++    CGDataProviderRelease(provider);
++    return image;
++}
++
++int Cocoa_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format, void **pixels, int *pitch)
++{ COCOA_FB_POOL
++{
++    Cocoa_Framebuffer *fb;
++    int w, h;
++
++    SDL_GetWindowSizeInPixels(window, &w, &h);
++    if (w < 1 || h < 1) {
++        return SDL_SetError("Window has no pixels to draw into");
++    }
++
++    fb = (Cocoa_Framebuffer *)SDL_calloc(1, sizeof(*fb));
++    if (!fb) {
++        return SDL_OutOfMemory();
++    }
++    fb->w = w;
++    fb->h = h;
++    fb->pitch = w * 4;
++    fb->pixels = SDL_calloc((size_t)h, (size_t)fb->pitch); /* starts out black, like the window */
++    if (!fb->pixels) {
++        SDL_free(fb);
++        return SDL_OutOfMemory();
++    }
++    pthread_mutex_lock(&framebuffer_lock);
++    Cocoa_FreeFramebufferLocked(window);
++    SDL_SetWindowData(window, COCOA_FRAMEBUFFER_DATA, fb);
++    pthread_mutex_unlock(&framebuffer_lock);
++
++    *format = SDL_PIXELFORMAT_RGB888;
++    *pixels = fb->pixels;
++    *pitch = fb->pitch;
++    return 0;
++}}
++
++int Cocoa_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects, int numrects)
++{ COCOA_FB_POOL
++{
++    Cocoa_Framebuffer *fb = Cocoa_GetFramebuffer(window);
++    SDL_WindowData *data = (__bridge SDL_WindowData *)window->driverdata;
++    NSView *view = data.sdlContentView;
++    CGImageRef image;
++    CGImageRef previous;
++
++    if (!fb) {
++        return SDL_SetError("Window has no framebuffer");
++    }
++
++    /* A fresh image every time: CoreGraphics may cache what it read from
++       the provider, and the app has just changed the pixels. */
++    image = Cocoa_CreateFramebufferImage(fb);
++    if (!image) {
++        return SDL_SetError("Couldn't create the framebuffer image");
++    }
++    pthread_mutex_lock(&framebuffer_lock);
++    previous = fb->image;
++    fb->image = image;
++    pthread_mutex_unlock(&framebuffer_lock);
++    if (previous) {
++        CGImageRelease(previous); /* a repaint in progress holds the lock until it is done with it */
++    }
++
++#ifdef MAC_OS_X_VERSION_10_7
++    {
++        CALayer *layer = [view layer];
++        if (layer) {
++            /* Layer-backed view: hand the image to Core Animation.  The
++               transaction disables the implicit contents cross-fade, and
++               the flush pushes it out now rather than at the end of the
++               current runloop pass. */
++            [CATransaction begin];
++            [CATransaction setDisableActions:YES];
++            layer.contents = (__bridge id)image;
++            [CATransaction commit];
++            [CATransaction flush];
++            return 0;
++        }
++    }
++#endif
++
++    /* Classic view: draw straight into the window's backing store,
++       clipped to the dirty rects (top-left pixel coordinates to
++       bottom-left points).  lockFocusIfCanDraw fails when the window
++       cannot be drawn into (hidden, miniaturized); AppKit repaints the
++       buffer through -drawRect: once it can. */
++    if ([view lockFocusIfCanDraw]) {
++#ifdef MAC_OS_X_VERSION_10_10
++        CGContextRef context = [[NSGraphicsContext currentContext] CGContext];
++#else
++        CGContextRef context = (CGContextRef)[[NSGraphicsContext currentContext] graphicsPort];
++#endif
++        if (context) {
++            const NSRect bounds = [view bounds];
++            const CGFloat sx = bounds.size.width / (CGFloat)fb->w;
++            const CGFloat sy = bounds.size.height / (CGFloat)fb->h;
++            CGRect *clip = SDL_stack_alloc(CGRect, numrects);
++            if (clip) {
++                int i;
++                for (i = 0; i < numrects; ++i) {
++                    clip[i] = CGRectMake(rects[i].x * sx,
++                                         bounds.size.height - (rects[i].y + rects[i].h) * sy,
++                                         rects[i].w * sx,
++                                         rects[i].h * sy);
++                }
++                CGContextClipToRects(context, clip, numrects);
++                SDL_stack_free(clip);
++            }
++            CGContextSetInterpolationQuality(context, kCGInterpolationNone);
++            CGContextDrawImage(context, CGRectMake(0, 0, bounds.size.width, bounds.size.height), image);
++        }
++        [view unlockFocus];
++        [[view window] flushWindow];
++    }
++    return 0;
++}}
++
++SDL_bool Cocoa_DrawWindowFramebuffer(SDL_Window *window, CGContextRef context, CGRect bounds)
++{
++    Cocoa_Framebuffer *fb;
++    SDL_bool drawn = SDL_FALSE;
++
++    if (!window || !context) {
++        return SDL_FALSE;
++    }
++    /* Under the lock: the presenting thread neither swaps the image nor
++       frees the pixels it reads while this draw is in progress. */
++    pthread_mutex_lock(&framebuffer_lock);
++    fb = Cocoa_GetFramebuffer(window);
++    if (fb && fb->image) {
++        /* The view is not flipped, so the image lands upright; CoreGraphics
++           clips to the dirty region and scales pixels to points if needed. */
++        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
++        CGContextDrawImage(context, bounds, fb->image);
++        drawn = SDL_TRUE;
++    }
++    pthread_mutex_unlock(&framebuffer_lock);
++    return drawn;
++}
++
++void Cocoa_DestroyWindowFramebuffer(_THIS, SDL_Window *window)
++{ COCOA_FB_POOL
++{
++    pthread_mutex_lock(&framebuffer_lock);
++    Cocoa_FreeFramebufferLocked(window);
++    pthread_mutex_unlock(&framebuffer_lock);
++}}
++
++#endif /* SDL_VIDEO_DRIVER_COCOA */
++
++/* vi: set ts=4 sw=4 expandtab: */
+diff --git src/video/cocoa/SDL_cocoavideo.h src/video/cocoa/SDL_cocoavideo.h
+index d159a0c1d..55130deef 100644
+--- src/video/cocoa/SDL_cocoavideo.h
++++ src/video/cocoa/SDL_cocoavideo.h
+@@ -37,4 +37,5 @@
+ #include "SDL_cocoaclipboard.h"
+ #include "SDL_cocoaevents.h"
++#include "SDL_cocoaframebuffer.h"
+ #include "SDL_cocoakeyboard.h"
+ #include "SDL_cocoamodes.h"
+diff --git src/video/cocoa/SDL_cocoavideo.m src/video/cocoa/SDL_cocoavideo.m
+index 02d823515..ea61a8f24 100644
+--- src/video/cocoa/SDL_cocoavideo.m
++++ src/video/cocoa/SDL_cocoavideo.m
+@@ -136,4 +136,11 @@ static SDL_VideoDevice *Cocoa_CreateDevice(void)
+     device->SetWindowKeyboardGrab = Cocoa_SetWindowKeyboardGrab;
+     device->DestroyWindow = Cocoa_DestroyWindow;
++
++    /* Software framebuffer; the generic code prefers a renderer-backed
++       texture when an accelerated renderer exists and only uses this
++       when there is none (or SDL_FRAMEBUFFER_ACCELERATION=0). */
++    device->CreateWindowFramebuffer = Cocoa_CreateWindowFramebuffer;
++    device->UpdateWindowFramebuffer = Cocoa_UpdateWindowFramebuffer;
++    device->DestroyWindowFramebuffer = Cocoa_DestroyWindowFramebuffer;
+     device->GetWindowWMInfo = Cocoa_GetWindowWMInfo;
+     device->SetWindowHitTest = Cocoa_SetWindowHitTest;
+diff --git src/video/cocoa/SDL_cocoawindow.m src/video/cocoa/SDL_cocoawindow.m
+index 40f559523..7568bc6f1 100644
+--- src/video/cocoa/SDL_cocoawindow.m
++++ src/video/cocoa/SDL_cocoawindow.m
+@@ -1701,4 +1701,14 @@ static int Cocoa_SendMouseButtonClicks(SDL_Mouse * mouse, NSEvent *theEvent, SDL
+        only gets called for window creation and other extraordinary events. */
+     if ([NSGraphicsContext currentContext]) {
++        /* Software framebuffer in use (SDL_cocoaframebuffer.m): paint it. */
++        const NSRect bounds = [self bounds];
++#ifdef MAC_OS_X_VERSION_10_10
++        CGContextRef context = [[NSGraphicsContext currentContext] CGContext];
++#else
++        CGContextRef context = (CGContextRef)[[NSGraphicsContext currentContext] graphicsPort];
++#endif
++        if (Cocoa_DrawWindowFramebuffer(_sdlWindow, context, CGRectMake(0, 0, bounds.size.width, bounds.size.height))) {
++            return; /* no expose event: the app has nothing to redraw, this was its own buffer */
++        }
+         [[NSColor blackColor] setFill];
+         NSRectFill(dirtyRect);
