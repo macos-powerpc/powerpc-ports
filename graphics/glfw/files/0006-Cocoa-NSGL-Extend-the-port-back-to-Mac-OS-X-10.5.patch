@@ -1,0 +1,534 @@
+From 41e598cb491543c2f21819cc796dac43186c0122 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 17 Sep 2026 23:07:42 +0000
+Subject: [PATCH] Cocoa/NSGL: Extend the port back to Mac OS X 10.5
+
+The 10.6 port still relies on a number of APIs that Snow Leopard
+introduced.  The build stops at the first of them, CGDisplayModeRef in
+cocoa_platform.h, but the rest follow right behind:
+
+- Shim the whole CGDisplayMode API in cocoa_monitor.m on top of the
+  10.5 CGDisplayCurrentMode/CGDisplayAvailableModes/CGDisplaySwitchToMode
+  dictionary API, and typedef CGDisplayModeRef to CFDictionaryRef in
+  cocoa_platform.h so _GLFWmonitorNS is unchanged.  The older calls
+  follow the Get rule where the ones they stand in for follow the Copy
+  rule, so the shims retain; pixel encoding is derived from
+  kCGDisplayBitsPerPixel.
+- Guard -[NSWindow setStyleMask:] behind -respondsToSelector: in a new
+  setWindowStyleMask helper, which reports GLFW_FEATURE_UNAVAILABLE on
+  10.5, where a window's style mask is fixed at creation.  Full screen
+  windows are still created borderless, so only later toggling of
+  decoration, resizability and monitor is affected.
+- Guard +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:] in
+  _glfwWindowHoveredCocoa, leaving 10.5 with only the rectangle test.
+- Read dropped files from NSFilenamesPboardType on 10.5, as
+  -[NSPasteboard readObjectsForClasses:options:] is 10.6 only, and map
+  NSPasteboardTypeString to NSStringPboardType for pre-10.6 deployment
+  targets.
+- Subscribe to the Carbon distributed input source notification on 10.5,
+  as NSTextInputContextKeyboardSelectionDidChangeNotification is 10.6
+  only.  Its name is loaded from HIToolbox alongside the TIS symbols, so
+  no link-time dependency is added, which moves the subscription after
+  initializeTIS into a register/unregister pair.
+- Drop the <NSApplicationDelegate> conformance declaration on 10.5,
+  where the application delegate methods are still an informal protocol.
+- Replace NSRunningApplication with -[NSApplication isRunning] and
+  -setActivationPolicy: with TransformProcessType on 10.5.
+
+Also fixes a latent bug this uncovered on the 10.6 target:
+-[NSURL fileSystemRepresentation] was only added in the 10.9 SDK, so the
+dropped URLs are now converted with -[NSURL path] and the NSString
+method of the same name, which exists everywhere.
+
+Untested on the target; only the Cocoa/NSGL sources are in scope.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ src/cocoa_init.m     | 99 +++++++++++++++++++++++++++++++++++++++-----
+ src/cocoa_monitor.m  | 99 ++++++++++++++++++++++++++++++++++++++++++++
+ src/cocoa_platform.h | 23 ++++++++++
+ src/cocoa_window.m   | 69 +++++++++++++++++++++++++++---
+ src/nsgl_context.m   |  2 +-
+ 5 files changed, 275 insertions(+), 17 deletions(-)
+
+diff --git a/src/cocoa_init.m b/src/cocoa_init.m
+index 14c5fd72..604c7302 100644
+--- a/src/cocoa_init.m
++++ b/src/cocoa_init.m
+@@ -375,6 +375,25 @@ static GLFWbool initializeTIS(void)
+     _glfw.ns.tis.kPropertyUnicodeKeyLayoutData =
+         *kPropertyUnicodeKeyLayoutData;
+ 
++    // NOTE: Mac OS X 10.5 has no
++    //       NSTextInputContextKeyboardSelectionDidChangeNotification and only
++    //       posts the Carbon distributed notification instead.  Its name is
++    //       fetched here, the same way as the symbols above, so that this file
++    //       stays free of a direct link-time dependency on HIToolbox
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++    CFStringRef* notifyName =
++        CFBundleGetDataPointerForName(_glfw.ns.tis.bundle,
++                                      CFSTR("kTISNotifySelectedKeyboardInputSourceChanged"));
++    if (!notifyName)
++    {
++        _glfwInputError(GLFW_PLATFORM_ERROR,
++                        "Cocoa: Failed to load TIS API symbols");
++        return GLFW_FALSE;
++    }
++
++    _glfw.ns.tis.kNotifySelectedKeyboardInputSourceChanged = *notifyName;
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
+     return updateUnicodeData();
+ }
+ 
+@@ -394,6 +413,46 @@ static GLFWbool initializeTIS(void)
+ 
+ @end // GLFWHelper
+ 
++// Subscribe to notifications about the selected keyboard input source changing
++//
++// NOTE: NSTextInputContextKeyboardSelectionDidChangeNotification was added in
++//       the 10.6 SDK; on Mac OS X 10.5 the same event is only delivered as the
++//       Carbon distributed notification whose name initializeTIS looks up
++//
++static void registerInputSourceObserver(void)
++{
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
++    [[NSNotificationCenter defaultCenter]
++        addObserver:_glfw.ns.helper
++           selector:@selector(selectedKeyboardInputSourceChanged:)
++               name:NSTextInputContextKeyboardSelectionDidChangeNotification
++             object:nil];
++#else
++    [[NSDistributedNotificationCenter defaultCenter]
++        addObserver:_glfw.ns.helper
++           selector:@selector(selectedKeyboardInputSourceChanged:)
++               name:(NSString*) kTISNotifySelectedKeyboardInputSourceChanged
++             object:nil];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++}
++
++// Unsubscribe from the notification registered above
++//
++static void unregisterInputSourceObserver(void)
++{
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
++    [[NSNotificationCenter defaultCenter]
++        removeObserver:_glfw.ns.helper
++                  name:NSTextInputContextKeyboardSelectionDidChangeNotification
++                object:nil];
++#else
++    [[NSDistributedNotificationCenter defaultCenter]
++        removeObserver:_glfw.ns.helper
++                  name:(NSString*) kTISNotifySelectedKeyboardInputSourceChanged
++                object:nil];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++}
++
+ // GLFW application class
+ //
+ // NOTE: This exists (instead of using -[NSEvent addLocalMonitorForEventsMatchingMask:handler:])
+@@ -422,7 +481,14 @@ static GLFWbool initializeTIS(void)
+ 
+ @end // GLFWApplication
+ 
++// NOTE: The NSApplicationDelegate formal protocol was added in the 10.6 SDK;
++//       on Mac OS X 10.5 the delegate methods are an informal protocol and the
++//       conformance declaration has to be left out
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+ @interface GLFWApplicationDelegate : NSObject <NSApplicationDelegate>
++#else
++@interface GLFWApplicationDelegate : NSObject
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ @end
+ 
+ @implementation GLFWApplicationDelegate
+@@ -609,12 +675,6 @@ int _glfwInitCocoa(void)
+                                      forKey:@"ApplePressAndHoldEnabled"];
+     [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
+ 
+-    [[NSNotificationCenter defaultCenter]
+-        addObserver:_glfw.ns.helper
+-           selector:@selector(selectedKeyboardInputSourceChanged:)
+-               name:NSTextInputContextKeyboardSelectionDidChangeNotification
+-             object:nil];
+-
+     createKeyTables();
+ 
+     _glfw.ns.eventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+@@ -632,14 +692,36 @@ int _glfwInitCocoa(void)
+         return GLFW_FALSE;
+     }
+ 
++    // NOTE: This is registered after initializeTIS as the pre-10.6 path needs
++    //       the notification name that initializeTIS loads from HIToolbox
++    registerInputSourceObserver();
++
+     _glfwPollMonitorsCocoa();
+ 
++    // NOTE: NSRunningApplication was added in the 10.6 SDK; on Mac OS X 10.5
++    //       -[NSApplication isRunning] is the closest test for whether the
++    //       event loop has already been started on our behalf
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+     if (![[NSRunningApplication currentApplication] isFinishedLaunching])
+         [NSApp run];
++#else
++    if (![NSApp isRunning])
++        [NSApp run];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     // In case we are unbundled, make us a proper UI application
++    // NOTE: -setActivationPolicy: was added in the 10.6 SDK; on Mac OS X 10.5
++    //       the Carbon TransformProcessType is the only way to promote an
++    //       unbundled process to a foreground application
+     if (_glfw.hints.init.ns.menubar)
++    {
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++#else
++        ProcessSerialNumber psn = { 0, kCurrentProcess };
++        TransformProcessType(&psn, kProcessTransformToForegroundApplication);
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++    }
+ 
+     [pool release];
+     return GLFW_TRUE;
+@@ -671,10 +753,7 @@ void _glfwTerminateCocoa(void)
+ 
+     if (_glfw.ns.helper)
+     {
+-        [[NSNotificationCenter defaultCenter]
+-            removeObserver:_glfw.ns.helper
+-                      name:NSTextInputContextKeyboardSelectionDidChangeNotification
+-                    object:nil];
++        unregisterInputSourceObserver();
+         [[NSNotificationCenter defaultCenter]
+             removeObserver:_glfw.ns.helper];
+         [_glfw.ns.helper release];
+diff --git a/src/cocoa_monitor.m b/src/cocoa_monitor.m
+index 487c3712..ab3c99b4 100644
+--- a/src/cocoa_monitor.m
++++ b/src/cocoa_monitor.m
+@@ -38,6 +38,105 @@
+ #include <ApplicationServices/ApplicationServices.h>
+ 
+ 
++// NOTE: The CGDisplayMode API was added in Mac OS X 10.6.  On the 10.5 SDK a
++//       display mode is a CFDictionaryRef coming from the older
++//       CGDisplayCurrentMode/CGDisplayAvailableModes/CGDisplaySwitchToMode API.
++//       The shims below present that API under the newer names, so that the
++//       rest of this file only ever has to speak the 10.6 interface.  Note that
++//       the older calls follow the Get rule while the ones they stand in for
++//       follow the Copy rule, hence the added retains
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++
++// Returns the value of the specified numeric display mode dictionary key
++//
++static double getModeNumber(CGDisplayModeRef mode, CFStringRef key)
++{
++    CFNumberRef value = mode ? CFDictionaryGetValue(mode, key) : NULL;
++    double result = 0.0;
++
++    if (value)
++        CFNumberGetValue(value, kCFNumberDoubleType, &result);
++
++    return result;
++}
++
++static size_t CGDisplayModeGetWidth(CGDisplayModeRef mode)
++{
++    return (size_t) getModeNumber(mode, kCGDisplayWidth);
++}
++
++static size_t CGDisplayModeGetHeight(CGDisplayModeRef mode)
++{
++    return (size_t) getModeNumber(mode, kCGDisplayHeight);
++}
++
++static double CGDisplayModeGetRefreshRate(CGDisplayModeRef mode)
++{
++    return getModeNumber(mode, kCGDisplayRefreshRate);
++}
++
++static uint32_t CGDisplayModeGetIOFlags(CGDisplayModeRef mode)
++{
++    return (uint32_t) getModeNumber(mode, kCGDisplayIOFlags);
++}
++
++static CFStringRef CGDisplayModeCopyPixelEncoding(CGDisplayModeRef mode)
++{
++    CFStringRef encoding;
++
++    switch ((int) getModeNumber(mode, kCGDisplayBitsPerPixel))
++    {
++        case 32:
++            encoding = CFSTR(IO32BitDirectPixels);
++            break;
++        case 16:
++            encoding = CFSTR(IO16BitDirectPixels);
++            break;
++        case 8:
++            encoding = CFSTR(IO8BitIndexedPixels);
++            break;
++        default:
++            encoding = CFSTR("");
++            break;
++    }
++
++    return (CFStringRef) CFRetain(encoding);
++}
++
++static CGDisplayModeRef CGDisplayCopyDisplayMode(CGDirectDisplayID display)
++{
++    CGDisplayModeRef mode = CGDisplayCurrentMode(display);
++    if (!mode)
++        return NULL;
++
++    return (CGDisplayModeRef) CFRetain(mode);
++}
++
++static void CGDisplayModeRelease(CGDisplayModeRef mode)
++{
++    if (mode)
++        CFRelease(mode);
++}
++
++static CFArrayRef CGDisplayCopyAllDisplayModes(CGDirectDisplayID display,
++                                               CFDictionaryRef options)
++{
++    CFArrayRef modes = CGDisplayAvailableModes(display);
++    if (!modes)
++        return NULL;
++
++    return (CFArrayRef) CFRetain(modes);
++}
++
++static CGError CGDisplaySetDisplayMode(CGDirectDisplayID display,
++                                       CGDisplayModeRef mode,
++                                       CFDictionaryRef options)
++{
++    return CGDisplaySwitchToMode(display, mode);
++}
++
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
+ // Get the name of the specified display, or NULL
+ //
+ static char* getMonitorName(CGDirectDisplayID displayID, NSScreen* screen)
+diff --git a/src/cocoa_platform.h b/src/cocoa_platform.h
+index 41421839..1ba92255 100644
+--- a/src/cocoa_platform.h
++++ b/src/cocoa_platform.h
+@@ -78,6 +78,15 @@ typedef void* id;
+  #define NSWindowCollectionBehaviorManaged NSWindowCollectionBehaviorDefault
+ #endif
+ 
++// NOTE: The CGDisplayMode API was added in Mac OS X 10.6.  The 10.5 SDK instead
++//       represents a display mode as a CFDictionaryRef obtained from
++//       CGDisplayCurrentMode and CGDisplayAvailableModes.  cocoa_monitor.m
++//       wraps that older API in the newer one, so only the opaque type itself
++//       is needed here
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++typedef CFDictionaryRef CGDisplayModeRef;
++#endif
++
+ // NOTE: Many Cocoa dynamically linked constants have been renamed and we need
+ //       to build across SDK versions where one is unavailable or deprecated.
+ //       We use the newer names in code and replace them with the older names if
+@@ -87,6 +96,10 @@ typedef void* id;
+  #define NSPasteboardTypeURL NSURLPboardType
+ #endif
+ 
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1060
++ #define NSPasteboardTypeString NSStringPboardType
++#endif
++
+ typedef VkFlags VkMacOSSurfaceCreateFlagsMVK;
+ typedef VkFlags VkMetalSurfaceCreateFlagsEXT;
+ 
+@@ -125,6 +138,13 @@ typedef void* (*PFN_TISGetInputSourceProperty)(TISInputSourceRef,CFStringRef);
+ #define TISGetInputSourceProperty _glfw.ns.tis.GetInputSourceProperty
+ typedef UInt8 (*PFN_LMGetKbdType)(void);
+ #define LMGetKbdType _glfw.ns.tis.GetKbdType
++// NOTE: NSTextInputContextKeyboardSelectionDidChangeNotification was added in
++//       the 10.6 SDK; on Mac OS X 10.5 the equivalent is the Carbon distributed
++//       notification of the same meaning, whose name is loaded from HIToolbox
++//       alongside the TIS symbols above
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++ #define kTISNotifySelectedKeyboardInputSourceChanged _glfw.ns.tis.kNotifySelectedKeyboardInputSourceChanged
++#endif
+ 
+ 
+ // NSGL-specific per-context data
+@@ -196,6 +216,9 @@ typedef struct _GLFWlibraryNS
+         PFN_TISGetInputSourceProperty GetInputSourceProperty;
+         PFN_LMGetKbdType GetKbdType;
+         CFStringRef     kPropertyUnicodeKeyLayoutData;
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++        CFStringRef     kNotifySelectedKeyboardInputSourceChanged;
++#endif
+     } tis;
+ } _GLFWlibraryNS;
+ 
+diff --git a/src/cocoa_window.m b/src/cocoa_window.m
+index 05cff7b2..6dd8b8c0 100644
+--- a/src/cocoa_window.m
++++ b/src/cocoa_window.m
+@@ -42,6 +42,33 @@
+ //       having been (according to documentation) added in Mac OS X 10.7
+ #define NSWindowCollectionBehaviorFullScreenNone (1 << 9)
+ 
++// NOTE: -[NSWindow setStyleMask:] was added in the 10.6 SDK and is missing
++//       entirely from the 10.5 one.  This declaration exists only to give the
++//       compiler a prototype for the call in setWindowStyleMask below, which is
++//       gated on -respondsToSelector:
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++@interface NSWindow (GLFWStyleMask)
++- (void)setStyleMask:(NSUInteger)styleMask;
++@end
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
++// Applies the specified style mask to the specified window
++//
++static void setWindowStyleMask(_GLFWwindow* window, NSUInteger styleMask)
++{
++    // NOTE: -[NSWindow setStyleMask:] was added in Mac OS X 10.6; on 10.5 the
++    //       style mask is fixed once the window has been created, so window
++    //       decoration, resizability and full screen cannot be toggled
++    if (![window->ns.object respondsToSelector:@selector(setStyleMask:)])
++    {
++        _glfwInputError(GLFW_FEATURE_UNAVAILABLE,
++                        "Cocoa: Changing the window style mask requires Mac OS X 10.6 or later");
++        return;
++    }
++
++    [window->ns.object setStyleMask:styleMask];
++}
++
+ // Returns whether the cursor is in the content area of the specified window
+ //
+ static GLFWbool cursorInContentArea(_GLFWwindow* window)
+@@ -365,7 +392,15 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+         markedText = [[NSMutableAttributedString alloc] init];
+ 
+         [self updateTrackingAreas];
++        // NOTE: -[NSPasteboard readObjectsForClasses:options:] was added in the
++        //       10.6 SDK, so Mac OS X 10.5 takes the dropped file names from
++        //       the older NSFilenamesPboardType instead; see
++        //       -performDragOperation: below
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+         [self registerForDraggedTypes:[NSArray arrayWithObject:NSPasteboardTypeURL]];
++#else
++        [self registerForDraggedTypes:[NSArray arrayWithObject:NSFilenamesPboardType]];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+     }
+ 
+     return self;
+@@ -685,18 +720,34 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
+     _glfwInputCursorPos(window, pos.x, contentRect.size.height - pos.y);
+ 
+     NSPasteboard* pasteboard = [sender draggingPasteboard];
++
++    // NOTE: -[NSPasteboard readObjectsForClasses:options:] was added in the
++    //       10.6 SDK; on Mac OS X 10.5 the dropped file names are read from the
++    //       older NSFilenamesPboardType, which is already a list of paths
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+     NSDictionary* options =
+         [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES]
+                                      forKey:NSPasteboardURLReadingFileURLsOnlyKey];
+     NSArray* urls = [pasteboard readObjectsForClasses:[NSArray arrayWithObject:[NSURL class]]
+                                               options:options];
+-    const NSUInteger count = [urls count];
++    NSMutableArray* files = [NSMutableArray arrayWithCapacity:[urls count]];
++
++    // NOTE: -[NSURL fileSystemRepresentation] was only added in the 10.9 SDK,
++    //       so the URLs are turned into paths here and the NSString method of
++    //       the same name is used below instead
++    for (NSURL* url in urls)
++        [files addObject:[url path]];
++#else
++    NSArray* files = [pasteboard propertyListForType:NSFilenamesPboardType];
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
++    const NSUInteger count = [files count];
+     if (count)
+     {
+         char** paths = _glfw_calloc(count, sizeof(char*));
+ 
+         for (NSUInteger i = 0;  i < count;  i++)
+-            paths[i] = _glfw_strdup([[urls objectAtIndex:i] fileSystemRepresentation]);
++            paths[i] = _glfw_strdup([[files objectAtIndex:i] fileSystemRepresentation]);
+ 
+         _glfwInputDrop(window, (int) count, (const char**) paths);
+ 
+@@ -1402,7 +1453,7 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
+             styleMask &= ~NSWindowStyleMaskResizable;
+     }
+ 
+-    [window->ns.object setStyleMask:styleMask];
++    setWindowStyleMask(window, styleMask);
+     // HACK: Changing the style mask can cause the first responder to be cleared
+     [window->ns.object makeFirstResponder:window->ns.view];
+ 
+@@ -1506,12 +1557,18 @@ GLFWbool _glfwWindowHoveredCocoa(_GLFWwindow* window)
+ 
+     const NSPoint point = [NSEvent mouseLocation];
+ 
++    // NOTE: +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:] was
++    //       added in the 10.6 SDK; Mac OS X 10.5 has no way of telling whether
++    //       another window is in front, so only the rectangle test below is
++    //       performed there
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+     if ([NSWindow windowNumberAtPoint:point belowWindowWithWindowNumber:0] !=
+         [window->ns.object windowNumber])
+     {
+         [pool release];
+         return GLFW_FALSE;
+     }
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
+     [pool release];
+ 
+@@ -1540,7 +1597,7 @@ void _glfwSetWindowResizableCocoa(_GLFWwindow* window, GLFWbool enabled)
+     const NSUInteger styleMask = [window->ns.object styleMask];
+     if (enabled)
+     {
+-        [window->ns.object setStyleMask:(styleMask | NSWindowStyleMaskResizable)];
++        setWindowStyleMask(window, styleMask | NSWindowStyleMaskResizable);
+         const NSWindowCollectionBehavior behavior =
+             NSWindowCollectionBehaviorFullScreenPrimary |
+             NSWindowCollectionBehaviorManaged;
+@@ -1548,7 +1605,7 @@ void _glfwSetWindowResizableCocoa(_GLFWwindow* window, GLFWbool enabled)
+     }
+     else
+     {
+-        [window->ns.object setStyleMask:(styleMask & ~NSWindowStyleMaskResizable)];
++        setWindowStyleMask(window, styleMask & ~NSWindowStyleMaskResizable);
+         const NSWindowCollectionBehavior behavior =
+             NSWindowCollectionBehaviorFullScreenNone;
+         [window->ns.object setCollectionBehavior:behavior];
+@@ -1573,7 +1630,7 @@ void _glfwSetWindowDecoratedCocoa(_GLFWwindow* window, GLFWbool enabled)
+         styleMask &= ~(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable);
+     }
+ 
+-    [window->ns.object setStyleMask:styleMask];
++    setWindowStyleMask(window, styleMask);
+     [window->ns.object makeFirstResponder:window->ns.view];
+ 
+     [pool release];
+diff --git a/src/nsgl_context.m b/src/nsgl_context.m
+index 2b2494c8..78cab6e9 100644
+--- a/src/nsgl_context.m
++++ b/src/nsgl_context.m
+@@ -163,7 +163,7 @@ GLFWbool _glfwCreateContextNSGL(_GLFWwindow* window,
+     if (ctxconfig->major > 2 || (ctxconfig->major == 2 && ctxconfig->minor > 1))
+     {
+         _glfwInputError(GLFW_VERSION_UNAVAILABLE,
+-                        "NSGL: OpenGL 2.1 or below is the only version available on Mac OS X 10.6");
++                        "NSGL: OpenGL 2.1 or below is the only version available on Mac OS X 10.6 and earlier");
+         return GLFW_FALSE;
+     }
+ 
+-- 
+2.43.0
+
