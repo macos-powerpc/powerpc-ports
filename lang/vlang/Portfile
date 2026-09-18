@@ -9,7 +9,7 @@ PortGroup           makefile 1.0
 legacysupport.newest_darwin_requires_legacy 15
 
 github.setup        vlang v 0.5.2
-revision            1
+revision            2
 name                vlang
 license             MIT
 categories          lang
@@ -52,6 +52,44 @@ if {${configure.build_arch} in [list ppc ppc64]} {
     configure.ldflags-append -latomic
 }
 
+# GCC sizes its garbage-collected heap from RAM, not from the address space:
+# with 1 GB or more it lets the heap grow to twice the live data before
+# collecting (--param ggc-min-expand defaults to 100). A 32-bit cc1 compiling
+# the ~550k-line C file V generates for itself then dies at the 4 GB ceiling
+# with "mmap(...) failed (error code=12)" / "cc1: out of memory". Collecting
+# after 10% growth keeps the peak near the live data, for some extra time.
+# -parallel-cc (below) now cuts that file into pieces, so this is extra
+# margin at the price of compile time; drop it once a full build has passed.
+if {${configure.build_arch} in [list ppc i386]} {
+    configure.cflags-append --param ggc-min-expand=10
+}
+
+# A 32-bit Mach-O object cannot hold a section larger than 16 MB that has
+# scattered relocation entries (their r_address field is 24 bits wide), and
+# on ppc every reference from code to a local symbol - string literals,
+# static data - is one. V's -prod build of itself is ~22 MB of ppc text in
+# a single object, so cctools as dies with "Section too large, can't encode
+# r_address (0x1515e08) into 24-bits of scattered relocation entry" after
+# cc1 spent hours on it. -parallel-cc makes V split the generated C into
+# several files and link their objects. It also drops -flto, which was
+# doubling the work: GCC on Darwin has no linker plugin, so its LTO objects
+# carry a complete native compile as well (that is what the assembler
+# choked on), and the LTO link recompiles everything from bytecode anyway.
+# Stock V takes both the number of files and the number of concurrent C
+# compilers from VJOBS; patch-parallel-cc-files.diff adds V_PARALLEL_CC_FILES
+# so a fine split does not multiply the peak memory. The unpatched vc
+# snapshot (v1) only knows VJOBS, so v1 -> v2 is split ${build.jobs} ways;
+# that stage has no GC pins and its text fit in one object before.
+if {${configure.build_arch} in [list ppc ppc64 i386]} {
+    set parallel_cc_vflag   -parallel-cc
+    build.env-append        V_PARALLEL_CC_FILES=8
+    pre-build {
+        build.env-append    VJOBS=${build.jobs}
+    }
+} else {
+    set parallel_cc_vflag   ""
+}
+
 # Path to V compiler
 set vc_path ${worksrcpath}/vc
 
@@ -83,6 +121,12 @@ patchfiles          patch-boehmgc-prefix.diff \
                     patch-msg-nosignal.diff \
                     patch-no-clang-only-warning-flags.diff
 
+# https://github.com/vlang/v/issues/28612
+patchfiles-append   patch-stable-type-hash-cache.diff
+
+patchfiles-append   patch-parallel-cc-files.diff \
+                    patch-parallel-cc-gc-keepalive.diff
+
 # See https://github.com/vlang/v/issues/6605
 if {${os.major} <= [option legacysupport.newest_darwin_requires_legacy]} {
     # Use LegacySupport with the time module
@@ -102,16 +146,46 @@ post-patch {
     }
 }
 
-# FIXME: we still need to rebuild V with FINAL_GC_VFLAG="-gc boehm" added, but that fails:
-# v2(48980,0xf0403000) malloc: *** mmap(size=16777216) failed (error code=12)
-# https://github.com/vlang/v/issues/28612
-
 # -cg, -showcc and -show-c-output allows for better error debugging
 # local prevents fetching the V compiler during the build
 # https://github.com/vlang/v/issues/10796 - Set correct deployment target.
+
+# The installed compiler needs a GC: built with -gc none it never frees,
+# and compiling any sizeable project exhausts a 32-bit address space. Only
+# the final stage gets it (FINAL_GC_VFLAG, from patch-final-gc-mode.diff):
+# the bootstrap stages have no GC, and a GC-less v2 building V-with-boehm
+# ran out of memory too, until patch-stable-type-hash-cache.diff.
+
+# Every VFLAGS entry must be a single word without quotes or escapes. VFLAGS
+# reaches V twice: make expands it into the recipe, where the shell parses that
+# copy, and, as a command-line variable, exports it verbatim into the recipe's
+# environment, where V reads it again and tokenizes it itself
+# (vlib/v/util/vflags/vflags.v: whitespace-separated, quotes honoured,
+# backslashes not). The former `-cflags [shellescape ${configure.cflags}]`
+# became `-cflags -Os\ --param\ ggc-min-expand=10` there and v1 stopped with
+# "Unknown argument `--param\`". It was redundant anyway: the makefile
+# PortGroup exports CPPFLAGS and CFLAGS to make, and V's GNUmakefile passes them
+# to every stage as -cflags "..." (BOOTSTRAP_VC_VFLAGS, BOOTSTRAP_VFLAGS).
 build.args-append   local=true \
-                    VFLAGS="-v -cg -showcc -show-c-output -prod -cc ${configure.cc} -macosx-version-min ${macosx_deployment_target} -cflags [shellescape ${configure.cflags}]" \
+                    VFLAGS="-v -cg -showcc -show-c-output -prod ${parallel_cc_vflag} -cc ${configure.cc} -macosx-version-min ${macosx_deployment_target}" \
+                    FINAL_GC_VFLAG="-gc boehm" \
                     VC=${vc_path}
+
+pre-build {
+    # V would create $VTMP itself with mode 0700 (os.v, create_folder_when_it_does_not_exist);
+    # an existing directory is used as is, so create it readable for inspection.
+    xinstall -d -m 0755 ${workpath}/vtmp ${workpath}/tmp
+}
+
+build.env-append    VTMP=${workpath}/vtmp \
+                    TMPDIR=${workpath}/tmp
+
+# When the C compiler fails, V regenerates the C with #line directives,
+# recompiles it with the same command, then builds and runs its bug reporter
+# to POST to bugs.vlang.io (vlib/v/builder/c_error_report.v). That doubles
+# the cost of a failure and buries the real error under the reporter's own
+# output; with it disabled the first error is the last thing in the log.
+build.env-append    V_C_ERROR_BUG_REPORT_DISABLED=1
 
 # See https://trac.macports.org/ticket/64913
 # In case _developer group doesn't exist
