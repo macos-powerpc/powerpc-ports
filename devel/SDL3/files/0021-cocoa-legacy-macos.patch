@@ -879,10 +879,10 @@ index 000000000..f87cb640c
 +#endif // SDL_cocoaframebuffer_h_
 diff --git src/video/cocoa/SDL_cocoaframebuffer.m src/video/cocoa/SDL_cocoaframebuffer.m
 new file mode 100644
-index 000000000..b7142b7a3
+index 000000000..518f8c4ef
 --- /dev/null
 +++ src/video/cocoa/SDL_cocoaframebuffer.m
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,250 @@
 +/*
 +  Simple DirectMedia Layer
 +  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
@@ -910,6 +910,8 @@ index 000000000..b7142b7a3
 +#include "SDL_cocoavideo.h"
 +#include "SDL_cocoaframebuffer.h"
 +
++#include <pthread.h>
++
 +#ifdef MAC_OS_X_VERSION_10_7 /* pre-10.7 SDKs don't expose the CALayer interface via Cocoa.h */
 +#import <QuartzCore/QuartzCore.h>
 +#endif
@@ -920,17 +922,42 @@ index 000000000..b7142b7a3
 +
 +   Presentation: views that are layer-backed (macOS 10.8+ with the SDL3View
 +   -wantsUpdateLayer path, all views on 10.14+) get the image as the layer
-+   contents; classic views are marked dirty and drawn synchronously through
-+   -[NSView drawRect:], which calls Cocoa_DrawWindowFramebuffer.
++   contents; classic views are drawn into directly under lockFocusIfCanDraw,
++   the AppKit way that also works from a secondary thread (mpv presents from
++   its VO thread on the legacy builds).  -[NSView drawRect:] only repaints
++   the buffer when AppKit asks (exposes, live resizes), via
++   Cocoa_DrawWindowFramebuffer, and sends no expose event for that: the app
++   has nothing to redraw, the buffer is what it last presented.
 +
-+   Like SDL_UpdateWindowSurface() itself, this is main-thread code. */
++   Threads: the presenting thread need not be the main thread (mpv presents
++   from its VO thread while its main thread runs the Cocoa runloop, which
++   delivers -drawRect: repaints).  One lock serializes the image swap and
++   the buffer teardown on the presenting thread against those repaints;
++   the swap never leaves the image pointer NULL, so a repaint always has a
++   complete frame to draw. */
 +
-+static void Cocoa_ReleaseFramebufferImage(SDL_CocoaWindowData *data)
++static pthread_mutex_t framebuffer_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* caller holds framebuffer_lock */
++static void Cocoa_FreeFramebufferLocked(SDL_CocoaWindowData *data)
 +{
++#ifdef MAC_OS_X_VERSION_10_7
++    if (data.framebuffer_image) {
++        CALayer *layer = [data.sdlContentView layer];
++        if (layer && layer.contents == (__bridge id)data.framebuffer_image) {
++            layer.contents = nil;
++        }
++    }
++#endif
 +    if (data.framebuffer_image) {
 +        CGImageRelease(data.framebuffer_image);
 +        data.framebuffer_image = NULL;
 +    }
++    SDL_free(data.framebuffer_pixels);
++    data.framebuffer_pixels = NULL;
++    data.framebuffer_w = 0;
++    data.framebuffer_h = 0;
++    data.framebuffer_pitch = 0;
 +}
 +
 +static CGImageRef Cocoa_CreateFramebufferImage(SDL_CocoaWindowData *data)
@@ -964,8 +991,6 @@ index 000000000..b7142b7a3
 +        SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
 +        int w, h;
 +
-+        Cocoa_DestroyWindowFramebuffer(_this, window);
-+
 +        SDL_GetWindowSizeInPixels(window, &w, &h);
 +        if (w < 1 || h < 1) {
 +            return SDL_SetError("Window has no pixels to draw into");
@@ -978,10 +1003,13 @@ index 000000000..b7142b7a3
 +            return false;
 +        }
 +
++        pthread_mutex_lock(&framebuffer_lock);
++        Cocoa_FreeFramebufferLocked(data);
 +        data.framebuffer_pixels = *pixels;
 +        data.framebuffer_w = w;
 +        data.framebuffer_h = h;
 +        data.framebuffer_pitch = *pitch;
++        pthread_mutex_unlock(&framebuffer_lock);
 +        return true;
 +    }
 +}
@@ -992,6 +1020,7 @@ index 000000000..b7142b7a3
 +        SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
 +        NSView *view = data.sdlContentView;
 +        CGImageRef image;
++        CGImageRef previous;
 +
 +        if (!data.framebuffer_pixels) {
 +            return SDL_SetError("Window has no framebuffer");
@@ -1003,8 +1032,13 @@ index 000000000..b7142b7a3
 +        if (!image) {
 +            return SDL_SetError("Couldn't create the framebuffer image");
 +        }
-+        Cocoa_ReleaseFramebufferImage(data);
++        pthread_mutex_lock(&framebuffer_lock);
++        previous = data.framebuffer_image;
 +        data.framebuffer_image = image;
++        pthread_mutex_unlock(&framebuffer_lock);
++        if (previous) {
++            CGImageRelease(previous); /* a repaint in progress holds the lock until it is done with it */
++        }
 +
 +#ifdef MAC_OS_X_VERSION_10_7
 +        {
@@ -1024,22 +1058,38 @@ index 000000000..b7142b7a3
 +        }
 +#endif
 +
-+        /* Classic view: mark the dirty rects (top-left pixel coordinates to
-+           bottom-left points) and draw them synchronously via -drawRect:. */
-+        {
-+            const NSRect bounds = [view bounds];
-+            const CGFloat sx = bounds.size.width / (CGFloat)data.framebuffer_w;
-+            const CGFloat sy = bounds.size.height / (CGFloat)data.framebuffer_h;
-+            int i;
-+
-+            for (i = 0; i < numrects; ++i) {
-+                NSRect dirty = NSMakeRect(rects[i].x * sx,
-+                                          bounds.size.height - (rects[i].y + rects[i].h) * sy,
-+                                          rects[i].w * sx,
-+                                          rects[i].h * sy);
-+                [view setNeedsDisplayInRect:dirty];
++        /* Classic view: draw straight into the window's backing store,
++           clipped to the dirty rects (top-left pixel coordinates to
++           bottom-left points).  lockFocusIfCanDraw fails when the window
++           cannot be drawn into (hidden, miniaturized); AppKit repaints the
++           buffer through -drawRect: once it can. */
++        if ([view lockFocusIfCanDraw]) {
++#ifdef MAC_OS_X_VERSION_10_10
++            CGContextRef context = [[NSGraphicsContext currentContext] CGContext];
++#else
++            CGContextRef context = (CGContextRef)[[NSGraphicsContext currentContext] graphicsPort];
++#endif
++            if (context) {
++                const NSRect bounds = [view bounds];
++                const CGFloat sx = bounds.size.width / (CGFloat)data.framebuffer_w;
++                const CGFloat sy = bounds.size.height / (CGFloat)data.framebuffer_h;
++                bool isstack;
++                CGRect *clip = SDL_small_alloc(CGRect, numrects, &isstack);
++                if (clip) {
++                    int i;
++                    for (i = 0; i < numrects; ++i) {
++                        clip[i] = CGRectMake(rects[i].x * sx,
++                                             bounds.size.height - (rects[i].y + rects[i].h) * sy,
++                                             rects[i].w * sx,
++                                             rects[i].h * sy);
++                    }
++                    CGContextClipToRects(context, clip, numrects);
++                    SDL_small_free(clip, isstack);
++                }
++                CGContextSetInterpolationQuality(context, kCGInterpolationNone);
++                CGContextDrawImage(context, CGRectMake(0, 0, bounds.size.width, bounds.size.height), image);
 +            }
-+            [view displayIfNeeded];
++            [view unlockFocus];
 +            [[view window] flushWindow];
 +        }
 +        return true;
@@ -1049,15 +1099,23 @@ index 000000000..b7142b7a3
 +bool Cocoa_DrawWindowFramebuffer(SDL_Window *window, CGContextRef context, CGRect bounds)
 +{
 +    SDL_CocoaWindowData *data = window ? (__bridge SDL_CocoaWindowData *)window->internal : nil;
++    bool drawn = false;
 +
-+    if (!data || !data.framebuffer_image || !context) {
++    if (!data || !context) {
 +        return false;
 +    }
-+    /* The view is not flipped, so the image lands upright; CoreGraphics
-+       clips to the dirty region and scales pixels to points if needed. */
-+    CGContextSetInterpolationQuality(context, kCGInterpolationNone);
-+    CGContextDrawImage(context, bounds, data.framebuffer_image);
-+    return true;
++    /* Under the lock: the presenting thread neither swaps the image nor
++       frees the pixels it reads while this draw is in progress. */
++    pthread_mutex_lock(&framebuffer_lock);
++    if (data.framebuffer_image) {
++        /* The view is not flipped, so the image lands upright; CoreGraphics
++           clips to the dirty region and scales pixels to points if needed. */
++        CGContextSetInterpolationQuality(context, kCGInterpolationNone);
++        CGContextDrawImage(context, bounds, data.framebuffer_image);
++        drawn = true;
++    }
++    pthread_mutex_unlock(&framebuffer_lock);
++    return drawn;
 +}
 +
 +void Cocoa_DestroyWindowFramebuffer(SDL_VideoDevice *_this, SDL_Window *window)
@@ -1068,30 +1126,30 @@ index 000000000..b7142b7a3
 +        if (!data) {
 +            return;
 +        }
-+
-+#ifdef MAC_OS_X_VERSION_10_7
-+        if (data.framebuffer_image) {
-+            CALayer *layer = [data.sdlContentView layer];
-+            if (layer && layer.contents == (__bridge id)data.framebuffer_image) {
-+                layer.contents = nil;
-+            }
-+        }
-+#endif
-+        Cocoa_ReleaseFramebufferImage(data);
-+        SDL_free(data.framebuffer_pixels);
-+        data.framebuffer_pixels = NULL;
-+        data.framebuffer_w = 0;
-+        data.framebuffer_h = 0;
-+        data.framebuffer_pitch = 0;
++        pthread_mutex_lock(&framebuffer_lock);
++        Cocoa_FreeFramebufferLocked(data);
++        pthread_mutex_unlock(&framebuffer_lock);
 +    }
 +}
 +
 +#endif // SDL_VIDEO_DRIVER_COCOA
 diff --git src/video/cocoa/SDL_cocoakeyboard.m src/video/cocoa/SDL_cocoakeyboard.m
-index dfec20fe7..f6529f575 100644
+index dfec20fe7..42ed687d4 100644
 --- src/video/cocoa/SDL_cocoakeyboard.m
 +++ src/video/cocoa/SDL_cocoakeyboard.m
-@@ -127,7 +127,8 @@
+@@ -83,7 +83,10 @@
+     // Deliver the raw key event that generated this text
+     [self sendPendingKey];
+ 
+-    if ((int)replacementRange.location != -1) {
++    /* NSNotFound, not -1: the int truncation upstream relied on only yields -1
++       on 64-bit; on 32-bit NSNotFound is INT_MAX and every inserted character
++       was preceded by a spurious backspace. */
++    if (replacementRange.location != NSNotFound) {
+         // We're replacing the last character
+         SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, SDL_SCANCODE_BACKSPACE, true);
+         SDL_SendKeyboardKey(0, SDL_GLOBAL_KEYBOARD_ID, 0, SDL_SCANCODE_BACKSPACE, false);
+@@ -127,7 +130,8 @@
      }
  
      if (_markedText != aString) {
@@ -1101,7 +1159,7 @@ index dfec20fe7..f6529f575 100644
      }
  
      _selectedRange = selectedRange;
-@@ -150,6 +151,7 @@
+@@ -150,6 +154,7 @@
  
  - (void)unmarkText
  {
@@ -1109,7 +1167,7 @@ index dfec20fe7..f6529f575 100644
      _markedText = nil;
  
      // This key event was consumed by the IME
-@@ -158,6 +160,14 @@
+@@ -158,6 +163,14 @@
      SDL_SendEditingText("", 0, 0);
  }
  
@@ -1124,7 +1182,7 @@ index dfec20fe7..f6529f575 100644
  - (NSRect)firstRectForCharacterRange:(NSRange)aRange actualRange:(NSRangePointer)actualRange
  {
      NSWindow *window = [self window];
-@@ -174,7 +184,11 @@
+@@ -174,7 +187,11 @@
                (int)aRange.location, (int)aRange.length, windowHeight,
                NSStringFromRect(rect));
  
@@ -1136,7 +1194,7 @@ index dfec20fe7..f6529f575 100644
  
      return rect;
  }
-@@ -410,7 +424,12 @@ void Cocoa_InitKeyboard(SDL_VideoDevice *_this)
+@@ -410,7 +427,12 @@ void Cocoa_InitKeyboard(SDL_VideoDevice *_this)
      SDL_SetScancodeName(SDL_SCANCODE_RALT, "Right Option");
      SDL_SetScancodeName(SDL_SCANCODE_RGUI, "Right Command");
  
@@ -1149,7 +1207,7 @@ index dfec20fe7..f6529f575 100644
      SDL_ToggleModState(SDL_KMOD_CAPS, (data.modifierFlags & NSEventModifierFlagCapsLock) ? true : false);
  
      SDL_AddHintCallback(SDL_HINT_MAC_OPTION_AS_ALT, SDL_MacOptionAsAltChanged, _this);
-@@ -418,7 +437,7 @@ void Cocoa_InitKeyboard(SDL_VideoDevice *_this)
+@@ -418,7 +440,7 @@ void Cocoa_InitKeyboard(SDL_VideoDevice *_this)
  
  bool Cocoa_StartTextInput(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID props)
  {
@@ -1158,7 +1216,7 @@ index dfec20fe7..f6529f575 100644
          NSView *parentView;
          SDL_CocoaVideoData *data = (__bridge SDL_CocoaVideoData *)_this->internal;
          NSWindow *nswindow = ((__bridge SDL_CocoaWindowData *)window->internal).nswindow;
-@@ -431,7 +450,9 @@ bool Cocoa_StartTextInput(SDL_VideoDevice *_this, SDL_Window *window, SDL_Proper
+@@ -431,7 +453,9 @@ bool Cocoa_StartTextInput(SDL_VideoDevice *_this, SDL_Window *window, SDL_Proper
           * text input, simply remove the field editor from its superview then add
           * it to the front most window's content view */
          if (!data.fieldEdit) {
@@ -1169,7 +1227,7 @@ index dfec20fe7..f6529f575 100644
          }
  
          if (![[data.fieldEdit superview] isEqual:parentView]) {
-@@ -446,7 +467,7 @@ bool Cocoa_StartTextInput(SDL_VideoDevice *_this, SDL_Window *window, SDL_Proper
+@@ -446,7 +470,7 @@ bool Cocoa_StartTextInput(SDL_VideoDevice *_this, SDL_Window *window, SDL_Proper
  
  bool Cocoa_StopTextInput(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -2723,7 +2781,7 @@ index b2695bed8..d55088099 100644
  #ifdef SDL_VIDEO_OPENGL_EGL
  @property(nonatomic) EGLSurface egl_surface;
 diff --git src/video/cocoa/SDL_cocoawindow.m src/video/cocoa/SDL_cocoawindow.m
-index 51eda933a..e075c1e37 100644
+index 51eda933a..42dc696b6 100644
 --- src/video/cocoa/SDL_cocoawindow.m
 +++ src/video/cocoa/SDL_cocoawindow.m
 @@ -60,10 +60,48 @@
@@ -3198,7 +3256,7 @@ index 51eda933a..e075c1e37 100644
  - (void)updateTrackingAreas;
  @end
  
-@@ -2172,18 +2321,35 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
+@@ -2172,18 +2321,34 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
         white until the app is ready to draw. In practice on modern macOS, this
         only gets called for window creation and other extraordinary events. */
      BOOL transparent = (_sdlWindow->flags & SDL_WINDOW_TRANSPARENT) != 0;
@@ -3211,8 +3269,7 @@ index 51eda933a..e075c1e37 100644
 +        CGContextRef context = (CGContextRef)[[NSGraphicsContext currentContext] graphicsPort];
 +#endif
 +        if (Cocoa_DrawWindowFramebuffer(_sdlWindow, context, CGRectMake(0, 0, bounds.size.width, bounds.size.height))) {
-+            Cocoa_SendExposedEventIfVisible(_sdlWindow);
-+            return;
++            return; /* no expose event: the app has nothing to redraw, this was its own buffer */
 +        }
 +    }
      if ([NSGraphicsContext currentContext]) {
@@ -3234,7 +3291,7 @@ index 51eda933a..e075c1e37 100644
  - (BOOL)wantsUpdateLayer
  {
      return YES;
-@@ -2201,6 +2367,7 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
+@@ -2201,6 +2366,7 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
      ScheduleContextUpdates((__bridge SDL_CocoaWindowData *)_sdlWindow->internal);
      Cocoa_SendExposedEventIfVisible(_sdlWindow);
  }
@@ -3242,7 +3299,7 @@ index 51eda933a..e075c1e37 100644
  
  - (void)rightMouseDown:(NSEvent *)theEvent
  {
-@@ -2243,10 +2410,19 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
+@@ -2243,10 +2409,19 @@ static void Cocoa_SendMouseButtonClicks(SDL_Mouse *mouse, NSEvent *theEvent, SDL
      SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)_sdlWindow->internal;
      if (_trackingArea) {
          [self removeTrackingArea:_trackingArea];
@@ -3262,7 +3319,7 @@ index 51eda933a..e075c1e37 100644
  @end
  
  static void Cocoa_UpdateMouseFocus()
-@@ -2254,6 +2430,7 @@ static void Cocoa_UpdateMouseFocus()
+@@ -2254,6 +2429,7 @@ static void Cocoa_UpdateMouseFocus()
      const NSPoint mouseLocation = [NSEvent mouseLocation];
  
      // Find the topmost window under the pointer and send a motion event if it is an SDL window.
@@ -3270,7 +3327,7 @@ index 51eda933a..e075c1e37 100644
      [NSApp enumerateWindowsWithOptions:NSWindowListOrderedFrontToBack
                              usingBlock:^(NSWindow *nswin, BOOL *stop) {
                                NSRect r = [nswin contentRectForFrameRect:[nswin frame]];
-@@ -2278,11 +2455,37 @@ static void Cocoa_UpdateMouseFocus()
+@@ -2278,11 +2454,37 @@ static void Cocoa_UpdateMouseFocus()
                                    }
                                }
                              }];
@@ -3309,7 +3366,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaVideoData *videodata = (__bridge SDL_CocoaVideoData *)_this->internal;
          SDL_CocoaWindowData *data;
  
-@@ -2292,21 +2495,32 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
+@@ -2292,21 +2494,32 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
              return SDL_OutOfMemory();
          }
          window->internal = (SDL_WindowData *)CFBridgingRetain(data);
@@ -3344,7 +3401,7 @@ index 51eda933a..e075c1e37 100644
  
          // Fill in the SDL window with the window data
          {
-@@ -2392,7 +2606,7 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
+@@ -2392,7 +2605,7 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
              }
          }
  
@@ -3353,7 +3410,7 @@ index 51eda933a..e075c1e37 100644
              window->flags &= ~SDL_WINDOW_TRANSPARENT;
          } else {
              window->flags |= SDL_WINDOW_TRANSPARENT;
-@@ -2402,7 +2616,9 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
+@@ -2402,7 +2615,9 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
           * it will also call [NSWindow close] in DestroyWindow before releasing the
           * NSWindow, so the extra release provided by releasedWhenClosed isn't
           * necessary. */
@@ -3364,7 +3421,7 @@ index 51eda933a..e075c1e37 100644
  
          /* Prevents the window's "window device" from being destroyed when it is
           * hidden. See http://www.mikeash.com/pyblog/nsopenglcontext-and-one-shot.html
-@@ -2428,7 +2644,7 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
+@@ -2428,7 +2643,7 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, NSWindow
  
  bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID create_props)
  {
@@ -3373,7 +3430,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaVideoData *videodata = (__bridge SDL_CocoaVideoData *)_this->internal;
          const void *data = SDL_GetPointerProperty(create_props, "sdl2-compat.external_window", NULL);
          NSWindow *nswindow = nil;
-@@ -2488,16 +2704,28 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
+@@ -2488,16 +2703,28 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
                  rect.origin.y = SDL_max(rect.origin.y, screenRect.origin.y);
              }
  
@@ -3402,7 +3459,7 @@ index 51eda933a..e075c1e37 100644
  
              // we put fullscreen desktop windows in their own Space, without a toggle button or menubar, later
              if ((window->flags & SDL_WINDOW_RESIZABLE) && videodata.allow_spaces) {
-@@ -2519,9 +2747,9 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
+@@ -2519,9 +2746,9 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
          }
  
          if (window->flags & SDL_WINDOW_TRANSPARENT) {
@@ -3415,7 +3472,7 @@ index 51eda933a..e075c1e37 100644
          }
  
  // We still support OpenGL as long as Apple offers it, deprecated or not, so disable deprecation warnings about it.
-@@ -2532,7 +2760,11 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
+@@ -2532,7 +2759,11 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
          /* Note: as of the macOS 10.15 SDK, this defaults to YES instead of NO when
           * the NSHighResolutionCapable boolean is set in Info.plist. */
          BOOL highdpi = (window->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY) ? YES : NO;
@@ -3427,7 +3484,7 @@ index 51eda933a..e075c1e37 100644
  #ifdef __clang__
  #pragma clang diagnostic pop
  #endif
-@@ -2542,19 +2774,30 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
+@@ -2542,19 +2773,30 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
          if ((window->flags & SDL_WINDOW_OPENGL) &&
              _this->gl_config.profile_mask == SDL_GL_CONTEXT_PROFILE_ES) {
              [nsview setWantsLayer:TRUE];
@@ -3458,7 +3515,7 @@ index 51eda933a..e075c1e37 100644
  
          if (!(window->flags & SDL_WINDOW_OPENGL)) {
              return true;
-@@ -2580,17 +2823,17 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
+@@ -2580,17 +2822,17 @@ bool Cocoa_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Properti
  
  void Cocoa_SetWindowTitle(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3479,7 +3536,7 @@ index 51eda933a..e075c1e37 100644
          NSImage *nsimage = Cocoa_CreateImage(icon);
  
          if (nsimage) {
-@@ -2605,7 +2848,7 @@ bool Cocoa_SetWindowIcon(SDL_VideoDevice *_this, SDL_Window *window, SDL_Surface
+@@ -2605,7 +2847,7 @@ bool Cocoa_SetWindowIcon(SDL_VideoDevice *_this, SDL_Window *window, SDL_Surface
  
  bool Cocoa_SetWindowPosition(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3488,7 +3545,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = windata.nswindow;
          NSRect rect = [nswindow contentRectForFrameRect:[nswindow frame]];
-@@ -2656,7 +2899,7 @@ bool Cocoa_SetWindowPosition(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2656,7 +2898,7 @@ bool Cocoa_SetWindowPosition(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3497,7 +3554,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = windata.nswindow;
  
-@@ -2692,7 +2935,7 @@ void Cocoa_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2692,7 +2934,7 @@ void Cocoa_SetWindowSize(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_SetWindowMinimumSize(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3506,7 +3563,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
  
          NSSize minSize;
-@@ -2705,7 +2948,7 @@ void Cocoa_SetWindowMinimumSize(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2705,7 +2947,7 @@ void Cocoa_SetWindowMinimumSize(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_SetWindowMaximumSize(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3515,7 +3572,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
  
          NSSize maxSize;
-@@ -2718,7 +2961,7 @@ void Cocoa_SetWindowMaximumSize(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2718,7 +2960,7 @@ void Cocoa_SetWindowMaximumSize(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_SetWindowAspectRatio(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3524,7 +3581,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
  
          if (window->min_aspect > 0.0f && window->min_aspect == window->max_aspect) {
-@@ -2733,7 +2976,7 @@ void Cocoa_SetWindowAspectRatio(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2733,7 +2975,7 @@ void Cocoa_SetWindowAspectRatio(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_GetWindowSizeInPixels(SDL_VideoDevice *_this, SDL_Window *window, int *w, int *h)
  {
@@ -3533,7 +3590,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
  
          *w = (int)windata.viewport.size.width;
-@@ -2743,7 +2986,7 @@ void Cocoa_GetWindowSizeInPixels(SDL_VideoDevice *_this, SDL_Window *window, int
+@@ -2743,7 +2985,7 @@ void Cocoa_GetWindowSizeInPixels(SDL_VideoDevice *_this, SDL_Window *window, int
  
  void Cocoa_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3542,7 +3599,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windowData = ((__bridge SDL_CocoaWindowData *)window->internal);
          NSWindow *nswindow = windowData.nswindow;
          bool bActivate = SDL_GetHintBoolean(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, true);
-@@ -2781,7 +3024,7 @@ void Cocoa_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2781,7 +3023,7 @@ void Cocoa_ShowWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3551,7 +3608,7 @@ index 51eda933a..e075c1e37 100644
          NSWindow *nswindow = ((__bridge SDL_CocoaWindowData *)window->internal).nswindow;
          const BOOL waskey = [nswindow isKeyWindow];
  
-@@ -2829,7 +3072,7 @@ void Cocoa_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2829,7 +3071,7 @@ void Cocoa_HideWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_RaiseWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3560,7 +3617,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windowData = ((__bridge SDL_CocoaWindowData *)window->internal);
          NSWindow *nswindow = windowData.nswindow;
          bool bActivate = SDL_GetHintBoolean(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, true);
-@@ -2862,7 +3105,7 @@ void Cocoa_RaiseWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2862,7 +3104,7 @@ void Cocoa_RaiseWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_MaximizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3569,7 +3626,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *windata = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = windata.nswindow;
  
-@@ -2886,7 +3129,7 @@ void Cocoa_MaximizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2886,7 +3128,7 @@ void Cocoa_MaximizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_MinimizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3578,7 +3635,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = data.nswindow;
  
-@@ -2904,7 +3147,7 @@ void Cocoa_MinimizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2904,7 +3146,7 @@ void Cocoa_MinimizeWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_RestoreWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3587,7 +3644,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = data.nswindow;
  
-@@ -2933,7 +3176,7 @@ void Cocoa_RestoreWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -2933,7 +3175,7 @@ void Cocoa_RestoreWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  void Cocoa_SetWindowBordered(SDL_VideoDevice *_this, SDL_Window *window, bool bordered)
  {
@@ -3596,7 +3653,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
          // If the window is in or transitioning to/from fullscreen, this will be set on leave.
-@@ -2952,7 +3195,7 @@ void Cocoa_SetWindowBordered(SDL_VideoDevice *_this, SDL_Window *window, bool bo
+@@ -2952,7 +3194,7 @@ void Cocoa_SetWindowBordered(SDL_VideoDevice *_this, SDL_Window *window, bool bo
  
  void Cocoa_SetWindowResizable(SDL_VideoDevice *_this, SDL_Window *window, bool resizable)
  {
@@ -3605,7 +3662,7 @@ index 51eda933a..e075c1e37 100644
          /* Don't set this if we're in or transitioning to/from a space!
           * The window will get permanently stuck if resizable is false.
           * -flibit
-@@ -2976,7 +3219,7 @@ void Cocoa_SetWindowResizable(SDL_VideoDevice *_this, SDL_Window *window, bool r
+@@ -2976,7 +3218,7 @@ void Cocoa_SetWindowResizable(SDL_VideoDevice *_this, SDL_Window *window, bool r
  
  void Cocoa_SetWindowAlwaysOnTop(SDL_VideoDevice *_this, SDL_Window *window, bool on_top)
  {
@@ -3614,7 +3671,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = data.nswindow;
  
-@@ -2993,7 +3236,7 @@ void Cocoa_SetWindowAlwaysOnTop(SDL_VideoDevice *_this, SDL_Window *window, bool
+@@ -2993,7 +3235,7 @@ void Cocoa_SetWindowAlwaysOnTop(SDL_VideoDevice *_this, SDL_Window *window, bool
  
  SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Window *window, SDL_VideoDisplay *display, SDL_FullscreenOp fullscreen)
  {
@@ -3623,7 +3680,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = data.nswindow;
          NSRect rect;
-@@ -3031,7 +3274,13 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3031,7 +3273,13 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
                  }
              }
  
@@ -3637,7 +3694,7 @@ index 51eda933a..e075c1e37 100644
          } else {
              NSRect frameRect;
  
-@@ -3055,7 +3304,13 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3055,7 +3303,13 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
               * macOS 10.15 where the window doesn't properly restore the windowed
               * mode decorations after exiting fullscreen-desktop, when the window
               * was created as fullscreen-desktop. */
@@ -3651,7 +3708,7 @@ index 51eda933a..e075c1e37 100644
  
              // Hack to restore window decorations on macOS 10.10
              frameRect = [nswindow frame];
-@@ -3072,7 +3327,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3072,7 +3326,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
          [nswindow setFrameOrigin:rect.origin];
  
          // Disable the window shadow in fullscreen to avoid a visible 1px border on Tahoe
@@ -3660,7 +3717,7 @@ index 51eda933a..e075c1e37 100644
  
          // When the window style changes the title is cleared
          if (!fullscreen) {
-@@ -3101,6 +3356,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3101,6 +3355,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
  
          // Update the safe area insets
          // The view never seems to reflect the safe area, so we'll use the screen instead
@@ -3668,7 +3725,7 @@ index 51eda933a..e075c1e37 100644
          if (@available(macOS 12.0, *)) {
              if (fullscreen) {
                  NSScreen *screen = [nswindow screen];
-@@ -3114,6 +3370,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3114,6 +3369,7 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
                  SDL_SetWindowSafeAreaInsets(data.window, 0, 0, 0, 0);
              }
          }
@@ -3676,7 +3733,7 @@ index 51eda933a..e075c1e37 100644
  
          /* When coming out of fullscreen to minimize, this needs to happen after the window
           * is made key again, or it won't minimize on 15.0 (Sequoia).
-@@ -3135,7 +3392,11 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
+@@ -3135,7 +3391,11 @@ SDL_FullscreenResult Cocoa_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Windo
  
  void *Cocoa_GetWindowICCProfile(SDL_VideoDevice *_this, SDL_Window *window, size_t *size)
  {
@@ -3689,7 +3746,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          NSWindow *nswindow = data.nswindow;
          NSScreen *screen = [nswindow screen];
-@@ -3167,11 +3428,12 @@ void *Cocoa_GetWindowICCProfile(SDL_VideoDevice *_this, SDL_Window *window, size
+@@ -3167,11 +3427,12 @@ void *Cocoa_GetWindowICCProfile(SDL_VideoDevice *_this, SDL_Window *window, size
          *size = [iccProfileData length];
          return retIccProfileData;
      }
@@ -3703,7 +3760,7 @@ index 51eda933a..e075c1e37 100644
          NSScreen *screen;
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
-@@ -3207,7 +3469,7 @@ bool Cocoa_SetWindowMouseRect(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -3207,7 +3468,7 @@ bool Cocoa_SetWindowMouseRect(SDL_VideoDevice *_this, SDL_Window *window)
  
  bool Cocoa_SetWindowMouseGrab(SDL_VideoDevice *_this, SDL_Window *window, bool grabbed)
  {
@@ -3712,7 +3769,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
          Cocoa_UpdateClipCursor(window);
-@@ -3230,7 +3492,7 @@ bool Cocoa_SetWindowMouseGrab(SDL_VideoDevice *_this, SDL_Window *window, bool g
+@@ -3230,7 +3491,7 @@ bool Cocoa_SetWindowMouseGrab(SDL_VideoDevice *_this, SDL_Window *window, bool g
  
  void Cocoa_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
@@ -3721,7 +3778,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (SDL_CocoaWindowData *)CFBridgingRelease(window->internal);
  
          if (data) {
-@@ -3261,15 +3523,26 @@ void Cocoa_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -3261,15 +3522,26 @@ void Cocoa_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
              [data.listener close];
              data.listener = nil;
  
@@ -3750,7 +3807,7 @@ index 51eda933a..e075c1e37 100644
              for (SDL3OpenGLContext *context in contexts) {
                  // Calling setWindow:NULL causes the context to remove itself from the context list.
                  [context setWindow:NULL];
-@@ -3283,7 +3556,7 @@ void Cocoa_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -3283,7 +3555,7 @@ void Cocoa_DestroyWindow(SDL_VideoDevice *_this, SDL_Window *window)
  
  bool Cocoa_SetWindowFullscreenSpace(SDL_Window *window, bool state, bool blocking)
  {
@@ -3759,7 +3816,7 @@ index 51eda933a..e075c1e37 100644
          bool succeeded = false;
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
-@@ -3338,11 +3611,16 @@ bool Cocoa_SetWindowHitTest(SDL_Window *window, bool enabled)
+@@ -3338,11 +3610,16 @@ bool Cocoa_SetWindowHitTest(SDL_Window *window, bool enabled)
  
  void Cocoa_AcceptDragAndDrop(SDL_Window *window, bool accept)
  {
@@ -3779,7 +3836,7 @@ index 51eda933a..e075c1e37 100644
          } else {
              [data.nswindow unregisterDraggedTypes];
          }
-@@ -3351,7 +3629,7 @@ void Cocoa_AcceptDragAndDrop(SDL_Window *window, bool accept)
+@@ -3351,7 +3628,7 @@ void Cocoa_AcceptDragAndDrop(SDL_Window *window, bool accept)
  
  bool Cocoa_SetWindowParent(SDL_VideoDevice *_this, SDL_Window *window, SDL_Window *parent)
  {
@@ -3788,7 +3845,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *child_data = (__bridge SDL_CocoaWindowData *)window->internal;
  
          // Remove an existing parent.
-@@ -3371,7 +3649,7 @@ bool Cocoa_SetWindowParent(SDL_VideoDevice *_this, SDL_Window *window, SDL_Windo
+@@ -3371,7 +3648,7 @@ bool Cocoa_SetWindowParent(SDL_VideoDevice *_this, SDL_Window *window, SDL_Windo
  
  bool Cocoa_SetWindowModal(SDL_VideoDevice *_this, SDL_Window *window, bool modal)
  {
@@ -3797,7 +3854,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
          if (data.modal_session) {
-@@ -3389,7 +3667,7 @@ bool Cocoa_SetWindowModal(SDL_VideoDevice *_this, SDL_Window *window, bool modal
+@@ -3389,7 +3666,7 @@ bool Cocoa_SetWindowModal(SDL_VideoDevice *_this, SDL_Window *window, bool modal
  
  bool Cocoa_FlashWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_FlashOperation operation)
  {
@@ -3806,7 +3863,7 @@ index 51eda933a..e075c1e37 100644
          // Note that this is app-wide and not window-specific!
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
  
-@@ -3436,7 +3714,7 @@ bool Cocoa_SetWindowFocusable(SDL_VideoDevice *_this, SDL_Window *window, bool f
+@@ -3436,7 +3713,7 @@ bool Cocoa_SetWindowFocusable(SDL_VideoDevice *_this, SDL_Window *window, bool f
  
  bool Cocoa_SetWindowOpacity(SDL_VideoDevice *_this, SDL_Window *window, float opacity)
  {
@@ -3815,7 +3872,7 @@ index 51eda933a..e075c1e37 100644
          SDL_CocoaWindowData *data = (__bridge SDL_CocoaWindowData *)window->internal;
          [data.nswindow setAlphaValue:opacity];
          return true;
-@@ -3447,7 +3725,7 @@ bool Cocoa_SyncWindow(SDL_VideoDevice *_this, SDL_Window *window)
+@@ -3447,7 +3724,7 @@ bool Cocoa_SyncWindow(SDL_VideoDevice *_this, SDL_Window *window)
  {
      bool result = false;
  
