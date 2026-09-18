@@ -1,0 +1,84 @@
+Cache stable_type_symbol_hash() for concrete types.
+
+stable_type_symbol_key() serialises the entire type graph reachable from a type
+into one string and hashes it, and scope_gc_pin_pregen() asks for that hash for
+every pinned variable of every call statement, for every `-prod` build that
+targets a Boehm GC mode. Nothing memoises it, so a bootstrap compiler built with
+`-gc none` (V's own default) leaks megabytes per statement while compiling
+`cmd/v` with `-prod -gc boehm`, or any large program with the default GC mode.
+On 32-bit that exhausts the address space (https://github.com/vlang/v/issues/28612).
+The hash of a concrete type cannot depend on the generic context, so it is cached
+once per compilation, shared between the per-file cgen instances. Generated C is
+unchanged.
+
+--- vlib/v/gen/c/utils.v.original
++++ vlib/v/gen/c/utils.v
+@@ -12,9 +12,41 @@
+ const cgen_scope_var_type_cache_salt = u64(0xc2b2ae3d27d4eb4f)
+ 
+ // stable_type_symbol_hash returns a deterministic hash for generated helper names.
++//
++// stable_type_symbol_key walks every type reachable from `typ` and serialises the whole
++// graph into one string, which is then hashed. scope_gc_pin_pregen asks for the hash of
++// the same few types for every call statement it visits, so for a variable of a large
++// struct type (an AST node, say) that is megabytes of temporary strings per statement.
++// A compiler built with `-gc none` (what V's own bootstrap stages use) never frees them,
++// which is enough to exhaust a 32-bit address space while compiling `cmd/v` itself with
++// `-prod -gc boehm`. So cache the hash of concrete types: their descriptor cannot depend
++// on the current generic context (unwrap_generic and recheck_concrete_type leave them,
++// and everything they reach, untouched), hence the cache needs no clearing from
++// clear_type_resolution_caches, and it is shared between the per-file Gens of a
++// parallel cgen so that each descriptor is built once per compilation.
+ fn (mut g Gen) stable_type_symbol_hash(typ ast.Type) u64 {
++	cacheable := typ != 0 && !typ.has_flag(.generic) && !g.type_has_unresolved_generic_parts(typ)
++	if cacheable {
++		mut cached := u64(0)
++		mut found := false
++		rlock g.stable_type_symbol_hash_cache {
++			if h := g.stable_type_symbol_hash_cache[typ] {
++				cached = h
++				found = true
++			}
++		}
++		if found {
++			return cached
++		}
++	}
+ 	mut seen := map[string]bool{}
+-	return fnv1a.sum64_string(g.stable_type_symbol_key(typ, mut seen))
++	hash := fnv1a.sum64_string(g.stable_type_symbol_key(typ, mut seen))
++	if cacheable {
++		lock g.stable_type_symbol_hash_cache {
++			g.stable_type_symbol_hash_cache[typ] = hash
++		}
++	}
++	return hash
+ }
+ 
+ // stable_type_symbol_key builds a stable type descriptor without using table registration ids.
+--- vlib/v/gen/c/cgen.v.original
++++ vlib/v/gen/c/cgen.v
+@@ -97,6 +97,7 @@
+ 	generic_parts_cache                  []i8              // type idx -> 0 unknown, 1 false, 2 true
+ 	unwrap_generic_cache                 map[u64]ast.Type
+ 	resolved_scope_var_type_cache        map[u64]ast.Type
++	stable_type_symbol_hash_cache        shared map[ast.Type]u64 // concrete type -> stable_type_symbol_hash(); one map for all per-file Gens
+ 	unique_file_path_hash                u64 // a hash of file.path, used for making auxiliary fn generation unique (like `compare_xyz`)
+ 	fn_decl                              &ast.FnDecl = unsafe { nil } // pointer to the FnDecl we are currently inside otherwise 0
+ 	last_fn_c_name                       string
+@@ -439,6 +440,7 @@
+ 		generic_parts_cache:           []i8{len: table.type_symbols.len}
+ 		unwrap_generic_cache:          map[u64]ast.Type{}
+ 		resolved_scope_var_type_cache: map[u64]ast.Type{}
++		stable_type_symbol_hash_cache: map[ast.Type]u64{}
+ 	}
+ 
+ 	global_g.type_resolver = type_resolver.TypeResolver.new(table, global_g)
+@@ -1101,6 +1103,7 @@
+ 		generic_parts_cache:                []i8{len: global_g.table.type_symbols.len}
+ 		unwrap_generic_cache:               map[u64]ast.Type{}
+ 		resolved_scope_var_type_cache:      map[u64]ast.Type{}
++		stable_type_symbol_hash_cache:      global_g.stable_type_symbol_hash_cache
+ 	}
+ 	g.type_resolver = type_resolver.TypeResolver.new(global_g.table, g)
+ 	g.comptime = &g.type_resolver.info

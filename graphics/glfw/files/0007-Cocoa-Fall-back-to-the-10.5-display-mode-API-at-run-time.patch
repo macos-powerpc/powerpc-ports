@@ -1,0 +1,418 @@
+From 552a6c949cffca0339d62d4694037830e38b7fcd Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 18 Sep 2026 01:26:38 +0000
+Subject: [PATCH] Cocoa: Fall back to the 10.5 display mode API at run time
+
+Mac OS X 10.6 on PowerPC ships a CoreGraphics shim in which the 10.6
+CGDisplayMode API is present but does not work: CGDisplayCopyDisplayMode
+returns NULL, so glfwGetVideoMode fails and a client going full screen
+has nothing to hand glfwSetWindowMonitor.  The older
+CGDisplayCurrentMode/CGDisplayAvailableModes/CGDisplaySwitchToMode API
+that the 10.5 shim already wraps is still there.
+
+Route every display mode access in cocoa_monitor.m through wrappers that
+use the 10.6 API and, when built with a 10.6 or later SDK for a 10.6 or
+earlier deployment target, fall back to the 10.5 API at run time if the
+10.6 call returns nothing.  The two kinds of mode object are told apart
+by their CF type.  The 10.5 SDK build keeps its compile-time shim, now
+sharing the dictionary helpers, and builds for 10.7 and later are
+unchanged.
+
+Also stop assuming the mode queries succeed: monitor polling tolerates a
+missing current mode, _glfwGetVideoModesCocoa reports an error instead
+of passing NULL to CFArrayGetCount, and _glfwSetVideoModeCocoa does not
+switch modes when the current mode is unknown (it could not be restored
+afterwards), when no mode was chosen, or when the mode list is missing.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/cocoa_monitor.m | 260 ++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 217 insertions(+), 43 deletions(-)
+
+diff --git a/src/cocoa_monitor.m b/src/cocoa_monitor.m
+index ab3c99b4..6df62344 100644
+--- a/src/cocoa_monitor.m
++++ b/src/cocoa_monitor.m
+@@ -45,11 +45,25 @@
+ //       rest of this file only ever has to speak the 10.6 interface.  Note that
+ //       the older calls follow the Get rule while the ones they stand in for
+ //       follow the Copy rule, hence the added retains
+-#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++//
++// NOTE: The 10.6 API can also be present but not work: the CoreGraphics of
++//       Mac OS X 10.6 for PowerPC only stubs it, so CGDisplayCopyDisplayMode
++//       returns NULL there, while the older API remains available.  When
++//       built with a 10.6 or later SDK for a 10.6 or earlier deployment
++//       target, the wrappers below therefore fall back to the older API at
++//       run time, telling the two kinds of mode object apart by their CF type
++#if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060 && MAC_OS_X_VERSION_MIN_REQUIRED < 1070
++ #define _GLFW_RUNTIME_LEGACY_DISPLAY_MODES
++ // The older API is deprecated as of the 10.6 SDK
++ #pragma GCC diagnostic push
++ #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#endif
++
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070
+ 
+ // Returns the value of the specified numeric display mode dictionary key
+ //
+-static double getModeNumber(CGDisplayModeRef mode, CFStringRef key)
++static double getLegacyModeNumber(CFDictionaryRef mode, CFStringRef key)
+ {
+     CFNumberRef value = mode ? CFDictionaryGetValue(mode, key) : NULL;
+     double result = 0.0;
+@@ -60,31 +74,15 @@ static double getModeNumber(CGDisplayModeRef mode, CFStringRef key)
+     return result;
+ }
+ 
+-static size_t CGDisplayModeGetWidth(CGDisplayModeRef mode)
+-{
+-    return (size_t) getModeNumber(mode, kCGDisplayWidth);
+-}
+-
+-static size_t CGDisplayModeGetHeight(CGDisplayModeRef mode)
+-{
+-    return (size_t) getModeNumber(mode, kCGDisplayHeight);
+-}
+-
+-static double CGDisplayModeGetRefreshRate(CGDisplayModeRef mode)
+-{
+-    return getModeNumber(mode, kCGDisplayRefreshRate);
+-}
+-
+-static uint32_t CGDisplayModeGetIOFlags(CGDisplayModeRef mode)
+-{
+-    return (uint32_t) getModeNumber(mode, kCGDisplayIOFlags);
+-}
++#if MAC_OS_X_VERSION_MAX_ALLOWED <= 101100
+ 
+-static CFStringRef CGDisplayModeCopyPixelEncoding(CGDisplayModeRef mode)
++// Returns the pixel encoding of the specified display mode dictionary
++//
++static CFStringRef copyLegacyModePixelEncoding(CFDictionaryRef mode)
+ {
+     CFStringRef encoding;
+ 
+-    switch ((int) getModeNumber(mode, kCGDisplayBitsPerPixel))
++    switch ((int) getLegacyModeNumber(mode, kCGDisplayBitsPerPixel))
+     {
+         case 32:
+             encoding = CFSTR(IO32BitDirectPixels);
+@@ -103,6 +101,37 @@ static CFStringRef CGDisplayModeCopyPixelEncoding(CGDisplayModeRef mode)
+     return (CFStringRef) CFRetain(encoding);
+ }
+ 
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
++#endif /*MAC_OS_X_VERSION_MIN_REQUIRED*/
++
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1060
++
++static size_t CGDisplayModeGetWidth(CGDisplayModeRef mode)
++{
++    return (size_t) getLegacyModeNumber(mode, kCGDisplayWidth);
++}
++
++static size_t CGDisplayModeGetHeight(CGDisplayModeRef mode)
++{
++    return (size_t) getLegacyModeNumber(mode, kCGDisplayHeight);
++}
++
++static double CGDisplayModeGetRefreshRate(CGDisplayModeRef mode)
++{
++    return getLegacyModeNumber(mode, kCGDisplayRefreshRate);
++}
++
++static uint32_t CGDisplayModeGetIOFlags(CGDisplayModeRef mode)
++{
++    return (uint32_t) getLegacyModeNumber(mode, kCGDisplayIOFlags);
++}
++
++static CFStringRef CGDisplayModeCopyPixelEncoding(CGDisplayModeRef mode)
++{
++    return copyLegacyModePixelEncoding(mode);
++}
++
+ static CGDisplayModeRef CGDisplayCopyDisplayMode(CGDirectDisplayID display)
+ {
+     CGDisplayModeRef mode = CGDisplayCurrentMode(display);
+@@ -137,6 +166,140 @@ static CGError CGDisplaySetDisplayMode(CGDirectDisplayID display,
+ 
+ #endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
+ 
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++
++// Returns whether the specified display mode came from the older API
++//
++static GLFWbool isLegacyDisplayMode(CGDisplayModeRef mode)
++{
++    return CFGetTypeID(mode) == CFDictionaryGetTypeID();
++}
++
++#endif /*_GLFW_RUNTIME_LEGACY_DISPLAY_MODES*/
++
++// Returns the current mode of the specified display, or NULL
++//
++static CGDisplayModeRef copyCurrentDisplayMode(CGDirectDisplayID display)
++{
++    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
++
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (!mode)
++    {
++        CFDictionaryRef legacy = CGDisplayCurrentMode(display);
++        if (legacy)
++            mode = (CGDisplayModeRef) CFRetain(legacy);
++    }
++#endif
++
++    return mode;
++}
++
++// Returns all modes of the specified display, or NULL
++//
++static CFArrayRef copyAllDisplayModes(CGDirectDisplayID display)
++{
++    CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, NULL);
++
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (!modes || CFArrayGetCount(modes) == 0)
++    {
++        if (modes)
++            CFRelease(modes);
++
++        modes = CGDisplayAvailableModes(display);
++        if (modes)
++            CFRetain(modes);
++    }
++#endif
++
++    return modes;
++}
++
++static CGError setDisplayMode(CGDirectDisplayID display, CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return CGDisplaySwitchToMode(display, (CFDictionaryRef) mode);
++#endif
++
++    return CGDisplaySetDisplayMode(display, mode, NULL);
++}
++
++static void releaseDisplayMode(CGDisplayModeRef mode)
++{
++    if (!mode)
++        return;
++
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++    {
++        CFRelease(mode);
++        return;
++    }
++#endif
++
++    CGDisplayModeRelease(mode);
++}
++
++static size_t getDisplayModeWidth(CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return (size_t) getLegacyModeNumber((CFDictionaryRef) mode, kCGDisplayWidth);
++#endif
++
++    return CGDisplayModeGetWidth(mode);
++}
++
++static size_t getDisplayModeHeight(CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return (size_t) getLegacyModeNumber((CFDictionaryRef) mode, kCGDisplayHeight);
++#endif
++
++    return CGDisplayModeGetHeight(mode);
++}
++
++static double getDisplayModeRefreshRate(CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return getLegacyModeNumber((CFDictionaryRef) mode, kCGDisplayRefreshRate);
++#endif
++
++    return CGDisplayModeGetRefreshRate(mode);
++}
++
++static uint32_t getDisplayModeIOFlags(CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return (uint32_t) getLegacyModeNumber((CFDictionaryRef) mode, kCGDisplayIOFlags);
++#endif
++
++    return CGDisplayModeGetIOFlags(mode);
++}
++
++#if MAC_OS_X_VERSION_MAX_ALLOWED <= 101100
++
++static CFStringRef copyDisplayModePixelEncoding(CGDisplayModeRef mode)
++{
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++    if (isLegacyDisplayMode(mode))
++        return copyLegacyModePixelEncoding((CFDictionaryRef) mode);
++#endif
++
++    return CGDisplayModeCopyPixelEncoding(mode);
++}
++
++#endif /*MAC_OS_X_VERSION_MAX_ALLOWED*/
++
++#if defined(_GLFW_RUNTIME_LEGACY_DISPLAY_MODES)
++ #pragma GCC diagnostic pop
++#endif
++
+ // Get the name of the specified display, or NULL
+ //
+ static char* getMonitorName(CGDirectDisplayID displayID, NSScreen* screen)
+@@ -227,7 +390,7 @@ static char* getMonitorName(CGDirectDisplayID displayID, NSScreen* screen)
+ //
+ static GLFWbool modeIsGood(CGDisplayModeRef mode)
+ {
+-    uint32_t flags = CGDisplayModeGetIOFlags(mode);
++    uint32_t flags = getDisplayModeIOFlags(mode);
+ 
+     if (!(flags & kDisplayModeValidFlag) || !(flags & kDisplayModeSafeFlag))
+         return GLFW_FALSE;
+@@ -237,7 +400,7 @@ static GLFWbool modeIsGood(CGDisplayModeRef mode)
+         return GLFW_FALSE;
+ 
+ #if MAC_OS_X_VERSION_MAX_ALLOWED <= 101100
+-    CFStringRef format = CGDisplayModeCopyPixelEncoding(mode);
++    CFStringRef format = copyDisplayModePixelEncoding(mode);
+     if (CFStringCompare(format, CFSTR(IO16BitDirectPixels), 0) &&
+         CFStringCompare(format, CFSTR(IO32BitDirectPixels), 0))
+     {
+@@ -256,15 +419,15 @@ static GLFWvidmode vidmodeFromCGDisplayMode(CGDisplayModeRef mode,
+                                             double fallbackRefreshRate)
+ {
+     GLFWvidmode result;
+-    result.width = (int) CGDisplayModeGetWidth(mode);
+-    result.height = (int) CGDisplayModeGetHeight(mode);
+-    result.refreshRate = (int) round(CGDisplayModeGetRefreshRate(mode));
++    result.width = (int) getDisplayModeWidth(mode);
++    result.height = (int) getDisplayModeHeight(mode);
++    result.refreshRate = (int) round(getDisplayModeRefreshRate(mode));
+ 
+     if (result.refreshRate == 0)
+         result.refreshRate = (int) round(fallbackRefreshRate);
+ 
+ #if MAC_OS_X_VERSION_MAX_ALLOWED <= 101100
+-    CFStringRef format = CGDisplayModeCopyPixelEncoding(mode);
++    CFStringRef format = copyDisplayModePixelEncoding(mode);
+     if (CFStringCompare(format, CFSTR(IO16BitDirectPixels), 0) == 0)
+     {
+         result.redBits = 5;
+@@ -462,10 +625,10 @@ void _glfwPollMonitorsCocoa(void)
+ 
+         _glfw_free(name);
+ 
+-        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(displays[i]);
+-        if (CGDisplayModeGetRefreshRate(mode) == 0.0)
++        CGDisplayModeRef mode = copyCurrentDisplayMode(displays[i]);
++        if (!mode || getDisplayModeRefreshRate(mode) == 0.0)
+             monitor->ns.fallbackRefreshRate = getFallbackRefreshRate(displays[i]);
+-        CGDisplayModeRelease(mode);
++        releaseDisplayMode(mode);
+ 
+         _glfwInputMonitor(monitor, GLFW_CONNECTED, _GLFW_INSERT_LAST);
+     }
+@@ -484,14 +647,19 @@ void _glfwPollMonitorsCocoa(void)
+ //
+ void _glfwSetVideoModeCocoa(_GLFWmonitor* monitor, const GLFWvidmode* desired)
+ {
++    // Without the current mode there is no way to restore it afterwards
+     GLFWvidmode current;
+-    _glfwGetVideoModeCocoa(monitor, &current);
++    if (!_glfwGetVideoModeCocoa(monitor, &current))
++        return;
+ 
+     const GLFWvidmode* best = _glfwChooseVideoMode(monitor, desired);
+-    if (_glfwCompareVideoModes(&current, best) == 0)
++    if (!best || _glfwCompareVideoModes(&current, best) == 0)
++        return;
++
++    CFArrayRef modes = copyAllDisplayModes(monitor->ns.displayID);
++    if (!modes)
+         return;
+ 
+-    CFArrayRef modes = CGDisplayCopyAllDisplayModes(monitor->ns.displayID, NULL);
+     const CFIndex count = CFArrayGetCount(modes);
+     CGDisplayModeRef native = NULL;
+ 
+@@ -513,10 +681,10 @@ void _glfwSetVideoModeCocoa(_GLFWmonitor* monitor, const GLFWvidmode* desired)
+     if (native)
+     {
+         if (monitor->ns.previousMode == NULL)
+-            monitor->ns.previousMode = CGDisplayCopyDisplayMode(monitor->ns.displayID);
++            monitor->ns.previousMode = copyCurrentDisplayMode(monitor->ns.displayID);
+ 
+         CGDisplayFadeReservationToken token = beginFadeReservation();
+-        CGDisplaySetDisplayMode(monitor->ns.displayID, native, NULL);
++        setDisplayMode(monitor->ns.displayID, native);
+         endFadeReservation(token);
+     }
+ 
+@@ -530,11 +698,10 @@ void _glfwRestoreVideoModeCocoa(_GLFWmonitor* monitor)
+     if (monitor->ns.previousMode)
+     {
+         CGDisplayFadeReservationToken token = beginFadeReservation();
+-        CGDisplaySetDisplayMode(monitor->ns.displayID,
+-                                monitor->ns.previousMode, NULL);
++        setDisplayMode(monitor->ns.displayID, monitor->ns.previousMode);
+         endFadeReservation(token);
+ 
+-        CGDisplayModeRelease(monitor->ns.previousMode);
++        releaseDisplayMode(monitor->ns.previousMode);
+         monitor->ns.previousMode = NULL;
+     }
+ }
+@@ -622,7 +789,14 @@ GLFWvidmode* _glfwGetVideoModesCocoa(_GLFWmonitor* monitor, int* count)
+ 
+     *count = 0;
+ 
+-    CFArrayRef modes = CGDisplayCopyAllDisplayModes(monitor->ns.displayID, NULL);
++    CFArrayRef modes = copyAllDisplayModes(monitor->ns.displayID);
++    if (!modes)
++    {
++        _glfwInputError(GLFW_PLATFORM_ERROR, "Cocoa: Failed to query display modes");
++        [pool release];
++        return NULL;
++    }
++
+     const CFIndex found = CFArrayGetCount(modes);
+     GLFWvidmode* result = _glfw_calloc(found, sizeof(GLFWvidmode));
+ 
+@@ -659,7 +833,7 @@ GLFWbool _glfwGetVideoModeCocoa(_GLFWmonitor* monitor, GLFWvidmode *mode)
+ {
+     NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+ 
+-    CGDisplayModeRef native = CGDisplayCopyDisplayMode(monitor->ns.displayID);
++    CGDisplayModeRef native = copyCurrentDisplayMode(monitor->ns.displayID);
+     if (!native)
+     {
+         _glfwInputError(GLFW_PLATFORM_ERROR, "Cocoa: Failed to query display mode");
+@@ -668,7 +842,7 @@ GLFWbool _glfwGetVideoModeCocoa(_GLFWmonitor* monitor, GLFWvidmode *mode)
+     }
+ 
+     *mode = vidmodeFromCGDisplayMode(native, monitor->ns.fallbackRefreshRate);
+-    CGDisplayModeRelease(native);
++    releaseDisplayMode(native);
+     [pool release];
+     return GLFW_TRUE;
+ }
+-- 
+2.43.0
+
