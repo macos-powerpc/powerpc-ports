@@ -1,0 +1,609 @@
+diff --git a/README.md b/README.md
+index 2e09647..d52c584 100644
+--- a/README.md
++++ b/README.md
+@@ -195,10 +195,14 @@ Rendering goes through the small `RenderBackend` interface
+   compatibility GL context too. On drivers without
+   `GL_ARB_texture_non_power_of_two` (most G4/G5 era Apple drivers) video frames
+   and thumbnails are padded to power-of-two textures; frames larger than
+-  `GL_MAX_TEXTURE_SIZE` are scaled down inside the GStreamer pipeline. Frames
+-  are requested from GStreamer in the packed `GL_BGRA` +
+-  `GL_UNSIGNED_INT_8_8_8_8_REV` layout Apple's drivers upload without a
+-  swizzle pass (`ARGB` bytes on big-endian, `BGRA` on little-endian).
++  `GL_MAX_TEXTURE_SIZE` are scaled down inside the GStreamer pipeline. Where
++  the driver has `GL_APPLE_ycbcr_422` (every Mac GPU, QuickTime's own path)
++  frames are requested as 4:2:2 `UYVY` and uploaded as is: the GPU does the
++  colour conversion while sampling, the CPU only packs chroma instead of
++  running a YUV-to-RGB pass, and each frame is half the bytes. Elsewhere
++  frames come in the packed `GL_BGRA` + `GL_UNSIGNED_INT_8_8_8_8_REV` layout
++  Apple's drivers upload without a swizzle pass (`ARGB` bytes on big-endian,
++  `BGRA` on little-endian). The `[gl2]` startup line shows which is in use.
+ * **GLES 3.2** (`GlesContext`) — the shader backend. Runs on any Linux PC via
+   Mesa and on the STM32MPU via the VeriSilicon `gcnano` driver.
+ 
+@@ -273,7 +277,10 @@ fullscreen and idle waits; older 3.x still builds).
+ On a G4 the first-launch stream resolution is 360p (a G5 gets 1080p); change it
+ under Settings, the choice is persisted. `IMTUBE_GL_FORCE_POT=1` in the
+ environment forces the power-of-two texture path on a GPU that does not need
+-it, for testing.
++it, for testing. `IMTUBE_GL_YCBCR=0` disables the 4:2:2 video upload path
++(32-bit frames instead, for A/B comparisons); `IMTUBE_GL_YCBCR=swap` flips
++the 16-bit upload type between `8_8` and `8_8_REV`, the diagnostic to reach
++for if a driver ever shows the picture with luma and chroma exchanged.
+ 
+ ### Linux PC (SDL3 + GLES)
+ 
+diff --git a/src/core/GStreamerPlayer.cpp b/src/core/GStreamerPlayer.cpp
+index aa94d76..7524809 100644
+--- a/src/core/GStreamerPlayer.cpp
++++ b/src/core/GStreamerPlayer.cpp
+@@ -736,6 +736,7 @@ bool GStreamerPlayer::pull_frame()
+                 DBG("pull_frame: got %dx%d frame", info.width, info.height);
+                 m_frame_w = info.width;
+                 m_frame_h = info.height;
++                m_frame_stride = GST_VIDEO_INFO_PLANE_STRIDE(&info, 0);
+                 m_frame.assign(map.data, map.data + map.size);
+                 gst_buffer_unmap(buffer, &map);
+                 got = true;
+diff --git a/src/core/GStreamerPlayer.h b/src/core/GStreamerPlayer.h
+index 275feb2..b3ae924 100644
+--- a/src/core/GStreamerPlayer.h
++++ b/src/core/GStreamerPlayer.h
+@@ -99,6 +99,9 @@ public:
+     const uint8_t* frame_pixels() const { return m_frame.empty() ? nullptr : m_frame.data(); }
+     int frame_width() const { return m_frame_w; }
+     int frame_height() const { return m_frame_h; }
++    /* Bytes between the starts of consecutive rows of frame_pixels() (the
++     * decoder may pad rows); pass it to RenderTexture::upload(). */
++    int frame_stride() const { return m_frame_stride; }
+ 
+     /* Process pending bus messages (EOS/ERROR). Call from the main thread. */
+     void pump_bus();
+@@ -179,10 +182,12 @@ private:
+     mutable std::mutex m_mutex;
+     std::string m_error;
+ 
+-    /* Latest decoded RGBA frame (owned here; written by the main thread). */
++    /* Latest decoded frame in the negotiated layout (set_video_format();
++     * owned here, written by the main thread). */
+     std::vector<uint8_t> m_frame;
+     int m_frame_w = 0;
+     int m_frame_h = 0;
++    int m_frame_stride = 0;
+ };
+ 
+ } /* namespace imtube */
+diff --git a/src/render/Gl2Context.cpp b/src/render/Gl2Context.cpp
+index c71fc5b..12b965e 100644
+--- a/src/render/Gl2Context.cpp
++++ b/src/render/Gl2Context.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "imgui_impl_opengl2.h"
+ 
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -43,6 +44,32 @@ bool has_extension_token(const char* extensions, const char* name)
+     }
+ }
+ 
++/* Allocate and fill a tiny 4:2:2 Y'CbCr texture with `type` and report
++ * whether the driver accepted it. The video format is chosen before the
++ * stream starts and cannot change afterwards, so an advertised extension
++ * is not taken on trust. */
++bool probe_ycbcr422(GLenum type)
++{
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ; /* discard stale errors so the probe only sees its own */
++
++    GLuint tex = 0;
++    glGenTextures(1, &tex);
++    if (tex == 0)
++        return false;
++
++    /* 2x2 pixels of video black: Cb=128, Y=16, Cr=128, Y=16 per pair. */
++    const uint8_t pixels[2 * 2 * 2] = { 128, 16, 128, 16, 128, 16, 128, 16 };
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 2, 2, 0, GL_YCBCR_422_APPLE, type, pixels);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_YCBCR_422_APPLE, type, pixels);
++    const bool ok = glGetError() == GL_NO_ERROR;
++    glBindTexture(GL_TEXTURE_2D, 0);
++    glDeleteTextures(1, &tex);
++    return ok;
++}
++
+ } /* namespace */
+ 
+ bool Gl2Context::init(Platform& platform)
+@@ -92,9 +119,45 @@ bool Gl2Context::init(Platform& platform)
+     if (getenv("IMTUBE_GL_FORCE_POT") != nullptr)
+         m_npot = false;
+ 
++    /* GL_APPLE_ycbcr_422: video frames stay 4:2:2 Y'CbCr and the GPU
++     * converts them while sampling. That halves every upload and turns the
++     * CPU-side videoconvert step from a YUV->RGB matrix pass into chroma
++     * packing, which is what makes 1080p viable on a G5. It is QuickTime's
++     * own path, present on every Mac GPU since the Rage 128; Mesa exposes it
++     * on some drivers too, and everything else keeps the 32-bit layout.
++     *
++     * The GL packed 16-bit types follow host byte order. UYVY has the chroma
++     * byte first in every pair; the spec puts luminance in the high byte of
++     * GL_UNSIGNED_SHORT_8_8_APPLE and chroma in the high byte of the _REV
++     * type, so a big-endian host needs _REV (the spec's own '2vuy' pairing,
++     * written for PowerPC) and a little-endian host the plain type (Apple's
++     * Intel-era sample code). IMTUBE_GL_YCBCR=0 turns the path off for A/B
++     * comparisons; IMTUBE_GL_YCBCR=swap flips the type, should a driver ever
++     * disagree with that rule (the picture is then obviously wrong, not
++     * subtly). */
++    m_ycbcr422 = has_extension_token(extensions, "GL_APPLE_ycbcr_422");
++    m_ycbcr_type = kHostBigEndian ? GL_UNSIGNED_SHORT_8_8_REV_APPLE : GL_UNSIGNED_SHORT_8_8_APPLE;
++    if (const char* env = getenv("IMTUBE_GL_YCBCR"))
++    {
++        if (strcmp(env, "0") == 0 || strcmp(env, "off") == 0)
++            m_ycbcr422 = false;
++        else if (strcmp(env, "swap") == 0)
++            m_ycbcr_type = (m_ycbcr_type == GL_UNSIGNED_SHORT_8_8_APPLE)
++                               ? GL_UNSIGNED_SHORT_8_8_REV_APPLE
++                               : GL_UNSIGNED_SHORT_8_8_APPLE;
++    }
++    if (m_ycbcr422 && !probe_ycbcr422((GLenum)m_ycbcr_type))
++    {
++        fprintf(stderr, "[gl2] GL_APPLE_ycbcr_422 is advertised but a test upload failed; "
++                        "using 32-bit video frames\n");
++        m_ycbcr422 = false;
++    }
++
+     char line[256];
+-    snprintf(line, sizeof(line), "%s, GL %s, max texture %d, NPOT %s",
+-             renderer, version, m_max_texture_size, m_npot ? "yes" : "no");
++    snprintf(line, sizeof(line), "%s, GL %s, max texture %d, NPOT %s, YCbCr 4:2:2 %s",
++             renderer, version, m_max_texture_size, m_npot ? "yes" : "no",
++             m_ycbcr422 ? (m_ycbcr_type == GL_UNSIGNED_SHORT_8_8_REV_APPLE ? "yes (8_8_REV)" : "yes (8_8)")
++                        : "no");
+     m_description = line;
+     fprintf(stderr, "[gl2] %s\n", m_description.c_str());
+ 
+@@ -143,7 +206,8 @@ void Gl2Context::render(ImDrawData* draw_data)
+ 
+ std::unique_ptr<RenderTexture> Gl2Context::create_texture(int width, int height)
+ {
+-    return std::make_unique<Gl2Texture>(width, height, /*pad_to_pot=*/!m_npot, m_max_texture_size);
++    return std::make_unique<Gl2Texture>(width, height, /*pad_to_pot=*/!m_npot, m_max_texture_size,
++                                        m_ycbcr422 ? m_ycbcr_type : 0u);
+ }
+ 
+ } /* namespace imtube */
+diff --git a/src/render/Gl2Context.h b/src/render/Gl2Context.h
+index 5efaacf..4e46839 100644
+--- a/src/render/Gl2Context.h
++++ b/src/render/Gl2Context.h
+@@ -45,7 +45,12 @@ public:
+ 
+     std::unique_ptr<RenderTexture> create_texture(int width, int height) override;
+     int max_texture_size() const override { return m_max_texture_size; }
+-    PixelFormat preferred_video_format() const override { return PixelFormat::Packed32; }
++    /* 4:2:2 Y'CbCr through GL_APPLE_ycbcr_422 when the driver has it (see
++     * init()), else the 32-bit no-swizzle layout. */
++    PixelFormat preferred_video_format() const override
++    {
++        return m_ycbcr422 ? PixelFormat::YCbCr422 : PixelFormat::Packed32;
++    }
+ 
+ private:
+     std::string m_description;
+@@ -57,6 +62,11 @@ private:
+      * a power of two. */
+     bool m_npot = false;
+ 
++    /* GL_APPLE_ycbcr_422 present and verified (init()), and the 16-bit GL
++     * <type> that puts UYVY's chroma-first byte order right on this host. */
++    bool m_ycbcr422 = false;
++    uint32_t m_ycbcr_type = 0;
++
+     bool m_initialized = false;
+     bool m_imgui_initialized = false;
+ };
+diff --git a/src/render/Gl2Texture.cpp b/src/render/Gl2Texture.cpp
+index 05499c4..faa2fa3 100644
+--- a/src/render/Gl2Texture.cpp
++++ b/src/render/Gl2Texture.cpp
+@@ -23,10 +23,43 @@ int next_pow2(int value)
+     return p;
+ }
+ 
++/* glTexImage2D / glTexSubImage2D arguments for each pixel layout. */
++struct GlLayout {
++    GLint internal_format;
++    GLenum format;
++    GLenum type;
++};
++
++GlLayout layout_for(PixelFormat format, uint32_t ycbcr_type)
++{
++    switch (format)
++    {
++    case PixelFormat::Packed32:
++        /* GL_BGRA + GL_UNSIGNED_INT_8_8_8_8_REV: Apple's own documented
++         * no-swizzle upload path (their OpenGL driver's native pixel format),
++         * and exactly the byte layout GStreamer calls "ARGB" on the
++         * big-endian PowerPC target this backend exists for (see PixelFormat
++         * in RenderTexture.h), so the decoder's output can be handed straight
++         * to glTexSubImage2D with no CPU-side channel swizzle. */
++        return { GL_RGBA8, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV };
++
++    case PixelFormat::YCbCr422:
++        /* GL_APPLE_ycbcr_422: the driver keeps the 4:2:2 data as it is and
++         * the GPU converts to RGB while sampling. The spec asks for an RGB
++         * internal format (the data is RGB information, just encoded). The
++         * 16-bit <type> decides which byte of each pair is luminance; it is
++         * chosen by Gl2Context for the host's byte order. */
++        return { GL_RGB, GL_YCBCR_422_APPLE, (GLenum)ycbcr_type };
++
++    default:
++        return { GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE };
++    }
++}
++
+ } /* namespace */
+ 
+-Gl2Texture::Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size)
+-    : m_width(width), m_height(height)
++Gl2Texture::Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size, uint32_t ycbcr_type)
++    : m_ycbcr_type(ycbcr_type), m_width(width), m_height(height)
+ {
+     if (m_width <= 0 || m_height <= 0)
+     {
+@@ -56,51 +89,99 @@ Gl2Texture::Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_s
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    /* Storage is allocated by the first upload(), in that upload's layout. */
++}
++
++bool Gl2Texture::allocate(PixelFormat format)
++{
++    if (format == PixelFormat::YCbCr422)
++    {
++        if (m_ycbcr_type == 0)
++        {
++            fprintf(stderr, "[gl2] texture: YCbCr 4:2:2 upload without GL_APPLE_ycbcr_422\n");
++            return false;
++        }
++        /* Every 16-bit pair holds the chroma of two pixels, so a row must
++         * hold whole pairs. Every YouTube size is even; anything else gets a
++         * clear message rather than a GL error. */
++        if ((m_width & 1) != 0)
++        {
++            fprintf(stderr, "[gl2] texture: YCbCr 4:2:2 needs an even width, got %d\n", m_width);
++            return false;
++        }
++    }
++
++    const GlLayout gl = layout_for(format, m_ycbcr_type);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+ 
+     if (m_alloc_w != m_width || m_alloc_h != m_height)
+     {
+         /* The padding strip is inside the sampled area: bilinear filtering
+-         * blends into it right at the image's right/bottom edge. Zero it so
+-         * that blend is black instead of whatever the driver left behind in
+-         * freshly allocated GPU memory. */
+-        std::vector<uint8_t> blank(static_cast<size_t>(m_alloc_w) * static_cast<size_t>(m_alloc_h) * 4, 0);
+-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_alloc_w, m_alloc_h, 0,
+-                     GL_RGBA, GL_UNSIGNED_BYTE, blank.data());
++         * blends into it right at the image's right/bottom edge. Fill it with
++         * black so that blend is black instead of whatever the driver left
++         * behind in freshly allocated GPU memory. Black is all zeros for the
++         * RGB layouts; in 4:2:2 Y'CbCr it is Y=16 with neutral chroma 128,
++         * i.e. the byte pattern Cb=128, Y=16, Cr=128, Y=16. */
++        const size_t bpp = (size_t)bytes_per_pixel(format);
++        std::vector<uint8_t> blank((size_t)m_alloc_w * (size_t)m_alloc_h * bpp, 0);
++        if (format == PixelFormat::YCbCr422)
++        {
++            for (size_t i = 0; i + 1 < blank.size(); i += 2)
++            {
++                blank[i] = 128;
++                blank[i + 1] = 16;
++            }
++        }
++        glTexImage2D(GL_TEXTURE_2D, 0, gl.internal_format, m_alloc_w, m_alloc_h, 0,
++                     gl.format, gl.type, blank.data());
+     }
+     else
+     {
+-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_alloc_w, m_alloc_h, 0,
+-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++        glTexImage2D(GL_TEXTURE_2D, 0, gl.internal_format, m_alloc_w, m_alloc_h, 0,
++                     gl.format, gl.type, nullptr);
+     }
+ 
+-    glBindTexture(GL_TEXTURE_2D, 0);
++    m_allocated = true;
++    m_alloc_format = format;
++    return true;
+ }
+ 
+-bool Gl2Texture::upload(const uint8_t* pixels, PixelFormat format)
++bool Gl2Texture::upload(const uint8_t* pixels, PixelFormat format, int stride_bytes)
+ {
+     if (m_texture == 0 || pixels == nullptr)
+         return false;
+ 
++    const int bpp = bytes_per_pixel(format);
++    const int tight = m_width * bpp;
++    if (stride_bytes <= 0)
++        stride_bytes = tight;
++    if (stride_bytes < tight || (stride_bytes % bpp) != 0)
++    {
++        fprintf(stderr, "[gl2] texture: unusable row stride %d for %dx%d at %d bytes/pixel\n",
++                stride_bytes, m_width, m_height, bpp);
++        return false;
++    }
++
+     glBindTexture(GL_TEXTURE_2D, m_texture);
+-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+ 
+-    /* Packed32 means GL_BGRA + GL_UNSIGNED_INT_8_8_8_8_REV: this is Apple's
+-     * own documented no-swizzle upload path (their OpenGL driver's native
+-     * pixel format), and it is exactly the byte layout GStreamer calls
+-     * "ARGB" on the big-endian PowerPC target this backend exists for (see
+-     * PixelFormat in RenderTexture.h) - so the decoder's output can be
+-     * handed straight to glTexSubImage2D with no CPU-side channel swizzle. */
+-    GLenum gl_format = GL_RGBA;
+-    GLenum gl_type = GL_UNSIGNED_BYTE;
+-    if (format == PixelFormat::Packed32)
++    if (!m_allocated || m_alloc_format != format)
+     {
+-        gl_format = GL_BGRA;
+-        gl_type = GL_UNSIGNED_INT_8_8_8_8_REV;
++        if (!allocate(format))
++        {
++            glBindTexture(GL_TEXTURE_2D, 0);
++            return false;
++        }
+     }
+ 
+-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, gl_format, gl_type, pixels);
++    const GlLayout gl = layout_for(format, m_ycbcr_type);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    /* GL_UNPACK_ROW_LENGTH counts pixels; for the 4:2:2 layout a pixel is
++     * one 16-bit element, which is what the stride check above guarantees. */
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride_bytes == tight ? 0 : stride_bytes / bpp);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, gl.format, gl.type, pixels);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     glBindTexture(GL_TEXTURE_2D, 0);
+     return true;
+ }
+@@ -125,6 +206,7 @@ void Gl2Texture::destroy()
+     m_height = 0;
+     m_alloc_w = 0;
+     m_alloc_h = 0;
++    m_allocated = false;
+ }
+ 
+ } /* namespace imtube */
+diff --git a/src/render/Gl2Texture.h b/src/render/Gl2Texture.h
+index d2536af..827ad3a 100644
+--- a/src/render/Gl2Texture.h
++++ b/src/render/Gl2Texture.h
+@@ -13,20 +13,32 @@ namespace imtube {
+  * power-of-two-sized texture larger than the image and only sample the
+  * image's corner of it. Callers never see the allocation size: width()/
+  * height() report the image size, and uv1() gives the bottom-right texture
+- * coordinate to pass to ImGui so the padding never shows up on screen. */
++ * coordinate to pass to ImGui so the padding never shows up on screen.
++ *
++ * The GPU-side storage is allocated by the first upload(), in that upload's
++ * layout (32-bit RGB, or 4:2:2 Y'CbCr through GL_APPLE_ycbcr_422), and
++ * reallocated if a later upload switches layout. A texture only ever
++ * receives one layout in practice (thumbnails RGBA8, video frames whatever
++ * the backend prefers), so this costs nothing and keeps the choice out of
++ * the constructor. */
+ class Gl2Texture : public RenderTexture {
+ public:
+     /* `pad_to_pot` requests power-of-two padding (Gl2Context sets it to true
+      * whenever the driver lacks GL_ARB_texture_non_power_of_two).
+      * `max_texture_size` is GL_MAX_TEXTURE_SIZE (0 = unknown/unchecked); the
+-     * texture is left invalid if the allocation would exceed it. */
+-    Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size);
++     * texture is left invalid if the allocation would exceed it.
++     * `ycbcr_type` is the GL <type> for GL_YCBCR_422_APPLE uploads
++     * (GL_UNSIGNED_SHORT_8_8_APPLE or _REV_APPLE, chosen by Gl2Context), or
++     * 0 when the driver has no GL_APPLE_ycbcr_422: YCbCr422 uploads then
++     * fail instead of producing garbage. */
++    Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size, uint32_t ycbcr_type);
+     ~Gl2Texture() override { destroy(); }
+ 
+     Gl2Texture(const Gl2Texture&) = delete;
+     Gl2Texture& operator=(const Gl2Texture&) = delete;
+ 
+-    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) override;
++    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8,
++                int stride_bytes = 0) override;
+     bool valid() const override { return m_texture != 0; }
+     int width() const override { return m_width; }
+     int height() const override { return m_height; }
+@@ -34,12 +46,20 @@ public:
+     ImVec2 uv1() const override;
+ 
+ private:
++    /* glTexImage2D for `format` at the allocation size (texture bound). */
++    bool allocate(PixelFormat format);
+     void destroy();
+ 
+     uint32_t m_texture = 0;
++    uint32_t m_ycbcr_type = 0;
+     int m_width = 0;
+     int m_height = 0;
+ 
++    /* Layout of the current GPU storage; nothing is allocated until the
++     * first upload(). */
++    bool m_allocated = false;
++    PixelFormat m_alloc_format = PixelFormat::RGBA8;
++
+     /* Allocation size: equal to width()/height() unless padded to a power of
+      * two. */
+     int m_alloc_w = 0;
+diff --git a/src/render/GlHeaders.h b/src/render/GlHeaders.h
+index cabe29c..212ec4c 100644
+--- a/src/render/GlHeaders.h
++++ b/src/render/GlHeaders.h
+@@ -42,3 +42,17 @@
+ #ifndef GL_CLAMP_TO_EDGE
+ #define GL_CLAMP_TO_EDGE 0x812F
+ #endif
++
++/* GL_APPLE_ycbcr_422, the video upload fast path (see Gl2Context). Apple's
++ * and Mesa's glext.h both declare these; other headers may not. */
++#ifndef GL_YCBCR_422_APPLE
++#define GL_YCBCR_422_APPLE 0x85B9
++#endif
++
++#ifndef GL_UNSIGNED_SHORT_8_8_APPLE
++#define GL_UNSIGNED_SHORT_8_8_APPLE 0x85BA
++#endif
++
++#ifndef GL_UNSIGNED_SHORT_8_8_REV_APPLE
++#define GL_UNSIGNED_SHORT_8_8_REV_APPLE 0x85BB
++#endif
+diff --git a/src/render/GlesTexture.cpp b/src/render/GlesTexture.cpp
+index bb7d54f..81ed753 100644
+--- a/src/render/GlesTexture.cpp
++++ b/src/render/GlesTexture.cpp
+@@ -27,17 +27,23 @@ GlesTexture::GlesTexture(int width, int height)
+     glBindTexture(GL_TEXTURE_2D, 0);
+ }
+ 
+-bool GlesTexture::upload(const uint8_t* rgba_pixels, PixelFormat format)
++bool GlesTexture::upload(const uint8_t* rgba_pixels, PixelFormat format, int stride_bytes)
+ {
+-    /* GLES has no GL_BGRA/8_8_8_8_REV upload path; only RGBA8 is accepted
+-     * (and only ever requested: preferred_video_format() stays RGBA8). */
++    /* GLES has neither the GL_BGRA/8_8_8_8_REV nor the GL_APPLE_ycbcr_422
++     * upload path; only RGBA8 is accepted (and only ever requested:
++     * preferred_video_format() stays RGBA8). */
+     if (m_texture == 0 || rgba_pixels == nullptr || format != PixelFormat::RGBA8)
+         return false;
++    if (stride_bytes < 0 || (stride_bytes % 4) != 0 || (stride_bytes > 0 && stride_bytes < m_width * 4))
++        return false;
+ 
+     glBindTexture(GL_TEXTURE_2D, m_texture);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    /* GL_UNPACK_ROW_LENGTH is core in ES 3.0 (in pixels; 0 = tightly packed). */
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride_bytes > 0 ? stride_bytes / 4 : 0);
+     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba_pixels);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+     glBindTexture(GL_TEXTURE_2D, 0);
+     return true;
+ }
+diff --git a/src/render/GlesTexture.h b/src/render/GlesTexture.h
+index 56b2f2f..f61b3d2 100644
+--- a/src/render/GlesTexture.h
++++ b/src/render/GlesTexture.h
+@@ -16,7 +16,8 @@ public:
+     GlesTexture(const GlesTexture&) = delete;
+     GlesTexture& operator=(const GlesTexture&) = delete;
+ 
+-    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) override;
++    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8,
++                int stride_bytes = 0) override;
+     bool valid() const override { return m_texture != 0; }
+     int width() const override { return m_width; }
+     int height() const override { return m_height; }
+diff --git a/src/render/RenderTexture.h b/src/render/RenderTexture.h
+index 5e4649a..e4421e5 100644
+--- a/src/render/RenderTexture.h
++++ b/src/render/RenderTexture.h
+@@ -13,26 +13,45 @@ constexpr bool kHostBigEndian = true;
+ constexpr bool kHostBigEndian = false;
+ #endif
+ 
+-/* Pixel layouts accepted by RenderTexture::upload(). Both are 4 bytes/pixel.
++/* Pixel layouts accepted by RenderTexture::upload().
+  *
+- *  RGBA8    bytes in memory: R, G, B, A. What stb_image produces and what
+- *           GStreamer calls "RGBA". Every backend accepts it.
++ *  RGBA8    4 bytes/pixel, in memory R, G, B, A. What stb_image produces and
++ *           what GStreamer calls "RGBA". Every backend accepts it.
+  *
+- *  Packed32 one native 32-bit word per pixel holding A:R:G:B from the most
+- *           significant byte down. This is OpenGL's GL_BGRA +
++ *  Packed32 4 bytes/pixel: one native 32-bit word holding A:R:G:B from the
++ *           most significant byte down. This is OpenGL's GL_BGRA +
+  *           GL_UNSIGNED_INT_8_8_8_8_REV, the layout Apple's drivers upload
+  *           without a CPU swizzle pass. In memory it is B,G,R,A on
+  *           little-endian hosts (GStreamer "BGRA") and A,R,G,B on big-endian
+- *           hosts (GStreamer "ARGB"). Only request it for video frames when
+- *           RenderBackend::preferred_video_format() returns it. */
+-enum class PixelFormat { RGBA8, Packed32 };
++ *           hosts (GStreamer "ARGB").
++ *
++ *  YCbCr422 2 bytes/pixel: 4:2:2 chroma-subsampled Y'CbCr, in memory
++ *           Cb, Y0, Cr, Y1 for every pair of pixels (GStreamer "UYVY",
++ *           QuickTime '2vuy'). Uploaded as is through GL_APPLE_ycbcr_422,
++ *           so the GPU does the colour conversion while it samples: the CPU
++ *           side only packs the decoder's planar chroma instead of running
++ *           a YUV->RGB matrix pass, and every frame is half the bytes of the
++ *           32-bit layouts. The byte order is fixed, it does not depend on
++ *           the host.
++ *
++ * Only request Packed32 / YCbCr422 for video frames when
++ * RenderBackend::preferred_video_format() returns them. */
++enum class PixelFormat { RGBA8, Packed32, YCbCr422 };
++
++inline int bytes_per_pixel(PixelFormat fmt)
++{
++    return fmt == PixelFormat::YCbCr422 ? 2 : 4;
++}
+ 
+ /* GStreamer video/x-raw "format" name producing the given layout on this host. */
+ inline const char* gst_format_name(PixelFormat fmt)
+ {
+-    if (fmt == PixelFormat::Packed32)
+-        return kHostBigEndian ? "ARGB" : "BGRA";
+-    return "RGBA";
++    switch (fmt)
++    {
++    case PixelFormat::Packed32: return kHostBigEndian ? "ARGB" : "BGRA";
++    case PixelFormat::YCbCr422: return "UYVY";
++    default:                    return "RGBA";
++    }
+ }
+ 
+ /* A sampled 2D texture renderable by the ImGui backend.
+@@ -44,9 +63,12 @@ class RenderTexture {
+ public:
+     virtual ~RenderTexture() = default;
+ 
+-    /* Upload full-frame pixels (width * height * 4 bytes) in the given layout.
+-     * RGBA8 must always work; Packed32 only when the backend prefers it. */
+-    virtual bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) = 0;
++    /* Upload full-frame pixels in the given layout. `stride_bytes` is the
++     * distance between the starts of consecutive rows; 0 means tightly packed
++     * (width * bytes_per_pixel(format)). RGBA8 must always work; the other
++     * layouts only when the backend prefers them. */
++    virtual bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8,
++                        int stride_bytes = 0) = 0;
+ 
+     virtual bool valid() const = 0;
+ 
+diff --git a/src/ui/ImTubeUI.cpp b/src/ui/ImTubeUI.cpp
+index 323b913..e858bd6 100644
+--- a/src/ui/ImTubeUI.cpp
++++ b/src/ui/ImTubeUI.cpp
+@@ -732,7 +732,7 @@ void ImTubeUI::update_video_frame()
+                 return;
+         }
+         if (m_video_texture)
+-            m_video_texture->upload(m_player.frame_pixels(), m_video_format);
++            m_video_texture->upload(m_player.frame_pixels(), m_video_format, m_player.frame_stride());
+     }
+ }
+ 

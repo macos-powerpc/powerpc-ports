@@ -1,0 +1,255 @@
+diff --git a/README.md b/README.md
+index d7a8a3f..12899fc 100644
+--- a/README.md
++++ b/README.md
+@@ -275,7 +275,9 @@ library) plus the backend sources under `share/imgui/backends`. The port's
+ GLFW instead of SDL2: `-DIMTUBE_PLATFORM=glfw` (GLFW 3.2 or newer for
+ fullscreen and idle waits; older 3.x still builds).
+ 
+-On a G4 the first-launch stream resolution is 360p (a G5 gets 1080p); change it
++On a G4 the first-launch stream resolution is 360p (a G5 gets 720p; 1080p
++H.264 is beyond a dual 2 GHz 970, the player then shows how far the picture
++is behind the sound); change it
+ under Settings, the choice is persisted. Settings also holds the preferred
+ video codec (H.264, VP9 or AV1, a preference with fallback to whatever the
+ video has; YouTube's H.264 ladder ends at 1080p, so VP9 or AV1 is the way to
+diff --git a/src/core/GStreamerPlayer.cpp b/src/core/GStreamerPlayer.cpp
+index 99fc3e6..8e45799 100644
+--- a/src/core/GStreamerPlayer.cpp
++++ b/src/core/GStreamerPlayer.cpp
+@@ -374,6 +374,17 @@ bool GStreamerPlayer::toggle_pause()
+     return m_paused;
+ }
+ 
++int64_t GStreamerPlayer::video_lag_ms() const
++{
++    if (m_pipeline == nullptr || m_appsink == nullptr || m_audio_sink == nullptr)
++        return 0;
++    gint64 a = 0, v = 0;
++    if (!gst_element_query_position(m_audio_sink, GST_FORMAT_TIME, &a) ||
++        !gst_element_query_position(GST_ELEMENT_CAST(m_appsink), GST_FORMAT_TIME, &v))
++        return 0;
++    return a > v ? (int64_t)((a - v) / GST_MSECOND) : 0;
++}
++
+ bool GStreamerPlayer::get_position_and_duration(int64_t* pos_ms, int64_t* dur_ms) const
+ {
+     if (m_pipeline == nullptr)
+@@ -381,7 +392,14 @@ bool GStreamerPlayer::get_position_and_duration(int64_t* pos_ms, int64_t* dur_ms
+ 
+     gint64 pos = 0;
+     gint64 dur = 0;
+-    const bool pos_ok = gst_element_query_position(m_pipeline, GST_FORMAT_TIME, &pos);
++    /* The audio sink's position is real playback time. The video appsink's
++     * lags behind it whenever the decoder cannot keep up (late frames are
++     * still shown), and the bin would answer with whichever is larger. */
++    bool pos_ok = false;
++    if (m_audio_sink != nullptr)
++        pos_ok = gst_element_query_position(m_audio_sink, GST_FORMAT_TIME, &pos);
++    if (!pos_ok)
++        pos_ok = gst_element_query_position(m_pipeline, GST_FORMAT_TIME, &pos);
+     const bool dur_ok = gst_element_query_duration(m_pipeline, GST_FORMAT_TIME, &dur);
+ 
+     /* After a seek the byte source is a section of the video re-based to zero;
+@@ -768,6 +786,7 @@ void GStreamerPlayer::link_branch(GstPad* pad, bool is_video)
+          * later volume changes reach it too). */
+         m_volume_elem = chain[2];
+         g_object_set(m_volume_elem, "volume", (double)(m_muted ? 0.0 : m_volume), nullptr);
++        m_audio_sink = chain[4];
+     }
+     DBG("link_branch(%s): creating branch", is_video ? "video" : "audio");
+ 
+@@ -827,6 +846,7 @@ void GStreamerPlayer::link_branch(GstPad* pad, bool is_video)
+         }
+         if (!is_video)
+             m_volume_elem = nullptr;
++            m_audio_sink = nullptr;
+         return;
+     }
+ 
+@@ -1057,6 +1077,7 @@ void GStreamerPlayer::teardown()
+         m_appsrc = nullptr;
+         m_appsink = nullptr;
+         m_volume_elem = nullptr;
++        m_audio_sink = nullptr;
+     }
+ 
+     for (GstPad* pad : m_branch_pads)
+diff --git a/src/core/GStreamerPlayer.h b/src/core/GStreamerPlayer.h
+index 8df1819..43a8745 100644
+--- a/src/core/GStreamerPlayer.h
++++ b/src/core/GStreamerPlayer.h
+@@ -60,6 +60,12 @@ public:
+      * Returns false when nothing is playing. */
+     bool get_position_and_duration(int64_t* pos_ms, int64_t* dur_ms) const;
+ 
++    /* How far the picture is behind the sound, in ms (0 when in step or
++     * unknown). A decoder that cannot keep up shows here: late frames are
++     * still displayed, so the lag is invisible otherwise, and the audio track
++     * simply ends before the video does. */
++    int64_t video_lag_ms() const;
++
+     /* Playback rate (0.5 = half speed ... 2.0 = double). Returns false when the
+      * pipeline cannot change speed (e.g. before the stream starts); on success
+      * playback_speed() reports the new rate. Forward playback only. */
+@@ -145,6 +151,7 @@ private:
+     GstElement* m_appsrc = nullptr;
+     GstAppSink* m_appsink = nullptr;
+     GstElement* m_volume_elem = nullptr;
++    GstElement* m_audio_sink = nullptr; /* the audio branch's sink, for position queries */
+ 
+     int m_pipe_fd = -1;
+     pid_t m_child_pid = -1;
+diff --git a/src/core/YtDlpHelper.cpp b/src/core/YtDlpHelper.cpp
+index 9ff641e..cdde033 100644
+--- a/src/core/YtDlpHelper.cpp
++++ b/src/core/YtDlpHelper.cpp
+@@ -745,7 +745,7 @@ std::string YtDlpHelper::cache_dir()
+     return dir;
+ }
+ 
+-int YtDlpHelper::launch_download(const std::string& url, int max_height,
++int YtDlpHelper::launch_download(const std::string& url, int max_height, VideoCodec codec,
+                                  const std::string& out_dir, int* out_pid)
+ {
+     std::vector<std::string> args;
+@@ -755,16 +755,29 @@ int YtDlpHelper::launch_download(const std::string& url, int max_height,
+     args.push_back("--newline");
+     args.push_back("--progress");
+     args.push_back("-f");
+-    char fmt[192];
++    /* The preferred codec first, then H.264 (plays anywhere, QuickTime on the
++     * old Macs included), then anything. Without a codec filter yt-dlp's own
++     * ordering takes AV1 whenever YouTube offers it, which a G5 cannot decode
++     * at all. m4a audio keeps the mp4 self-contained where it exists. */
++    const char* f = codec_filter(codec);
++    const char* h = codec_filter(VideoCodec::H264);
++    char fmt[512];
+     snprintf(fmt, sizeof(fmt),
+-             "bv*[height<=%d][ext=mp4]+ba[ext=m4a]/b[height<=%d][ext=mp4]/b/"
+-             "bv*[height<=%d]+ba/best[ext=mp4]/best",
+-             max_height, max_height, max_height);
++             "bv*[height<=%d]%s+ba[ext=m4a]/bv*[height<=%d]%s+ba/"
++             "bv*[height<=%d]%s+ba[ext=m4a]/bv*[height<=%d]%s+ba/"
++             "b[height<=%d]%s/b[height<=%d]/bv*[height<=%d]+ba/b/best",
++             max_height, f, max_height, f,
++             max_height, h, max_height, h,
++             max_height, h, max_height, max_height);
+     args.push_back(fmt);
+     args.push_back("--merge-output-format");
+     args.push_back("mp4");
++    /* Name the file after the title (yt-dlp sanitises it for the filesystem)
++     * and report the resulting path as the last line on the pipe. */
++    args.push_back("--print");
++    args.push_back("after_move:filepath");
+     args.push_back("-o");
+-    args.push_back(out_dir + "/%(id)s.%(ext)s");
++    args.push_back(out_dir + "/%(title)s.%(ext)s");
+     args.push_back(url);
+ 
+     int pipefd[2];
+diff --git a/src/core/YtDlpHelper.h b/src/core/YtDlpHelper.h
+index 82a0531..bf1d3c4 100644
+--- a/src/core/YtDlpHelper.h
++++ b/src/core/YtDlpHelper.h
+@@ -135,12 +135,14 @@ public:
+      * the user when playback fails right after starting. */
+     const std::string& last_stderr_log() const { return m_stderr_log; }
+ 
+-    /* Downloads the video (best stream up to max_height, merged into mp4) into
++    /* Downloads the video (the preferred codec up to max_height, H.264 as the fallback so the
++     * file plays anywhere, merged into mp4, named after the title; the last
++     * line yt-dlp prints on the pipe is the final file path) into
+      * out_dir, saving "<id>.mp4". Returns the read end of a pipe carrying
+      * yt-dlp's stderr progress ("[download] 42.3% ..."), or -1 on failure
+      * (*out_pid is valid then). The caller drains the pipe until EOF and then
+      * waitpid()s the child. */
+-    int launch_download(const std::string& url, int max_height,
++    int launch_download(const std::string& url, int max_height, VideoCodec codec,
+                         const std::string& out_dir, int* out_pid);
+ 
+     /* Runs yt-dlp to fetch English (auto)subtitles for the video into the cache
+diff --git a/src/ui/ImTubeUI.cpp b/src/ui/ImTubeUI.cpp
+index 31f73c0..f7f0e28 100644
+--- a/src/ui/ImTubeUI.cpp
++++ b/src/ui/ImTubeUI.cpp
+@@ -164,13 +164,15 @@ int ImTubeUI::default_resolution()
+ #elif defined(__APPLE__) && (defined(__ppc__) || defined(__ppc64__))
+     /* A G4 decodes 360p H.264 in software at best, and below 360p yt-dlp
+      * streams a single progressive file so no ffmpeg merge competes for the
+-     * CPU. A G5 (PowerPC 970) manages 1080p. Settings persist the user's
+-     * own choice afterwards. */
++     * CPU. A G5 (PowerPC 970) keeps up with 720p; at 1080p avdec_h264 falls
++     * behind real time on a dual 2 GHz 970 (with QoS the picture drops to a
++     * slideshow, without it the audio track ends ahead of the picture).
++     * Settings persist the user's own choice afterwards. */
+     int subtype = 0;
+     size_t len = sizeof(subtype);
+     if (sysctlbyname("hw.cpusubtype", &subtype, &len, nullptr, 0) == 0 &&
+         subtype == CPU_SUBTYPE_POWERPC_970)
+-        return 1080;
++        return 720;
+     return 360;
+ #else
+     return 1080;
+@@ -921,6 +923,17 @@ void ImTubeUI::render_video_view()
+     }
+     ImGui::SameLine();
+     ImGui::TextColored(kColTextDim, "Resolution: %dp", m_resolution);
++    /* A decoder that cannot keep up is invisible otherwise: late frames are
++     * still displayed and look smooth, while the audio track quietly ends
++     * ahead of the picture. */
++    const int64_t lag_ms = m_player.video_lag_ms();
++    if (lag_ms > 1500)
++    {
++        ImGui::SameLine();
++        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
++                           "video %.1f s behind the sound: decoder too slow, try a lower resolution",
++                           (double)lag_ms / 1000.0);
++    }
+     ImGui::SameLine();
+ 
+     if (m_download_active)
+@@ -1212,7 +1225,7 @@ void ImTubeUI::start_download(const VideoItem& video)
+     const std::string url = watch_url_for(video);
+     YtDlpHelper helper(m_ytdlp_binary);
+     int pid = -1;
+-    const int fd = helper.launch_download(url, m_resolution, m_download_dir, &pid);
++    const int fd = helper.launch_download(url, m_resolution, m_video_codec, m_download_dir, &pid);
+     if (fd < 0)
+     {
+         m_download_message = "Failed to start download (is yt-dlp installed?).";
+@@ -1252,6 +1265,11 @@ void ImTubeUI::poll_download()
+             m_download_buf.erase(0, nl + 1);
+             trim_inplace(line);
+ 
++            /* The final file, printed by yt-dlp (--print after_move:filepath)
++             * as an absolute path once the merge is done. */
++            if (!line.empty() && line[0] == '/')
++                m_download_path = line;
++
+             /* "[download]  42.3% of 100.00MiB at 2.13MiB/s ETA 00:42" */
+             if (line.rfind("[download]", 0) == 0)
+             {
+@@ -1291,6 +1309,12 @@ void ImTubeUI::poll_download()
+             m_download_progress = 100.0;
+             m_download_message = "Saved to " + saved;
+         }
++        else if (ok)
++        {
++            /* yt-dlp succeeded but did not print the path (older version). */
++            m_download_progress = 100.0;
++            m_download_message = "Saved in " + m_download_dir;
++        }
+         else
+         {
+             m_download_progress = -1.0;
+@@ -1596,7 +1620,7 @@ void ImTubeUI::render_settings_tab()
+         ImGui::TextColored(kColTextDim,
+             "Resolution used by yt-dlp when streaming videos (%dp default on this machine). "
+             "Above 360p YouTube streams require ffmpeg to merge the DASH video and audio tracks; "
+-            "a G4 copes with 360p at most, a G5 with 1080p.", default_resolution());
++            "a G4 copes with 360p at most, a G5 with 720p (1080p drops frames).", default_resolution());
+ 
+         ImGui::Spacing();
+         ImGui::TextUnformatted("Preferred video codec:");
