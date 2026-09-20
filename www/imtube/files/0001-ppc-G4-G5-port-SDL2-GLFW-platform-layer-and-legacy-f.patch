@@ -1,0 +1,3442 @@
+From 5081037c60bc8976dbfa2225d0fb785b58e12242 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 19 Sep 2026 18:44:49 +0000
+Subject: [PATCH 01/15] ppc: G4/G5 port - SDL2/GLFW platform layer and legacy
+ fixed-function GL renderer
+
+Replaces upstream's SDL3 + GLES/Vulkan-only stack with a Platform interface
+(SDL2/SDL3/GLFW) and a RenderBackend interface with a legacy fixed-function
+OpenGL implementation, so ImTube runs on G4 and G5 Power Macs under Mac OS X
+10.4-10.6 alongside every platform upstream supports: NPOT texture padding
+for pre-GL-2.0 GPUs, a packed BGRA upload path, per-machine default stream
+resolution, and macOS OpenGL.framework vs Mesa selection.
+
+---
+ .gitignore                    |   2 +-
+ CMakeLists.txt                | 121 +++++++-----
+ CMakePresets.json             |  54 +++--
+ README.md                     | 155 +++++++++++----
+ cmake/ImTubeDeps.cmake        | 357 +++++++++++++++++++++++-----------
+ src/app/App.cpp               | 119 +++++++-----
+ src/app/App.h                 |  16 +-
+ src/core/GStreamerPlayer.cpp  |  18 +-
+ src/core/GStreamerPlayer.h    |  18 +-
+ src/core/ThumbnailLoader.cpp  |  10 +
+ src/core/ThumbnailLoader.h    |   4 +
+ src/main.cpp                  |   2 +-
+ src/platform/GlfwPlatform.cpp | 226 +++++++++++++++++++++
+ src/platform/GlfwPlatform.h   |  68 +++++++
+ src/platform/Platform.h       |  88 +++++++++
+ src/platform/SdlPlatform.cpp  | 343 ++++++++++++++++++++++++++++++++
+ src/platform/SdlPlatform.h    |  71 +++++++
+ src/render/Gl2Context.cpp     | 149 ++++++++++++++
+ src/render/Gl2Context.h       |  64 ++++++
+ src/render/Gl2Texture.cpp     | 130 +++++++++++++
+ src/render/Gl2Texture.h       |  49 +++++
+ src/render/GlHeaders.h        |  44 +++++
+ src/render/GlesContext.cpp    |  71 ++-----
+ src/render/GlesContext.h      |  28 +--
+ src/render/GlesTexture.cpp    |   6 +-
+ src/render/GlesTexture.h      |   2 +-
+ src/render/RenderBackend.h    |  80 ++++----
+ src/render/RenderTexture.h    |  49 ++++-
+ src/ui/ImTubeUI.cpp           | 103 +++++++---
+ src/ui/ImTubeUI.h             |  26 ++-
+ 30 files changed, 2027 insertions(+), 446 deletions(-)
+ create mode 100644 src/platform/GlfwPlatform.cpp
+ create mode 100644 src/platform/GlfwPlatform.h
+ create mode 100644 src/platform/Platform.h
+ create mode 100644 src/platform/SdlPlatform.cpp
+ create mode 100644 src/platform/SdlPlatform.h
+ create mode 100644 src/render/Gl2Context.cpp
+ create mode 100644 src/render/Gl2Context.h
+ create mode 100644 src/render/Gl2Texture.cpp
+ create mode 100644 src/render/Gl2Texture.h
+ create mode 100644 src/render/GlHeaders.h
+
+diff --git a/.gitignore b/.gitignore
+index 297b9f2..7c92711 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -24,7 +24,7 @@ target
+ 
+ # Build directory (CMake output, fetched dependencies)
+ /build/
+-/build-vk/
++/build-*/
+ 
+ # Dear ImGui per-run UI config
+ /imgui.ini
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 16fdf88..14a4b37 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,8 +1,8 @@
+-cmake_minimum_required(VERSION 3.24)
++cmake_minimum_required(VERSION 3.16...3.31)
+ 
+ project(ImTube
+     VERSION 0.1.0
+-    DESCRIPTION "Lightweight YouTube-style client built with Dear ImGui, SDL3, GLES/Vulkan and yt-dlp"
++    DESCRIPTION "Lightweight YouTube-style client built with Dear ImGui, SDL2/SDL3/GLFW, OpenGL and yt-dlp"
+     LANGUAGES C CXX
+ )
+ 
+@@ -22,36 +22,77 @@ set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake"
+ option(IMTUBE_BUILD_IMGUI_DEMO "Compile the Dear ImGui demo window into the app" OFF)
+ option(IMTUBE_WITH_CURL "Enable libcurl thumbnail downloads (thumbnails degrade to placeholders otherwise)" ON)
+ option(IMTUBE_EMBEDDED "Tune the app for the embedded STM32MPU target (set by the toolchain file)" OFF)
++option(IMTUBE_LTO "Link-time optimisation for native Release builds" ON)
+ 
+-# Rendering backend. The GLES (OpenGL ES 3.2) backend is the portable default:
+-# it runs on a regular Linux PC via Mesa and on the STM32MPU via the
+-# VeriSilicon gcnano driver. Vulkan is optional (PC only).
+-set(IMTUBE_RENDERER "gles" CACHE STRING "Rendering backend: gles or vulkan")
+-set_property(CACHE IMTUBE_RENDERER PROPERTY STRINGS gles vulkan)
+-if(NOT IMTUBE_RENDERER STREQUAL "gles" AND NOT IMTUBE_RENDERER STREQUAL "vulkan")
+-    message(FATAL_ERROR "ImTube: IMTUBE_RENDERER must be 'gles' or 'vulkan' (got '${IMTUBE_RENDERER}')")
++# Downloading missing dependencies (SDL3, nlohmann_json) with FetchContent is a
++# convenience for PC builds; package-based builds (MacPorts, Yocto) want every
++# dependency to come from the system and a hard error otherwise.
++if(CMAKE_CROSSCOMPILING)
++    set(_imtube_fetch_default OFF)
++else()
++    set(_imtube_fetch_default ON)
++endif()
++option(IMTUBE_ALLOW_FETCH "Fetch missing dependencies (SDL3, nlohmann_json) from the network instead of failing" ${_imtube_fetch_default})
++
++# Windowing platform. SDL2 is the primary target (it runs on PowerPC Macs on
++# Mac OS X 10.4/10.5 as well as everywhere else); SDL3 keeps the existing Linux
++# and STM32MPU builds working; GLFW is an alternative for the same OpenGL path.
++set(IMTUBE_PLATFORM "sdl2" CACHE STRING "Windowing platform: sdl2, sdl3 or glfw")
++set_property(CACHE IMTUBE_PLATFORM PROPERTY STRINGS sdl2 sdl3 glfw)
++if(NOT IMTUBE_PLATFORM MATCHES "^(sdl2|sdl3|glfw)$")
++    message(FATAL_ERROR "ImTube: IMTUBE_PLATFORM must be 'sdl2', 'sdl3' or 'glfw' (got '${IMTUBE_PLATFORM}')")
++endif()
++
++# Rendering backend. 'gl2' is legacy desktop OpenGL through ImGui's
++# fixed-function backend: it needs nothing beyond GL 1.1 and runs on every G4/G5
++# Mac GPU (no shaders, no NPOT textures required), on Mesa and on modern macOS
++# legacy contexts. 'gles' is OpenGL ES 3.2 (Linux PC via Mesa, STM32MPU via the
++# VeriSilicon driver).
++set(IMTUBE_RENDERER "gl2" CACHE STRING "Rendering backend: gl2 (legacy OpenGL, fixed function) or gles (OpenGL ES 3.2)")
++set_property(CACHE IMTUBE_RENDERER PROPERTY STRINGS gl2 gles)
++if(NOT IMTUBE_RENDERER MATCHES "^(gl2|gles)$")
++    message(FATAL_ERROR "ImTube: IMTUBE_RENDERER must be 'gl2' or 'gles' (got '${IMTUBE_RENDERER}')")
+ endif()
+ 
++# Dear ImGui: the vendored copy (docking branch) or a system package found by
++# pkg-config (e.g. the MacPorts 'imgui' port, which installs the core static
++# library, the headers and the backend sources).
++set(IMTUBE_IMGUI "auto" CACHE STRING "Dear ImGui source: auto (system when pkg-config finds it, else vendored), system or vendored")
++set_property(CACHE IMTUBE_IMGUI PROPERTY STRINGS auto system vendored)
++
++# First-launch stream resolution. 0 lets the app pick per machine (360p on a
++# G4, 1080p on a G5 and everything else); the user can change it in Settings.
++set(IMTUBE_DEFAULT_RESOLUTION 0 CACHE STRING "First-launch stream resolution in lines (0 = pick per machine)")
++
+ # --- Speed --------------------------------------------------------------------
+-# Release already defaults to -O3 -DNDEBUG. On the native desktop build we also
+-# target the host CPU and enable link-time optimization for the fastest binary.
+-# The embedded toolchain cross-compiles for the STM32MPU (Cortex-A35), so it is
+-# excluded (the portable Release -O3 default still applies there), and Debug
+-# builds keep -O0 for debugging.
++# Release already defaults to -O3 -DNDEBUG. On a native desktop build we also
++# tune for the host CPU and enable link-time optimisation. The embedded
++# toolchain cross-compiles for the STM32MPU (Cortex-A35), so it is excluded (the
++# portable Release -O3 default still applies there), and Debug builds keep -O0.
+ if(NOT IMTUBE_EMBEDDED AND NOT CMAKE_CROSSCOMPILING)
+     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+-        add_compile_options(-march=native -mtune=native)
++        string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _imtube_proc)
++        if(_imtube_proc MATCHES "ppc|powerpc|power macintosh")
++            # GCC's PowerPC backend has no -march; -mtune=native schedules for
++            # the host (G4/G5) without changing the instruction set.
++            add_compile_options(-mtune=native)
++        elseif(_imtube_proc MATCHES "x86_64|amd64|i[3-6]86")
++            add_compile_options(-march=native -mtune=native)
++        endif()
+         if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+-            add_compile_options(-O3 -flto)
+-            add_link_options(-flto)
++            add_compile_options(-O3)
++            if(IMTUBE_LTO)
++                add_compile_options(-flto)
++                add_link_options(-flto)
++            endif()
+         endif()
+     endif()
+ endif()
+ 
+-# --- Dependencies (SDL3, Vulkan, Dear ImGui, GStreamer) ----------------------
++# --- Dependencies (platform, GL, Dear ImGui) ---------------------------------
+ include(ImTubeDeps)
+ 
+-# --- Core dependencies (GStreamer, libcurl, stb_image) ------------------------
++# --- Core dependencies (GStreamer, libcurl, stb_image, nlohmann/json) ---------
+ find_package(PkgConfig REQUIRED)
+ pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
+     gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0
+@@ -71,8 +112,9 @@ set(IMTUBE_STB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/libraries/stb")
+ find_package(nlohmann_json CONFIG QUIET)
+ if(nlohmann_json_FOUND)
+     message(STATUS "ImTube: using system nlohmann_json")
+-elseif(NOT CMAKE_CROSSCOMPILING)
++elseif(IMTUBE_ALLOW_FETCH)
+     message(STATUS "ImTube: nlohmann_json not found on system; fetching from source")
++    include(FetchContent)
+     set(IMTUBE_NLOHMANN_TAG "v3.11.3" CACHE STRING "nlohmann/json release tag to fetch")
+     FetchContent_Declare(nlohmann_json
+         GIT_REPOSITORY https://github.com/nlohmann/json.git
+@@ -83,31 +125,8 @@ elseif(NOT CMAKE_CROSSCOMPILING)
+     FetchContent_MakeAvailable(nlohmann_json)
+ else()
+     message(FATAL_ERROR
+-        "ImTube: nlohmann_json not found in the target sysroot.\n"
+-        "Add nlohmann-json to your recipe DEPENDS.")
+-endif()
+-
+-# --- Renderer backend (sources, defines, link targets) ----------------------
+-if(IMTUBE_RENDERER STREQUAL "vulkan")
+-    set(IMTUBE_RENDERER_SOURCES
+-        src/app/VulkanContext.cpp
+-        src/render/VulkanTexture.cpp
+-    )
+-    set(IMTUBE_RENDERER_DEFINE IMTUBE_RENDERER_VULKAN)
+-    set(IMTUBE_RENDERER_LIBS ${IMTUBE_VULKAN_TARGETS})
+-else()
+-    pkg_check_modules(GLES2 REQUIRED IMPORTED_TARGET glesv2)
+-    pkg_check_modules(EGL   REQUIRED IMPORTED_TARGET egl)
+-
+-    set(IMTUBE_RENDERER_SOURCES
+-        src/render/GlesContext.cpp
+-        src/render/GlesTexture.cpp
+-    )
+-    set(IMTUBE_RENDERER_DEFINE IMTUBE_RENDERER_GLES)
+-    set(IMTUBE_RENDERER_LIBS PkgConfig::GLES2 PkgConfig::EGL)
+-    set_source_files_properties(${IMTUBE_IMGUI_OPENGL3_SOURCE} PROPERTIES
+-        COMPILE_DEFINITIONS IMGUI_IMPL_OPENGL_ES3
+-    )
++        "ImTube: nlohmann_json not found (and IMTUBE_ALLOW_FETCH is OFF).\n"
++        "Install the nlohmann-json package (MacPorts: nlohmann-json; Yocto: add it to DEPENDS).")
+ endif()
+ 
+ # --- Target -----------------------------------------------------------------
+@@ -120,6 +139,7 @@ add_executable(imtube
+     src/core/YtDlpHelper.cpp
+     src/core/ThumbnailLoader.cpp
+     src/ui/ImTubeUI.cpp
++    ${IMTUBE_PLATFORM_SOURCES}
+     ${IMTUBE_RENDERER_SOURCES}
+     ${IMTUBE_IMGUI_BACKEND_SOURCES}
+ )
+@@ -130,10 +150,11 @@ endif()
+ 
+ target_compile_definitions(imtube PRIVATE
+     IMTUBE_VERSION="${PROJECT_VERSION}"
++    ${IMTUBE_PLATFORM_DEFINE}
+     ${IMTUBE_RENDERER_DEFINE}
++    IMTUBE_DEFAULT_RESOLUTION=${IMTUBE_DEFAULT_RESOLUTION}
+     $<$<BOOL:${IMTUBE_BUILD_IMGUI_DEMO}>:IMTUBE_ENABLE_IMGUI_DEMO>
+     $<$<BOOL:${IMTUBE_EMBEDDED}>:IMTUBE_EMBEDDED>
+-    $<$<AND:$<CONFIG:Debug>,$<STREQUAL:${IMTUBE_RENDERER},vulkan>>:IMTUBE_VULKAN_DEBUG>
+     $<$<NOT:$<BOOL:${IMTUBE_WITH_CURL}>>:IMTUBE_WITHOUT_CURL>
+ )
+ 
+@@ -146,18 +167,19 @@ target_include_directories(imtube PRIVATE
+ find_package(Threads REQUIRED)
+ 
+ target_link_libraries(imtube PRIVATE
+-    imtube_imgui
+-    ${IMTUBE_SDL3_TARGET}
++    ${IMTUBE_IMGUI_TARGET}
++    ${IMTUBE_PLATFORM_LIBS}
+     ${IMTUBE_RENDERER_LIBS}
+     PkgConfig::GSTREAMER
+     nlohmann_json::nlohmann_json
+     $<$<BOOL:${CURL_FOUND}>:PkgConfig::CURL>
+     Threads::Threads
+-    dl
+ )
+ 
+ install(TARGETS imtube RUNTIME DESTINATION bin)
+ 
++message(STATUS "ImTube: platform=${IMTUBE_PLATFORM} renderer=${IMTUBE_RENDERER} imgui=${IMTUBE_IMGUI_RESOLVED}")
++
+ # --- Tests ------------------------------------------------------------------
+ # The embedded build targets the STM32MPU toolchain, which cannot run tests.
+ if(NOT IMTUBE_EMBEDDED)
+@@ -174,7 +196,6 @@ if(NOT IMTUBE_EMBEDDED)
+         PkgConfig::GSTREAMER
+         nlohmann_json::nlohmann_json
+         Threads::Threads
+-        dl
+     )
+ 
+     add_test(NAME imtube_tests COMMAND imtube_tests)
+diff --git a/CMakePresets.json b/CMakePresets.json
+index fac13fd..a10bc4c 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -1,59 +1,51 @@
+ {
+-  "version": 6,
++  "version": 3,
+   "cmakeMinimumRequired": {
+     "major": 3,
+-    "minor": 24,
++    "minor": 21,
+     "patch": 0
+   },
+   "configurePresets": [
+     {
+-      "name": "gles",
+-      "displayName": "GLES (default, portable)",
+-      "description": "OpenGL ES 3.2 backend via SDL; runs on a Linux PC and the STM32MPU (OpenSTLinux).",
++      "name": "sdl2-gl2",
++      "displayName": "SDL2 + legacy OpenGL (default)",
++      "description": "Fixed-function OpenGL through SDL2; the lightweight build for old Macs, also fine on Linux/Mesa.",
+       "generator": "Ninja",
+       "binaryDir": "${sourceDir}/build",
+       "cacheVariables": {
+         "CMAKE_BUILD_TYPE": "Release",
+-        "IMTUBE_RENDERER": "gles"
++        "IMTUBE_PLATFORM": "sdl2",
++        "IMTUBE_RENDERER": "gl2"
+       }
+     },
+     {
+-      "name": "gles-debug",
+-      "displayName": "GLES (debug)",
+-      "inherits": "gles",
++      "name": "sdl2-gl2-debug",
++      "displayName": "SDL2 + legacy OpenGL (debug)",
++      "inherits": "sdl2-gl2",
+       "binaryDir": "${sourceDir}/build-debug",
+       "cacheVariables": {
+         "CMAKE_BUILD_TYPE": "Debug"
+       }
+     },
+     {
+-      "name": "vulkan",
+-      "displayName": "Vulkan (PC only)",
+-      "description": "Vulkan backend via SDL; requires a Vulkan loader + ICD.",
+-      "inherits": "gles",
+-      "binaryDir": "${sourceDir}/build-vk",
++      "name": "glfw-gl2",
++      "displayName": "GLFW + legacy OpenGL",
++      "inherits": "sdl2-gl2",
++      "binaryDir": "${sourceDir}/build-glfw",
+       "cacheVariables": {
+-        "IMTUBE_RENDERER": "vulkan"
++        "IMTUBE_PLATFORM": "glfw"
+       }
+     },
+     {
+-      "name": "vulkan-debug",
+-      "displayName": "Vulkan (debug)",
+-      "inherits": "vulkan",
+-      "binaryDir": "${sourceDir}/build-vk-debug",
++      "name": "gles",
++      "displayName": "SDL3 + OpenGL ES 3.2",
++      "description": "OpenGL ES 3.2 backend via SDL3; runs on a Linux PC and the STM32MPU (OpenSTLinux).",
++      "inherits": "sdl2-gl2",
++      "binaryDir": "${sourceDir}/build-gles",
+       "cacheVariables": {
+-        "CMAKE_BUILD_TYPE": "Debug"
++        "IMTUBE_PLATFORM": "sdl3",
++        "IMTUBE_RENDERER": "gles"
+       }
+-    },
+-  ],
+-  "buildPresets": [
+-    { "name": "gles",         "configurePreset": "gles" },
+-    { "name": "gles-debug",   "configurePreset": "gles-debug" },
+-    { "name": "vulkan",       "configurePreset": "vulkan" },
+-    { "name": "vulkan-debug", "configurePreset": "vulkan-debug" }
+-  ],
+-  "testPresets": [
+-    { "name": "gles",   "configurePreset": "gles",   "output": { "outputOnFailure": true } },
+-    { "name": "vulkan", "configurePreset": "vulkan", "output": { "outputOnFailure": true } }
++    }
+   ]
+ }
+diff --git a/README.md b/README.md
+index fdb08bd..f916ba9 100644
+--- a/README.md
++++ b/README.md
+@@ -1,16 +1,19 @@
+ # ImTube
+ 
+-**ImTube** is a lightweight YouTube client for Linux, built for embedded systems
+-(the **STM32MPU** / OpenSTLinux) and desktop PCs. It is a single-window,
+-Dear ImGui application that searches, browses and plays YouTube videos with
+-hardware-accelerated rendering and low CPU/RAM overhead.
++**ImTube** is a lightweight YouTube client. This fork targets old Macs first:
++G4/G5 PowerPC machines on Mac OS X 10.4/10.5, where a fixed-function OpenGL UI
++and a software-decoded 360p stream are all the hardware can carry. It still
++builds on Linux (desktop and the STM32MPU / OpenSTLinux board the project
++started on) and on x86 Macs. It is a single-window Dear ImGui application that
++searches, browses and plays YouTube videos with low CPU/RAM overhead.
+ 
+ ![ImTube running (animated)](docs/screenshots/ImTube.gif)
+ 
+ The whole stack is deliberately small: no Qt, no GTK, no Electron. The pieces are
+-**Dear ImGui** (UI), **SDL3** (window/input), **GStreamer** (decode + playback),
+-**yt-dlp** (YouTube extraction) and a thin render abstraction with **OpenGL ES 3.2**
+-(default) and **Vulkan** (optional) backends.
++**Dear ImGui** (UI), **SDL2** (window/input; SDL3 and GLFW are alternatives),
++**GStreamer** (decode + playback), **yt-dlp** (YouTube extraction) and a thin
++render abstraction with a **legacy OpenGL** (fixed function, default) and an
++**OpenGL ES 3.2** backend.
+ 
+ ---
+ 
+@@ -49,12 +52,12 @@ The whole stack is deliberately small: no Qt, no GTK, no Electron. The pieces ar
+    │    raw RGBA frames (CPU memory)
+    ▼
+  RenderBackend
+- GLES 3.2 / Vulkan
++ OpenGL 1.x / GLES 3.2
+    │
+    ▼
+  GPU  →  Display
+ 
+-Order: yt-dlp → GStreamer → ImGui → RenderBackend (GLES/Vulkan) → GPU → Display
++Order: yt-dlp → GStreamer → ImGui → RenderBackend (GL2/GLES) → GPU → Display
+ ```
+ 
+ The data flows one way through the components. `yt-dlp` extracts the media and
+@@ -62,9 +65,9 @@ writes its bytes to stdout; GStreamer reads those bytes (through an `appsrc`
+ pipe), decodes them and hands back raw RGBA frames in CPU memory. ImGui (the
+ UI) receives those frames and uploads each one into a GPU texture. It does not
+ render directly: ImGui only issues draw commands, and the RenderBackend
+-(`VulkanContext` or `GlesContext`) executes them on the GPU before the frame is
+-presented to the display. In short, ImGui sits *in front of* Vulkan/GLES — it
+-is the user interface, while the backend is the renderer that draws it.
++(`Gl2Context` or `GlesContext`) executes them on the GPU before the frame is
++presented to the display. In short, ImGui sits *in front of* OpenGL — it is the
++user interface, while the backend is the renderer that draws it.
+ 
+ | Piece | Responsibility |
+ | --- | --- |
+@@ -73,8 +76,9 @@ is the user interface, while the backend is the renderer that draws it.
+ | `src/core/GStreamerPlayer.*` | Owns the GStreamer pipeline, the byte-feeding thread, seeking, rate changes and the decoded frame buffer. |
+ | `src/core/SubtitleParser.*` | Parses VTT/SRT files into timed cues. |
+ | `src/core/ThumbnailLoader.*` | Downloads/decodes thumbnail JPEGs off the UI thread. |
+-| `src/render/RenderBackend.h` | Texture-upload + ImGui-render interface. `GlesContext` (default) and `VulkanContext` implement it. |
+-| `src/app/App.*` | SDL3 window, main loop, render-backend selection, ImGui setup. |
++| `src/render/RenderBackend.h` | Texture-upload + ImGui-render interface. `Gl2Context` (default) and `GlesContext` implement it. |
++| `src/platform/Platform.h` | Window, input events, GL context and the ImGui platform backend. `SdlPlatform` (SDL2 or SDL3) and `GlfwPlatform` implement it. |
++| `src/app/App.*` | Main loop, platform/renderer selection, ImGui setup. |
+ 
+ ### Playback pipeline (the interesting part)
+ 
+@@ -101,7 +105,7 @@ appsink delivers raw RGBA frames in CPU memory  (pull_frame)
+ UI uploads each frame into a GPU texture  (RenderBackend::create_texture / upload)
+    │
+    ▼
+-ImGui::Image(texture)  — rendered by the GLES/Vulkan backend
++ImGui::Image(texture)  — rendered by the GL2/GLES backend
+ ```
+ 
+ Key points:
+@@ -185,37 +189,100 @@ Keyboard shortcuts: `F11` fullscreen, `Esc` leave fullscreen, `Ctrl+Q` quit,
+ Rendering goes through the small `RenderBackend` interface
+ (`src/render/RenderBackend.h`):
+ 
+-* **GLES 3.2** (`GlesContext`) — the default. Runs on any Linux PC via Mesa and
+-  on the STM32MPU via the VeriSilicon `gcnano` driver.
+-* **Vulkan** (`VulkanContext`) — optional, PC-focused. The STM32MPU Vulkan
+-  driver is still immature, so GLES is the safe default on hardware.
+-
+-Selected at configure time with `-DIMTUBE_RENDERER=gles|vulkan`.
++* **Legacy OpenGL** (`Gl2Context`) — the default. Dear ImGui's fixed-function
++  `imgui_impl_opengl2` backend plus GL 1.2 texture uploads: nothing beyond
++  what a Rage 128 or a GeForce 4 MX offers. Runs on Mesa and on any legacy or
++  compatibility GL context too. On drivers without
++  `GL_ARB_texture_non_power_of_two` (most G4/G5 era Apple drivers) video frames
++  and thumbnails are padded to power-of-two textures; frames larger than
++  `GL_MAX_TEXTURE_SIZE` are scaled down inside the GStreamer pipeline. Frames
++  are requested from GStreamer in the packed `GL_BGRA` +
++  `GL_UNSIGNED_INT_8_8_8_8_REV` layout Apple's drivers upload without a
++  swizzle pass (`ARGB` bytes on big-endian, `BGRA` on little-endian).
++* **GLES 3.2** (`GlesContext`) — the shader backend. Runs on any Linux PC via
++  Mesa and on the STM32MPU via the VeriSilicon `gcnano` driver.
++
++Selected at configure time with `-DIMTUBE_RENDERER=gl2|gles`. The window and
++input layer is chosen separately with `-DIMTUBE_PLATFORM=sdl2|sdl3|glfw`
++(SDL2 is the default; SDL3 is needed for the STM32MPU Wayland build).
++
++### Big-endian note
++
++Dear ImGui packs colours into 32-bit words with little-endian byte shifts, and
++the GL backends hand vertex colours and the font atlas to GL as byte arrays.
++On PowerPC the five `IM_COL32_*_SHIFT/MASK` macros are therefore redefined: on
++the compile line of the vendored copy (`cmake/ImTubeDeps.cmake` sets them when
++the host is big-endian, which `imgui.h` honours through its `#ifndef`
++guards), or by the big-endian patch of the MacPorts `imgui` port for a system
++copy. The vendored Dear ImGui tree itself is never modified.
+ 
+ ---
+ 
+ ## Building
+ 
+-Dependencies: CMake ≥ 3.24, a C++20 compiler, `pkg-config`, GStreamer 1.0 dev
+-packages (`gstreamer-1.0`, `gstreamer-app-1.0`, `gstreamer-video-1.0`), OpenGL ES
+-headers (`glesv2`, `egl`) and `libcurl`. Dear ImGui is vendored under `src/libraries/imgui`; stb is vendored under
+-`src/libraries/stb`. SDL3 and nlohmann/json are fetched and built by CMake
+-automatically (or resolved from system packages in cross-builds).
++Dependencies: CMake ≥ 3.16, a C++20 compiler, `pkg-config`, GStreamer 1.0 dev
++packages (`gstreamer-1.0`, `gstreamer-app-1.0`, `gstreamer-video-1.0`), SDL2
++(or SDL3 / GLFW 3), OpenGL headers (or `glesv2` + `egl` for the GLES backend),
++`libcurl` and nlohmann/json. Dear ImGui is either the vendored copy under
++`src/libraries/imgui` or a system package found through pkg-config (see below);
++stb is vendored under `src/libraries/stb`. SDL3 and nlohmann/json can be
++fetched by CMake when missing (`IMTUBE_ALLOW_FETCH`, on by default for native
++builds); package-based builds pass `-DIMTUBE_ALLOW_FETCH=OFF` to require
++system packages.
+ 
+-### Linux PC (GLES, default)
++### Linux or macOS PC (SDL2 + legacy OpenGL, default)
+ 
+ ```sh
+-cmake --preset gles        # or: cmake -S . -B build -G Ninja
++cmake --preset sdl2-gl2    # or: cmake -S . -B build -G Ninja
+ cmake --build build
+ ./build/imtube
+ ```
+ 
+-### Linux PC (Vulkan)
++On macOS the build links the system `OpenGL.framework`, because that is the
++library behind the Cocoa video driver SDL2/SDL3/GLFW use there (also on
++10.4/10.5 PowerPC). It deliberately does not go through CMake's
++`find_package(OpenGL)`: with MacPorts' cmake (frameworks searched last) and
++the `mesa` port installed, that returns Mesa's X11 `libGL.dylib`, which never
++sees the Cocoa context. The symptom is a black window and
++`glGetString called without a rendering context` on stderr; ImTube now
++refuses to start in that state and says so. To run under XQuartz with Mesa
++instead, build with `-DIMTUBE_MACOS_GL=x11` and start with
++`SDL_VIDEODRIVER=x11`. The `[platform]` line on stderr shows the driver in
++use, e.g. `SDL 2.32.10 (cocoa)`.
++
++### PowerPC Macs (Mac OS X 10.4/10.5, MacPorts)
++
++Everything comes from ports: `sdl2` (or `glfw`), `imgui`, `gstreamer1` with
++the base/good/bad/libav plugin sets, `curl`, `nlohmann-json`, `ffmpeg`,
++`yt-dlp` with a JavaScript runtime (QuickJS), and a GCC with C++20.
++
++```sh
++cmake -S . -B build -G Ninja \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DIMTUBE_PLATFORM=sdl2 -DIMTUBE_RENDERER=gl2 \
++    -DIMTUBE_IMGUI=system -DIMTUBE_ALLOW_FETCH=OFF
++cmake --build build
++```
++
++The system Dear ImGui is expected in the layout of the MacPorts `imgui` port:
++a pkg-config module `imgui` (headers under `include/imgui`, static core
++library) plus the backend sources under `share/imgui/backends`. The port's
++`imgui.pc` may export `backendsdir=` to override that path.
++
++GLFW instead of SDL2: `-DIMTUBE_PLATFORM=glfw` (GLFW 3.2 or newer for
++fullscreen and idle waits; older 3.x still builds).
++
++On a G4 the first-launch stream resolution is 360p (a G5 gets 1080p); change it
++under Settings, the choice is persisted. `IMTUBE_GL_FORCE_POT=1` in the
++environment forces the power-of-two texture path on a GPU that does not need
++it, for testing.
++
++### Linux PC (SDL3 + GLES)
+ 
+ ```sh
+-cmake --preset vulkan      # needs a Vulkan loader + ICD
+-cmake --build build-vk
+-./build-vk/imtube
++cmake --preset gles
++cmake --build build-gles
++./build-gles/imtube
+ ```
+ 
+ ### STM32MPU (Yocto / OpenSTLinux)
+@@ -253,7 +320,13 @@ ctest --test-dir build --output-on-failure
+ 
+ | Option | Default | Meaning |
+ | --- | --- | --- |
+-| `IMTUBE_RENDERER` | `gles` | `gles` or `vulkan` |
++| `IMTUBE_PLATFORM` | `sdl2` | Windowing layer: `sdl2`, `sdl3` or `glfw` |
++| `IMTUBE_RENDERER` | `gl2` | `gl2` (legacy OpenGL, fixed function) or `gles` (OpenGL ES 3.2) |
++| `IMTUBE_IMGUI` | `auto` | Dear ImGui source: `auto` (system when pkg-config finds `imgui`, else vendored), `system`, `vendored` |
++| `IMTUBE_MACOS_GL` | `framework` | macOS only, `gl2` renderer: `framework` (system OpenGL.framework, matches the Cocoa driver) or `x11` (Mesa `libGL` for `SDL_VIDEODRIVER=x11` under XQuartz) |
++| `IMTUBE_DEFAULT_RESOLUTION` | `0` | First-launch stream resolution; `0` picks per machine (360p on a G4, 1080p elsewhere) |
++| `IMTUBE_LTO` | `ON` | Link-time optimisation for native Release builds |
++| `IMTUBE_ALLOW_FETCH` | `ON` | Fetch SDL3 / nlohmann_json when missing (`OFF` when cross-compiling; pass `OFF` for package builds) |
+ | `IMTUBE_EMBEDDED` | `OFF` | STM32MPU tuning (single H.264 stream, no tests) |
+ | `IMTUBE_WITH_CURL` | `ON` | libcurl thumbnail downloads (otherwise placeholders) |
+ | `IMTUBE_BUILD_IMGUI_DEMO` | `OFF` | Compile the Dear ImGui demo window into the app |
+@@ -275,16 +348,17 @@ status line, etc.).
+ 
+ ```text
+ src/
+-├── app/            SDL3 window, main loop, render-backend setup
++├── app/            main loop, platform + render-backend setup
+ ├── core/           yt-dlp helper, GStreamer playback, thumbnails, subtitles
+ │   ├── GStreamerPlayer.*   pipeline, feeder thread, seek, speed, frames
+ │   ├── YtDlpHelper.*       yt-dlp process management (search/stream/subs/download)
+ │   ├── SubtitleParser.*    VTT/SRT parsing
+ │   ├── ThumbnailLoader.*   background thumbnail download+decode
+ │   └── PlaybackRate.*      playback-rate helpers
+-├── libraries/imgui/  vendored Dear ImGui (docking branch) + sdl3/opengl3/vulkan backends
++├── libraries/imgui/  vendored Dear ImGui (docking branch) + sdl2/sdl3/glfw/opengl2/opengl3 backends
+ ├── libraries/stb/    vendored stb_image (header-only thumbnail decode)
+-├── render/         RenderBackend / RenderTexture + GLES & Vulkan impls
++├── platform/       Platform interface + SDL (2/3) and GLFW implementations
++├── render/         RenderBackend / RenderTexture + legacy GL & GLES impls
+ └── ui/             ImTubeUI (all UI + app logic glue)
+ tests/test_main.cpp         unit tests (ctest)
+ ```
+@@ -293,9 +367,10 @@ tests/test_main.cpp         unit tests (ctest)
+ 
+ ## Target hardware
+ 
+-The primary embedded target is the **STM32MPU** family (STM32MP1 and STM32MP2,
+-running OpenSTLinux with Wayland/Weston). The app is developed and tested on
+-desktop Linux (GLES via Mesa or Vulkan) and cross-compiled for the board.
++This fork's primary target is the G4/G5 PowerPC Mac on Mac OS X 10.4/10.5
++(SDL2 + legacy OpenGL). The upstream project's embedded target, the
++**STM32MPU** family (STM32MP1 and STM32MP2 running OpenSTLinux with
++Wayland/Weston), is still served by the SDL3 + GLES build.
+ 
+ ---
+ 
+@@ -303,7 +378,7 @@ desktop Linux (GLES via Mesa or Vulkan) and cross-compiled for the board.
+ 
+ * [Dear ImGui](https://github.com/ocornut/imgui) – UI (vendored under `src/libraries/imgui`, docking branch)
+ * [stb](https://github.com/nothings/stb) – image decode (vendored under `src/libraries/stb`)
+-* [SDL3](https://github.com/libsdl-org/SDL) – platform/window/input
++* [SDL2 / SDL3](https://github.com/libsdl-org/SDL) or [GLFW](https://www.glfw.org/) – platform/window/input
+ * [GStreamer](https://gstreamer.freedesktop.org/) – media playback
+ * [yt-dlp](https://github.com/yt-dlp/yt-dlp) – YouTube extraction
+ * nlohmann/json, libcurl – JSON parsing, thumbnail downloads
+diff --git a/cmake/ImTubeDeps.cmake b/cmake/ImTubeDeps.cmake
+index 9ec7231..40ec04e 100644
+--- a/cmake/ImTubeDeps.cmake
++++ b/cmake/ImTubeDeps.cmake
+@@ -1,144 +1,273 @@
+-# ImTube dependency resolution.
++# ImTube dependency resolution: windowing platform, GL, Dear ImGui.
+ #
+-# Resolves the ImTube dependencies:
+-#   * GLES/EGL     - system OpenGL ES 3.2 dev packages (glesv2/egl pkg-config
+-#                    modules). Used by the default renderer.
+-#   * Vulkan       - system loader + headers preferred; falls back to a fetched
+-#                    copy of KhronosGroup/Vulkan-Headers plus the runtime loader.
+-#                    Only resolved when IMTUBE_RENDERER=vulkan.
+-#   * SDL3         - system install preferred; otherwise built from source
+-#                    (FetchContent) with a trimmed-down configuration.
+-#   * Dear ImGui   - vendored under src/libraries/imgui (docking branch), compiled
+-#                    into the imtube_imgui static library.
++# Inputs (cache variables set in CMakeLists.txt):
++#   IMTUBE_PLATFORM     sdl2 | sdl3 | glfw
++#   IMTUBE_RENDERER     gl2  | gles
++#   IMTUBE_IMGUI        auto | system | vendored
++#   IMTUBE_ALLOW_FETCH  fetch SDL3 from source when no system package exists
++#   IMTUBE_MACOS_GL     framework | x11  (Apple only, gl2 renderer; defined here)
+ #
+-# Exposes the following targets/variables:
+-#   imtube_imgui                (target)   vendored Dear ImGui core library
+-#   IMTUBE_SDL3_TARGET          (target)   SDL3 library to link against
+-#   IMTUBE_VULKAN_TARGETS       (targets)  Vulkan headers (+ loader) to link against
+-#   IMTUBE_IMGUI_BACKEND_SOURCES(file list) ImGui platform/rendering backends
+-#   IMTUBE_IMGUI_OPENGL3_SOURCE (file or empty)
+-#   IMTUBE_IMGUI_DEMO_SOURCE    (file)
+-#   IMTUBE_IMGUI_INCLUDE_DIRS   (dirs)
++# Outputs:
++#   IMTUBE_PLATFORM_SOURCES / IMTUBE_PLATFORM_DEFINE / IMTUBE_PLATFORM_LIBS
++#   IMTUBE_RENDERER_SOURCES / IMTUBE_RENDERER_DEFINE / IMTUBE_RENDERER_LIBS
++#   IMTUBE_IMGUI_TARGET          Dear ImGui core library to link
++#   IMTUBE_IMGUI_INCLUDE_DIRS    extra include dirs (vendored layout only)
++#   IMTUBE_IMGUI_BACKEND_SOURCES ImGui platform + renderer backend sources
++#   IMTUBE_IMGUI_DEMO_SOURCE     imgui_demo.cpp
++#   IMTUBE_IMGUI_RESOLVED        "system (<version>)" or "vendored" for the summary
+ #
+-# Override tags with, e.g.:
+-#   cmake -DIMTUBE_SDL3_TAG=release-3.4.2 ...
++# Override the SDL3 tag with, e.g.: cmake -DIMTUBE_SDL3_TAG=release-3.4.2 ...
+ 
+-include(FetchContent)
+-
+-set(FETCHCONTENT_QUIET OFF)
++find_package(PkgConfig REQUIRED)
+ 
+ # ============================================================================
+-# Vulkan (only needed for the optional Vulkan renderer)
++# Dear ImGui
+ # ============================================================================
++#
++# System layout (as installed by the MacPorts 'imgui' port, see
++# macos-powerpc/powerpc-ports devel/imgui): pkg-config module 'imgui' with
++# -I<prefix>/include/imgui -I<prefix>/include/imgui/backends and -limgui, plus
++# the backend sources under <prefix>/share/imgui/backends (a 'backendsdir'
++# pkg-config variable is honoured when the .pc file provides one).
++#
++# Vendored layout: src/libraries/imgui (docking branch), compiled into the
++# imtube_imgui static library, backends under src/libraries/imgui/backends.
+ 
+-if(IMTUBE_RENDERER STREQUAL "vulkan")
+-    find_package(Vulkan QUIET)
+-    if(Vulkan_FOUND)
+-        message(STATUS "ImTube: using system Vulkan (${Vulkan_VERSION})")
+-        set(IMTUBE_VULKAN_TARGETS Vulkan::Vulkan)
+-    else()
+-        message(STATUS "ImTube: no system Vulkan dev package found; fetching Vulkan-Headers")
+-        set(IMTUBE_VULKAN_HEADERS_TAG "v1.3.296" CACHE STRING "Vulkan-Headers tag to fetch")
+-        FetchContent_Declare(VulkanHeaders
+-            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+-            GIT_TAG        ${IMTUBE_VULKAN_HEADERS_TAG}
+-            GIT_SHALLOW    TRUE
+-            GIT_PROGRESS   TRUE
+-        )
+-        FetchContent_MakeAvailable(VulkanHeaders)
++set(IMTUBE_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/libraries/imgui")
++set(_imgui_system OFF)
+ 
+-        # Many distros ship only the ABI loader (libvulkan.so.1) without a dev
+-        # symlink; find the shared object directly.
+-        find_library(IMTUBE_VULKAN_LOADER
+-            NAMES vulkan vulkan.so.1 libvulkan.so.1
+-            PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu
+-        )
+-        if(NOT IMTUBE_VULKAN_LOADER)
+-            message(FATAL_ERROR "ImTube: could not locate the Vulkan loader (libvulkan.so.1). "
+-                                "Install a Vulkan loader + ICD runtime to proceed.")
+-        endif()
+-        message(STATUS "ImTube: Vulkan loader found at ${IMTUBE_VULKAN_LOADER}")
+-        set(IMTUBE_VULKAN_TARGETS Vulkan::Headers "${IMTUBE_VULKAN_LOADER}")
++if(NOT IMTUBE_IMGUI STREQUAL "vendored")
++    pkg_check_modules(IMGUI QUIET IMPORTED_TARGET imgui)
++    if(IMGUI_FOUND)
++        set(_imgui_system ON)
++    elseif(IMTUBE_IMGUI STREQUAL "system")
++        message(FATAL_ERROR "ImTube: IMTUBE_IMGUI=system but pkg-config found no 'imgui' module")
++    endif()
++endif()
++
++if(_imgui_system)
++    set(IMTUBE_IMGUI_TARGET PkgConfig::IMGUI)
++    set(IMTUBE_IMGUI_INCLUDE_DIRS "")
++    set(IMTUBE_IMGUI_RESOLVED "system (${IMGUI_VERSION})")
++
++    pkg_get_variable(IMTUBE_IMGUI_BACKENDS_DIR imgui backendsdir)
++    if(NOT IMTUBE_IMGUI_BACKENDS_DIR)
++        pkg_get_variable(_imgui_prefix imgui prefix)
++        set(IMTUBE_IMGUI_BACKENDS_DIR "${_imgui_prefix}/share/imgui/backends")
++    endif()
++    if(NOT EXISTS "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_opengl2.cpp")
++        message(FATAL_ERROR
++            "ImTube: system Dear ImGui found but no backend sources at "
++            "'${IMTUBE_IMGUI_BACKENDS_DIR}'. Set IMTUBE_IMGUI=vendored or install "
++            "the backend sources (share/imgui/backends).")
+     endif()
++    get_filename_component(_imgui_share "${IMTUBE_IMGUI_BACKENDS_DIR}" DIRECTORY)
++    set(IMTUBE_IMGUI_DEMO_SOURCE "${_imgui_share}/imgui_demo.cpp")
++    message(STATUS "ImTube: using system Dear ImGui ${IMGUI_VERSION}, backends in ${IMTUBE_IMGUI_BACKENDS_DIR}")
+ else()
+-    set(IMTUBE_VULKAN_TARGETS "")
++    add_library(imtube_imgui STATIC
++        "${IMTUBE_IMGUI_DIR}/imgui.cpp"
++        "${IMTUBE_IMGUI_DIR}/imgui_draw.cpp"
++        "${IMTUBE_IMGUI_DIR}/imgui_tables.cpp"
++        "${IMTUBE_IMGUI_DIR}/imgui_widgets.cpp"
++    )
++    target_include_directories(imtube_imgui PUBLIC "${IMTUBE_IMGUI_DIR}")
++    set_target_properties(imtube_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
++
++    set(IMTUBE_IMGUI_TARGET imtube_imgui)
++    set(IMTUBE_IMGUI_BACKENDS_DIR "${IMTUBE_IMGUI_DIR}/backends")
++    set(IMTUBE_IMGUI_INCLUDE_DIRS "${IMTUBE_IMGUI_DIR}" "${IMTUBE_IMGUI_BACKENDS_DIR}")
++    set(IMTUBE_IMGUI_DEMO_SOURCE "${IMTUBE_IMGUI_DIR}/imgui_demo.cpp")
++    set(IMTUBE_IMGUI_RESOLVED "vendored")
++
++    # Dear ImGui packs colours into ImU32 with little-endian byte shifts, and
++    # the OpenGL backends hand ImDrawVert::col and the RGBA32 font atlas to GL
++    # as byte arrays: on a big-endian host red and alpha swap and text
++    # disappears. imgui.h honours these macros when they are already defined
++    # (#ifndef IM_COL32_R_SHIFT), so the fix rides on the compile line instead
++    # of patching the vendored headers. The MacPorts 'imgui' port carries the
++    # same fix, which is why the system path above needs nothing.
++    set(_imtube_big_endian OFF)
++    if(DEFINED CMAKE_CXX_BYTE_ORDER)
++        if(CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
++            set(_imtube_big_endian ON)
++        endif()
++    else() # CMake < 3.20 has no CMAKE_CXX_BYTE_ORDER
++        include(TestBigEndian)
++        test_big_endian(_imtube_big_endian)
++    endif()
++    if(_imtube_big_endian)
++        target_compile_definitions(imtube_imgui PUBLIC
++            IM_COL32_R_SHIFT=24 IM_COL32_G_SHIFT=16 IM_COL32_B_SHIFT=8
++            IM_COL32_A_SHIFT=0  IM_COL32_A_MASK=0x000000FF)
++        message(STATUS "ImTube: big-endian host, vendored Dear ImGui built with swapped IM_COL32 shifts")
++    endif()
++
++    message(STATUS "ImTube: using vendored Dear ImGui (${IMTUBE_IMGUI_DIR})")
+ endif()
+ 
+ # ============================================================================
+-# SDL3
++# Windowing platform
+ # ============================================================================
+ 
+-option(IMTUBE_SDL_WAYLAND "Build SDL3 with the Wayland video driver (set ON for the STM32MPU cross build)" OFF)
+-
+-find_package(SDL3 QUIET)
+-if(SDL3_FOUND)
+-    message(STATUS "ImTube: using system SDL3")
+-    set(IMTUBE_SDL3_TARGET SDL3::SDL3)
+-else()
+-    message(STATUS "ImTube: SDL3 not found on system; building SDL3 from source "
+-                   "(this takes a minute on the first configure)")
+-
+-    # Trim the SDL3 build to what ImTube needs.
+-    set(SDL_SHARED        ON  CACHE BOOL "Build shared SDL3"          FORCE)
+-    set(SDL_STATIC        OFF CACHE BOOL "Build static SDL3"          FORCE)
+-    set(SDL_INSTALL       OFF CACHE BOOL "Install SDL3"               FORCE)
+-    set(SDL_TESTS         OFF CACHE BOOL "Build SDL3 tests"           FORCE)
+-    set(SDL_TEST_LIBRARY  OFF CACHE BOOL "Build SDL3 test library"    FORCE)
+-    set(SDL_EXAMPLES      OFF CACHE BOOL "Build SDL3 examples"        FORCE)
+-    set(SDL_WAYLAND       ${IMTUBE_SDL_WAYLAND} CACHE BOOL "Use Wayland video driver" FORCE)
+-    set(SDL_X11_XTEST     OFF CACHE BOOL "Use XInput2 XTEST support"  FORCE) # needs libxtst-dev
+-    if(IMTUBE_RENDERER STREQUAL "vulkan")
+-        set(SDL_VULKAN        ON  CACHE BOOL "Enable Vulkan support"      FORCE)
+-        set(SDL_RENDER_VULKAN ON  CACHE BOOL "Enable the Vulkan render driver" FORCE)
++if(IMTUBE_PLATFORM STREQUAL "sdl2")
++    pkg_check_modules(SDL2 QUIET IMPORTED_TARGET sdl2)
++    if(SDL2_FOUND)
++        message(STATUS "ImTube: using system SDL2 ${SDL2_VERSION} (pkg-config)")
++        set(IMTUBE_PLATFORM_LIBS PkgConfig::SDL2)
+     else()
++        find_package(SDL2 CONFIG QUIET)
++        if(NOT SDL2_FOUND)
++            message(FATAL_ERROR "ImTube: SDL2 not found (pkg-config 'sdl2' or SDL2Config.cmake)")
++        endif()
++        message(STATUS "ImTube: using system SDL2 (CMake config)")
++        set(IMTUBE_PLATFORM_LIBS SDL2::SDL2)
++    endif()
++    set(IMTUBE_PLATFORM_SOURCES src/platform/SdlPlatform.cpp)
++    set(IMTUBE_PLATFORM_DEFINE IMTUBE_PLATFORM_SDL2)
++    set(_imgui_platform_backend "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_sdl2.cpp")
++
++elseif(IMTUBE_PLATFORM STREQUAL "sdl3")
++    option(IMTUBE_SDL_WAYLAND "Build SDL3 with the Wayland video driver (set ON for the STM32MPU cross build)" OFF)
++
++    find_package(SDL3 CONFIG QUIET)
++    if(SDL3_FOUND)
++        message(STATUS "ImTube: using system SDL3")
++    elseif(IMTUBE_ALLOW_FETCH)
++        message(STATUS "ImTube: SDL3 not found on system; building SDL3 from source "
++                       "(this takes a minute on the first configure)")
++        include(FetchContent)
++        set(FETCHCONTENT_QUIET OFF)
++
++        # Trim the SDL3 build to what ImTube needs.
++        set(SDL_SHARED        ON  CACHE BOOL "Build shared SDL3"          FORCE)
++        set(SDL_STATIC        OFF CACHE BOOL "Build static SDL3"          FORCE)
++        set(SDL_INSTALL       OFF CACHE BOOL "Install SDL3"               FORCE)
++        set(SDL_TESTS         OFF CACHE BOOL "Build SDL3 tests"           FORCE)
++        set(SDL_TEST_LIBRARY  OFF CACHE BOOL "Build SDL3 test library"    FORCE)
++        set(SDL_EXAMPLES      OFF CACHE BOOL "Build SDL3 examples"        FORCE)
++        set(SDL_WAYLAND       ${IMTUBE_SDL_WAYLAND} CACHE BOOL "Use Wayland video driver" FORCE)
++        set(SDL_X11_XTEST     OFF CACHE BOOL "Use XInput2 XTEST support"  FORCE) # needs libxtst-dev
+         set(SDL_VULKAN        OFF CACHE BOOL "Enable Vulkan support"      FORCE)
+         set(SDL_RENDER_VULKAN OFF CACHE BOOL "Enable the Vulkan render driver" FORCE)
++        set(SDL_RENDER        ON  CACHE BOOL "Build SDL3 renderer"        FORCE)
++
++        set(IMTUBE_SDL3_TAG "release-3.4.2" CACHE STRING "SDL3 tag to fetch")
++        FetchContent_Declare(SDL3
++            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
++            GIT_TAG        ${IMTUBE_SDL3_TAG}
++            GIT_SHALLOW    TRUE
++            GIT_PROGRESS   TRUE
++        )
++        FetchContent_MakeAvailable(SDL3)
++    else()
++        message(FATAL_ERROR "ImTube: SDL3 not found (and IMTUBE_ALLOW_FETCH is OFF)")
+     endif()
+-    set(SDL_RENDER        ON  CACHE BOOL "Build SDL3 renderer"        FORCE)
+-
+-    set(IMTUBE_SDL3_TAG "release-3.4.2" CACHE STRING "SDL3 tag to fetch")
+-    FetchContent_Declare(SDL3
+-        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+-        GIT_TAG        ${IMTUBE_SDL3_TAG}
+-        GIT_SHALLOW    TRUE
+-        GIT_PROGRESS   TRUE
+-    )
+-    FetchContent_MakeAvailable(SDL3)
+-    set(IMTUBE_SDL3_TARGET SDL3::SDL3)
++    set(IMTUBE_PLATFORM_LIBS SDL3::SDL3)
++    set(IMTUBE_PLATFORM_SOURCES src/platform/SdlPlatform.cpp)
++    set(IMTUBE_PLATFORM_DEFINE IMTUBE_PLATFORM_SDL3)
++    set(_imgui_platform_backend "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_sdl3.cpp")
++
++else() # glfw
++    pkg_check_modules(GLFW QUIET IMPORTED_TARGET glfw3)
++    if(GLFW_FOUND)
++        message(STATUS "ImTube: using system GLFW ${GLFW_VERSION} (pkg-config)")
++        set(IMTUBE_PLATFORM_LIBS PkgConfig::GLFW)
++    else()
++        find_package(glfw3 CONFIG QUIET)
++        if(NOT glfw3_FOUND)
++            message(FATAL_ERROR "ImTube: GLFW not found (pkg-config 'glfw3' or glfw3Config.cmake)")
++        endif()
++        message(STATUS "ImTube: using system GLFW (CMake config)")
++        set(IMTUBE_PLATFORM_LIBS glfw)
++    endif()
++    set(IMTUBE_PLATFORM_SOURCES src/platform/GlfwPlatform.cpp)
++    set(IMTUBE_PLATFORM_DEFINE IMTUBE_PLATFORM_GLFW)
++    set(_imgui_platform_backend "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_glfw.cpp")
+ endif()
+ 
+ # ============================================================================
+-# Dear ImGui (vendored under src/libraries/imgui, docking branch)
++# Rendering backend
+ # ============================================================================
+ 
+-set(IMTUBE_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/libraries/imgui")
++if(IMTUBE_RENDERER STREQUAL "gl2")
++    set(IMTUBE_RENDERER_SOURCES
++        src/render/Gl2Context.cpp
++        src/render/Gl2Texture.cpp
++    )
++    set(IMTUBE_RENDERER_DEFINE IMTUBE_RENDERER_GL2)
++    set(_imgui_renderer_backend "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_opengl2.cpp")
++
++    if(APPLE)
++        # The fixed-function backend calls GL entry points directly (no
++        # loader), so the libGL we link must be the one that owns the context
++        # the windowing library creates. On macOS SDL2, SDL3 and GLFW all use
++        # the Cocoa driver (NSOpenGLContext), i.e. the system OpenGL.framework.
++        #
++        # find_package(OpenGL) is not used here on purpose: CMake's FindOpenGL
++        # searches "NAMES OpenGL GL", and MacPorts' cmake is patched to search
++        # frameworks last with ${prefix}/lib first, so with the mesa port
++        # installed (a dependency of libsdl2 +x11 +opengl) it returns Mesa's
++        # X11/GLX libGL.dylib. That library never sees the Cocoa context: every
++        # call fails with "glGetString called without a rendering context" and
++        # the window stays black.
++        #
++        # IMTUBE_MACOS_GL=x11 is the opposite pairing for an XQuartz session
++        # (SDL_VIDEODRIVER=x11, Mesa's libGL through its gl.pc).
++        set(IMTUBE_MACOS_GL "framework" CACHE STRING
++            "macOS OpenGL library: framework (system OpenGL.framework, matches the Cocoa video driver) or x11 (Mesa libGL for SDL_VIDEODRIVER=x11 under XQuartz)")
++        set_property(CACHE IMTUBE_MACOS_GL PROPERTY STRINGS framework x11)
++        if(IMTUBE_MACOS_GL STREQUAL "framework")
++            set(IMTUBE_RENDERER_LIBS "-framework OpenGL")
++            message(STATUS "ImTube: legacy OpenGL from the system OpenGL.framework (Cocoa)")
++        elseif(IMTUBE_MACOS_GL STREQUAL "x11")
++            pkg_check_modules(GL REQUIRED IMPORTED_TARGET gl)
++            set(IMTUBE_RENDERER_LIBS PkgConfig::GL)
++            list(APPEND IMTUBE_RENDERER_DEFINE IMTUBE_GL_X11)
++            message(STATUS "ImTube: legacy OpenGL from Mesa ${GL_VERSION} (X11/GLX; run with SDL_VIDEODRIVER=x11)")
++        else()
++            message(FATAL_ERROR "ImTube: IMTUBE_MACOS_GL must be 'framework' or 'x11' (got '${IMTUBE_MACOS_GL}')")
++        endif()
++    else()
++        # Link the classic libGL (which SDL/GLFW also load) rather than GLVND's
++        # libOpenGL+libGLX split.
++        set(OpenGL_GL_PREFERENCE LEGACY)
++        find_package(OpenGL REQUIRED)
++        set(IMTUBE_RENDERER_LIBS OpenGL::GL)
++    endif()
+ 
+-add_library(imtube_imgui STATIC
+-    "${IMTUBE_IMGUI_DIR}/imgui.cpp"
+-    "${IMTUBE_IMGUI_DIR}/imgui_draw.cpp"
+-    "${IMTUBE_IMGUI_DIR}/imgui_tables.cpp"
+-    "${IMTUBE_IMGUI_DIR}/imgui_widgets.cpp"
+-)
+-target_include_directories(imtube_imgui PUBLIC "${IMTUBE_IMGUI_DIR}")
+-set_target_properties(imtube_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+-
+-if(IMTUBE_RENDERER STREQUAL "vulkan")
+-    set(IMTUBE_IMGUI_BACKEND_SOURCES
+-        "${IMTUBE_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
+-        "${IMTUBE_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp"
++else() # gles
++    pkg_check_modules(GLES2 REQUIRED IMPORTED_TARGET glesv2)
++    pkg_check_modules(EGL   REQUIRED IMPORTED_TARGET egl)
++    set(IMTUBE_RENDERER_SOURCES
++        src/render/GlesContext.cpp
++        src/render/GlesTexture.cpp
+     )
+-    set(IMTUBE_IMGUI_OPENGL3_SOURCE "")
+-    target_link_libraries(imtube_imgui PUBLIC ${IMTUBE_VULKAN_TARGETS})
+-else()
+-    set(IMTUBE_IMGUI_BACKEND_SOURCES
+-        "${IMTUBE_IMGUI_DIR}/backends/imgui_impl_sdl3.cpp"
+-        "${IMTUBE_IMGUI_DIR}/backends/imgui_impl_opengl3.cpp"
++    set(IMTUBE_RENDERER_DEFINE IMTUBE_RENDERER_GLES)
++    # ${CMAKE_DL_LIBS}: the ImGui GL3 backend resolves GL entry points with dlsym.
++    set(IMTUBE_RENDERER_LIBS PkgConfig::GLES2 PkgConfig::EGL ${CMAKE_DL_LIBS})
++    set(_imgui_renderer_backend "${IMTUBE_IMGUI_BACKENDS_DIR}/imgui_impl_opengl3.cpp")
++    set_source_files_properties("${_imgui_renderer_backend}" PROPERTIES
++        COMPILE_DEFINITIONS IMGUI_IMPL_OPENGL_ES3
+     )
+-    set(IMTUBE_IMGUI_OPENGL3_SOURCE "${IMTUBE_IMGUI_DIR}/backends/imgui_impl_opengl3.cpp")
+ endif()
+-set(IMTUBE_IMGUI_DEMO_SOURCE "${IMTUBE_IMGUI_DIR}/imgui_demo.cpp")
+ 
+-set(IMTUBE_IMGUI_INCLUDE_DIRS
+-    "${IMTUBE_IMGUI_DIR}"
+-    "${IMTUBE_IMGUI_DIR}/backends"
+-)
++set(IMTUBE_IMGUI_BACKEND_SOURCES "${_imgui_platform_backend}" "${_imgui_renderer_backend}")
++foreach(_src IN LISTS IMTUBE_IMGUI_BACKEND_SOURCES)
++    if(NOT EXISTS "${_src}")
++        if(IMTUBE_IMGUI_RESOLVED STREQUAL "vendored")
++            # Upstream vendors only the sdl3 / opengl3 / vulkan backends, and this
++            # port deliberately adds none: the MacPorts 'imgui' port installs the
++            # whole set under share/imgui/backends.
++            message(FATAL_ERROR
++                "ImTube: Dear ImGui backend source not found: ${_src}\n"
++                "The vendored Dear ImGui carries only the sdl3/opengl3/vulkan backends. "
++                "Either build against a system Dear ImGui that installs its backend "
++                "sources (-DIMTUBE_IMGUI=system, e.g. the MacPorts 'imgui' port), or copy "
++                "the missing imgui_impl_*.cpp/.h from the matching Dear ImGui release "
++                "into ${IMTUBE_IMGUI_BACKENDS_DIR}.")
++        else()
++            message(FATAL_ERROR "ImTube: Dear ImGui backend source not found: ${_src}")
++        endif()
++    endif()
++endforeach()
+diff --git a/src/app/App.cpp b/src/app/App.cpp
+index e2a39c1..d2320d0 100644
+--- a/src/app/App.cpp
++++ b/src/app/App.cpp
+@@ -1,29 +1,54 @@
+ #include "app/App.h"
+ 
++#include "platform/Platform.h"
+ #include "render/RenderBackend.h"
+ #include "ui/ImTubeUI.h"
+ 
+-#ifdef IMTUBE_RENDERER_VULKAN
+-#include "app/VulkanContext.h"
++#if defined(IMTUBE_PLATFORM_GLFW)
++#include "platform/GlfwPlatform.h"
+ #else
++#include "platform/SdlPlatform.h"
++#endif
++
++#if defined(IMTUBE_RENDERER_GLES)
+ #include "render/GlesContext.h"
++#else
++#include "render/Gl2Context.h"
+ #endif
+ 
+ #include "imgui.h"
+-#include "imgui_impl_sdl3.h"
+ 
+ #include <cstdio>
+ #include <memory>
+ 
+ namespace imtube {
+ 
++namespace {
++
++/* How long the loop sleeps waiting for input when nothing on screen moves.
++ * Keeps an idle ImTube from redrawing a static page at the vsync rate, which
++ * on a G4 is a whole core. Input wakes the loop immediately. */
++constexpr int kIdleWaitMs = 50;
++
++} /* namespace */
++
++/* Compile-time choice of platform (see CMakeLists.txt). */
++std::unique_ptr<Platform> create_platform()
++{
++#if defined(IMTUBE_PLATFORM_GLFW)
++    return std::make_unique<GlfwPlatform>();
++#else
++    return std::make_unique<SdlPlatform>();
++#endif
++}
++
+ /* Compile-time choice of rendering backend (see CMakeLists.txt). */
+ std::unique_ptr<RenderBackend> create_render_backend()
+ {
+-#ifdef IMTUBE_RENDERER_VULKAN
+-    return std::make_unique<VulkanContext>();
+-#else
++#if defined(IMTUBE_RENDERER_GLES)
+     return std::make_unique<GlesContext>();
++#else
++    return std::make_unique<Gl2Context>();
+ #endif
+ }
+ 
+@@ -32,36 +57,26 @@ App::~App() { shutdown(); }
+ 
+ bool App::init()
+ {
+-    /* SDL3's SDL_Init returns bool: true on success, false on failure. */
+-    if (!SDL_Init(SDL_INIT_VIDEO))
+-    {
+-        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+-        return false;
+-    }
+-    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+-
++    m_platform = create_platform();
+     m_backend = create_render_backend();
+-    if (!m_backend)
++    if (!m_platform || !m_backend)
+     {
+-        std::fprintf(stderr, "no rendering backend available\n");
++        std::fprintf(stderr, "no platform / rendering backend available\n");
+         return false;
+     }
+ 
+-    /* Let the backend configure the window (GL attributes, ...) before the
+-     * window is created. */
+-    m_backend->prepare_window();
+-
+-    m_window = SDL_CreateWindow("ImTube", 1280, 760,
+-                                SDL_WINDOW_RESIZABLE | m_backend->window_flags());
+-    if (m_window == nullptr)
++    /* The window (and, for GL renderers, the GL context) comes first; the
++     * renderer then attaches to it. */
++    if (!m_platform->init("ImTube", 1280, 760, m_backend->context_kind()))
+     {
+-        std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
++        std::fprintf(stderr, "failed to initialise the windowing platform\n");
++        shutdown();
+         return false;
+     }
+ 
+-    if (!m_backend->init(m_window))
++    if (!m_backend->init(*m_platform))
+     {
+-        std::fprintf(stderr, "failed to initialise the rendering backend\n");
++        std::fprintf(stderr, "failed to initialise the %s rendering backend\n", m_backend->name());
+         shutdown();
+         return false;
+     }
+@@ -71,16 +86,25 @@ bool App::init()
+     ImGui::GetIO().IniFilename = "imgui.ini";
+     ImGui::StyleColorsDark();
+ 
+-    if (!m_backend->init_imgui(m_window))
++    if (!m_platform->init_imgui())
++    {
++        std::fprintf(stderr, "failed to initialise the ImGui platform backend\n");
++        shutdown();
++        return false;
++    }
++    if (!m_backend->init_imgui())
+     {
+-        std::fprintf(stderr, "failed to initialise the ImGui backends\n");
++        std::fprintf(stderr, "failed to initialise the ImGui renderer backend\n");
+         shutdown();
+         return false;
+     }
+ 
++    std::fprintf(stderr, "[imtube] %s + %s%s%s\n", m_platform->name(), m_backend->name(),
++                 m_backend->description()[0] != '\0' ? ": " : "", m_backend->description());
++
+     m_ui = new ImTubeUI;
+     m_ui->set_backend(m_backend.get());
+-    m_ui->set_window(m_window);
++    m_ui->set_platform(m_platform.get());
+ 
+     m_running = true;
+     return true;
+@@ -90,33 +114,32 @@ int App::run()
+ {
+     while (m_running)
+     {
+-        SDL_Event event;
+-        while (SDL_PollEvent(&event))
++        /* Poll (and let vsync pace the loop) while video plays or background
++         * work is in flight; otherwise block for input up to kIdleWaitMs. */
++        const int timeout_ms = m_ui->wants_continuous_redraw() ? 0 : kIdleWaitMs;
++        if (!m_platform->pump_events(timeout_ms))
+         {
+-            ImGui_ImplSDL3_ProcessEvent(&event);
+-            if (event.type == SDL_EVENT_QUIT)
+-                m_running = false;
+-            else if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+-                     event.window.windowID == SDL_GetWindowID(m_window))
+-                m_running = false;
++            m_running = false;
++            break;
+         }
+ 
+         if (m_backend->needs_recreate())
+         {
+             int w = 0, h = 0;
+-            SDL_GetWindowSize(m_window, &w, &h);
++            m_platform->get_framebuffer_size(&w, &h);
+             m_backend->recreate(w, h);
+         }
+ 
+-        m_backend->new_frame();      /* renderer NewFrame (e.g. GL clear) */
+-        ImGui_ImplSDL3_NewFrame();   /* platform NewFrame */
++        m_backend->new_frame();   /* renderer NewFrame */
++        m_platform->new_frame();  /* platform NewFrame */
+         ImGui::NewFrame();
+ 
+         m_ui->render();
+ 
+         ImGui::Render();
+         m_backend->render(ImGui::GetDrawData());
+-        m_backend->present();
++        m_backend->present();        /* no-op for the GL backends */
++        m_platform->swap_buffers();
+     }
+     return 0;
+ }
+@@ -125,23 +148,27 @@ void App::shutdown()
+ {
+     if (m_ui != nullptr)
+     {
+-        delete m_ui; /* stops playback, joins worker threads, saves lists */
++        delete m_ui; /* stops playback, joins worker threads, saves lists, frees textures */
+         m_ui = nullptr;
+     }
++    /* ImGui teardown order: renderer backend, platform backend, context.
++     * The GL context must still be current while the renderer releases its
++     * objects, so the platform is shut down last. */
+     if (m_backend)
+     {
+         m_backend->wait_idle();
+         m_backend->shutdown();
+         m_backend.reset();
+     }
++    if (m_platform)
++        m_platform->shutdown_imgui();
+     if (ImGui::GetCurrentContext() != nullptr)
+         ImGui::DestroyContext();
+-    if (m_window != nullptr)
++    if (m_platform)
+     {
+-        SDL_DestroyWindow(m_window);
+-        m_window = nullptr;
++        m_platform->shutdown();
++        m_platform.reset();
+     }
+-    SDL_Quit();
+ }
+ 
+ } /* namespace imtube */
+diff --git a/src/app/App.h b/src/app/App.h
+index f4e25a3..e48f1a9 100644
+--- a/src/app/App.h
++++ b/src/app/App.h
+@@ -1,19 +1,21 @@
+ #pragma once
+ 
+-#include <SDL3/SDL.h>
+-
+ #include <memory>
+ 
+ namespace imtube {
+ 
++class Platform;
+ class RenderBackend;
+ class ImTubeUI;
+ 
+-/* Application shell: owns the SDL window, the rendering backend, the Dear ImGui
+- * context and the ImTube user interface, and drives the main render loop.
++/* Application shell: owns the platform (window + input + ImGui platform
++ * backend), the rendering backend (ImGui renderer backend + textures), the
++ * Dear ImGui context and the ImTube user interface, and drives the main loop.
+  *
+- * The rendering backend is selected at compile time (default: OpenGL ES 3.2 so
+- * the same binary path runs on a regular Linux PC and on the STM32MPU). */
++ * Both layers are selected at compile time:
++ *   IMTUBE_PLATFORM  = sdl2 | sdl3 | glfw
++ *   IMTUBE_RENDERER  = gl2 | gles
++ * The lightweight combination for old Macs is sdl2 + gl2. */
+ class App {
+ public:
+     App();
+@@ -27,7 +29,7 @@ public:
+     void shutdown();
+ 
+ private:
+-    SDL_Window* m_window = nullptr;
++    std::unique_ptr<Platform> m_platform;
+     std::unique_ptr<RenderBackend> m_backend;
+     ImTubeUI* m_ui = nullptr;
+     bool m_running = false;
+diff --git a/src/core/GStreamerPlayer.cpp b/src/core/GStreamerPlayer.cpp
+index 3a6c54e..aa94d76 100644
+--- a/src/core/GStreamerPlayer.cpp
++++ b/src/core/GStreamerPlayer.cpp
+@@ -148,7 +148,7 @@ bool GStreamerPlayer::start_pipeline()
+     gst_app_sink_set_drop(m_appsink, TRUE);
+     gst_app_sink_set_wait_on_eos(m_appsink, FALSE);
+     g_object_set(m_appsink, "sync", TRUE, nullptr);
+-    GstCaps* vcaps = gst_caps_from_string("video/x-raw,format=RGBA");
++    GstCaps* vcaps = gst_caps_from_string(video_caps_string().c_str());
+     gst_app_sink_set_caps(m_appsink, vcaps);
+     gst_caps_unref(vcaps);
+ 
+@@ -492,6 +492,20 @@ void GStreamerPlayer::set_muted(bool muted)
+         g_object_set(m_volume_elem, "volume", (double)(muted ? 0.0 : m_volume), nullptr);
+ }
+ 
++std::string GStreamerPlayer::video_caps_string() const
++{
++    std::string caps = "video/x-raw,format=" + m_video_format;
++    if (m_max_frame_dim > 0)
++    {
++        /* An int range lets videoscale pick the largest size that fits while
++         * keeping the display aspect ratio (legacy GL caps textures at 2048
++         * or less; padding to a power of two never exceeds the cap either). */
++        const std::string range = "(int)[1," + std::to_string(m_max_frame_dim) + "]";
++        caps += ",width=" + range + ",height=" + range;
++    }
++    return caps;
++}
++
+ void GStreamerPlayer::on_pad_added(GstElement* /*decodebin*/, GstPad* pad)
+ {
+     if (pad == nullptr || gst_pad_is_linked(pad))
+@@ -558,7 +572,7 @@ void GStreamerPlayer::link_branch(GstPad* pad, bool is_video)
+ 
+     if (is_video)
+     {
+-        GstCaps* caps = gst_caps_from_string("video/x-raw,format=RGBA");
++        GstCaps* caps = gst_caps_from_string(video_caps_string().c_str());
+         g_object_set(chain[3], "caps", caps, nullptr);
+         gst_caps_unref(caps);
+     }
+diff --git a/src/core/GStreamerPlayer.h b/src/core/GStreamerPlayer.h
+index b0e84ce..275feb2 100644
+--- a/src/core/GStreamerPlayer.h
++++ b/src/core/GStreamerPlayer.h
+@@ -20,7 +20,8 @@ namespace imtube {
+  * (see YtDlpHelper::launch_stream) through an appsrc element. A worker thread
+  * performs the pipe->appsrc transfer with natural backpressure, while a
+  * decodebin branches into:
+- *   video -> queue ! videoconvert ! videoscale ! appsink (video/x-raw,RGBA)
++ *   video -> queue ! videoconvert ! videoscale ! appsink (video/x-raw, RGBA or the
++ *            renderer's packed layout, scaled to fit its largest texture)
+  *   audio -> queue ! audioconvert ! audioresample ! autoaudiosink
+  *
+  * The main thread pulls the newest decoded RGBA frame (appsink keeps only one
+@@ -77,6 +78,18 @@ public:
+      * the end of the video. Pass 0 when unknown (live streams, raw URLs). */
+     void set_known_duration_ms(int64_t ms) { m_known_duration_ms = ms; }
+ 
++    /* Pixel layout of the decoded frames as a GStreamer video/x-raw format
++     * name: "RGBA" (default), or "BGRA"/"ARGB" for the packed 32-bit layout a
++     * renderer uploads fastest (see render/RenderTexture.h). Applies to the
++     * next start(). */
++    void set_video_format(const std::string& gst_format) { m_video_format = gst_format; }
++    const std::string& video_format() const { return m_video_format; }
++
++    /* Largest frame width/height the renderer can hold in one texture
++     * (0 = no limit). Bigger streams are scaled down by videoscale before they
++     * reach the appsink, keeping the aspect ratio. Applies to the next start(). */
++    void set_max_frame_size(int max_dim) { m_max_frame_dim = max_dim; }
++
+     void set_volume(float volume);   /* 0..1 */
+     float volume() const { return m_volume; }
+     void set_muted(bool muted);
+@@ -98,6 +111,7 @@ public:
+ 
+ private:
+     void on_pad_added(GstElement* decodebin, GstPad* pad);
++    std::string video_caps_string() const;
+     void link_branch(GstPad* pad, bool is_video);
+ 
+     void feeder_loop();
+@@ -135,6 +149,8 @@ private:
+     /* Stream parameters, kept so seek_to_ms() can restart playback. */
+     std::string m_url;
+     int m_max_height = 0;
++    std::string m_video_format = "RGBA";
++    int m_max_frame_dim = 0;
+     std::string m_ytdlp_binary = "yt-dlp";
+ 
+     /* Media-time offset of the current byte source (0 for a normal stream,
+diff --git a/src/core/ThumbnailLoader.cpp b/src/core/ThumbnailLoader.cpp
+index ba2320d..fcb6815 100644
+--- a/src/core/ThumbnailLoader.cpp
++++ b/src/core/ThumbnailLoader.cpp
+@@ -155,6 +155,14 @@ bool ThumbnailLoader::poll(DecodedThumbnail& out)
+     return true;
+ }
+ 
++bool ThumbnailLoader::busy() const
++{
++    if (m_loading)
++        return true;
++    std::lock_guard<std::mutex> lk(m_mutex);
++    return !m_pending.empty() || !m_ready.empty();
++}
++
+ void ThumbnailLoader::shutdown()
+ {
+     if (!m_running.exchange(false))
+@@ -180,7 +188,9 @@ void ThumbnailLoader::worker_loop()
+             item = std::move(m_pending.front());
+             m_pending.pop();
+         }
++        m_loading = true;
+         load_one(item);
++        m_loading = false;
+     }
+ }
+ 
+diff --git a/src/core/ThumbnailLoader.h b/src/core/ThumbnailLoader.h
+index 971cc75..741430f 100644
+--- a/src/core/ThumbnailLoader.h
++++ b/src/core/ThumbnailLoader.h
+@@ -46,6 +46,9 @@ public:
+     /* Non-blocking. Returns one decoded thumbnail when available. */
+     bool poll(DecodedThumbnail& out);
+ 
++    /* True while thumbnails are queued, downloading or waiting to be polled. */
++    bool busy() const;
++
+     void shutdown();
+ 
+ private:
+@@ -54,6 +57,7 @@ private:
+ 
+     std::thread m_thread;
+     std::atomic<bool> m_running{false};
++    std::atomic<bool> m_loading{false}; /* worker is inside load_one() */
+ 
+     mutable std::mutex m_mutex;
+     std::condition_variable m_cv;
+diff --git a/src/main.cpp b/src/main.cpp
+index 357e9d6..821077c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,5 +1,5 @@
+ /* ImTube: a lightweight YouTube-style client
+- * (Dear ImGui + SDL3 + Vulkan, powered by yt-dlp).
++ * (Dear ImGui + SDL2/SDL3/GLFW + OpenGL, powered by yt-dlp).
+  * Project layout and behavior are inspired by the FLTube project
+  * (https://gitlab.com/facuA/fltube). */
+ 
+diff --git a/src/platform/GlfwPlatform.cpp b/src/platform/GlfwPlatform.cpp
+new file mode 100644
+index 0000000..7f1ccf6
+--- /dev/null
++++ b/src/platform/GlfwPlatform.cpp
+@@ -0,0 +1,226 @@
++#include "platform/GlfwPlatform.h"
++
++#include "imgui_impl_glfw.h"
++
++#include <cstdio>
++
++namespace imtube {
++
++namespace {
++
++/* GLFW_VERSION_MAJOR/MINOR come from whichever <GLFW/glfw3.h> this was
++ * compiled against, so this is a build-time, not run-time, capability
++ * check (matches the "guard with version macros" approach used for the
++ * ImGui GLFW backend itself). */
++#define IMTUBE_GLFW_VERSION (GLFW_VERSION_MAJOR * 1000 + GLFW_VERSION_MINOR * 100)
++
++void glfw_error_callback(int error, const char* description)
++{
++    std::fprintf(stderr, "[glfw] error %d: %s\n", error, description);
++}
++
++} /* namespace */
++
++const char* GlfwPlatform::name() const
++{
++    static char buf[64];
++    int major = 0, minor = 0, rev = 0;
++    glfwGetVersion(&major, &minor, &rev);
++
++    /* The windowing platform (cocoa, x11, wayland, ...) decides which GL
++     * library owns the context, so it belongs in every diagnostic line.
++     * glfwGetPlatform() is 3.4+; it returns GLFW_PLATFORM_NULL (0) before
++     * glfwInit(), which is reported as "not initialised". */
++    const char* platform = "";
++#if IMTUBE_GLFW_VERSION >= 3400
++    switch (glfwGetPlatform())
++    {
++    case GLFW_PLATFORM_COCOA:   platform = " (cocoa)"; break;
++    case GLFW_PLATFORM_X11:     platform = " (x11)"; break;
++    case GLFW_PLATFORM_WAYLAND: platform = " (wayland)"; break;
++    case GLFW_PLATFORM_WIN32:   platform = " (win32)"; break;
++    default:                    platform = " (not initialised)"; break;
++    }
++#endif
++    std::snprintf(buf, sizeof(buf), "GLFW %d.%d.%d%s", major, minor, rev, platform);
++    return buf;
++}
++
++bool GlfwPlatform::init(const char* title, int width, int height, ContextKind kind)
++{
++    glfwSetErrorCallback(glfw_error_callback);
++
++    if (!glfwInit())
++    {
++        std::fprintf(stderr, "glfwInit() failed\n");
++        return false;
++    }
++
++    if (kind == ContextKind::OpenGLES3)
++    {
++        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
++        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
++        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
++    }
++    else /* ContextKind::OpenGL: no version/profile hint -> legacy context. */
++    {
++        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
++    }
++    /* GLFW_DOUBLEBUFFER defaults to true and GLFW_SRGB_CAPABLE defaults to
++     * false; both already match what the SDL platforms request explicitly,
++     * so nothing more to set here. */
++
++    m_window = glfwCreateWindow(width, height, title, nullptr, nullptr);
++    if (m_window == nullptr)
++    {
++        std::fprintf(stderr, "glfwCreateWindow() failed\n");
++        return false;
++    }
++
++    glfwMakeContextCurrent(m_window);
++    glfwSwapInterval(1); /* best-effort vsync */
++
++    std::fprintf(stderr, "[platform] %s\n", name());
++    return true;
++}
++
++void GlfwPlatform::shutdown()
++{
++    /* Defensive: an ImGui platform backend still bound to m_window must go
++     * first, in case a caller skipped the normal shutdown_imgui() step. */
++    if (m_imgui_initialized)
++        shutdown_imgui();
++
++    if (m_window != nullptr)
++    {
++        glfwDestroyWindow(m_window);
++        m_window = nullptr;
++    }
++    glfwTerminate(); /* safe even if glfwInit() was never called or already terminated */
++}
++
++bool GlfwPlatform::init_imgui()
++{
++    if (!ImGui_ImplGlfw_InitForOpenGL(m_window, true /* install_callbacks */))
++    {
++        std::fprintf(stderr, "Error: ImGui_ImplGlfw_InitForOpenGL() failed\n");
++        return false;
++    }
++    m_imgui_initialized = true;
++    return true;
++}
++
++void GlfwPlatform::shutdown_imgui()
++{
++    if (!m_imgui_initialized)
++        return;
++    ImGui_ImplGlfw_Shutdown();
++    m_imgui_initialized = false;
++}
++
++void GlfwPlatform::new_frame()
++{
++    ImGui_ImplGlfw_NewFrame();
++}
++
++bool GlfwPlatform::pump_events(int timeout_ms)
++{
++#if IMTUBE_GLFW_VERSION >= 3200
++    if (timeout_ms > 0)
++        glfwWaitEventsTimeout(timeout_ms / 1000.0);
++    else
++        glfwPollEvents();
++#else
++    (void)timeout_ms; /* GLFW < 3.2 has no wait-with-timeout; busy-poll instead */
++    glfwPollEvents();
++#endif
++
++    return !(glfwWindowShouldClose(m_window) || m_quit_requested);
++}
++
++void GlfwPlatform::swap_buffers()
++{
++    if (m_window != nullptr)
++        glfwSwapBuffers(m_window);
++}
++
++void GlfwPlatform::request_quit()
++{
++    m_quit_requested = true;
++    if (m_window != nullptr)
++        glfwSetWindowShouldClose(m_window, GLFW_TRUE);
++#if IMTUBE_GLFW_VERSION >= 3100
++    glfwPostEmptyEvent(); /* wakes a thread blocked in glfwWaitEventsTimeout() */
++#endif
++}
++
++void GlfwPlatform::set_fullscreen(bool on)
++{
++    if (m_window == nullptr)
++        return;
++
++#if IMTUBE_GLFW_VERSION >= 3200
++    if (on == is_fullscreen())
++        return;
++
++    if (on)
++    {
++        glfwGetWindowPos(m_window, &m_windowed_x, &m_windowed_y);
++        glfwGetWindowSize(m_window, &m_windowed_w, &m_windowed_h);
++
++        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
++        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
++        glfwSetWindowMonitor(m_window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
++    }
++    else
++    {
++        glfwSetWindowMonitor(m_window, nullptr, m_windowed_x, m_windowed_y,
++                              m_windowed_w, m_windowed_h, 0);
++    }
++#else
++    (void)on;
++    if (!m_fullscreen_warned)
++    {
++        std::fprintf(stderr, "[glfw] fullscreen toggle requires GLFW 3.2+ (running %s); ignoring\n", name());
++        m_fullscreen_warned = true;
++    }
++#endif
++}
++
++bool GlfwPlatform::is_fullscreen() const
++{
++    if (m_window == nullptr)
++        return false;
++    return glfwGetWindowMonitor(m_window) != nullptr;
++}
++
++void GlfwPlatform::set_title(const char* title)
++{
++    if (m_window != nullptr)
++        glfwSetWindowTitle(m_window, title);
++}
++
++void GlfwPlatform::get_window_pos(int* x, int* y) const
++{
++    if (m_window != nullptr)
++        glfwGetWindowPos(m_window, x, y);
++}
++
++void GlfwPlatform::get_window_size(int* w, int* h) const
++{
++    if (m_window != nullptr)
++        glfwGetWindowSize(m_window, w, h);
++}
++
++void GlfwPlatform::get_framebuffer_size(int* w, int* h) const
++{
++    if (m_window != nullptr)
++        glfwGetFramebufferSize(m_window, w, h);
++}
++
++void* GlfwPlatform::native_window() const
++{
++    return m_window;
++}
++
++} /* namespace imtube */
+diff --git a/src/platform/GlfwPlatform.h b/src/platform/GlfwPlatform.h
+new file mode 100644
+index 0000000..595881e
+--- /dev/null
++++ b/src/platform/GlfwPlatform.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++/* GLFW windowing platform (CMake IMTUBE_PLATFORM=glfw), the alternative to
++ * SDL2 for the same legacy-OpenGL path. The PowerPC MacPorts tree carries a
++ * current GLFW (3.5.x, Cocoa), which has everything used here; the code
++ * still compiles against GLFW 3.0 because a handful of calls only exist from
++ * 3.1 or 3.2 onward (glfwPostEmptyEvent, glfwWaitEventsTimeout,
++ * glfwSetWindowMonitor): GlfwPlatform.cpp guards those behind a
++ * compile-time version check and degrades gracefully (poll instead of
++ * wait-with-timeout; no fullscreen toggle) on an older library. */
++
++#include "platform/Platform.h"
++
++#include <GLFW/glfw3.h>
++
++namespace imtube {
++
++class GlfwPlatform : public Platform {
++public:
++    GlfwPlatform() = default;
++    ~GlfwPlatform() override { shutdown(); }
++
++    GlfwPlatform(const GlfwPlatform&) = delete;
++    GlfwPlatform& operator=(const GlfwPlatform&) = delete;
++
++    const char* name() const override;
++
++    bool init(const char* title, int width, int height, ContextKind kind) override;
++    void shutdown() override;
++
++    bool init_imgui() override;
++    void shutdown_imgui() override;
++    void new_frame() override;
++
++    bool pump_events(int timeout_ms) override;
++    void swap_buffers() override;
++    void request_quit() override;
++
++    void set_fullscreen(bool on) override;
++    bool is_fullscreen() const override;
++
++    void set_title(const char* title) override;
++
++    void get_window_pos(int* x, int* y) const override;
++    void get_window_size(int* w, int* h) const override;
++    void get_framebuffer_size(int* w, int* h) const override;
++
++    void* native_window() const override;
++
++private:
++    GLFWwindow* m_window = nullptr;
++    bool m_imgui_initialized = false;
++    bool m_quit_requested = false;
++
++    /* Windowed geometry saved on entering fullscreen and restored on
++     * leaving it (GLFW models fullscreen as "the window now occupies a
++     * monitor"; there is no separate borderless-window state to fall back
++     * to, so the caller - us - has to remember where the window was). */
++    int m_windowed_x = 0;
++    int m_windowed_y = 0;
++    int m_windowed_w = 0;
++    int m_windowed_h = 0;
++
++    /* Print the "GLFW is too old for fullscreen" note only once. */
++    bool m_fullscreen_warned = false;
++};
++
++} /* namespace imtube */
+diff --git a/src/platform/Platform.h b/src/platform/Platform.h
+new file mode 100644
+index 0000000..93d7d35
+--- /dev/null
++++ b/src/platform/Platform.h
+@@ -0,0 +1,88 @@
++#pragma once
++
++#include <memory>
++
++namespace imtube {
++
++/* Which kind of drawing surface the renderer needs the platform to create. */
++enum class ContextKind {
++    OpenGL,     /* legacy desktop OpenGL: no version/profile request, fixed function is enough */
++    OpenGLES3   /* OpenGL ES 3.2 (GlesContext) */
++};
++
++/* Windowing layer: window, input events, GL context and the Dear ImGui
++ * *platform* backend (ImGui_ImplSDL2/SDL3/Glfw). The rendering backend
++ * (RenderBackend) never talks to the windowing library except through this
++ * interface, so SDL2, SDL3 and GLFW are interchangeable at build time
++ * (CMake: IMTUBE_PLATFORM=sdl2|sdl3|glfw).
++ *
++ * Lifecycle, driven by App:
++ *   1. init(title, w, h, kind)      window (+ GL context made current for GL kinds)
++ *   2. RenderBackend::init(*this)
++ *   3. ImGui::CreateContext()
++ *   4. init_imgui()                 ImGui platform backend
++ *   5. RenderBackend::init_imgui()
++ *   6. per frame: pump_events() -> RenderBackend::new_frame() -> new_frame()
++ *                 -> ImGui::NewFrame() ... ImGui::Render()
++ *                 -> RenderBackend::render() -> RenderBackend::present() -> swap_buffers()
++ *   7. RenderBackend::shutdown() -> shutdown_imgui() -> ImGui::DestroyContext() -> shutdown()
++ *
++ * All functions are main-thread only. */
++class Platform {
++public:
++    virtual ~Platform() = default;
++
++    /* Human-readable name with the runtime library version and, once init()
++     * has run, the video driver / windowing platform in use, e.g.
++     * "SDL 2.30.9 (cocoa)". The driver is what decides which GL library owns
++     * the context, so it is part of every diagnostic line. */
++    virtual const char* name() const = 0;
++
++    /* Create the window and the GL context of the requested kind, and make
++     * the context current on the calling thread (vsync requested best-effort). */
++    virtual bool init(const char* title, int width, int height, ContextKind kind) = 0;
++
++    /* Destroy the GL context and window and quit the library. Idempotent. */
++    virtual void shutdown() = 0;
++
++    /* ImGui platform backend. Call after ImGui::CreateContext(). */
++    virtual bool init_imgui() = 0;
++    virtual void shutdown_imgui() = 0;
++
++    /* ImGui platform NewFrame (ImGui_ImplXXX_NewFrame()). */
++    virtual void new_frame() = 0;
++
++    /* Wait up to timeout_ms for input (0 = just poll), then process every
++     * pending event, feeding them to the ImGui platform backend. Returns false
++     * once the user asked to quit (window close button or request_quit()). */
++    virtual bool pump_events(int timeout_ms) = 0;
++
++    /* Present the GL back buffer. */
++    virtual void swap_buffers() = 0;
++
++    /* Make the next pump_events() return false (and wake it if waiting). */
++    virtual void request_quit() = 0;
++
++    /* Borderless fullscreen on the window's display. */
++    virtual void set_fullscreen(bool on) = 0;
++    virtual bool is_fullscreen() const = 0;
++
++    virtual void set_title(const char* title) = 0;
++
++    /* Window position/size in screen coordinates (debug geometry dumps). */
++    virtual void get_window_pos(int* x, int* y) const = 0;
++    virtual void get_window_size(int* w, int* h) const = 0;
++
++    /* Drawable size in pixels (swapchain recreation). */
++    virtual void get_framebuffer_size(int* w, int* h) const = 0;
++
++    /* Native window handle (SDL_Window* or GLFWwindow*) for code that must
++     * talk to the windowing library directly. No current renderer needs it. */
++    virtual void* native_window() const = 0;
++};
++
++/* Creates the compile-time-selected platform (SdlPlatform unless
++ * IMTUBE_PLATFORM_GLFW is defined). Defined in App.cpp. */
++std::unique_ptr<Platform> create_platform();
++
++} /* namespace imtube */
+diff --git a/src/platform/SdlPlatform.cpp b/src/platform/SdlPlatform.cpp
+new file mode 100644
+index 0000000..02ca4c0
+--- /dev/null
++++ b/src/platform/SdlPlatform.cpp
+@@ -0,0 +1,343 @@
++#include "platform/SdlPlatform.h"
++
++#if defined(IMTUBE_PLATFORM_SDL2)
++#include "imgui_impl_sdl2.h"
++#elif defined(IMTUBE_PLATFORM_SDL3)
++#include "imgui_impl_sdl3.h"
++#endif
++
++#include <cstdio>
++#include <cstring>
++
++namespace imtube {
++
++namespace {
++
++/* ---- the handful of spots where SDL2 and SDL3 disagree ----------------
++ * Everything else below (attribute setting, window pos/size queries, GL
++ * swap, title, fullscreen-flag test, ...) has an identical signature and
++ * meaning in both libraries and is called directly, without a wrapper. */
++
++#if defined(IMTUBE_PLATFORM_SDL2)
++
++/* SDL2: SDL_CreateWindow(title, x, y, w, h, flags); flags is Uint32. */
++SDL_Window* create_window(const char* title, int w, int h, Uint32 flags)
++{
++    return SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
++}
++
++/* SDL2: 0 on success. */
++bool gl_make_current(SDL_Window* window, SDL_GLContext ctx)
++{
++    return SDL_GL_MakeCurrent(window, ctx) == 0;
++}
++
++void gl_destroy_context(SDL_GLContext ctx)
++{
++    SDL_GL_DeleteContext(ctx);
++}
++
++/* SDL2 has no borderless-fullscreen bit of its own; FULLSCREEN_DESKTOP is
++ * SDL2's non-video-mode-switching fullscreen and is what we want here. */
++void set_window_fullscreen(SDL_Window* window, bool on)
++{
++    SDL_SetWindowFullscreen(window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
++}
++
++void get_drawable_size(SDL_Window* window, int* w, int* h)
++{
++    SDL_GL_GetDrawableSize(window, w, h);
++}
++
++bool imgui_init_for_opengl(SDL_Window* window, SDL_GLContext ctx)
++{
++    return ImGui_ImplSDL2_InitForOpenGL(window, ctx);
++}
++
++void imgui_shutdown() { ImGui_ImplSDL2_Shutdown(); }
++void imgui_new_frame() { ImGui_ImplSDL2_NewFrame(); }
++void imgui_process_event(const SDL_Event* event) { ImGui_ImplSDL2_ProcessEvent(event); }
++
++#else /* IMTUBE_PLATFORM_SDL3 */
++
++/* SDL3: SDL_CreateWindow(title, w, h, flags); no x/y (always centered by
++ * the window manager); flags is the wider SDL_WindowFlags. */
++SDL_Window* create_window(const char* title, int w, int h, SDL_WindowFlags flags)
++{
++    return SDL_CreateWindow(title, w, h, flags);
++}
++
++/* SDL3: true on success. */
++bool gl_make_current(SDL_Window* window, SDL_GLContext ctx)
++{
++    return SDL_GL_MakeCurrent(window, ctx);
++}
++
++void gl_destroy_context(SDL_GLContext ctx)
++{
++    SDL_GL_DestroyContext(ctx);
++}
++
++/* SDL3 folded FULLSCREEN_DESKTOP into a plain bool: there is only one
++ * fullscreen mode and the window manager decides how it looks. */
++void set_window_fullscreen(SDL_Window* window, bool on)
++{
++    SDL_SetWindowFullscreen(window, on);
++}
++
++void get_drawable_size(SDL_Window* window, int* w, int* h)
++{
++    SDL_GetWindowSizeInPixels(window, w, h);
++}
++
++bool imgui_init_for_opengl(SDL_Window* window, SDL_GLContext ctx)
++{
++    return ImGui_ImplSDL3_InitForOpenGL(window, ctx);
++}
++
++void imgui_shutdown() { ImGui_ImplSDL3_Shutdown(); }
++void imgui_new_frame() { ImGui_ImplSDL3_NewFrame(); }
++void imgui_process_event(const SDL_Event* event) { ImGui_ImplSDL3_ProcessEvent(event); }
++
++#endif
++
++} /* namespace */
++
++const char* SdlPlatform::name() const
++{
++    static char buf[64];
++    /* The video driver (cocoa, x11, wayland, ...) decides which GL library
++     * owns the context, so it belongs in every diagnostic line. Null until
++     * SDL_Init(); same call in SDL2 and SDL3. */
++    const char* driver = SDL_GetCurrentVideoDriver();
++#if defined(IMTUBE_PLATFORM_SDL2)
++    SDL_version v;
++    SDL_GetVersion(&v);
++    std::snprintf(buf, sizeof(buf), "SDL %d.%d.%d (%s)", v.major, v.minor, v.patch,
++                  driver != nullptr ? driver : "no video driver");
++#else
++    const int v = SDL_GetVersion();
++    std::snprintf(buf, sizeof(buf), "SDL %d.%d.%d (%s)",
++                  SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v),
++                  driver != nullptr ? driver : "no video driver");
++#endif
++    return buf;
++}
++
++bool SdlPlatform::init(const char* title, int width, int height, ContextKind kind)
++{
++#if defined(IMTUBE_PLATFORM_SDL2)
++    if (SDL_Init(SDL_INIT_VIDEO) != 0)
++#else
++    if (!SDL_Init(SDL_INIT_VIDEO))
++#endif
++    {
++        std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
++        return false;
++    }
++    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
++
++    /* GL attributes must be requested before SDL_CreateWindow(); both
++     * libraries share this attribute set/enum, only the SRGB hint differs. */
++    if (kind == ContextKind::OpenGLES3)
++    {
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
++    }
++    /* ContextKind::OpenGL: no version/profile request at all, which is what
++     * yields the legacy desktop context on Mac OS X 10.4-10.5 (and a
++     * compatibility context elsewhere). */
++
++    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++
++    /* ImGui writes already-sRGB-encoded colours; a linear (non-sRGB) default
++     * framebuffer is required or the GPU re-encodes on write and visibly
++     * brightens the whole UI. */
++    SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, 0);
++#if defined(IMTUBE_PLATFORM_SDL3)
++    SDL_SetHint(SDL_HINT_OPENGL_FORCE_SRGB_FRAMEBUFFER, "0"); /* no SDL2 equivalent */
++#endif
++
++#if defined(IMTUBE_PLATFORM_SDL2)
++    const Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
++#else
++    const SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
++#endif
++
++    m_window = create_window(title, width, height, flags);
++    if (m_window == nullptr)
++    {
++        std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
++        return false;
++    }
++
++    m_gl_context = SDL_GL_CreateContext(m_window);
++    if (m_gl_context == nullptr)
++    {
++        std::fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError());
++        return false;
++    }
++    if (!gl_make_current(m_window, m_gl_context))
++    {
++        std::fprintf(stderr, "SDL_GL_MakeCurrent: %s\n", SDL_GetError());
++        return false;
++    }
++    SDL_GL_SetSwapInterval(1); /* best-effort vsync; ignore failure */
++
++    std::fprintf(stderr, "[platform] %s\n", name());
++    return true;
++}
++
++void SdlPlatform::shutdown()
++{
++    /* Defensive: an ImGui platform backend still bound to m_window must go
++     * first, in case a caller skipped the normal shutdown_imgui() step. */
++    if (m_imgui_initialized)
++        shutdown_imgui();
++
++    if (m_gl_context != nullptr)
++    {
++        gl_destroy_context(m_gl_context);
++        m_gl_context = nullptr;
++    }
++    if (m_window != nullptr)
++    {
++        SDL_DestroyWindow(m_window);
++        m_window = nullptr;
++    }
++    SDL_Quit(); /* safe even if SDL_Init() was never called or already quit */
++}
++
++bool SdlPlatform::init_imgui()
++{
++    if (m_window == nullptr || m_gl_context == nullptr)
++        return false;
++
++    if (!imgui_init_for_opengl(m_window, m_gl_context))
++    {
++        std::fprintf(stderr, "Error: ImGui SDL platform backend init failed\n");
++        return false;
++    }
++    m_imgui_initialized = true;
++    return true;
++}
++
++void SdlPlatform::shutdown_imgui()
++{
++    if (!m_imgui_initialized)
++        return;
++    imgui_shutdown();
++    m_imgui_initialized = false;
++}
++
++void SdlPlatform::new_frame()
++{
++    imgui_new_frame();
++}
++
++void SdlPlatform::process_event(const SDL_Event& event)
++{
++    imgui_process_event(&event);
++
++#if defined(IMTUBE_PLATFORM_SDL2)
++    if (event.type == SDL_QUIT)
++        m_quit_requested = true;
++    else if (event.type == SDL_WINDOWEVENT &&
++             event.window.event == SDL_WINDOWEVENT_CLOSE &&
++             event.window.windowID == SDL_GetWindowID(m_window))
++        m_quit_requested = true;
++#else
++    if (event.type == SDL_EVENT_QUIT)
++        m_quit_requested = true;
++    else if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
++             event.window.windowID == SDL_GetWindowID(m_window))
++        m_quit_requested = true;
++#endif
++}
++
++bool SdlPlatform::pump_events(int timeout_ms)
++{
++    SDL_Event event;
++
++    /* SDL_WaitEventTimeout returns non-zero/true when it dequeued an event
++     * (int 1 in SDL2, bool true in SDL3 - both truthy here); a plain
++     * timeout returns zero/false and event is left untouched. */
++    if (timeout_ms > 0 && SDL_WaitEventTimeout(&event, timeout_ms))
++        process_event(event);
++
++    while (SDL_PollEvent(&event))
++        process_event(event);
++
++    return !m_quit_requested;
++}
++
++void SdlPlatform::swap_buffers()
++{
++    if (m_window != nullptr)
++        SDL_GL_SwapWindow(m_window);
++}
++
++void SdlPlatform::request_quit()
++{
++    m_quit_requested = true;
++
++    /* Push a quit event so a thread blocked in SDL_WaitEventTimeout() (in
++     * pump_events()) wakes up immediately instead of waiting out the
++     * timeout. */
++    SDL_Event event;
++    std::memset(&event, 0, sizeof(event));
++#if defined(IMTUBE_PLATFORM_SDL2)
++    event.type = SDL_QUIT;
++#else
++    event.type = SDL_EVENT_QUIT;
++#endif
++    SDL_PushEvent(&event);
++}
++
++void SdlPlatform::set_fullscreen(bool on)
++{
++    if (m_window != nullptr)
++        set_window_fullscreen(m_window, on);
++}
++
++bool SdlPlatform::is_fullscreen() const
++{
++    if (m_window == nullptr)
++        return false;
++    /* SDL_WINDOW_FULLSCREEN_DESKTOP (SDL2) always carries the plain
++     * SDL_WINDOW_FULLSCREEN bit too, so this single test works for both
++     * libraries and both of SDL2's fullscreen styles. */
++    return (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
++}
++
++void SdlPlatform::set_title(const char* title)
++{
++    if (m_window != nullptr)
++        SDL_SetWindowTitle(m_window, title);
++}
++
++void SdlPlatform::get_window_pos(int* x, int* y) const
++{
++    if (m_window != nullptr)
++        SDL_GetWindowPosition(m_window, x, y);
++}
++
++void SdlPlatform::get_window_size(int* w, int* h) const
++{
++    if (m_window != nullptr)
++        SDL_GetWindowSize(m_window, w, h);
++}
++
++void SdlPlatform::get_framebuffer_size(int* w, int* h) const
++{
++    if (m_window != nullptr)
++        get_drawable_size(m_window, w, h);
++}
++
++void* SdlPlatform::native_window() const
++{
++    return m_window;
++}
++
++} /* namespace imtube */
+diff --git a/src/platform/SdlPlatform.h b/src/platform/SdlPlatform.h
+new file mode 100644
+index 0000000..205ee86
+--- /dev/null
++++ b/src/platform/SdlPlatform.h
+@@ -0,0 +1,71 @@
++#pragma once
++
++/* SDL windowing platform (CMake IMTUBE_PLATFORM=sdl2|sdl3).
++ *
++ * One source serves both SDL generations; the build defines exactly one of
++ *   IMTUBE_PLATFORM_SDL2  ->  #include <SDL.h>,      links libSDL2
++ *   IMTUBE_PLATFORM_SDL3  ->  #include <SDL3/SDL.h>, links libSDL3
++ * The two libraries disagree on a handful of return-value conventions and a
++ * few call shapes (SDL_Init: int 0-success vs. bool; SDL_CreateWindow's
++ * parameter list; SDL2's umbrella SDL_WINDOWEVENT vs. SDL3's flat
++ * SDL_EVENT_WINDOW_*; ...). SdlPlatform.cpp keeps every such difference
++ * behind small #if blocks or tiny static helper functions so the shared
++ * control flow (init order, event pump, shutdown order) is written once.
++ * SDL2 is the primary target: it is what runs on PowerPC Macs on 10.4/10.5. */
++
++#include "platform/Platform.h"
++
++#if defined(IMTUBE_PLATFORM_SDL2)
++#include <SDL.h>
++#elif defined(IMTUBE_PLATFORM_SDL3)
++#include <SDL3/SDL.h>
++#else
++#error "SdlPlatform.h requires IMTUBE_PLATFORM_SDL2 or IMTUBE_PLATFORM_SDL3 to be defined"
++#endif
++
++namespace imtube {
++
++class SdlPlatform : public Platform {
++public:
++    SdlPlatform() = default;
++    ~SdlPlatform() override { shutdown(); }
++
++    SdlPlatform(const SdlPlatform&) = delete;
++    SdlPlatform& operator=(const SdlPlatform&) = delete;
++
++    const char* name() const override;
++
++    bool init(const char* title, int width, int height, ContextKind kind) override;
++    void shutdown() override;
++
++    bool init_imgui() override;
++    void shutdown_imgui() override;
++    void new_frame() override;
++
++    bool pump_events(int timeout_ms) override;
++    void swap_buffers() override;
++    void request_quit() override;
++
++    void set_fullscreen(bool on) override;
++    bool is_fullscreen() const override;
++
++    void set_title(const char* title) override;
++
++    void get_window_pos(int* x, int* y) const override;
++    void get_window_size(int* w, int* h) const override;
++    void get_framebuffer_size(int* w, int* h) const override;
++
++    void* native_window() const override;
++
++private:
++    /* Feed one SDL_Event to the ImGui platform backend and update
++     * m_quit_requested for a quit/close-button event. */
++    void process_event(const SDL_Event& event);
++
++    SDL_Window* m_window = nullptr;
++    SDL_GLContext m_gl_context = nullptr;
++    bool m_imgui_initialized = false;
++    bool m_quit_requested = false;
++};
++
++} /* namespace imtube */
+diff --git a/src/render/Gl2Context.cpp b/src/render/Gl2Context.cpp
+new file mode 100644
+index 0000000..c71fc5b
+--- /dev/null
++++ b/src/render/Gl2Context.cpp
+@@ -0,0 +1,149 @@
++#include "render/Gl2Context.h"
++
++#include "render/Gl2Texture.h"
++#include "render/GlHeaders.h"
++
++#include "imgui_impl_opengl2.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace imtube {
++
++namespace {
++
++/* True if `extensions` (a space-separated GL_EXTENSIONS string) contains
++ * `name` as a standalone token, not merely as a substring. A plain strstr()
++ * would also match a hypothetical longer extension that happens to start
++ * with the same characters (e.g. some future "GL_ARB_texture_non_power_of_
++ * two_ext"), so every candidate match is checked for a space or a string
++ * boundary on both sides before it counts. `extensions` may be null (some
++ * contexts return null instead of an empty string); that means "unknown", so
++ * treat it as not present. */
++bool has_extension_token(const char* extensions, const char* name)
++{
++    if (extensions == nullptr || name == nullptr || name[0] == '\0')
++        return false;
++
++    const size_t name_len = strlen(name);
++    const char* p = extensions;
++    for (;;)
++    {
++        const char* found = strstr(p, name);
++        if (found == nullptr)
++            return false;
++
++        const bool start_ok = (found == extensions) || (found[-1] == ' ');
++        const bool end_ok = (found[name_len] == '\0') || (found[name_len] == ' ');
++        if (start_ok && end_ok)
++            return true;
++
++        p = found + name_len;
++    }
++}
++
++} /* namespace */
++
++bool Gl2Context::init(Platform& platform)
++{
++    /* The platform already made the GL context current. GL_VERSION is never
++     * null on a current context, so a null here means the libGL this binary
++     * is linked against is not the one that owns the platform's context (the
++     * calls land in a library with no current context and every one of them
++     * silently fails). The classic case is macOS: the Cocoa driver's context
++     * belongs to the system OpenGL.framework, but a build that linked Mesa's
++     * X11 libGL (what find_package(OpenGL) returns under MacPorts' cmake once
++     * the mesa port is installed) prints "glGetString called without a
++     * rendering context" and shows a black window. Fail here with the
++     * explanation instead. */
++    const GLubyte* version_str = glGetString(GL_VERSION);
++    if (version_str == nullptr)
++    {
++        fprintf(stderr,
++                "Error: glGetString(GL_VERSION) returned NULL although %s created a GL context:\n"
++                "  the OpenGL library this binary is linked against is not the one behind that\n"
++                "  context. On macOS the Cocoa video driver needs the system OpenGL.framework\n"
++                "  (cmake -DIMTUBE_MACOS_GL=framework, the default); Mesa's X11 libGL only works\n"
++                "  with -DIMTUBE_MACOS_GL=x11 and SDL_VIDEODRIVER=x11 under XQuartz.\n",
++                platform.name());
++        return false;
++    }
++
++    const GLubyte* renderer_str = glGetString(GL_RENDERER);
++    const GLubyte* extensions_str = glGetString(GL_EXTENSIONS);
++
++    const char* renderer = renderer_str ? reinterpret_cast<const char*>(renderer_str) : "unknown renderer";
++    const char* version = reinterpret_cast<const char*>(version_str);
++    const char* extensions = extensions_str ? reinterpret_cast<const char*>(extensions_str) : nullptr;
++
++    GLint max_tex = 0;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
++    m_max_texture_size = max_tex > 0 ? (int)max_tex : 0;
++
++    /* Do not infer NPOT support from the GL version: GL 2.0 makes it
++     * mandatory on paper, but Apple's 10.4/10.5 drivers for the R300/NV3x
++     * generation (Radeon 9600/X800, GeForce FX) report 2.0 without listing
++     * GL_ARB_texture_non_power_of_two, and hardware without it would fall
++     * back to software rendering. The extension string is the signal that
++     * matches Apple's own capability tables. IMTUBE_GL_FORCE_POT forces the
++     * padded path for testing on capable hardware. */
++    m_npot = has_extension_token(extensions, "GL_ARB_texture_non_power_of_two");
++    if (getenv("IMTUBE_GL_FORCE_POT") != nullptr)
++        m_npot = false;
++
++    char line[256];
++    snprintf(line, sizeof(line), "%s, GL %s, max texture %d, NPOT %s",
++             renderer, version, m_max_texture_size, m_npot ? "yes" : "no");
++    m_description = line;
++    fprintf(stderr, "[gl2] %s\n", m_description.c_str());
++
++    m_initialized = true;
++    return true;
++}
++
++bool Gl2Context::init_imgui()
++{
++    if (!m_initialized)
++        return false;
++
++    if (!ImGui_ImplOpenGL2_Init())
++    {
++        fprintf(stderr, "Error: ImGui_ImplOpenGL2_Init() failed\n");
++        return false;
++    }
++    m_imgui_initialized = true;
++    return true;
++}
++
++void Gl2Context::shutdown()
++{
++    if (m_imgui_initialized)
++    {
++        ImGui_ImplOpenGL2_Shutdown();
++        m_imgui_initialized = false;
++    }
++    m_initialized = false;
++}
++
++void Gl2Context::new_frame()
++{
++    ImGui_ImplOpenGL2_NewFrame();
++}
++
++void Gl2Context::render(ImDrawData* draw_data)
++{
++    glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    /* imgui_impl_opengl2 sets its own viewport/scissor/ortho projection from
++     * draw_data, and legacy GL has no persistent shader/VAO state to restore
++     * around it, so there is nothing else to set up here. */
++    ImGui_ImplOpenGL2_RenderDrawData(draw_data);
++}
++
++std::unique_ptr<RenderTexture> Gl2Context::create_texture(int width, int height)
++{
++    return std::make_unique<Gl2Texture>(width, height, /*pad_to_pot=*/!m_npot, m_max_texture_size);
++}
++
++} /* namespace imtube */
+diff --git a/src/render/Gl2Context.h b/src/render/Gl2Context.h
+new file mode 100644
+index 0000000..5efaacf
+--- /dev/null
++++ b/src/render/Gl2Context.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include "render/RenderBackend.h"
++
++#include <string>
++
++namespace imtube {
++
++class Gl2Texture;
++
++/* Legacy (fixed-function) OpenGL renderer backend for ImGui.
++ *
++ * Target: G4/G5 Power Macs running Mac OS X 10.4/10.5. Their GPUs span
++ * Rage 128, GeForce 2/4 MX and Radeon 7500/9200 (no shaders at all) up to
++ * Radeon 9600/X800 and GeForce FX/6800 (GLSL only via ARB extensions, and
++ * often no non-power-of-two textures, see Gl2Texture). The same code runs
++ * unmodified on Linux/Mesa and on any modern box handing out a legacy or
++ * compatibility GL context, so it is not exclusively a PowerPC code path.
++ *
++ * Fixed-function was chosen over the shader-based backend (GlesContext)
++ * because it is the one path every card in that range supports:
++ * imgui_impl_opengl2 draws with GL 1.1 client-side vertex arrays
++ * (glVertexPointer/glTexCoordPointer/glColorPointer), no VBOs, no shaders,
++ * no framebuffer objects. The UI is a few thousand vertices, so the cost of
++ * the legacy path is negligible. */
++class Gl2Context : public RenderBackend {
++public:
++    Gl2Context() = default;
++    ~Gl2Context() override { shutdown(); }
++
++    Gl2Context(const Gl2Context&) = delete;
++    Gl2Context& operator=(const Gl2Context&) = delete;
++
++    const char* name() const override { return "OpenGL (fixed function)"; }
++    const char* description() const override { return m_description.c_str(); }
++    ContextKind context_kind() const override { return ContextKind::OpenGL; }
++
++    bool init(Platform& platform) override;
++    bool init_imgui() override;
++    void shutdown() override;
++    bool is_initialized() const override { return m_initialized; }
++
++    void new_frame() override;
++    void render(ImDrawData* draw_data) override;
++
++    std::unique_ptr<RenderTexture> create_texture(int width, int height) override;
++    int max_texture_size() const override { return m_max_texture_size; }
++    PixelFormat preferred_video_format() const override { return PixelFormat::Packed32; }
++
++private:
++    std::string m_description;
++    int m_max_texture_size = 0;
++
++    /* True when GL_ARB_texture_non_power_of_two is present and
++     * IMTUBE_GL_FORCE_POT is not set; false (the safe default) otherwise.
++     * Passed to every Gl2Texture so it knows whether to pad allocations up to
++     * a power of two. */
++    bool m_npot = false;
++
++    bool m_initialized = false;
++    bool m_imgui_initialized = false;
++};
++
++} /* namespace imtube */
+diff --git a/src/render/Gl2Texture.cpp b/src/render/Gl2Texture.cpp
+new file mode 100644
+index 0000000..05499c4
+--- /dev/null
++++ b/src/render/Gl2Texture.cpp
+@@ -0,0 +1,130 @@
++#include "render/Gl2Texture.h"
++
++#include "render/GlHeaders.h"
++
++#include <cstdio>
++#include <vector>
++
++namespace imtube {
++
++namespace {
++
++/* Smallest power of two that is >= value, minimum 1. Legacy GL textures
++ * without GL_ARB_texture_non_power_of_two must have power-of-two width and
++ * height, so Gl2Texture rounds its allocation up to this when asked to. */
++int next_pow2(int value)
++{
++    if (value <= 1)
++        return 1;
++
++    int p = 1;
++    while (p < value)
++        p <<= 1;
++    return p;
++}
++
++} /* namespace */
++
++Gl2Texture::Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size)
++    : m_width(width), m_height(height)
++{
++    if (m_width <= 0 || m_height <= 0)
++    {
++        fprintf(stderr, "[gl2] texture: invalid size %dx%d\n", m_width, m_height);
++        return;
++    }
++
++    m_alloc_w = pad_to_pot ? next_pow2(m_width) : m_width;
++    m_alloc_h = pad_to_pot ? next_pow2(m_height) : m_height;
++
++    if (max_texture_size > 0 && (m_alloc_w > max_texture_size || m_alloc_h > max_texture_size))
++    {
++        fprintf(stderr, "[gl2] texture: %dx%d (allocation %dx%d) exceeds max texture size %d\n",
++                m_width, m_height, m_alloc_w, m_alloc_h, max_texture_size);
++        return;
++    }
++
++    glGenTextures(1, &m_texture);
++    if (m_texture == 0)
++    {
++        fprintf(stderr, "[gl2] texture: glGenTextures failed for %dx%d\n", m_width, m_height);
++        return;
++    }
++
++    glBindTexture(GL_TEXTURE_2D, m_texture);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++
++    if (m_alloc_w != m_width || m_alloc_h != m_height)
++    {
++        /* The padding strip is inside the sampled area: bilinear filtering
++         * blends into it right at the image's right/bottom edge. Zero it so
++         * that blend is black instead of whatever the driver left behind in
++         * freshly allocated GPU memory. */
++        std::vector<uint8_t> blank(static_cast<size_t>(m_alloc_w) * static_cast<size_t>(m_alloc_h) * 4, 0);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_alloc_w, m_alloc_h, 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, blank.data());
++    }
++    else
++    {
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, m_alloc_w, m_alloc_h, 0,
++                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    }
++
++    glBindTexture(GL_TEXTURE_2D, 0);
++}
++
++bool Gl2Texture::upload(const uint8_t* pixels, PixelFormat format)
++{
++    if (m_texture == 0 || pixels == nullptr)
++        return false;
++
++    glBindTexture(GL_TEXTURE_2D, m_texture);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++
++    /* Packed32 means GL_BGRA + GL_UNSIGNED_INT_8_8_8_8_REV: this is Apple's
++     * own documented no-swizzle upload path (their OpenGL driver's native
++     * pixel format), and it is exactly the byte layout GStreamer calls
++     * "ARGB" on the big-endian PowerPC target this backend exists for (see
++     * PixelFormat in RenderTexture.h) - so the decoder's output can be
++     * handed straight to glTexSubImage2D with no CPU-side channel swizzle. */
++    GLenum gl_format = GL_RGBA;
++    GLenum gl_type = GL_UNSIGNED_BYTE;
++    if (format == PixelFormat::Packed32)
++    {
++        gl_format = GL_BGRA;
++        gl_type = GL_UNSIGNED_INT_8_8_8_8_REV;
++    }
++
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, m_width, m_height, gl_format, gl_type, pixels);
++    glBindTexture(GL_TEXTURE_2D, 0);
++    return true;
++}
++
++ImVec2 Gl2Texture::uv1() const
++{
++    if (m_alloc_w <= 0 || m_alloc_h <= 0)
++        return ImVec2(1.0f, 1.0f);
++
++    return ImVec2(static_cast<float>(m_width) / static_cast<float>(m_alloc_w),
++                   static_cast<float>(m_height) / static_cast<float>(m_alloc_h));
++}
++
++void Gl2Texture::destroy()
++{
++    if (m_texture != 0)
++    {
++        glDeleteTextures(1, &m_texture);
++        m_texture = 0;
++    }
++    m_width = 0;
++    m_height = 0;
++    m_alloc_w = 0;
++    m_alloc_h = 0;
++}
++
++} /* namespace imtube */
+diff --git a/src/render/Gl2Texture.h b/src/render/Gl2Texture.h
+new file mode 100644
+index 0000000..d2536af
+--- /dev/null
++++ b/src/render/Gl2Texture.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include "render/RenderTexture.h"
++
++#include <cstdint>
++
++namespace imtube {
++
++/* A texture for the legacy (fixed-function) GL backend.
++ *
++ * Many drivers in the Gl2Context target range (see its header comment) have
++ * no non-power-of-two texture support, so this class can allocate a
++ * power-of-two-sized texture larger than the image and only sample the
++ * image's corner of it. Callers never see the allocation size: width()/
++ * height() report the image size, and uv1() gives the bottom-right texture
++ * coordinate to pass to ImGui so the padding never shows up on screen. */
++class Gl2Texture : public RenderTexture {
++public:
++    /* `pad_to_pot` requests power-of-two padding (Gl2Context sets it to true
++     * whenever the driver lacks GL_ARB_texture_non_power_of_two).
++     * `max_texture_size` is GL_MAX_TEXTURE_SIZE (0 = unknown/unchecked); the
++     * texture is left invalid if the allocation would exceed it. */
++    Gl2Texture(int width, int height, bool pad_to_pot, int max_texture_size);
++    ~Gl2Texture() override { destroy(); }
++
++    Gl2Texture(const Gl2Texture&) = delete;
++    Gl2Texture& operator=(const Gl2Texture&) = delete;
++
++    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) override;
++    bool valid() const override { return m_texture != 0; }
++    int width() const override { return m_width; }
++    int height() const override { return m_height; }
++    ImTextureID imgui_id() const override { return (ImTextureID)(intptr_t)m_texture; }
++    ImVec2 uv1() const override;
++
++private:
++    void destroy();
++
++    uint32_t m_texture = 0;
++    int m_width = 0;
++    int m_height = 0;
++
++    /* Allocation size: equal to width()/height() unless padded to a power of
++     * two. */
++    int m_alloc_w = 0;
++    int m_alloc_h = 0;
++};
++
++} /* namespace imtube */
+diff --git a/src/render/GlHeaders.h b/src/render/GlHeaders.h
+new file mode 100644
+index 0000000..cabe29c
+--- /dev/null
++++ b/src/render/GlHeaders.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++/* Desktop OpenGL declarations for the fixed-function backend (Gl2Context,
++ * Gl2Texture). Both .cpp files include this instead of a raw <GL/gl.h> so the
++ * platform #ifdef and the legacy-enum fallbacks live in exactly one place.
++ *
++ * Apple's OpenGL framework predates the Khronos GL/gl.h + GL/glext.h layout
++ * used everywhere else (Linux/Mesa) and ships its own headers instead. We
++ * only ever call GL 1.2 core entry points here (no VBOs, no shaders, no
++ * extension function pointers), so there is nothing to load: every symbol we
++ * use is exported directly by libGL / the OpenGL framework and declared by
++ * the platform's own gl.h. GL_GLEXT_PROTOTYPES is therefore not needed on
++ * Linux either. */
++/* On macOS the library we link decides the headers: the system
++ * OpenGL.framework (IMTUBE_MACOS_GL=framework, the default, matching the
++ * Cocoa video driver) or Mesa (IMTUBE_MACOS_GL=x11, which defines
++ * IMTUBE_GL_X11 and pairs with SDL_VIDEODRIVER=x11 under XQuartz). See
++ * cmake/ImTubeDeps.cmake. GL_SILENCE_DEPRECATION keeps the 10.14+ SDK
++ * headers from flagging every GL call. */
++#if defined(__APPLE__) && !defined(IMTUBE_GL_X11)
++#ifndef GL_SILENCE_DEPRECATION
++#define GL_SILENCE_DEPRECATION
++#endif
++#include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
++#else
++#include <GL/gl.h>
++#endif
++
++/* A handful of very old or minimal GL headers omit enums that every real
++ * driver still understands (they are core as of GL 1.2 / EXT_bgra). Define
++ * them ourselves if missing so this backend always builds; the values are
++ * fixed by the Khronos registry and never change. */
++#ifndef GL_BGRA
++#define GL_BGRA 0x80E1
++#endif
++
++#ifndef GL_UNSIGNED_INT_8_8_8_8_REV
++#define GL_UNSIGNED_INT_8_8_8_8_REV 0x8367
++#endif
++
++#ifndef GL_CLAMP_TO_EDGE
++#define GL_CLAMP_TO_EDGE 0x812F
++#endif
+diff --git a/src/render/GlesContext.cpp b/src/render/GlesContext.cpp
+index 106359f..4603c37 100644
+--- a/src/render/GlesContext.cpp
++++ b/src/render/GlesContext.cpp
+@@ -3,68 +3,36 @@
+ #include "render/GlesTexture.h"
+ 
+ #include "imgui_impl_opengl3.h"
+-#include "imgui_impl_sdl3.h"
++
++#include <GLES3/gl3.h>
+ 
+ #include <cstdio>
+ 
+ namespace imtube {
+ 
+-void GlesContext::prepare_window()
++bool GlesContext::init(Platform& platform)
+ {
+-    /* Request an OpenGL ES 3.x context (supports the GLES3 core profile used by
+-     * imgui_impl_opengl3). SDL3 must see these attributes before the window is
+-     * created, so this runs ahead of SDL_CreateWindow(). */
+-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+-
+-    /* ImGui writes colours that are already sRGB-encoded, so the default
+-     * framebuffer must be a plain (linear) RGB buffer. SDL3's default of
+-     * SDL_GL_FRAMEBUFFER_SRGB_CAPABLE=-1 is treated as "request sRGB" by the
+-     * X11 backend, which makes the GPU re-encode every pixel on write and
+-     * visibly brightens the whole UI. Force a non-sRGB config. */
+-    SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, 0);
+-    SDL_SetHint(SDL_HINT_OPENGL_FORCE_SRGB_FRAMEBUFFER, "0");
+-}
++    (void)platform; /* the platform already made the ES 3.2 context current */
+ 
+-bool GlesContext::init(SDL_Window* window)
+-{
+-    if (window == nullptr)
+-        return false;
++    const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
++    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
++    GLint max_tex = 0;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
++    m_max_texture_size = max_tex > 0 ? (int)max_tex : 0;
+ 
+-    m_gl_context = SDL_GL_CreateContext(window);
+-    if (m_gl_context == nullptr)
+-    {
+-        fprintf(stderr, "Error: SDL_GL_CreateContext(): %s\n", SDL_GetError());
+-        return false;
+-    }
+-    if (!SDL_GL_MakeCurrent(window, m_gl_context))
+-    {
+-        fprintf(stderr, "Error: SDL_GL_MakeCurrent(): %s\n", SDL_GetError());
+-        SDL_GL_DestroyContext(m_gl_context);
+-        m_gl_context = nullptr;
+-        return false;
+-    }
++    m_description = std::string(renderer ? renderer : "unknown renderer") + ", " +
++                    (version ? version : "unknown version");
++    fprintf(stderr, "[gles] %s, max texture %d\n", m_description.c_str(), m_max_texture_size);
+ 
+-    /* Best-effort vsync; not all drivers support it. */
+-    SDL_GL_SetSwapInterval(1);
+-
+-    m_window = window;
+     m_initialized = true;
+     return true;
+ }
+ 
+-bool GlesContext::init_imgui(SDL_Window* window)
++bool GlesContext::init_imgui()
+ {
+     if (!m_initialized)
+         return false;
+ 
+-    if (!ImGui_ImplSDL3_InitForOpenGL(window, m_gl_context))
+-    {
+-        fprintf(stderr, "Error: ImGui_ImplSDL3_InitForOpenGL() failed\n");
+-        return false;
+-    }
+     if (!ImGui_ImplOpenGL3_Init("#version 300 es"))
+     {
+         fprintf(stderr, "Error: ImGui_ImplOpenGL3_Init() failed\n");
+@@ -79,15 +47,8 @@ void GlesContext::shutdown()
+     if (m_imgui_initialized)
+     {
+         ImGui_ImplOpenGL3_Shutdown();
+-        ImGui_ImplSDL3_Shutdown();
+         m_imgui_initialized = false;
+     }
+-    if (m_gl_context != nullptr)
+-    {
+-        SDL_GL_DestroyContext(m_gl_context);
+-        m_gl_context = nullptr;
+-    }
+-    m_window = nullptr;
+     m_initialized = false;
+ }
+ 
+@@ -101,12 +62,6 @@ void GlesContext::render(ImDrawData* draw_data)
+     ImGui_ImplOpenGL3_RenderDrawData(draw_data);
+ }
+ 
+-void GlesContext::present()
+-{
+-    if (m_window != nullptr)
+-        SDL_GL_SwapWindow(m_window);
+-}
+-
+ std::unique_ptr<RenderTexture> GlesContext::create_texture(int width, int height)
+ {
+     return std::make_unique<GlesTexture>(width, height);
+diff --git a/src/render/GlesContext.h b/src/render/GlesContext.h
+index 3842bde..cb83fc8 100644
+--- a/src/render/GlesContext.h
++++ b/src/render/GlesContext.h
+@@ -2,18 +2,19 @@
+ 
+ #include "render/RenderBackend.h"
+ 
+-#include <SDL3/SDL.h>
++#include <string>
+ 
+ namespace imtube {
+ 
+ class GlesTexture;
+ 
+-/* OpenGL ES 3.2 renderer backend for ImGui, driven through SDL (which manages
+- * the EGL context on both PC/Mesa and STM32MPU/gcnano).
++/* OpenGL ES 3.2 renderer backend for ImGui. The Platform (SDL3) creates the
++ * EGL context on both PC/Mesa and STM32MPU/gcnano; this class only owns the
++ * ImGui GL3 renderer backend and the textures.
+  *
+- * This is the default backend because GLES is the one graphics API guaranteed
+- * to work on both a regular Linux PC and the STM32MPU's VeriSilicon GPU.
+- */
++ * This is the default backend on Linux because GLES is the one graphics API
++ * guaranteed to work on both a regular Linux PC and the STM32MPU's VeriSilicon
++ * GPU. Legacy desktop GL (Gl2Context) is the choice for old Macs. */
+ class GlesContext : public RenderBackend {
+ public:
+     GlesContext() = default;
+@@ -23,24 +24,23 @@ public:
+     GlesContext& operator=(const GlesContext&) = delete;
+ 
+     const char* name() const override { return "OpenGL ES 3.2"; }
++    const char* description() const override { return m_description.c_str(); }
++    ContextKind context_kind() const override { return ContextKind::OpenGLES3; }
+ 
+-    SDL_WindowFlags window_flags() const override { return SDL_WINDOW_OPENGL; }
+-
+-    void prepare_window() override;
+-    bool init(SDL_Window* window) override;
+-    bool init_imgui(SDL_Window* window) override;
++    bool init(Platform& platform) override;
++    bool init_imgui() override;
+     void shutdown() override;
+     bool is_initialized() const override { return m_initialized; }
+ 
+     void new_frame() override;
+     void render(ImDrawData* draw_data) override;
+-    void present() override;
+ 
+     std::unique_ptr<RenderTexture> create_texture(int width, int height) override;
++    int max_texture_size() const override { return m_max_texture_size; }
+ 
+ private:
+-    SDL_Window* m_window = nullptr;
+-    SDL_GLContext m_gl_context = nullptr;
++    std::string m_description;
++    int m_max_texture_size = 0;
+     bool m_initialized = false;
+     bool m_imgui_initialized = false;
+ };
+diff --git a/src/render/GlesTexture.cpp b/src/render/GlesTexture.cpp
+index 9275303..bb7d54f 100644
+--- a/src/render/GlesTexture.cpp
++++ b/src/render/GlesTexture.cpp
+@@ -27,9 +27,11 @@ GlesTexture::GlesTexture(int width, int height)
+     glBindTexture(GL_TEXTURE_2D, 0);
+ }
+ 
+-bool GlesTexture::upload(const uint8_t* rgba_pixels)
++bool GlesTexture::upload(const uint8_t* rgba_pixels, PixelFormat format)
+ {
+-    if (m_texture == 0 || rgba_pixels == nullptr)
++    /* GLES has no GL_BGRA/8_8_8_8_REV upload path; only RGBA8 is accepted
++     * (and only ever requested: preferred_video_format() stays RGBA8). */
++    if (m_texture == 0 || rgba_pixels == nullptr || format != PixelFormat::RGBA8)
+         return false;
+ 
+     glBindTexture(GL_TEXTURE_2D, m_texture);
+diff --git a/src/render/GlesTexture.h b/src/render/GlesTexture.h
+index 501761a..56b2f2f 100644
+--- a/src/render/GlesTexture.h
++++ b/src/render/GlesTexture.h
+@@ -16,7 +16,7 @@ public:
+     GlesTexture(const GlesTexture&) = delete;
+     GlesTexture& operator=(const GlesTexture&) = delete;
+ 
+-    bool upload(const uint8_t* rgba_pixels) override;
++    bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) override;
+     bool valid() const override { return m_texture != 0; }
+     int width() const override { return m_width; }
+     int height() const override { return m_height; }
+diff --git a/src/render/RenderBackend.h b/src/render/RenderBackend.h
+index 7468ebd..2c7f78d 100644
+--- a/src/render/RenderBackend.h
++++ b/src/render/RenderBackend.h
+@@ -1,83 +1,91 @@
+ #pragma once
+ 
+-#include "imgui.h"
++#include "platform/Platform.h"
++#include "render/RenderTexture.h"
+ 
+-#include <SDL3/SDL.h>
++#include "imgui.h"
+ 
+ #include <cstdint>
+ #include <memory>
+ 
+ namespace imtube {
+ 
+-class RenderTexture;
+-
+ /* Backend-agnostic renderer interface. Everything lives on the render (main)
+- * thread, mirroring the single-threaded Vulkan-only flow the project started
+- * from.
++ * thread. The renderer never touches the windowing library: the Platform
++ * creates the window (and GL context) and owns the ImGui *platform* backend,
++ * the RenderBackend owns the ImGui *renderer* backend and the textures.
+  *
+  * Implementations:
+- *   * GlesContext   - OpenGL ES 3.2 via SDL (default; runs on any Linux PC and
+- *                     on the STM32MPU VeriSilicon GPU through OpenSTLinux).
+- *   * VulkanContext - Vulkan via SDL (optional, PC-focused backend).
++ *   * Gl2Context    - legacy OpenGL, fixed-function ImGui backend. Runs on any
++ *                     GL 1.1+ driver: G4/G5 Macs on 10.4-10.5, Mesa, modern GL.
++ *   * GlesContext   - OpenGL ES 3.2 (Linux PC and the STM32MPU GPU).
+  *
+- * Lifecycle driven by the App shell:
++ * Lifecycle driven by the App shell (see Platform.h for the full order):
+  *   1. create_render_backend()                  (compile-time choice)
+- *   2. backend->prepare_window()                before SDL_CreateWindow
+- *   3. backend->init(window)                    GPU context / swapchain
+- *   4. ImGui::CreateContext() + IO configuration
+- *   5. backend->init_imgui(window)              ImGui platform + renderer backends
+- *   6. per frame: new_frame() -> render() -> present()
+- *   7. backend->shutdown()                      release ImGui backends + GPU
++ *   2. platform.init(..., backend->context_kind())
++ *   3. backend->init(platform)                  GPU context / swapchain
++ *   4. ImGui::CreateContext() + platform.init_imgui()
++ *   5. backend->init_imgui()                    ImGui renderer backend
++ *   6. per frame: new_frame() -> render() -> present() -> platform.swap_buffers()
++ *   7. backend->shutdown()                      release ImGui renderer backend + GPU
+  */
+ class RenderBackend {
+ public:
+     virtual ~RenderBackend() = default;
+ 
+-    /* Human-readable backend name for logs and the About screen. */
++    /* Human-readable backend name for logs and the Settings screen. */
+     virtual const char* name() const = 0;
+ 
+-    /* Extra SDL_WindowFlags the window must be created with
+-     * (e.g. SDL_WINDOW_OPENGL). */
+-    virtual SDL_WindowFlags window_flags() const = 0;
++    /* Driver/GPU description for the Settings screen (e.g. GL_RENDERER and
++     * GL_VERSION). May be empty. Valid after init(). */
++    virtual const char* description() const { return ""; }
+ 
+-    /* Called before SDL_CreateWindow() so the backend can configure the window
+-     * (e.g. GL attributes). Default: nothing. */
+-    virtual void prepare_window() {}
++    /* What the platform must create before init(). */
++    virtual ContextKind context_kind() const = 0;
+ 
+-    /* Create the GPU context / swapchain for the window. Does not touch ImGui. */
+-    virtual bool init(SDL_Window* window) = 0;
++    /* Set up GPU resources. The platform has already made a GL context
++     * current. Does not touch ImGui. */
++    virtual bool init(Platform& platform) = 0;
+ 
+-    /* Initialize the ImGui platform + renderer backends. Must be called after
+-     * ImGui::CreateContext() and after init(). */
+-    virtual bool init_imgui(SDL_Window* window) = 0;
++    /* Initialize the ImGui renderer backend. Must be called after
++     * ImGui::CreateContext(), platform.init_imgui() and init(). */
++    virtual bool init_imgui() = 0;
+ 
+-    /* Tear the ImGui backends and the GPU context down. Idempotent. */
++    /* Tear the ImGui renderer backend and the GPU resources down. Idempotent. */
+     virtual void shutdown() = 0;
+ 
+     virtual bool is_initialized() const = 0;
+ 
+     /* True once the swapchain/backbuffer must be recreated at the current size. */
+     virtual bool needs_recreate() const { return false; }
+-    virtual void recreate(int width, int height) {}
++    virtual void recreate(int width, int height) { (void)width; (void)height; }
+ 
+-    /* ImGui renderer NewFrame, called before ImGui_ImplSDL3_NewFrame(). */
++    /* ImGui renderer NewFrame, called before the platform NewFrame. */
+     virtual void new_frame() = 0;
+ 
+     /* Render the ImGui draw data into the backbuffer. */
+     virtual void render(ImDrawData* draw_data) = 0;
+ 
+-    /* Present the backbuffer to the window. */
+-    virtual void present() = 0;
++    /* Submit and present the frame for backends that own presentation. GL
++     * backends do nothing here: the App calls Platform::swap_buffers() next. */
++    virtual void present() {}
+ 
+     /* Wait for pending GPU work (used during shutdown). */
+     virtual void wait_idle() {}
+ 
+-    /* Create a CPU->GPU RGBA8 texture. Render thread only. */
++    /* Create a CPU->GPU 32-bit texture of the given image size. Render thread only. */
+     virtual std::unique_ptr<RenderTexture> create_texture(int width, int height) = 0;
++
++    /* Largest texture width/height the GPU accepts; 0 = no known limit. The UI
++     * hands it to the player so decoded frames are scaled to fit. */
++    virtual int max_texture_size() const { return 0; }
++
++    /* Pixel layout the backend uploads fastest. The UI asks GStreamer for it. */
++    virtual PixelFormat preferred_video_format() const { return PixelFormat::RGBA8; }
+ };
+ 
+-/* Creates the compile-time-selected backend (GlesContext unless
+- * IMTUBE_RENDERER_VULKAN is defined). Defined in App.cpp. */
++/* Creates the compile-time-selected backend (IMTUBE_RENDERER_GL2 / _GLES).
++ * Defined in App.cpp. */
+ std::unique_ptr<RenderBackend> create_render_backend();
+ 
+ } /* namespace imtube */
+diff --git a/src/render/RenderTexture.h b/src/render/RenderTexture.h
+index c06da73..5e4649a 100644
+--- a/src/render/RenderTexture.h
++++ b/src/render/RenderTexture.h
+@@ -6,24 +6,61 @@
+ 
+ namespace imtube {
+ 
+-/* A sampled 2D RGBA8 texture renderable by the ImGui backend.
++/* True on big-endian hosts (PowerPC). Decides the byte order of Packed32. */
++#if defined(__BIG_ENDIAN__) || (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
++constexpr bool kHostBigEndian = true;
++#else
++constexpr bool kHostBigEndian = false;
++#endif
++
++/* Pixel layouts accepted by RenderTexture::upload(). Both are 4 bytes/pixel.
++ *
++ *  RGBA8    bytes in memory: R, G, B, A. What stb_image produces and what
++ *           GStreamer calls "RGBA". Every backend accepts it.
+  *
+- * imgui_id() is passed to ImGui::Image / ImDrawList::AddImage. Used for video
+- * frames and thumbnails. All functions must be called from the render thread.
+- */
++ *  Packed32 one native 32-bit word per pixel holding A:R:G:B from the most
++ *           significant byte down. This is OpenGL's GL_BGRA +
++ *           GL_UNSIGNED_INT_8_8_8_8_REV, the layout Apple's drivers upload
++ *           without a CPU swizzle pass. In memory it is B,G,R,A on
++ *           little-endian hosts (GStreamer "BGRA") and A,R,G,B on big-endian
++ *           hosts (GStreamer "ARGB"). Only request it for video frames when
++ *           RenderBackend::preferred_video_format() returns it. */
++enum class PixelFormat { RGBA8, Packed32 };
++
++/* GStreamer video/x-raw "format" name producing the given layout on this host. */
++inline const char* gst_format_name(PixelFormat fmt)
++{
++    if (fmt == PixelFormat::Packed32)
++        return kHostBigEndian ? "ARGB" : "BGRA";
++    return "RGBA";
++}
++
++/* A sampled 2D texture renderable by the ImGui backend.
++ *
++ * imgui_id() is passed to ImGui::Image / ImDrawList::AddImage, together with
++ * uv1() as the bottom-right texture coordinate. Used for video frames and
++ * thumbnails. All functions must be called from the render thread. */
+ class RenderTexture {
+ public:
+     virtual ~RenderTexture() = default;
+ 
+-    /* Upload full-frame RGBA8 pixels (width * height * 4 bytes). */
+-    virtual bool upload(const uint8_t* rgba_pixels) = 0;
++    /* Upload full-frame pixels (width * height * 4 bytes) in the given layout.
++     * RGBA8 must always work; Packed32 only when the backend prefers it. */
++    virtual bool upload(const uint8_t* pixels, PixelFormat format = PixelFormat::RGBA8) = 0;
+ 
+     virtual bool valid() const = 0;
++
++    /* Image size (not the size of a padded allocation). */
+     virtual int width() const = 0;
+     virtual int height() const = 0;
+ 
+     /* Opaque handle consumable by ImGui::Image / ImDrawList::AddImage. */
+     virtual ImTextureID imgui_id() const = 0;
++
++    /* Texture coordinate of the image's bottom-right corner: (1,1) unless the
++     * backend had to pad the allocation (power-of-two textures on legacy GL).
++     * Always pass it as uv1 when drawing the texture. */
++    virtual ImVec2 uv1() const { return ImVec2(1.0f, 1.0f); }
+ };
+ 
+ } /* namespace imtube */
+diff --git a/src/ui/ImTubeUI.cpp b/src/ui/ImTubeUI.cpp
+index e8f3087..323b913 100644
+--- a/src/ui/ImTubeUI.cpp
++++ b/src/ui/ImTubeUI.cpp
+@@ -4,7 +4,12 @@
+ 
+ #include "nlohmann/json.hpp"
+ 
+-#include <SDL3/SDL.h>
++#include "platform/Platform.h"
++
++#if defined(__APPLE__) && (defined(__ppc__) || defined(__ppc64__))
++#include <mach/machine.h>
++#include <sys/sysctl.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -103,22 +108,55 @@ ImTubeUI::~ImTubeUI()
+ 
+ void ImTubeUI::request_quit()
+ {
+-    SDL_Event ev{};
+-    ev.type = SDL_EVENT_QUIT;
+-    SDL_PushEvent(&ev);
++    if (m_platform != nullptr)
++        m_platform->request_quit();
+ }
+ 
+ void ImTubeUI::toggle_fullscreen()
+ {
+-    if (m_window == nullptr)
++    if (m_platform == nullptr)
+         return;
+-    const bool is_fullscreen = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
+-    SDL_SetWindowFullscreen(m_window, !is_fullscreen);
++    m_platform->set_fullscreen(!m_platform->is_fullscreen());
+ }
+ 
+ void ImTubeUI::set_backend(RenderBackend* backend)
+ {
+     m_backend = backend;
++    if (m_backend == nullptr)
++        return;
++
++    /* Ask GStreamer for the pixel layout the renderer uploads fastest, and
++     * keep decoded frames within one texture (legacy GL drivers cap textures
++     * at 2048 or even 1024 pixels; bigger frames are scaled down in-pipeline). */
++    m_video_format = m_backend->preferred_video_format();
++    m_player.set_video_format(gst_format_name(m_video_format));
++    m_player.set_max_frame_size(m_backend->max_texture_size());
++}
++
++bool ImTubeUI::wants_continuous_redraw() const
++{
++    return m_show_player || m_seeking || m_searching || m_search_done ||
++           m_sub_fetching || m_sub_fetch_done || m_download_active || m_thumbs.busy();
++}
++
++int ImTubeUI::default_resolution()
++{
++#if defined(IMTUBE_DEFAULT_RESOLUTION) && (IMTUBE_DEFAULT_RESOLUTION > 0)
++    return IMTUBE_DEFAULT_RESOLUTION;
++#elif defined(__APPLE__) && (defined(__ppc__) || defined(__ppc64__))
++    /* A G4 decodes 360p H.264 in software at best, and below 360p yt-dlp
++     * streams a single progressive file so no ffmpeg merge competes for the
++     * CPU. A G5 (PowerPC 970) manages 1080p. Settings persist the user's
++     * own choice afterwards. */
++    int subtype = 0;
++    size_t len = sizeof(subtype);
++    if (sysctlbyname("hw.cpusubtype", &subtype, &len, nullptr, 0) == 0 &&
++        subtype == CPU_SUBTYPE_POWERPC_970)
++        return 1080;
++    return 360;
++#else
++    return 1080;
++#endif
+ }
+ 
+ void ImTubeUI::set_ytdlp_binary(const std::string& path)
+@@ -362,13 +400,13 @@ void ImTubeUI::render()
+         toggle_fullscreen();
+     /* Esc leaves fullscreen mode (only meaningful while fullscreen). */
+     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
+-        (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN))
+-        SDL_SetWindowFullscreen(m_window, false);
++        m_platform != nullptr && m_platform->is_fullscreen())
++        m_platform->set_fullscreen(false);
+     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Q, false))
+         request_quit();
+ 
+     /* --- Menu bar (tabs) ---------------------------------------------------- */
+-    const bool fullscreen = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
++    const bool fullscreen = m_platform != nullptr && m_platform->is_fullscreen();
+     if (!fullscreen)
+         render_menu_bar();
+     const float menubar_height = fullscreen ? 0.0f : ImGui::GetFrameHeight();
+@@ -380,7 +418,11 @@ void ImTubeUI::render()
+     ImGui::Begin("##ImTubeMain", nullptr,
+                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+-                 ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoDocking);
++                 ImGuiWindowFlags_NoBringToFrontOnFocus
++#ifdef IMGUI_HAS_DOCK
++                 | ImGuiWindowFlags_NoDocking /* vendored docking branch only */
++#endif
++                 );
+ 
+     if (m_show_player)
+     {
+@@ -406,10 +448,10 @@ void ImTubeUI::render()
+     if (debug_geom && (++dump_counter % 45) == 0)
+     {
+         int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
+-        if (m_window != nullptr)
++        if (m_platform != nullptr)
+         {
+-            SDL_GetWindowPosition(m_window, &win_x, &win_y);
+-            SDL_GetWindowSize(m_window, &win_w, &win_h);
++            m_platform->get_window_pos(&win_x, &win_y);
++            m_platform->get_window_size(&win_w, &win_h);
+         }
+         fprintf(stderr,
+                 "[geo] win=%d,%d %dx%d search=(%.0f,%.0f) %.0fx%.0f btn=(%.0f,%.0f) "
+@@ -614,7 +656,8 @@ void ImTubeUI::play_video(const VideoItem& video)
+     m_live_stream = video.live;
+     m_speed_idx = 2; /* reset to 1x on a new video */
+     m_seek_message.clear();
+-    SDL_SetWindowTitle(m_window, ("ImTube - " + video.title).c_str());
++    if (m_platform != nullptr)
++        m_platform->set_title(("ImTube - " + video.title).c_str());
+ 
+     const std::string url = watch_url_for(video);
+     m_player.set_known_duration_ms(video.duration_seconds > 0 ? video.duration_seconds * 1000 : 0);
+@@ -651,7 +694,8 @@ void ImTubeUI::play_video(const VideoItem& video)
+ 
+ void ImTubeUI::stop_video()
+ {
+-    SDL_SetWindowTitle(m_window, "ImTube");
++    if (m_platform != nullptr)
++        m_platform->set_title("ImTube");
+     m_show_player = false;
+     m_video_failed = false;
+     m_now_playing.clear();
+@@ -688,7 +732,7 @@ void ImTubeUI::update_video_frame()
+                 return;
+         }
+         if (m_video_texture)
+-            m_video_texture->upload(m_player.frame_pixels());
++            m_video_texture->upload(m_player.frame_pixels(), m_video_format);
+     }
+ }
+ 
+@@ -696,7 +740,7 @@ void ImTubeUI::render_video_view()
+ {
+     update_video_frame();
+ 
+-    const bool fullscreen = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
++    const bool fullscreen = m_platform != nullptr && m_platform->is_fullscreen();
+     const bool chrome = !fullscreen;
+ 
+     int64_t pos_ms = -1, dur_ms = -1;
+@@ -733,7 +777,7 @@ void ImTubeUI::render_video_view()
+     ImGui::SetCursorPos(ImVec2((avail.x - img_size.x) * 0.5f, (avail.y - img_size.y) * 0.5f));
+ 
+     if (m_video_texture && m_video_texture->valid())
+-        ImGui::Image(m_video_texture->imgui_id(), img_size);
++        ImGui::Image(m_video_texture->imgui_id(), img_size, ImVec2(0, 0), m_video_texture->uv1());
+     else if (m_player.has_eos())
+         ImGui::TextColored(kColTextDim, "Playback ended.");
+     else if (m_video_failed)
+@@ -792,7 +836,7 @@ void ImTubeUI::render_video_view()
+         }
+     }
+     ImGui::SameLine();
+-    const bool fullscreen_active = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_FULLSCREEN) != 0;
++    const bool fullscreen_active = m_platform != nullptr && m_platform->is_fullscreen();
+     if (ImGui::Button("Expand", ImVec2(76, 0)))
+         toggle_fullscreen();
+     if (ImGui::IsItemHovered())
+@@ -1340,7 +1384,7 @@ void ImTubeUI::render_result_card(const VideoItem& video, int index)
+     {
+         dl->AddImage(tex_it->second->imgui_id(),
+                      thumb_tl, thumb_br,
+-                     ImVec2(0, 0), ImVec2(1, 1));
++                     ImVec2(0, 0), tex_it->second->uv1());
+         if (ImGui::IsItemHovered())
+             dl->AddRect(thumb_tl, thumb_br, kColThumbHover);
+     }
+@@ -1436,7 +1480,7 @@ void ImTubeUI::render_list_row(const VideoItem& video, int index)
+         const ImVec2 tl = ImGui::GetItemRectMin();
+         const ImVec2 br = ImGui::GetItemRectMax();
+         ImGui::GetWindowDrawList()->AddImage(
+-            tex_it->second->imgui_id(), tl, br, ImVec2(0, 0), ImVec2(1, 1));
++            tex_it->second->imgui_id(), tl, br, ImVec2(0, 0), tex_it->second->uv1());
+     }
+     ImGui::SameLine();
+ 
+@@ -1486,7 +1530,7 @@ void ImTubeUI::render_settings_tab()
+     if (ImGui::CollapsingHeader("Streaming", ImGuiTreeNodeFlags_DefaultOpen))
+     {
+         ImGui::TextUnformatted("Default stream resolution:");
+-        const int resolutions[] = { 240, 360, 480, 720, 1080 };
++        const int resolutions[] = { 240, 360, 480, 720, 1080, 1440 };
+         bool first_radio = true;
+         for (int r : resolutions)
+         {
+@@ -1501,8 +1545,9 @@ void ImTubeUI::render_settings_tab()
+             }
+         }
+         ImGui::TextColored(kColTextDim,
+-            "Resolution used by yt-dlp when streaming videos (1080p default). "
+-            "Above 360p YouTube streams require ffmpeg to merge the DASH video and audio tracks.");
++            "Resolution used by yt-dlp when streaming videos (%dp default on this machine). "
++            "Above 360p YouTube streams require ffmpeg to merge the DASH video and audio tracks; "
++            "a G4 copes with 360p at most, a G5 with 1080p.", default_resolution());
+     }
+ 
+     if (ImGui::CollapsingHeader("Recording", ImGuiTreeNodeFlags_DefaultOpen))
+@@ -1571,11 +1616,15 @@ void ImTubeUI::render_settings_tab()
+     {
+         ImGui::Text("ImTube v%s", IMTUBE_VERSION);
+         ImGui::TextColored(kColTextDim,
+-            "A lightweight YouTube-style client built with Dear ImGui, SDL3 and Vulkan, "
++            "A lightweight YouTube-style client built with Dear ImGui, SDL/GLFW and OpenGL, "
+             "powered by yt-dlp.");
+         ImGui::TextColored(kColTextDim, "FPS: %.1f", ImGui::GetIO().Framerate);
+         ImGui::Separator();
+-        ImGui::TextColored(kColTextDim, "Backends: Dear ImGui (ocornut/imgui), SDL3 (libsdl-org/SDL), Vulkan, GStreamer, yt-dlp.");
++        ImGui::TextColored(kColTextDim, "Platform: %s", m_platform != nullptr ? m_platform->name() : "none");
++        if (m_backend != nullptr)
++            ImGui::TextColored(kColTextDim, "Renderer: %s%s%s", m_backend->name(),
++                               m_backend->description()[0] != '\0' ? ", " : "", m_backend->description());
++        ImGui::TextColored(kColTextDim, "Dear ImGui %s, GStreamer, yt-dlp.", IMGUI_VERSION);
+     }
+ }
+ 
+diff --git a/src/ui/ImTubeUI.h b/src/ui/ImTubeUI.h
+index c4b2c86..1c6ccab 100644
+--- a/src/ui/ImTubeUI.h
++++ b/src/ui/ImTubeUI.h
+@@ -17,10 +17,10 @@
+ #include <thread>
+ #include <vector>
+ 
+-struct SDL_Window;
+-
+ namespace imtube {
+ 
++class Platform;
++
+ /* The ImTube user interface. Rendered every frame after ImGui::NewFrame().
+  *
+  * The search tab drives yt-dlp on a worker thread, thumbnails are downloaded by
+@@ -38,8 +38,13 @@ public:
+      * UI can create CPU->GPU textures. */
+     void set_backend(RenderBackend* backend);
+ 
+-    /* The SDL window, needed for window controls (minimize/maximize/close). */
+-    void set_window(SDL_Window* window) { m_window = window; }
++    /* The windowing platform: fullscreen, window title, quit, geometry. */
++    void set_platform(Platform* platform) { m_platform = platform; }
++
++    /* True while something on screen changes on its own (video, a search or
++     * download in flight, thumbnails arriving). The App then polls for events
++     * instead of sleeping between frames. */
++    bool wants_continuous_redraw() const;
+ 
+     void set_ytdlp_binary(const std::string& path);
+ 
+@@ -84,6 +89,9 @@ private:
+ 
+     void ensure_demo_data();
+ 
++    /* First-launch stream resolution for this machine (see the definition). */
++    static int default_resolution();
++
+     void load_saved();
+     void save_saved();
+     void load_settings();
+@@ -93,7 +101,7 @@ private:
+     Tab m_active_tab = Tab::Search;
+ 
+     /* Window controls */
+-    SDL_Window* m_window = nullptr;
++    Platform* m_platform = nullptr;
+ 
+     /* Debug geometry (IMTUBE_DEBUG=1): screen positions of key widgets so the
+      * automated UI tests can click the right pixels. */
+@@ -135,6 +143,7 @@ private:
+     /* Video playback */
+     GStreamerPlayer m_player;
+     std::unique_ptr<RenderTexture> m_video_texture;
++    PixelFormat m_video_format = PixelFormat::RGBA8; /* layout the player delivers */
+     bool m_show_player = false;
+     bool m_video_failed = false;
+     std::string m_now_playing;
+@@ -174,10 +183,9 @@ private:
+     int m_selected_list = 0;
+ 
+     /* Settings state */
+-    /* Default stream resolution. 1080p is the target quality the project
+-     * aims for (see README); the user can change it per-session from both
+-     * the Search tab and the Settings tab. */
+-    int m_resolution = 1080;
++    /* Default stream resolution: picked per machine on first launch (360p on
++     * a G4, 1080p elsewhere), then whatever the user chose in Settings. */
++    int m_resolution = default_resolution();
+     std::string m_ytdlp_binary = "yt-dlp";
+     bool m_ytdlp_version_checked = false;
+     std::string m_ytdlp_version;
