@@ -1,0 +1,220 @@
+Fix 128-bit emulation on big-endian and 32-bit targets
+
+Upstream issue: https://github.com/imneme/pcg-cpp/issues/93
+Reported against 32-bit PowerPC Darwin; affects any target without a native
+__uint128_t (pcg128_t is then pcg_extras::uint_x4<uint32_t,uint64_t>), and the
+first two hunks matter on any *big-endian* such target.
+
+1. pcg_uint128.hpp: flog2()/trailingzeros() on uint_x4 were wrong on
+   big-endian.  uint_x4's wa[4] array is in memory order, so on big-endian
+   wa[0] is the MOST significant word; both functions picked the right word
+   but then converted its index to a bit offset with UINT_BITS*i in both the
+   little- and big-endian branches.  On big-endian flog2(1) returned 96 rather
+   than 0 and flog2(1<<96) returned 0.
+
+   This is what crashes check-pcg128_once_insecure.  divmod() computes
+       bitcount_t logdiff = log2_dividend - log2_divisor;
+   which underflows the uint8_t with garbage inputs (e.g. 30-99 => 187), and
+   the resulting ONE << 187 walks off the end of wa[] (see 2), smashing the
+   stack.  That is the operator<< <- divmod backtrace in the bug report.
+   Reached from rng(2) -> bounded_rand -> operator% -> divmod, which is why
+   the test output stops right before the "Coins:" line.
+
+   Fixed by introducing wa_index(), a single place that maps a word's
+   significance to its array index, and expressing flog2, trailingzeros and
+   both shift operators in terms of it.  This also removes four
+   #if PCG_LITTLE_ENDIAN blocks.
+
+2. pcg_uint128.hpp: operator<</operator>> on uint_x4 indexed wa[] out of
+   bounds when the shift was >= the full width, because the uint8_t loop
+   bound 4-shiftdiv underflows.  Big-endian operator<< and little-endian
+   operator>> were both affected.  Such a shift yields zero, so return early.
+
+3. pcg_uint128.hpp: added #include <cstdlib> for abort(); the header did not
+   compile standalone.
+
+4. pcg_random.hpp: specific_stream::set_stream() did "(specific_seq << 1) | 1".
+   operator| is a template over uint_x4, so an int literal never converts and
+   any set_stream() call failed to compile without native 128-bit ints.  This
+   is the compile error that opens issue #93.
+
+5. test-high/run-tests.sh: the fallback diff was missing -x .gitignore, so on
+   every emulated-128-bit platform it reported a blanket "ERROR: Some tests
+   failed." instead of distinguishing real failures from the tests that
+   deliberately skip themselves ("not supported with emulated 128-bit math").
+
+Verified on powerpc-linux-gnu (32-bit, big-endian, gcc 14, run under
+qemu-ppc): before, check-pcg128_once_insecure and
+check-pcg128_oneseq_once_insecure die partway through; after, both are
+byte-identical to test-high/expected/ and the suite reports success for
+everything except the deliberately-skipped 128-bit extended generators.
+Also verified against native __uint128_t on x86-64 by differential testing
+(arithmetic, division, shifts, flog2/trailingzeros) with and without
+PCG_FORCE_EMULATED_128BIT_MATH.
+
+---
+diff --git a/include/pcg_random.hpp b/include/pcg_random.hpp
+index d479a81..341c865 100644
+--- a/include/pcg_random.hpp
++++ b/include/pcg_random.hpp
+@@ -333,7 +333,7 @@ public:
+ 
+     void set_stream(itype specific_seq)
+     {
+-         inc_ = (specific_seq << 1) | 1;
++         inc_ = (specific_seq << 1) | itype(1U);
+     }
+ 
+     static constexpr bool can_specify_stream = true;
+diff --git a/include/pcg_uint128.hpp b/include/pcg_uint128.hpp
+index 75c5699..8c1a685 100644
+--- a/include/pcg_uint128.hpp
++++ b/include/pcg_uint128.hpp
+@@ -38,6 +38,7 @@
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cassert>
+ #include <climits>
+ #include <utility>
+@@ -535,18 +536,33 @@ public:
+ 
+ };
+ 
++/*
++ * The wa[] array is laid out in memory order, so on a big-endian machine
++ * wa[0] holds the *most* significant word.  Every piece of code that walks
++ * the array thinks in terms of a word's significance (0 = least significant),
++ * so this is where the "must handle endian itself" yuckiness lives: it turns
++ * a significance into the index of the word that holds it.
++ */
++
++inline constexpr uint8_t wa_index(uint8_t significance)
++{
++#if PCG_LITTLE_ENDIAN
++    return significance;
++#else
++    return uint8_t(3 - significance);
++#endif
++}
++
+ template<typename U, typename V>
+ bitcount_t flog2(const uint_x4<U,V>& v)
+ {
+-#if PCG_LITTLE_ENDIAN
++    // Scan down from the most significant word.
+     for (uint8_t i = 4; i !=0; /* dec in loop */) {
+         --i;
+-#else
+-    for (uint8_t i = 0; i < 4; ++i) {
+-#endif
+-        if (v.wa[i] == 0)
++        U word = v.wa[wa_index(i)];
++        if (word == 0)
+              continue;
+-        return flog2(v.wa[i]) + uint_x4<U,V>::UINT_BITS*i;
++        return flog2(word) + uint_x4<U,V>::UINT_BITS*i;
+     }
+     abort();
+ }
+@@ -554,14 +570,11 @@ bitcount_t flog2(const uint_x4<U,V>& v)
+ template<typename U, typename V>
+ bitcount_t trailingzeros(const uint_x4<U,V>& v)
+ {
+-#if PCG_LITTLE_ENDIAN
++    // Scan up from the least significant word.
+     for (uint8_t i = 0; i < 4; ++i) {
+-#else
+-    for (uint8_t i = 4; i !=0; /* dec in loop */) {
+-        --i;
+-#endif
+-        if (v.wa[i] != 0)
+-            return trailingzeros(v.wa[i]) + uint_x4<U,V>::UINT_BITS*i;
++        U word = v.wa[wa_index(i)];
++        if (word != 0)
++            return trailingzeros(word) + uint_x4<U,V>::UINT_BITS*i;
+     }
+     return uint_x4<U,V>::UINT_BITS*4;
+ }
+@@ -909,25 +922,20 @@ uint_x4<UInt,UIntX2> operator<<(const uint_x4<UInt,UIntX2>& v,
+     const bitcount_t shiftdiv = shift / bits;
+     const bitcount_t shiftmod = shift & bitmask;
+ 
++    // Shifting by the full width (or more) shifts everything out.  Bailing
++    // out here also stops the loops below from walking off the end of wa[].
++    if (shiftdiv >= 4)
++        return r;
++
+     if (shiftmod) {
+         UInt carryover = 0;
+-#if PCG_LITTLE_ENDIAN
+         for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
+-#else
+-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
+-            --out, --in;
+-#endif
+-            r.wa[out] = (v.wa[in] << shiftmod) | carryover;
+-            carryover = (v.wa[in] >> (bits - shiftmod));
++            r.wa[wa_index(out)] = (v.wa[wa_index(in)] << shiftmod) | carryover;
++            carryover = (v.wa[wa_index(in)] >> (bits - shiftmod));
+         }
+     } else {
+-#if PCG_LITTLE_ENDIAN
+         for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
+-#else
+-        for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
+-            --out, --in;
+-#endif
+-            r.wa[out] = v.wa[in];
++            r.wa[wa_index(out)] = v.wa[wa_index(in)];
+         }
+     }
+ 
+@@ -944,25 +952,22 @@ uint_x4<UInt,UIntX2> operator>>(const uint_x4<UInt,UIntX2>& v,
+     const bitcount_t shiftdiv = shift / bits;
+     const bitcount_t shiftmod = shift & bitmask;
+ 
++    // Shifting by the full width (or more) shifts everything out.  Bailing
++    // out here also stops the loops below from walking off the end of wa[].
++    if (shiftdiv >= 4)
++        return r;
++
+     if (shiftmod) {
+         UInt carryover = 0;
+-#if PCG_LITTLE_ENDIAN
+         for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
+             --out, --in;
+-#else
+-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
+-#endif
+-            r.wa[out] = (v.wa[in] >> shiftmod) | carryover;
+-            carryover = (v.wa[in] << (bits - shiftmod));
++            r.wa[wa_index(out)] = (v.wa[wa_index(in)] >> shiftmod) | carryover;
++            carryover = (v.wa[wa_index(in)] << (bits - shiftmod));
+         }
+     } else {
+-#if PCG_LITTLE_ENDIAN
+         for (uint8_t out = 4-shiftdiv, in = 4; out != 0; /* dec in loop */) {
+             --out, --in;
+-#else
+-        for (uint8_t out = shiftdiv, in = 0; out < 4; ++out, ++in) {
+-#endif
+-            r.wa[out] = v.wa[in];
++            r.wa[wa_index(out)] = v.wa[wa_index(in)];
+         }
+     }
+ 
+diff --git a/test-high/run-tests.sh b/test-high/run-tests.sh
+index c72ab76..4147da7 100755
+--- a/test-high/run-tests.sh
++++ b/test-high/run-tests.sh
+@@ -88,7 +88,7 @@ then
+     echo All tests succeeded.
+ else
+     echo ''
+-    if diff -x "*-pcg64_[ck]*.out" \
++    if diff -x .gitignore -x "*-pcg64_[ck]*.out" \
+             -x "*-pcg128_[ck]*.out" -ru expected actual > /dev/null
+     then
+         echo All tests except tests awkward tests with 128-bit math succceed.
