@@ -1,0 +1,125 @@
+From 0164a771d948de292c68e82b8f8d7693b24c563f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 19 Sep 2026 17:10:06 +0000
+Subject: [PATCH 1/3] fix: build the real(16) runtime on targets without fp128
+ ABI wrappers
+
+The compiler-rt entry points for real(16) (__addtf3 and friends) have to
+be defined with the calling convention LLVM uses for fp128 on the target,
+which lfortran_float128.c only knows for x86-64, ARM64 and wasm32. Since
+PR #12352 every other target hit an #error while compiling the runtime
+library, so LFortran itself no longer built on PowerPC (issue #13240),
+and likewise on i686, armv7, riscv64, s390x or ppc64le.
+
+The #error sat at the wrong level: it broke the build of the compiler
+rather than the link of a program that actually uses real(16). Targets
+without a known ABI mapping now compile the portable struct-based
+implementation, which is all the compiler needs for constant folding,
+literal parsing and PRINT formatting, and define none of the public entry
+points. A program that does real(16) arithmetic at run time then resolves
+them from the toolchain's compiler-rt or libgcc, or fails to link with an
+undefined symbol instead of silently calling a mismatched ABI.
+
+Verified with powerpc-linux-gnu-gcc 14: lfortran_intrinsics.c hits the
+#error before this change and compiles cleanly after it, exporting the
+struct-based helpers and no __*tf2/__*tf3 symbols. The x86-64 build is
+unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/libasr/runtime/lfortran_float128.c      | 43 ++++++++++++++-------
+ src/libasr/runtime/lfortran_float128_llvm.h |  4 ++
+ 2 files changed, 33 insertions(+), 14 deletions(-)
+
+diff --git a/src/libasr/runtime/lfortran_float128.c b/src/libasr/runtime/lfortran_float128.c
+index 2336709..8bd4898 100644
+--- a/src/libasr/runtime/lfortran_float128.c
++++ b/src/libasr/runtime/lfortran_float128.c
+@@ -1665,27 +1665,30 @@ lf_float128 lf_float128_from_str(const char *s) {
+  * make the implementations operate on whatever the argument registers
+  * happened to hold.
+  *
+- * A 16-byte vector of doubles is classified exactly like __float128, so use
+- * it to spell the ABI and convert to the struct the implementations expect.
+- * On Windows x64 the same trick works with MSVC's __m128d: LLVM passes fp128
+- * indirectly by pointer and returns it in XMM0, which is exactly how MSVC
+- * treats __m128d parameters and return values.
+- * The conversions are pure memcpy, so no fp128 arithmetic is generated here
+- * and these wrappers cannot recurse into themselves.
++ * Each supported target therefore names a C type that the C compiler passes
++ * and returns exactly like LLVM passes and returns fp128, and the entry
++ * points below take that type and convert to the struct the implementations
++ * expect. The conversions are pure memcpy, so no fp128 arithmetic is
++ * generated here and these wrappers cannot recurse into themselves.
++ *
++ * Targets for which no such C type is known define none of these entry
++ * points, see the #else branch below.
+  * ======================================================================== */
+ #if !defined(__aarch64__) && !defined(__wasm32__)
+ 
+-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+-typedef double lf_f128_abi __attribute__((vector_size(16)));
+-#elif defined(_MSC_VER) && defined(_M_X64)
++#if (defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))) \
++    || (defined(_MSC_VER) && defined(_M_X64))
++
++#if defined(_MSC_VER)
+ /* On Windows x64 LLVM passes fp128 arguments indirectly through a pointer to
+  * a 16-byte aligned slot and returns fp128 in XMM0. MSVC gives __m128d
+  * parameters and return values exactly that treatment, so it spells the same
+- * ABI the vector typedef above does for the System V targets. */
++ * ABI the vector typedef below does for the System V targets. */
+ #include <emmintrin.h>
+ typedef __m128d lf_f128_abi;
+ #else
+-#error "unsupported real(16) compiler-rt ABI for this target; add target-specific fp128 ABI wrappers before enabling these entry points"
++/* A 16-byte vector of doubles is classified exactly like __float128. */
++typedef double lf_f128_abi __attribute__((vector_size(16)));
+ #endif
+ 
+ static lf_f128_abi lf_f128_to_abi(lf_float128 v) {
+@@ -1723,12 +1726,24 @@ int __gttf2   (lf_f128_abi a, lf_f128_abi b) { return __gttf2_lf_impl   (lf_f128
+ int __getf2   (lf_f128_abi a, lf_f128_abi b) { return __getf2_lf_impl   (lf_f128_from_abi(a), lf_f128_from_abi(b)); }
+ int __unordtf2(lf_f128_abi a, lf_f128_abi b) { return __unordtf2_lf_impl(lf_f128_from_abi(a), lf_f128_from_abi(b)); }
+ 
+-/* SIMD-ABI public entry points for the transcendentals called by
+- * LLVM-emitted `call fp128 @lf_sqrtq(fp128)` / `lf_powq(fp128, fp128)`. */
++/* Public entry points for the transcendentals called by LLVM-emitted
++ * `call fp128 @lf_sqrtq(fp128)` / `lf_powq(fp128, fp128)`. */
+ lf_f128_abi lf_sqrtq(lf_f128_abi a)                 { return lf_f128_to_abi(lf_f128_sqrt(lf_f128_from_abi(a))); }
+ lf_f128_abi lf_powq(lf_f128_abi a, lf_f128_abi b)   { return lf_f128_to_abi(lf_f128_pow(lf_f128_from_abi(a), lf_f128_from_abi(b))); }
++
++#else
++/* No C type is known to spell LLVM's fp128 calling convention on this
++ * target, so none of the compiler-rt entry points are defined here and the
++ * runtime library still builds. Everything the compiler itself needs
++ * (constant folding, literal parsing, PRINT formatting) goes through the
++ * struct-based API above and is unaffected. A program that does real(16)
++ * arithmetic at run time resolves __addtf3 and friends from the toolchain's
++ * own compiler-rt or libgcc; where those do not provide them, linking fails
++ * with an undefined symbol instead of silently calling a mismatched ABI. */
+ #endif
+ 
++#endif /* !__aarch64__ && !__wasm32__ */
++
+ /* ========================================================================
+  * P2. WASM32 fp128 ABI wrappers
+  *
+diff --git a/src/libasr/runtime/lfortran_float128_llvm.h b/src/libasr/runtime/lfortran_float128_llvm.h
+index d728cc3..b7a0702 100644
+--- a/src/libasr/runtime/lfortran_float128_llvm.h
++++ b/src/libasr/runtime/lfortran_float128_llvm.h
+@@ -14,6 +14,10 @@
+  * public entry points take a 16-byte vector rather than the struct.
+  * On ARM64, naked-function shims bridge the SIMD ABI to the struct ABI.
+  * On WASM, sret-style wrappers match the ABI LLVM uses for wasm32.
++ * On every other target none of the public entry points are defined: the
++ * struct-based implementations still build, so the compiler itself works,
++ * and a program doing real(16) arithmetic at run time gets the symbols from
++ * the toolchain's compiler-rt or libgcc, or fails to link.
+  */
+ 
+ #ifndef LFORTRAN_FLOAT128_LLVM_H
+-- 
+2.43.0
+

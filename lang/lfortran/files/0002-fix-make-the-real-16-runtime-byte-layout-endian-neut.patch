@@ -1,0 +1,407 @@
+From e036ff2378ea9bc2753b1fbb786d24081b6a3b2f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 19 Sep 2026 17:13:42 +0000
+Subject: [PATCH 2/3] fix: make the real(16) runtime byte layout endian-neutral
+
+lf_float128 was documented and implemented as a little-endian byte array:
+f128_unpack, f128_pack_parts, lf_float128_to_str and the sign flips read
+and wrote bytes[0..7] as the low half and bytes[15] as the sign byte. But
+lfortran_intrinsics.c fills the struct with memcpy from the program's
+fp128 values and the compiler-rt wrappers convert with memcpy too, so on
+a big-endian target such as PowerPC every value was read with its halves
+swapped: PRINT of 1.0_16 produced 0.000000000000029859651965415290707E-4933.
+
+Define lf_float128 as the value's native memory image instead, and route
+every access to its halves through lf_f128_to_words()/lf_f128_from_words()
+in the shared header, which pick the byte order from __BYTE_ORDER__. The
+codegen side, which turns a kind=16 RealConstant into an APInt, uses the
+same helper so compiler and runtime agree on any host. Little-endian
+targets are unchanged: the helpers reduce to the previous memcpy pairs.
+
+Verified with a struct-API harness that feeds native binary128 images
+through to_str/from_str, arithmetic, sign and comparison helpers: built
+with powerpc-linux-gnu-gcc 14 and run under qemu-ppc it fails 20 of 20
+checks before this change and passes after; on x86-64 it passes before and
+after, as does a __float128 harness exercising the public entry points.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/libasr/codegen/asr_to_llvm.cpp          |   4 +-
+ src/libasr/runtime/lfortran_float128.c      | 122 ++++++++------------
+ src/libasr/runtime/lfortran_float128_llvm.h |  33 +++++-
+ 3 files changed, 80 insertions(+), 79 deletions(-)
+
+diff --git a/src/libasr/codegen/asr_to_llvm.cpp b/src/libasr/codegen/asr_to_llvm.cpp
+index 799f535..8d2c50e 100644
+--- a/src/libasr/codegen/asr_to_llvm.cpp
++++ b/src/libasr/codegen/asr_to_llvm.cpp
+@@ -16518,10 +16518,8 @@ public:
+                 break;
+             }
+             case 16 : {
+-                const uint8_t* bytes = ASRUtils::real_constant_get_r16_bytes(&x);
+                 uint64_t lo, hi;
+-                std::memcpy(&lo, bytes,     sizeof(lo));
+-                std::memcpy(&hi, bytes + 8, sizeof(hi));
++                lf_f128_to_words(ASRUtils::real_constant_get_r16(&x), &lo, &hi);
+                 // APInt(numBits, ArrayRef<uint64_t>{lo, hi}) — low word first.
+                 uint64_t words[2] = { lo, hi };
+                 llvm::APInt bits(128, llvm::ArrayRef<uint64_t>(words, 2));
+diff --git a/src/libasr/runtime/lfortran_float128.c b/src/libasr/runtime/lfortran_float128.c
+index 8bd4898..5f136e8 100644
+--- a/src/libasr/runtime/lfortran_float128.c
++++ b/src/libasr/runtime/lfortran_float128.c
+@@ -247,9 +247,10 @@ static void u128_mul128(u128 a, u128 b, u128 *hi_out, u128 *lo_out) {
+  * B. Pack / Unpack
+  * ======================================================================== */
+ 
+-/* f128 bit layout (little-endian struct):
+- *   bytes[0..7]  = low  64 bits (mantissa low)
+- *   bytes[8..15] = high 64 bits
++/* f128 bit layout, in terms of the two 64-bit halves that lf_f128_to_words()
++ * yields (the byte order inside lf_float128 is the target's, see the header):
++ *   lo = low  64 bits (mantissa low)
++ *   hi = high 64 bits
+  *     bit  127    = sign
+  *     bits 126:112 = biased exponent (15 bits, bias=16383)
+  *     bits 111:0   = mantissa (no explicit leading 1 for normals)
+@@ -266,8 +267,7 @@ typedef struct {
+ static f128_parts f128_unpack(lf_float128 v) {
+     f128_parts p = {0};
+     uint64_t lo, hi;
+-    memcpy(&lo, v.bytes,   8);
+-    memcpy(&hi, v.bytes+8, 8);
++    lf_f128_to_words(v, &lo, &hi);
+ 
+     p.sign = (int)(hi >> 63);
+     int32_t biased = (int32_t)((hi >> 48) & 0x7FFFu);
+@@ -296,16 +296,13 @@ static f128_parts f128_unpack(lf_float128 v) {
+ /* Normalise mant so that bit 112 is set, adjusting exp.
+  * Then pack into lf_float128. */
+ static lf_float128 f128_pack_parts(int sign, int32_t exp, u128 mant) {
+-    lf_float128 r;
+     uint64_t lo, hi;
+ 
+     if (u128_is_zero(mant)) {
+         /* zero */
+         hi = (uint64_t)sign << 63;
+         lo = 0;
+-        memcpy(r.bytes,   &lo, 8);
+-        memcpy(r.bytes+8, &hi, 8);
+-        return r;
++        return lf_f128_from_words(lo, hi);
+     }
+ 
+     /* Normalise: shift mant so bit 112 is the leading 1 */
+@@ -338,9 +335,7 @@ static lf_float128 f128_pack_parts(int sign, int32_t exp, u128 mant) {
+             /* underflow to zero */
+             hi = (uint64_t)sign << 63;
+             lo = 0;
+-            memcpy(r.bytes,   &lo, 8);
+-            memcpy(r.bytes+8, &hi, 8);
+-            return r;
++            return lf_f128_from_words(lo, hi);
+         }
+         mant = u128_shr(mant, subnorm_shift);
+         /* biased = 0 for subnormals */
+@@ -348,9 +343,7 @@ static lf_float128 f128_pack_parts(int sign, int32_t exp, u128 mant) {
+         uint64_t mlo = u128_lo(mant);
+         hi = ((uint64_t)sign << 63) | mhi;
+         lo = mlo;
+-        memcpy(r.bytes,   &lo, 8);
+-        memcpy(r.bytes+8, &hi, 8);
+-        return r;
++        return lf_f128_from_words(lo, hi);
+     }
+ 
+     int32_t biased = exp + 16383;
+@@ -358,9 +351,7 @@ static lf_float128 f128_pack_parts(int sign, int32_t exp, u128 mant) {
+         /* overflow to infinity */
+         hi = ((uint64_t)sign << 63) | ((uint64_t)0x7FFF << 48);
+         lo = 0;
+-        memcpy(r.bytes,   &lo, 8);
+-        memcpy(r.bytes+8, &hi, 8);
+-        return r;
++        return lf_f128_from_words(lo, hi);
+     }
+ 
+     /* strip implicit leading 1 (bit 112) and store */
+@@ -369,33 +360,22 @@ static lf_float128 f128_pack_parts(int sign, int32_t exp, u128 mant) {
+     uint64_t mlo = u128_lo(mant);
+     hi = ((uint64_t)sign << 63) | ((uint64_t)biased << 48) | mhi;
+     lo = mlo;
+-    memcpy(r.bytes,   &lo, 8);
+-    memcpy(r.bytes+8, &hi, 8);
+-    return r;
++    return lf_f128_from_words(lo, hi);
+ }
+ 
+ /* Build special values */
+ static lf_float128 f128_make_nan(void) {
+-    lf_float128 r;
+     uint64_t hi = 0x7FFF800000000000ull, lo = 0;
+-    memcpy(r.bytes,   &lo, 8);
+-    memcpy(r.bytes+8, &hi, 8);
+-    return r;
++    return lf_f128_from_words(lo, hi);
+ }
+ static lf_float128 f128_make_inf(int sign) {
+-    lf_float128 r;
+     uint64_t hi = ((uint64_t)sign << 63) | ((uint64_t)0x7FFF << 48);
+     uint64_t lo = 0;
+-    memcpy(r.bytes,   &lo, 8);
+-    memcpy(r.bytes+8, &hi, 8);
+-    return r;
++    return lf_f128_from_words(lo, hi);
+ }
+ static lf_float128 f128_make_zero(int sign) {
+-    lf_float128 r;
+     uint64_t hi = (uint64_t)sign << 63, lo = 0;
+-    memcpy(r.bytes,   &lo, 8);
+-    memcpy(r.bytes+8, &hi, 8);
+-    return r;
++    return lf_f128_from_words(lo, hi);
+ }
+ 
+ /* Is v a NaN / Inf / Zero? */
+@@ -412,12 +392,9 @@ static int f128_sign   (lf_float128 v) { return f128_unpack(v).sign;    }
+ /* Exact constant packer: given biased exp and 112-bit mantissa as two u64 */
+ static lf_float128 f128_const(int sign, int32_t biased,
+                                uint64_t mhi, uint64_t mlo) {
+-    lf_float128 r;
+     uint64_t hi = ((uint64_t)sign << 63) | ((uint64_t)biased << 48) | (mhi & 0x0000FFFFFFFFFFFFull);
+     uint64_t lo = mlo;
+-    memcpy(r.bytes,   &lo, 8);
+-    memcpy(r.bytes+8, &hi, 8);
+-    return r;
++    return lf_f128_from_words(lo, hi);
+ }
+ 
+ /* 1.0 */
+@@ -475,15 +452,15 @@ int __unordtf2_lf_impl(lf_float128 a, lf_float128 b) { return (f128_is_nan(a)||f
+  * ======================================================================== */
+ 
+ lf_float128 __negtf2_lf_impl(lf_float128 a) {
+-    lf_float128 r = a;
+-    r.bytes[15] ^= 0x80;  /* flip sign bit */
+-    return r;
++    uint64_t lo, hi;
++    lf_f128_to_words(a, &lo, &hi);
++    return lf_f128_from_words(lo, hi ^ (1ull << 63));  /* flip sign bit */
+ }
+ 
+ lf_float128 lf_f128_abs(lf_float128 a) {
+-    lf_float128 r = a;
+-    r.bytes[15] &= 0x7F;  /* clear sign bit */
+-    return r;
++    uint64_t lo, hi;
++    lf_f128_to_words(a, &lo, &hi);
++    return lf_f128_from_words(lo, hi & ~(1ull << 63));  /* clear sign bit */
+ }
+ 
+ /* ========================================================================
+@@ -1421,8 +1398,10 @@ static int32_t floor_log10_pow2b(int32_t n) {
+ }
+ 
+ void lf_float128_to_str(char *result, const uint8_t bytes[16]) {
++    lf_float128 v;
+     uint64_t lo_w, hi_w;
+-    memcpy(&lo_w, bytes, 8); memcpy(&hi_w, bytes+8, 8);
++    memcpy(v.bytes, bytes, 16);
++    lf_f128_to_words(v, &lo_w, &hi_w);
+     int vsign=(int)(hi_w>>63);
+     int32_t biased=(int32_t)((hi_w>>48)&0x7FFFu);
+     uint64_t mhi=hi_w&0x0000FFFFFFFFFFFFull, mlo=lo_w;
+@@ -1755,13 +1734,6 @@ lf_f128_abi lf_powq(lf_f128_abi a, lf_f128_abi b)   { return lf_f128_to_abi(lf_f
+ 
+ #define LF_WASM_TF2_ATTR __attribute__((weak))
+ 
+-static lf_float128 f128_from_words(uint64_t lo, uint64_t hi) {
+-    lf_float128 r;
+-    memcpy(r.bytes, &lo, 8);
+-    memcpy(r.bytes + 8, &hi, 8);
+-    return r;
+-}
+-
+ static void f128_store_words(lf_float128 *out, lf_float128 v) {
+     memcpy(out->bytes, v.bytes, 16);
+ }
+@@ -1769,29 +1741,29 @@ static void f128_store_words(lf_float128 *out, lf_float128 v) {
+ LF_WASM_TF2_ATTR void __addtf3(lf_float128 *out, uint64_t a_lo, uint64_t a_hi,
+         uint64_t b_lo, uint64_t b_hi) {
+     f128_store_words(out, __addtf3_lf_impl(
+-        f128_from_words(a_lo, a_hi), f128_from_words(b_lo, b_hi)));
++        lf_f128_from_words(a_lo, a_hi), lf_f128_from_words(b_lo, b_hi)));
+ }
+ 
+ LF_WASM_TF2_ATTR void __subtf3(lf_float128 *out, uint64_t a_lo, uint64_t a_hi,
+         uint64_t b_lo, uint64_t b_hi) {
+     f128_store_words(out, __subtf3_lf_impl(
+-        f128_from_words(a_lo, a_hi), f128_from_words(b_lo, b_hi)));
++        lf_f128_from_words(a_lo, a_hi), lf_f128_from_words(b_lo, b_hi)));
+ }
+ 
+ LF_WASM_TF2_ATTR void __multf3(lf_float128 *out, uint64_t a_lo, uint64_t a_hi,
+         uint64_t b_lo, uint64_t b_hi) {
+     f128_store_words(out, __multf3_lf_impl(
+-        f128_from_words(a_lo, a_hi), f128_from_words(b_lo, b_hi)));
++        lf_f128_from_words(a_lo, a_hi), lf_f128_from_words(b_lo, b_hi)));
+ }
+ 
+ LF_WASM_TF2_ATTR void __divtf3(lf_float128 *out, uint64_t a_lo, uint64_t a_hi,
+         uint64_t b_lo, uint64_t b_hi) {
+     f128_store_words(out, __divtf3_lf_impl(
+-        f128_from_words(a_lo, a_hi), f128_from_words(b_lo, b_hi)));
++        lf_f128_from_words(a_lo, a_hi), lf_f128_from_words(b_lo, b_hi)));
+ }
+ 
+ LF_WASM_TF2_ATTR void __negtf2(lf_float128 *out, uint64_t a_lo, uint64_t a_hi) {
+-    f128_store_words(out, __negtf2_lf_impl(f128_from_words(a_lo, a_hi)));
++    f128_store_words(out, __negtf2_lf_impl(lf_f128_from_words(a_lo, a_hi)));
+ }
+ 
+ LF_WASM_TF2_ATTR void __extenddftf2(lf_float128 *out, double a) {
+@@ -1803,11 +1775,11 @@ LF_WASM_TF2_ATTR void __extendsftf2(lf_float128 *out, float a) {
+ }
+ 
+ LF_WASM_TF2_ATTR double __trunctfdf2(uint64_t a_lo, uint64_t a_hi) {
+-    return __trunctfdf2_lf_impl(f128_from_words(a_lo, a_hi));
++    return __trunctfdf2_lf_impl(lf_f128_from_words(a_lo, a_hi));
+ }
+ 
+ LF_WASM_TF2_ATTR float __trunctfsf2(uint64_t a_lo, uint64_t a_hi) {
+-    return __trunctfsf2_lf_impl(f128_from_words(a_lo, a_hi));
++    return __trunctfsf2_lf_impl(lf_f128_from_words(a_lo, a_hi));
+ }
+ 
+ LF_WASM_TF2_ATTR void __floatsitf(lf_float128 *out, int32_t a) {
+@@ -1823,50 +1795,50 @@ LF_WASM_TF2_ATTR void __floatunditf(lf_float128 *out, uint64_t a) {
+ }
+ 
+ LF_WASM_TF2_ATTR int32_t __fixtfsi(uint64_t a_lo, uint64_t a_hi) {
+-    return __fixtfsi_lf_impl(f128_from_words(a_lo, a_hi));
++    return __fixtfsi_lf_impl(lf_f128_from_words(a_lo, a_hi));
+ }
+ 
+ LF_WASM_TF2_ATTR int64_t __fixtfdi(uint64_t a_lo, uint64_t a_hi) {
+-    return __fixtfdi_lf_impl(f128_from_words(a_lo, a_hi));
++    return __fixtfdi_lf_impl(lf_f128_from_words(a_lo, a_hi));
+ }
+ 
+ LF_WASM_TF2_ATTR int __eqtf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    return f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi)) == 0 ? 0 : 1;
++    return f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi)) == 0 ? 0 : 1;
+ }
+ 
+ LF_WASM_TF2_ATTR int __netf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    return f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi)) != 0 ? 1 : 0;
++    return f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi)) != 0 ? 1 : 0;
+ }
+ 
+ LF_WASM_TF2_ATTR int __lttf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    int c = f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi));
++    int c = f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi));
+     return c >= 2 ? 1 : c;
+ }
+ 
+ LF_WASM_TF2_ATTR int __letf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    int c = f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi));
++    int c = f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi));
+     return c >= 2 ? 1 : c;
+ }
+ 
+ LF_WASM_TF2_ATTR int __gttf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    int c = f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi));
++    int c = f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi));
+     return c >= 2 ? 1 : c;
+ }
+ 
+ LF_WASM_TF2_ATTR int __getf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    int c = f128_cmp_internal(f128_from_words(a_lo, a_hi),
+-        f128_from_words(b_lo, b_hi));
++    int c = f128_cmp_internal(lf_f128_from_words(a_lo, a_hi),
++        lf_f128_from_words(b_lo, b_hi));
+     return c >= 2 ? 1 : c;
+ }
+ 
+ LF_WASM_TF2_ATTR int __unordtf2(uint64_t a_lo, uint64_t a_hi, uint64_t b_lo, uint64_t b_hi) {
+-    return (f128_is_nan(f128_from_words(a_lo, a_hi)) ||
+-        f128_is_nan(f128_from_words(b_lo, b_hi))) ? 1 : 0;
++    return (f128_is_nan(lf_f128_from_words(a_lo, a_hi)) ||
++        f128_is_nan(lf_f128_from_words(b_lo, b_hi))) ? 1 : 0;
+ }
+ 
+ #undef LF_WASM_TF2_ATTR
+@@ -2086,7 +2058,7 @@ lf_float128 lf_f128_neg(lf_float128 a) { return lf_f128_from_quad(-lf_f128_to_qu
+ int lf_f128_isnan   (lf_float128 v) { return isnanq(lf_f128_to_quad(v)); }
+ int lf_f128_isinf   (lf_float128 v) { return isinfq(lf_f128_to_quad(v)); }
+ int lf_f128_signbit (lf_float128 v) {
+-    uint64_t hi; memcpy(&hi, v.bytes + 8, 8); return (int)(hi >> 63);
++    uint64_t lo, hi; lf_f128_to_words(v, &lo, &hi); return (int)(hi >> 63);
+ }
+ int lf_f128_cmp(lf_float128 a, lf_float128 b) {
+     __float128 aq = lf_f128_to_quad(a), bq = lf_f128_to_quad(b);
+diff --git a/src/libasr/runtime/lfortran_float128_llvm.h b/src/libasr/runtime/lfortran_float128_llvm.h
+index b7a0702..f1db6e9 100644
+--- a/src/libasr/runtime/lfortran_float128_llvm.h
++++ b/src/libasr/runtime/lfortran_float128_llvm.h
+@@ -24,14 +24,45 @@
+ #define LFORTRAN_FLOAT128_LLVM_H
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-/* Core type — 16-byte struct, little-endian IEEE 754 binary128 */
++/* Core type: the 16 bytes of an IEEE 754 binary128 value exactly as the
++ * target stores it in memory, which is what memcpy from an fp128 variable or
++ * an LLVM-emitted fp128 store yields. On a little-endian target bytes[0..7]
++ * hold the low 64 bits of the value, on a big-endian target they hold the
++ * high 64 bits. Code must not pick the halves out of the array itself;
++ * lf_f128_to_words() and lf_f128_from_words() do that in the target's byte
++ * order. */
+ typedef struct { uint8_t bytes[16]; } lf_float128;
+ 
++static inline void lf_f128_to_words(lf_float128 v, uint64_t *lo, uint64_t *hi) {
++#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
++    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++    memcpy(hi, v.bytes, 8);
++    memcpy(lo, v.bytes + 8, 8);
++#else
++    memcpy(lo, v.bytes, 8);
++    memcpy(hi, v.bytes + 8, 8);
++#endif
++}
++
++static inline lf_float128 lf_f128_from_words(uint64_t lo, uint64_t hi) {
++    lf_float128 v;
++#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
++    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++    memcpy(v.bytes, &hi, 8);
++    memcpy(v.bytes + 8, &lo, 8);
++#else
++    memcpy(v.bytes, &lo, 8);
++    memcpy(v.bytes + 8, &hi, 8);
++#endif
++    return v;
++}
++
+ /* ── Internal _lf_impl variants (struct ABI, all platforms) ────────────── */
+ lf_float128 __addtf3_lf_impl(lf_float128 a, lf_float128 b);
+ lf_float128 __subtf3_lf_impl(lf_float128 a, lf_float128 b);
+-- 
+2.43.0
+
