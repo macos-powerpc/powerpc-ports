@@ -1,0 +1,345 @@
+From 93b6fe443b355088bf39844fe59c136f075a6c66 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 23 Sep 2026 15:55:31 +0000
+Subject: [PATCH] vo_gpu/cocoa: don't call -[NSWindow setStyleMask:] on 10.5
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+-[NSWindow setStyleMask:] is 10.6+; before that a window's style mask is
+fixed at creation and the selector does not exist at all. MpvVideoWindow
+overrides it and calls [super setStyleMask:], so on 10.5 every call raises
+NSInvalidArgumentException:
+
+  *** -[MpvVideoWindow setStyleMask:]: unrecognized selector sent to instance
+
+(The runtime names the receiver's class, which is why our own override
+appears in the message.) It aborts -setFullScreen: right after
+_in_fullscreen = YES and before -setFrame:, the menubar hide and
+-windowDidEnterFullScreen, so fullscreen does nothing and leaves
+opts->fullscreen, _in_fullscreen and s->fullscreen three-way desynced --
+which also permanently disables the -constrainFrameRect: clamp. The same
+exception fires from -updateBorder: for runtime --border toggling. 10.6+
+is unaffected; the api-floor inventory audited the style-mask constants but
+not the setter, and COCOA-PORT-PLAN.md §4 actively prescribes it.
+
+Probe the setter with +[NSWindow instancesRespondToSelector:] -- probing
+self is useless, since this class overrides the selector and would always
+answer YES -- and compile the probe out to a constant YES when the
+deployment target is already 10.6, so 10.6+ builds keep the existing code
+path verbatim. -setStyleMask: becomes a no-op below 10.6 rather than
+raising; runtime border toggling is simply not expressible there (the mask
+create_window() picks at startup is final), but --border=no still works.
+
+Fullscreen gets a real fallback: -setLegacyFullScreen:onScreen: creates a
+second, borderless MpvVideoWindow covering the target screen and moves the
+view hierarchy -- and with it the NSOpenGLContext drawable -- into it via
+the new -[MpvCocoaAdapter moveContentViewToWindow:], then moves it back on
+the way out. s->window keeps pointing at the windowed window throughout;
+only the view's parent changes. The destination window is ordered on screen
+before the move, because -setView: on a view in an off-screen window leaves
+the context with no drawable. s->view survives -removeFromSuperview on the
++1 it keeps from -alloc in create_ui(), and s->video auto-resizes with it.
+The transition runs on the main thread with the VO thread blocked in
+VOCTRL_VO_OPTS_CHANGED, so no frame is in flight.
+
+-close tears the fullscreen window down first, so quitting while fullscreen
+cannot leave a borderless window and a hidden menubar behind.
+vo_cocoa_update_screen_info() now asks the window the view actually lives
+in and ignores a nil -[NSWindow screen], which an ordered-out window
+returns; on 10.6+ that is always s->window.
+
+Untested on hardware: needs a 10.5 PPC run (fullscreen enter/exit, --fs at
+startup, quit while fullscreen) and a 10.6 regression check.
+---
+ port-notes/inventory-api-floor.md |  19 +++++
+ video/out/cocoa/mpvadapter.h      |   1 +
+ video/out/cocoa/window.h          |   5 ++
+ video/out/cocoa/window.m          | 136 ++++++++++++++++++++++++++++++
+ video/out/cocoa_common.m          |  38 ++++++++-
+ 5 files changed, 198 insertions(+), 1 deletion(-)
+
+diff --git a/port-notes/inventory-api-floor.md b/port-notes/inventory-api-floor.md
+index f65581e7b0..232bb0c566 100644
+--- a/port-notes/inventory-api-floor.md
++++ b/port-notes/inventory-api-floor.md
+@@ -41,6 +41,25 @@ which is exactly what the `else` branches of this code already do for the *non-n
+ | `osdep/macosx_menubar.m:33` `NSFullScreenMenuItemEverywhere` user-default key | 10.7 (only meaningful with Lion fullscreen menu item) | 10.7 | DELETE — harmless no-op on 10.5/10.6 (just sets an unused NSUserDefaults key), but should be removed/`#if`-guarded for clarity since it documents intent that doesn't apply | DELETE |
+ | `video/out/cocoa_common.m:127-134` `queue_new_video_size` / `MpvWindowUpdate` — depends on window sized via fullscreen frame math | n/a (own code) | — | Verify the borderless-manual-fullscreen path (`setToFullScreen` else-branch) is exercised as the *only* path; it already looks 10.5-safe by itself (uses `setFrame:display:`, `NSWindowStyleMaskBorderless`) aside from the `NSWindowStyleMaskFullScreen` bit noted above | REDESIGN (integration, not new code) |
+ 
++**CORRECTION (2026-09-23).** This section audited the style-mask *constants* but missed
++the *setter*: `-[NSWindow setStyleMask:]` is **10.6+**. Before 10.6 a window's style mask is
++fixed at creation and the selector does not exist at all, so every call raises
++`NSInvalidArgumentException` (`*** -[MpvVideoWindow setStyleMask:]: unrecognized selector`,
++reported on 10.5; 10.6 is unaffected). The row above calling the borderless manual-fullscreen
++branch "already 10.5-safe" is therefore wrong, as is the `setStyleMask:NSBorderlessWindowMask`
++recipe in `COCOA-PORT-PLAN.md` §4. Affected call sites were `window.m` `-setFullScreen:`
++(enter/exit) and `-updateBorder:` (runtime `--border` toggling).
++
++Fixed by making `-setStyleMask:` a no-op below 10.6 (probed with
++`[NSWindow instancesRespondToSelector:]`, since the subclass overrides the selector and would
++always answer YES to `-respondsToSelector:`) and adding `-setLegacyFullScreen:onScreen:`: a
++second, borderless `MpvVideoWindow` covers the screen and the view hierarchy — and with it the
++`NSOpenGLContext` drawable — is moved across by
++`-[MpvCocoaAdapter moveContentViewToWindow:]`. Runtime border toggling remains impossible on
++10.5 (the mask picked by `create_window()` at startup is final); `--border=no` at startup
++still works. 10.6+ keeps the in-place `setStyleMask:` path, with the probe compiled out to a
++constant `YES`.
++
+ **Net recommendation:** Strip out the entire Lion `NSWindowDelegate` fullscreen protocol
+ conformance and the `toggleFullScreen:` override. Keep only the pre-existing "else" /
+ non-native manual fullscreen logic (borderless window + `setFrame:` to screen frame,
+diff --git a/video/out/cocoa/mpvadapter.h b/video/out/cocoa/mpvadapter.h
+index 1bbb722e20..dfd9697963 100644
+--- a/video/out/cocoa/mpvadapter.h
++++ b/video/out/cocoa/mpvadapter.h
+@@ -37,6 +37,7 @@
+ - (void)windowDidChangePhysicalScreen;
+ - (void)windowDidEnterFullScreen;
+ - (void)windowDidExitFullScreen;
++- (void)moveContentViewToWindow:(NSWindow *)target;
+ 
+ - (BOOL)isInFullScreenMode;
+ - (BOOL)wantsNativeFullscreen;
+diff --git a/video/out/cocoa/window.h b/video/out/cocoa/window.h
+index 601c01a9b2..115207bdfe 100644
+--- a/video/out/cocoa/window.h
++++ b/video/out/cocoa/window.h
+@@ -42,6 +42,11 @@
+     NSUInteger _fs_saved_style_mask;
+     NSInteger _fs_saved_level;
+     BOOL _in_fullscreen;
++    // 10.5 only: -[NSWindow setStyleMask:] does not exist before 10.6, so this
++    // window cannot be made borderless in place. Manual fullscreen moves the
++    // view hierarchy into this second, borderless window instead. Always nil
++    // on 10.6+.
++    MpvVideoWindow *_fs_window;
+ }
+ @property(nonatomic, retain) MpvCocoaAdapter *adapter;
+ - (BOOL)canBecomeKeyWindow;
+diff --git a/video/out/cocoa/window.m b/video/out/cocoa/window.m
+index 2311382e4a..7be0fe9872 100644
+--- a/video/out/cocoa/window.m
++++ b/video/out/cocoa/window.m
+@@ -56,8 +56,32 @@ static void mpv_set_menubar_hidden(BOOL hidden)
+ 
+ - (NSRect)frameRect:(NSRect)frameRect forCenteredContentSize:(NSSize)newSize;
+ - (void)setCenteredContentSize:(NSSize)newSize;
++- (void)setStyleMask:(NSWindowStyleMask)style;
++- (void)setCoversScreen:(BOOL)flag;
++- (void)setLegacyFullScreen:(BOOL)willBeFullscreen onScreen:(NSScreen *)target;
++- (void)dismissLegacyFullScreenWindow;
+ @end
+ 
++// -[NSWindow setStyleMask:] is 10.6+. Before that a window's style mask is
++// fixed at creation and the selector does not exist at all, so calling it
++// raises NSInvalidArgumentException. Probe NSWindow itself rather than self:
++// this class overrides the selector, so -respondsToSelector: on an instance
++// would always answer YES. (api-floor §1)
++static BOOL mpv_can_set_style_mask(void)
++{
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
++    // The deployment target already guarantees the setter exists; 10.6+ builds
++    // keep the original code path with no runtime check and never compile in
++    // any different behavior.
++    return YES;
++#else
++    static int cached = -1;
++    if (cached < 0)
++        cached = [NSWindow instancesRespondToSelector:@selector(setStyleMask:)];
++    return cached != 0;
++#endif
++}
++
+ @implementation MpvVideoWindow
+ 
+ @synthesize adapter = _adapter;
+@@ -97,6 +121,13 @@ static void mpv_set_menubar_hidden(BOOL hidden)
+ 
+ - (void)setStyleMask:(NSWindowStyleMask)style
+ {
++    // Pre-10.6 the mask is immutable; do nothing instead of raising. The
++    // fullscreen path uses -setLegacyFullScreen:onScreen: there, and a runtime
++    // border toggle (--border) is simply not expressible — the mask chosen in
++    // create_window() at startup is final.
++    if (!mpv_can_set_style_mask())
++        return;
++
+     NSResponder *nR = [self firstResponder];
+     [super setStyleMask:style];
+     [self makeFirstResponder:nR];
+@@ -120,6 +151,11 @@ static void mpv_set_menubar_hidden(BOOL hidden)
+     if (!target)
+         target = [NSScreen mainScreen];
+ 
++    if (!mpv_can_set_style_mask()) {
++        [self setLegacyFullScreen:willBeFullscreen onScreen:target];
++        return;
++    }
++
+     if (willBeFullscreen) {
+         // Save windowed state for restore.
+         _fs_saved_frame      = [self frame];
+@@ -156,6 +192,106 @@ static void mpv_set_menubar_hidden(BOOL hidden)
+     }
+ }
+ 
++// --- 10.5 fallback -------------------------------------------------------
++// A window's style mask is immutable before 10.6, so -setFullScreen: cannot
++// turn this window borderless in place. Instead a second, borderless window is
++// created to cover the screen and the view hierarchy — and with it the
++// NSOpenGLContext's drawable — is moved into it, then moved back on the way
++// out. 10.6+ never reaches any of this: mpv_can_set_style_mask() is a
++// compile-time YES there.
++
++- (void)setCoversScreen:(BOOL)flag
++{
++    // Only used so -constrainFrameRect:toScreen: lets the screen-covering
++    // (menubar-overlapping) frame through unclamped on the fullscreen window.
++    _in_fullscreen = flag;
++}
++
++- (void)dismissLegacyFullScreenWindow
++{
++    if (!_fs_window)
++        return;
++
++    mpv_set_menubar_hidden(NO);
++    // Callers must have put this window back on screen first: -setView: on an
++    // NSOpenGLContext whose view sits in an off-screen window leaves the
++    // context without a drawable. The teardown caller (-close) is the
++    // exception, and does not care -- nothing draws again.
++    [[self adapter] moveContentViewToWindow:self];
++
++    [_fs_window setDelegate:nil];
++    [_fs_window close];
++    [_fs_window release];
++    _fs_window = nil;
++}
++
++- (void)setLegacyFullScreen:(BOOL)willBeFullscreen onScreen:(NSScreen *)target
++{
++    if (willBeFullscreen) {
++        // Save windowed state for restore. The style mask is not saved: it
++        // never changes on this path.
++        _fs_saved_frame = [self frame];
++        _fs_saved_level = [self level];
++        _in_fullscreen  = YES;
++
++        _fs_window = [[MpvVideoWindow alloc]
++                         initWithContentRect:[target frame]
++                                   styleMask:NSWindowStyleMaskBorderless
++                                     backing:NSBackingStoreBuffered
++                                       defer:NO
++                                      screen:target];
++        // Own it explicitly rather than relying on -close releasing it.
++        [_fs_window setReleasedWhenClosed:NO];
++        [_fs_window setCoversScreen:YES];
++        [_fs_window setAdapter:[self adapter]];
++        [_fs_window setDelegate:_fs_window];
++        [_fs_window setBackgroundColor:[NSColor blackColor]];
++        // Inherit the windowed level (raised only by --ontop): as on 10.6, a
++        // window above NSMainMenuWindowLevel makes the auto-hide menubar
++        // reveal slide in underneath it, i.e. unreachable.
++        [_fs_window setLevel:[self level]];
++        // -constrainFrameRect: is bypassed by -setCoversScreen: above, so this
++        // pins the exact screen frame no matter what AppKit did during init.
++        [_fs_window setFrame:[target frame] display:NO];
++
++        mpv_set_menubar_hidden(YES);
++        [_fs_window makeKeyAndOrderFront:nil];
++        [[self adapter] moveContentViewToWindow:_fs_window];
++        [self orderOut:nil];
++        [_fs_window makeMainWindow];
++
++        [[self adapter] windowDidEnterFullScreen];
++    } else {
++        _in_fullscreen = NO;
++
++        // Show the windowed window (with the menubar back, so
++        // -constrainFrameRect: sees the real visible frame) *before* moving
++        // the views back into it, so the GL context reattaches to an on-screen
++        // surface.
++        mpv_set_menubar_hidden(NO);
++        [self setLevel:_fs_saved_level];
++        [self setFrame:_fs_saved_frame display:NO];
++        [self makeKeyAndOrderFront:nil];
++        [self makeMainWindow];
++
++        [self dismissLegacyFullScreenWindow];
++
++        [[self adapter] windowDidExitFullScreen];
++    }
++}
++
++- (void)close
++{
++    // Tearing down while still in fullscreen must not leave the borderless
++    // window — and a hidden menubar/dock — behind. _fs_window is always nil on
++    // 10.6+, where this is a plain [super close].
++    if (_fs_window) {
++        _in_fullscreen = NO;
++        [self dismissLegacyFullScreenWindow];
++    }
++    [super close];
++}
++
+ - (void)windowDidChangeScreen:(NSNotification *)notification
+ {
+     [[self adapter] windowDidChangeScreen:notification];
+diff --git a/video/out/cocoa_common.m b/video/out/cocoa_common.m
+index 95a7c31ef1..574ff3f21c 100644
+--- a/video/out/cocoa_common.m
++++ b/video/out/cocoa_common.m
+@@ -368,7 +368,14 @@ static void vo_cocoa_update_screen_info(struct vo *vo)
+         return;
+ 
+     if (s->current_screen && s->window) {
+-        s->current_screen = [s->window screen];
++        // Ask the window the view actually lives in: on 10.5 the legacy
++        // fullscreen path (window.m) parks the view in a second, borderless
++        // window while s->window is ordered out, and -[NSWindow screen] is nil
++        // for an off-screen window. On 10.6+ that is always s->window; in
++        // either case keep the last known screen rather than dropping to none.
++        NSScreen *screen = [([s->view window] ?: s->window) screen];
++        if (screen)
++            s->current_screen = screen;
+     } else if (!s->current_screen) {
+         s->current_screen = get_screen_by_id(vo, opts->screen_id);
+         if (!s->current_screen)
+@@ -1267,6 +1274,35 @@ int vo_cocoa_control(struct vo *vo, int *events, int request, void *arg)
+     vo_cocoa_anim_unlock([self vout]);
+ }
+ 
++// 10.5 only: -[NSWindow setStyleMask:] does not exist before 10.6, so the
++// manual fullscreen path in window.m covers the screen with a second,
++// borderless window and moves the view hierarchy — and with it the GL
++// drawable — across. s->window keeps pointing at the windowed window
++// throughout; only the view's parent changes. Called on the main thread with
++// the VO thread blocked in VOCTRL_VO_OPTS_CHANGED, so no frame is in flight.
++- (void)moveContentViewToWindow:(NSWindow *)target
++{
++    struct vo_cocoa_state *s = [self vout]->cocoa;
++    NSView *parent = [target contentView];
++
++    if (!s->view || !parent || [s->view superview] == parent)
++        return;
++
++    // Drop the drawable first: an NSOpenGLContext left attached across
++    // a window change points at a dead surface.
++    [s->nsgl_ctx clearDrawable];
++
++    // s->view holds the +1 from -alloc in create_ui() in addition to its
++    // superview's reference, so it survives -removeFromSuperview. s->video
++    // auto-resizes with it (NSView{Width,Height}Sizable).
++    [s->view removeFromSuperview];
++    [s->view setFrame:[parent bounds]];
++    [parent addSubview:s->view];
++
++    [s->nsgl_ctx setView:s->video];
++    [s->nsgl_ctx update];
++}
++
+ - (void)clearDrag
+ {
+     [self vout]->cocoa->window_is_dragged = false;
