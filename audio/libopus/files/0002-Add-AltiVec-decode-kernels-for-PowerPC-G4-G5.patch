@@ -1,0 +1,643 @@
+From 1696d701cda1e2eb9b6679c950235211119aaa27 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 20 Sep 2026 08:30:48 +0000
+Subject: [PATCH 2/4] Add AltiVec decode kernels for PowerPC G4/G5
+
+Five float-build decode kernels in celt/ppc/celt_altivec.c, hooked up through
+celt/ppc/celt_altivec.h in the MIPS style: OVERRIDE_* macros that point the
+existing celt/pitch.h and celt/mathops.h dispatch straight at the AltiVec
+functions, with no run-time dispatch table.
+
+  comb_filter_const        the 5-tap post-filter
+  celt_deemphasis          mono contiguous de-emphasis
+  deemphasis_stereo_simple stereo de-emphasis with interleaved output
+  celt_float2int16         scale/clamp/round to int16
+  celt_inner_prod          dot product
+
+The whole file and all the overrides are behind
+OPUS_PPC_PRESUME_ALTIVEC && !FIXED_POINT && big-endian, so every other
+configuration compiles the file to nothing and is bit-identical to before.
+
+Implementation notes:
+
+- There is no VSX, so nothing may be loaded or stored unaligned.  Every
+  kernel runs a scalar head until its store pointer is 16-byte aligned, then
+  an aligned-store vector body, then a scalar tail, and reads through
+  lvsl + two lvx + vperm.  The second load uses offset 15 rather than 16 so
+  it can never reach a block past the last byte wanted.
+- comb_filter_const keeps the five taps as five sliding windows into one
+  chained load stream, as in the FFmpeg AltiVec post-filter.  The chain runs
+  one block ahead, touching x[i-T+9]; the decoder calls this in place, and
+  T >= COMBFILTER_MINPERIOD (15) keeps that read behind the store pointer.
+- De-emphasis expands the IIR over four samples as a two-step scan,
+  s1 = t + c*shift1(t), s = s1 + c^2*shift2(s1), with the incoming state
+  folded into lane 0.  This re-associates the sum, so equivalence with C is
+  by tolerance, not bit-exactness.  The VERY_SMALL bias is kept: it guards
+  the G4's slow denormal path.
+- The stereo kernel needs an 8-byte-aligned pcm pointer to be able to reach
+  16-byte alignment by whole interleaved pairs; otherwise it stays scalar.
+- float2int16 uses vec_round (vrfin), which rounds ties to even exactly like
+  lrintf under the default rounding mode.
+
+Under --enable-check-asm each kernel runs its C twin on a copy of the inputs
+and asserts agreement: 1 LSB for int16, and for floats 1e-4 relative to the
+loudest sample of the block rather than to the individual value, since the
+re-association perturbs every output by about 1e-7 of the block's signal
+level and an output landing on a zero crossing is arbitrarily smaller than
+that.  The de-emphasis state is celt_sig-scale while its output is res-scale,
+so its reference level is scaled by CELT_SIG_SCALE to match.  The comb filter
+reference mirrors the caller's aliasing, because with y == x the filter is
+deliberately self-referential from i = T-2 on.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ celt/mathops.h          |   4 +
+ celt/pitch.h            |   4 +
+ celt/ppc/celt_altivec.c | 446 ++++++++++++++++++++++++++++++++++++++++
+ celt/ppc/celt_altivec.h |  91 ++++++++
+ 4 files changed, 545 insertions(+)
+ create mode 100644 celt/ppc/celt_altivec.c
+ create mode 100644 celt/ppc/celt_altivec.h
+
+diff --git a/celt/mathops.h b/celt/mathops.h
+index 4b6fa15c..7469cf84 100644
+--- a/celt/mathops.h
++++ b/celt/mathops.h
+@@ -44,6 +44,10 @@
+ #include "arm/mathops_arm.h"
+ #endif
+ 
++#if defined(OPUS_PPC_PRESUME_ALTIVEC)
++#include "ppc/celt_altivec.h"
++#endif
++
+ #define PI 3.1415926535897931
+ 
+ /* Multiplies two 16-bit fractional values. Bit-exactness of this macro is important */
+diff --git a/celt/pitch.h b/celt/pitch.h
+index 8d6652be..c0c7b83f 100644
+--- a/celt/pitch.h
++++ b/celt/pitch.h
+@@ -50,6 +50,10 @@
+ # include "arm/pitch_arm.h"
+ #endif
+ 
++#if defined(OPUS_PPC_PRESUME_ALTIVEC)
++# include "ppc/celt_altivec.h"
++#endif
++
+ void pitch_downsample(celt_sig * OPUS_RESTRICT x[], opus_val16 * OPUS_RESTRICT x_lp,
+       int len, int C, int factor, int arch);
+ 
+diff --git a/celt/ppc/celt_altivec.c b/celt/ppc/celt_altivec.c
+new file mode 100644
+index 00000000..092b32c5
+--- /dev/null
++++ b/celt/ppc/celt_altivec.c
+@@ -0,0 +1,446 @@
++/* Copyright (c) 2026 Sergey Fedorov */
++/**
++   @file celt_altivec.c
++   @brief AltiVec (PowerPC G4/G5) decode kernels
++ */
++
++/*
++   Redistribution and use in source and binary forms, with or without
++   modification, are permitted provided that the following conditions
++   are met:
++
++   - Redistributions of source code must retain the above copyright
++   notice, this list of conditions and the following disclaimer.
++
++   - Redistributions in binary form must reproduce the above copyright
++   notice, this list of conditions and the following disclaimer in the
++   documentation and/or other materials provided with the distribution.
++
++   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
++   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "celt_altivec.h"
++
++#if defined(OPUS_PPC_ALTIVEC_ENABLED)
++
++#include <altivec.h>
++#include "arch.h"
++#include "pitch.h"
++#include "mathops.h"
++#include "float_cast.h"
++
++#ifdef OPUS_CHECK_ASM
++#include <math.h>
++#include "os_support.h"
++#endif
++
++typedef __vector float          vfloat;
++typedef __vector unsigned char  vuchar;
++
++/* Byte offset of a pointer inside its 16-byte block.  Cast through size_t
++   rather than uintptr_t so the file needs no C99 header. */
++#define VEC_MISALIGN(p) ((int)((size_t)(const void *)(p) & 15))
++
++static OPUS_INLINE vfloat vsplatf(float v)
++{
++   return vec_splats(v);
++}
++
++/* Unaligned 4-float load.  There is no VSX here, so this is the classic
++   lvsl + two aligned loads + vperm.  The second load uses offset 15 (not 16)
++   so it can never touch a block past the last byte we actually want. */
++static OPUS_INLINE vfloat vec_ldu(const float *p)
++{
++   float *q = (float *)p;
++   return vec_perm(vec_ld(0, q), vec_ld(15, q), vec_lvsl(0, q));
++}
++
++/* Same, with the permute vector hoisted out of a loop.  Only valid while the
++   pointer keeps the same alignment, i.e. when it advances by whole vectors. */
++static OPUS_INLINE vfloat vec_ldu_perm(const float *p, vuchar perm)
++{
++   float *q = (float *)p;
++   return vec_perm(vec_ld(0, q), vec_ld(15, q), perm);
++}
++
++#ifdef OPUS_CHECK_ASM
++/* The vector forms re-associate the sums, so equivalence with the C twin is
++   checked by tolerance rather than bit-exactness.  The tolerance is relative
++   to the loudest sample of the block, not to the value being compared: the
++   re-association perturbs every output by roughly 1e-7 of the block's signal
++   level, which is unboundedly large next to a single output that happens to
++   land on a zero crossing. */
++static OPUS_INLINE float altivec_check_ref(const float *v, int n)
++{
++   float ref = 1.f;
++   int i;
++   for (i=0;i<n;i++)
++   {
++      float mag = v[i] < 0 ? -v[i] : v[i];
++      if (mag > ref) ref = mag;
++   }
++   return ref;
++}
++
++static OPUS_INLINE int altivec_close(float a, float b, float ref)
++{
++   float d = a - b;
++   if (d < 0) d = -d;
++   return d <= 1e-4f*ref;
++}
++
++static OPUS_INLINE void *altivec_check_alloc(int n, int size)
++{
++   void *p = opus_alloc((size_t)(n > 0 ? n : 1)*size);
++   celt_assert(p != NULL);
++   return p;
++}
++#endif
++
++
++void celt_float2int16_altivec(const float * OPUS_RESTRICT in,
++      short * OPUS_RESTRICT out, int cnt)
++{
++   int i = 0;
++   const vfloat vscale = vsplatf(CELT_SIG_SCALE);
++   const vfloat vzero = vsplatf(0.f);
++   const vfloat vmin = vsplatf(-32768.f);
++   const vfloat vmax = vsplatf(32767.f);
++#ifdef OPUS_CHECK_ASM
++   short *out_c = (short *)altivec_check_alloc(cnt, sizeof(*out_c));
++   celt_float2int16_c(in, out_c, cnt);
++#endif
++
++   /* Head: scalar until the store pointer is 16-byte aligned.  out is at
++      least 2-byte aligned, so this always terminates. */
++   for (;i<cnt && VEC_MISALIGN(out+i);i++)
++      out[i] = FLOAT2INT16(in[i]);
++
++   if (cnt - i >= 8)
++   {
++      const vuchar perm = vec_lvsl(0, (float *)(in+i));
++      for (;i<=cnt-8;i+=8)
++      {
++         vfloat a = vec_madd(vec_ldu_perm(in+i, perm), vscale, vzero);
++         vfloat b = vec_madd(vec_ldu_perm(in+i+4, perm), vscale, vzero);
++         a = vec_min(vec_max(a, vmin), vmax);
++         b = vec_min(vec_max(b, vmin), vmax);
++         vec_st(vec_packs(vec_cts(vec_round(a), 0), vec_cts(vec_round(b), 0)),
++                0, out+i);
++      }
++   }
++
++   for (;i<cnt;i++)
++      out[i] = FLOAT2INT16(in[i]);
++
++#ifdef OPUS_CHECK_ASM
++   for (i=0;i<cnt;i++)
++      celt_assert(out[i] - out_c[i] <= 1 && out_c[i] - out[i] <= 1);
++   opus_free(out_c);
++#endif
++}
++
++
++opus_val32 celt_inner_prod_altivec(const opus_val16 *x, const opus_val16 *y,
++      int N)
++{
++   int i;
++   float xy = 0;
++   const vfloat vzero = vsplatf(0.f);
++   vfloat sum = vzero;
++   float part[4] __attribute__((aligned(16)));
++#ifdef OPUS_CHECK_ASM
++   opus_val32 xy_c = celt_inner_prod_c(x, y, N);
++   float terms = 1.f;
++#endif
++
++   /* Band-offset pointers, so both streams are loaded unaligned. */
++   for (i=0;i<N-3;i+=4)
++      sum = vec_madd(vec_ldu(x+i), vec_ldu(y+i), sum);
++
++   /* Horizontal sum, kept out of the loop: the G5 moves vector lanes to the
++      scalar side through memory. */
++   sum = vec_add(sum, vec_sld(sum, sum, 8));
++   sum = vec_add(sum, vec_sld(sum, sum, 4));
++   vec_st(sum, 0, part);
++   xy = part[0];
++
++   for (;i<N;i++)
++      xy += x[i]*y[i];
++
++#ifdef OPUS_CHECK_ASM
++   /* A dot product's round-off scales with the sum of the term magnitudes,
++      not with the sum itself: celt_pitch_xcorr_c correlates celt_sig-scale
++      signals at mismatched lags, where the result nearly cancels to zero
++      while the terms stay large.  Measured worst case on such data is 1e-7 of
++      sum|terms| but 1e-3 of the result, so referring the tolerance to the
++      terms still leaves it three orders of magnitude tight enough to catch a
++      dropped lane or tail element. */
++   for (i=0;i<N;i++)
++   {
++      float term = x[i]*y[i];
++      terms += term < 0 ? -term : term;
++   }
++   celt_assert(altivec_close(xy, xy_c, terms));
++#endif
++   return xy;
++}
++
++
++void comb_filter_const_altivec(opus_val32 *y, opus_val32 *x, int T, int N,
++      celt_coef g10, celt_coef g11, celt_coef g12)
++{
++   int i = 0;
++   const vfloat vg10 = vsplatf(g10);
++   const vfloat vg11 = vsplatf(g11);
++   const vfloat vg12 = vsplatf(g12);
++#ifdef OPUS_CHECK_ASM
++   /* The decoder calls this in place, and then the filter is deliberately
++      self-referential: from i = T-2 on, the taps read samples this same call
++      has already replaced with output.  Snapshot x before touching y and
++      mirror the caller's aliasing, or the reference filters different data. */
++   opus_val32 *x_c = (opus_val32 *)altivec_check_alloc(N+T+2, sizeof(*x_c));
++   opus_val32 *y_c;
++   float ref;
++   int k;
++   OPUS_COPY(x_c, x-T-2, N+T+2);
++   y_c = y == x ? x_c+T+2
++                : (opus_val32 *)altivec_check_alloc(N, sizeof(*y_c));
++   comb_filter_const_c(y_c, x_c+T+2, T, N, g10, g11, g12);
++#endif
++
++   /* The chained tap load runs one 16-byte block ahead of the taps it feeds,
++      so it touches up to x[i-T+9].  With y == x that sample must already be
++      final, which needs T >= 10; the caller clamps T to COMBFILTER_MINPERIOD
++      (15) before getting here. */
++   celt_assert(T >= 10);
++
++   /* Head: scalar until the store pointer is 16-byte aligned. */
++   for (;i<N && VEC_MISALIGN(y+i);i++)
++      y[i] = x[i]
++             + MULT_COEF_32(g10, x[i-T])
++             + MULT_COEF_32(g11, ADD32(x[i-T+1], x[i-T-1]))
++             + MULT_COEF_32(g12, ADD32(x[i-T+2], x[i-T-2]));
++
++   if (N - i >= 4)
++   {
++      /* The five taps are five 4-float windows into one stream starting at
++         x[i-T-2]; load one block per iteration and slide the windows across
++         the pair.  The taps a group uses reach x[i-T+5], and the block being
++         chained in reaches x[i-T+9]; both stay behind the store pointer for
++         T >= 10, so with y == x no group ever reads a sample this same call
++         has still to write. */
++      const float *q = x + i - T - 2;
++      const vuchar permq = vec_lvsl(0, (float *)q);
++      const vuchar permx = vec_lvsl(0, (float *)(x+i));
++      vfloat vn = vec_ld(16, (float *)q);
++      vfloat u0 = vec_perm(vec_ld(0, (float *)q), vn, permq);
++      int qb = 32;
++
++      for (;i<=N-4;i+=4, qb+=16)
++      {
++         vfloat vn2 = vec_ld(qb, (float *)q);
++         vfloat u1 = vec_perm(vn, vn2, permq);   /* x[i-T+2] lanes */
++         vfloat x3 = vec_sld(u0, u1, 4);         /* x[i-T-1] lanes */
++         vfloat x2 = vec_sld(u0, u1, 8);         /* x[i-T]   lanes */
++         vfloat x1 = vec_sld(u0, u1, 12);        /* x[i-T+1] lanes */
++         vfloat acc = vec_ldu_perm(x+i, permx);
++         acc = vec_madd(vg10, x2, acc);
++         acc = vec_madd(vg11, vec_add(x1, x3), acc);
++         acc = vec_madd(vg12, vec_add(u1, u0), acc);  /* u0 = x[i-T-2] lanes */
++         vec_st(acc, 0, y+i);
++         u0 = u1;
++         vn = vn2;
++      }
++   }
++
++   for (;i<N;i++)
++      y[i] = x[i]
++             + MULT_COEF_32(g10, x[i-T])
++             + MULT_COEF_32(g11, ADD32(x[i-T+1], x[i-T-1]))
++             + MULT_COEF_32(g12, ADD32(x[i-T+2], x[i-T-2]));
++
++#ifdef OPUS_CHECK_ASM
++   ref = altivec_check_ref(y_c, N);
++   for (k=0;k<N;k++)
++      celt_assert(altivec_close(y[k], y_c[k], ref));
++   if (y_c != x_c+T+2)
++      opus_free(y_c);
++   opus_free(x_c);
++#endif
++}
++
++
++/* One step of the de-emphasis scan: given t with the incoming state already
++   folded into lane 0, return s[j] = t[j] + c*s[j-1] for the four lanes.
++   vec_sld(zero, v, 16-4k) shifts lanes toward higher indices on big-endian. */
++static OPUS_INLINE vfloat deemphasis_scan4(vfloat t, vfloat vc, vfloat vc2,
++      vfloat vzero)
++{
++   vfloat s1 = vec_madd(vc, vec_sld(vzero, t, 12), t);
++   return vec_madd(vc2, vec_sld(vzero, s1, 8), s1);
++}
++
++
++opus_val32 celt_deemphasis_altivec(opus_res *y, const opus_val32 *x,
++      opus_val16 coef0, opus_val32 m, int N)
++{
++   int i = 0;
++   const vfloat vc = vsplatf(coef0);
++   const vfloat vc2 = vsplatf(coef0*coef0);
++   const vfloat vzero = vsplatf(0.f);
++   const vfloat vsmall = vsplatf(VERY_SMALL);
++   const vfloat vres = vsplatf(1.f/CELT_SIG_SCALE);
++#ifdef OPUS_CHECK_ASM
++   opus_res *y_c = (opus_res *)altivec_check_alloc(N, sizeof(*y_c));
++   opus_val32 m_c = celt_deemphasis_c(y_c, x, coef0, m, N);
++   float ref;
++#endif
++
++   for (;i<N && VEC_MISALIGN(y+i);i++)
++   {
++      celt_sig tmp = x[i] + VERY_SMALL + m;
++      m = MULT16_32_Q15(coef0, tmp);
++      y[i] = SIG2RES(tmp);
++   }
++
++   if (N - i >= 4)
++   {
++      const vuchar permx = vec_lvsl(0, (float *)(x+i));
++      float part[4] __attribute__((aligned(16)));
++      vfloat vm = vsplatf(m);
++      for (;i<=N-4;i+=4)
++      {
++         vfloat t = vec_add(vec_ldu_perm(x+i, permx), vsmall);
++         vfloat s;
++         /* {m, 0, 0, 0}: only lane 0 carries the incoming state. */
++         t = vec_add(t, vec_sld(vm, vzero, 12));
++         s = deemphasis_scan4(t, vc, vc2, vzero);
++         vec_st(vec_madd(s, vres, vzero), 0, y+i);
++         vm = vec_madd(vec_splat(s, 3), vc, vzero);
++      }
++      vec_st(vm, 0, part);
++      m = part[0];
++   }
++
++   for (;i<N;i++)
++   {
++      celt_sig tmp = x[i] + VERY_SMALL + m;
++      m = MULT16_32_Q15(coef0, tmp);
++      y[i] = SIG2RES(tmp);
++   }
++
++#ifdef OPUS_CHECK_ASM
++   /* y[] is res-scale, the returned state is celt_sig-scale: same block, two
++      units, so the reference level is scaled to match. */
++   ref = altivec_check_ref(y_c, N);
++   for (i=0;i<N;i++)
++      celt_assert(altivec_close(y[i], y_c[i], ref));
++   celt_assert(altivec_close(m, m_c, CELT_SIG_SCALE*ref));
++   opus_free(y_c);
++#endif
++   return m;
++}
++
++
++void deemphasis_stereo_simple_altivec(celt_sig *in[], opus_res *pcm, int N,
++      opus_val16 coef0, celt_sig *mem)
++{
++   const celt_sig *x0 = in[0];
++   const celt_sig *x1 = in[1];
++   celt_sig m0 = mem[0];
++   celt_sig m1 = mem[1];
++   const vfloat vc = vsplatf(coef0);
++   const vfloat vc2 = vsplatf(coef0*coef0);
++   const vfloat vzero = vsplatf(0.f);
++   const vfloat vsmall = vsplatf(VERY_SMALL);
++   const vfloat vres = vsplatf(1.f/CELT_SIG_SCALE);
++   int j = 0;
++#ifdef OPUS_CHECK_ASM
++   opus_res *pcm_c = (opus_res *)altivec_check_alloc(2*N, sizeof(*pcm_c));
++   celt_sig mem_c[2];
++   float ref;
++   mem_c[0] = mem[0];
++   mem_c[1] = mem[1];
++   deemphasis_stereo_simple_c(in, pcm_c, N, coef0, mem_c);
++#endif
++
++   /* Each scalar iteration advances the interleaved store by 8 bytes, so the
++      head loop can only reach 16-byte alignment when pcm is 8-byte aligned. */
++   if (!((size_t)(const void *)pcm & 7))
++   {
++      for (;j<N && VEC_MISALIGN(pcm+2*j);j++)
++      {
++         celt_sig tmp0 = x0[j] + VERY_SMALL + m0;
++         celt_sig tmp1 = x1[j] + VERY_SMALL + m1;
++         m0 = MULT16_32_Q15(coef0, tmp0);
++         m1 = MULT16_32_Q15(coef0, tmp1);
++         pcm[2*j  ] = SIG2RES(tmp0);
++         pcm[2*j+1] = SIG2RES(tmp1);
++      }
++
++      if (N - j >= 4)
++      {
++         const vuchar perm0 = vec_lvsl(0, (float *)(x0+j));
++         const vuchar perm1 = vec_lvsl(0, (float *)(x1+j));
++         float part[4] __attribute__((aligned(16)));
++         vfloat vm0 = vsplatf(m0);
++         vfloat vm1 = vsplatf(m1);
++         for (;j<=N-4;j+=4)
++         {
++            vfloat t0 = vec_add(vec_ldu_perm(x0+j, perm0), vsmall);
++            vfloat t1 = vec_add(vec_ldu_perm(x1+j, perm1), vsmall);
++            vfloat s0, s1;
++            t0 = vec_add(t0, vec_sld(vm0, vzero, 12));
++            t1 = vec_add(t1, vec_sld(vm1, vzero, 12));
++            s0 = deemphasis_scan4(t0, vc, vc2, vzero);
++            s1 = deemphasis_scan4(t1, vc, vc2, vzero);
++            vec_st(vec_madd(vec_mergeh(s0, s1), vres, vzero), 0, pcm+2*j);
++            vec_st(vec_madd(vec_mergel(s0, s1), vres, vzero), 16, pcm+2*j);
++            vm0 = vec_madd(vec_splat(s0, 3), vc, vzero);
++            vm1 = vec_madd(vec_splat(s1, 3), vc, vzero);
++         }
++         vec_st(vm0, 0, part);
++         m0 = part[0];
++         vec_st(vm1, 0, part);
++         m1 = part[0];
++      }
++   }
++
++   for (;j<N;j++)
++   {
++      celt_sig tmp0 = x0[j] + VERY_SMALL + m0;
++      celt_sig tmp1 = x1[j] + VERY_SMALL + m1;
++      m0 = MULT16_32_Q15(coef0, tmp0);
++      m1 = MULT16_32_Q15(coef0, tmp1);
++      pcm[2*j  ] = SIG2RES(tmp0);
++      pcm[2*j+1] = SIG2RES(tmp1);
++   }
++   mem[0] = m0;
++   mem[1] = m1;
++
++#ifdef OPUS_CHECK_ASM
++   ref = altivec_check_ref(pcm_c, 2*N);
++   for (j=0;j<2*N;j++)
++      celt_assert(altivec_close(pcm[j], pcm_c[j], ref));
++   celt_assert(altivec_close(mem[0], mem_c[0], CELT_SIG_SCALE*ref));
++   celt_assert(altivec_close(mem[1], mem_c[1], CELT_SIG_SCALE*ref));
++   opus_free(pcm_c);
++#endif
++}
++
++#endif /* OPUS_PPC_ALTIVEC_ENABLED */
+diff --git a/celt/ppc/celt_altivec.h b/celt/ppc/celt_altivec.h
+new file mode 100644
+index 00000000..053c1c04
+--- /dev/null
++++ b/celt/ppc/celt_altivec.h
+@@ -0,0 +1,91 @@
++/* Copyright (c) 2026 Sergey Fedorov */
++/**
++   @file celt_altivec.h
++   @brief AltiVec (PowerPC G4/G5) decode kernels
++ */
++
++/*
++   Redistribution and use in source and binary forms, with or without
++   modification, are permitted provided that the following conditions
++   are met:
++
++   - Redistributions of source code must retain the above copyright
++   notice, this list of conditions and the following disclaimer.
++
++   - Redistributions in binary form must reproduce the above copyright
++   notice, this list of conditions and the following disclaimer in the
++   documentation and/or other materials provided with the distribution.
++
++   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
++   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#if !defined(CELT_ALTIVEC_H)
++# define CELT_ALTIVEC_H
++
++# include "arch.h"
++
++/* AltiVec is a compile-time decision: every G4/G5 has it, so there is no
++   run-time detection and OPUS_ARCHMASK stays 0.  The kernels are float-only
++   and big-endian-only; little-endian PowerPC keeps the C path. */
++# if defined(OPUS_PPC_PRESUME_ALTIVEC) && !defined(FIXED_POINT) \
++  && (defined(__BIG_ENDIAN__) \
++      || (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) \
++          && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
++#  define OPUS_PPC_ALTIVEC_ENABLED (1)
++# endif
++
++# if defined(OPUS_PPC_ALTIVEC_ENABLED)
++
++void celt_float2int16_altivec(const float * OPUS_RESTRICT in,
++      short * OPUS_RESTRICT out, int cnt);
++
++#  define OVERRIDE_FLOAT2INT16 (1)
++#  define celt_float2int16(in, out, cnt, arch) \
++     ((void)(arch), celt_float2int16_altivec(in, out, cnt))
++
++opus_val32 celt_inner_prod_altivec(const opus_val16 *x, const opus_val16 *y,
++      int N);
++
++#  define OVERRIDE_CELT_INNER_PROD (1)
++#  define celt_inner_prod(x, y, N, arch) \
++     ((void)(arch), celt_inner_prod_altivec(x, y, N))
++
++void comb_filter_const_altivec(opus_val32 *y, opus_val32 *x, int T, int N,
++      celt_coef g10, celt_coef g11, celt_coef g12);
++
++#  define OVERRIDE_COMB_FILTER_CONST (1)
++#  define comb_filter_const(y, x, T, N, g10, g11, g12, arch) \
++     ((void)(arch), comb_filter_const_altivec(y, x, T, N, g10, g11, g12))
++
++opus_val32 celt_deemphasis_altivec(opus_res *y, const opus_val32 *x,
++      opus_val16 coef0, opus_val32 m, int N);
++
++#  define OVERRIDE_CELT_DEEMPHASIS (1)
++#  define celt_deemphasis(y, x, coef, m, N, arch) \
++     ((void)(arch), celt_deemphasis_altivec(y, x, coef, m, N))
++
++void deemphasis_stereo_simple_altivec(celt_sig *in[], opus_res *pcm, int N,
++      opus_val16 coef0, celt_sig *mem);
++
++#  define OVERRIDE_DEEMPHASIS_STEREO_SIMPLE (1)
++#  define deemphasis_stereo_simple(in, pcm, N, coef, mem, arch) \
++     ((void)(arch), deemphasis_stereo_simple_altivec(in, pcm, N, coef, mem))
++
++/* The self-check builds call the C twin, which is otherwise static. */
++#  if defined(OPUS_CHECK_ASM)
++#   define NON_STATIC_COMB_FILTER_CONST_C
++#  endif
++
++# endif /* OPUS_PPC_ALTIVEC_ENABLED */
++
++#endif /* CELT_ALTIVEC_H */
+-- 
+2.43.0
+
