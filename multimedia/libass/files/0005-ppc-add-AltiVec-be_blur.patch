@@ -1,0 +1,154 @@
+From 6e85e5a6f324d6803310dc02079624763db837c2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 22 Sep 2026 22:48:44 +0000
+Subject: [PATCH 5/7] ppc: add AltiVec be_blur
+
+The running horizontal sum of the C version expands to
+col_pix[x] = buf[x-1] + 2*buf[x] + buf[x+1] with out-of-row pixels
+treated as zero, which vectorizes directly.  Whole vectors are processed
+per row with the row masked to zero past width, so the right edge and
+the columns beyond it match the C result.
+---
+ libass/ppc/be_blur_altivec.c | 130 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 130 insertions(+)
+ create mode 100644 libass/ppc/be_blur_altivec.c
+
+diff --git a/libass/ppc/be_blur_altivec.c b/libass/ppc/be_blur_altivec.c
+new file mode 100644
+index 0000000..cac0781
+--- /dev/null
++++ b/libass/ppc/be_blur_altivec.c
+@@ -0,0 +1,130 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ass_utils.h"
++
++#include "altivec_utils.h"
++
++
++#define ALIGNMENT  16
++
++/*
++ * The C version keeps a running horizontal sum; expanded, the horizontal
++ * pass is just col_pix[x] = buf[x - 1] + 2 * buf[x] + buf[x + 1] with
++ * buf[-1] and buf[width] treated as zero.  Everything below works on
++ * ceil(width / 16) whole vectors per row, with the row masked to zero past
++ * width so that both the right edge and the columns beyond it match the C
++ * result (which leaves them at zero).  The maximum value of a col_sum pair
++ * is 16 * 255, so 16-bit lanes never overflow.
++ */
++
++// 16 bytes of the row at byte offset offs, zeroed from width on
++static inline v_u8 load_row(const uint8_t *row, size_t offs, size_t width)
++{
++    v_u8 v = vec_ld(offs, row);
++    if (offs + 16 > width)
++        v = vec_and(v, ass_byte_mask(0, (int) (width - offs)));
++    return v;
++}
++
++static inline void col_pix(v_u8 prev, v_u8 cur, v_u8 next,
++                           v_u16 *lo, v_u16 *hi)
++{
++    v_u8 m1 = ass_sld_u8(prev, cur, 15);  // buf[x - 1]
++    v_u8 p1 = ass_sld_u8(cur, next, 1);   // buf[x + 1]
++    *lo = vec_add(vec_add(ass_unpack_lo_u8(m1), ass_unpack_lo_u8(p1)),
++                  vec_add(ass_unpack_lo_u8(cur), ass_unpack_lo_u8(cur)));
++    *hi = vec_add(vec_add(ass_unpack_hi_u8(m1), ass_unpack_hi_u8(p1)),
++                  vec_add(ass_unpack_hi_u8(cur), ass_unpack_hi_u8(cur)));
++}
++
++/**
++ * \brief Blur with [[1,2,1], [2,4,2], [1,2,1]] kernel
++ * This blur is the same as the one employed by vsfilter.
++ */
++void ass_be_blur_altivec(uint8_t *restrict buf, ptrdiff_t stride,
++                         size_t width, size_t height, uint16_t *restrict tmp)
++{
++    ASSUME(!((uintptr_t) buf % ALIGNMENT) && !(stride % ALIGNMENT));
++    ASSUME(!((uintptr_t) tmp % ALIGNMENT));
++    ASSUME(width > 1 && height > 1);
++
++    uint16_t *col_pix_buf = tmp;
++    uint16_t *col_sum_buf = tmp + stride;
++    size_t chunks = (width + 15) >> 4;
++
++    uint8_t *row = buf;
++    {
++        v_u8 prev = ass_zero_u8(), cur = load_row(row, 0, width);
++        for (size_t k = 0; k < chunks; k++) {
++            v_u8 next = k + 1 < chunks ? load_row(row, 16 * (k + 1), width)
++                                       : ass_zero_u8();
++            v_u16 lo, hi;
++            col_pix(prev, cur, next, &lo, &hi);
++            vec_st(lo, 32 * k,      col_pix_buf);
++            vec_st(hi, 32 * k + 16, col_pix_buf);
++            vec_st(lo, 32 * k,      col_sum_buf);
++            vec_st(hi, 32 * k + 16, col_sum_buf);
++            prev = cur;
++            cur = next;
++        }
++    }
++
++    for (size_t y = 1; y < height; y++) {
++        uint8_t *dst = row;
++        row += stride;
++
++        v_u8 prev = ass_zero_u8(), cur = load_row(row, 0, width);
++        for (size_t k = 0; k < chunks; k++) {
++            v_u8 next = k + 1 < chunks ? load_row(row, 16 * (k + 1), width)
++                                       : ass_zero_u8();
++            v_u16 pix_lo, pix_hi;
++            col_pix(prev, cur, next, &pix_lo, &pix_hi);
++
++            v_u16 sum_lo = vec_add(vec_ld(32 * k,      col_pix_buf), pix_lo);
++            v_u16 sum_hi = vec_add(vec_ld(32 * k + 16, col_pix_buf), pix_hi);
++            vec_st(pix_lo, 32 * k,      col_pix_buf);
++            vec_st(pix_hi, 32 * k + 16, col_pix_buf);
++
++            v_u16 out_lo = vec_add(vec_ld(32 * k,      col_sum_buf), sum_lo);
++            v_u16 out_hi = vec_add(vec_ld(32 * k + 16, col_sum_buf), sum_hi);
++            vec_st(sum_lo, 32 * k,      col_sum_buf);
++            vec_st(sum_hi, 32 * k + 16, col_sum_buf);
++
++            vec_st(vec_pack(vec_sr(out_lo, vec_splat_u16(4)),
++                            vec_sr(out_hi, vec_splat_u16(4))), 16 * k, dst);
++            prev = cur;
++            cur = next;
++        }
++    }
++
++    for (size_t k = 0; k < chunks; k++) {
++        v_u16 lo = vec_add(vec_ld(32 * k,      col_sum_buf),
++                           vec_ld(32 * k,      col_pix_buf));
++        v_u16 hi = vec_add(vec_ld(32 * k + 16, col_sum_buf),
++                           vec_ld(32 * k + 16, col_pix_buf));
++        vec_st(vec_pack(vec_sr(lo, vec_splat_u16(4)),
++                        vec_sr(hi, vec_splat_u16(4))), 16 * k, row);
++    }
++}
+-- 
+2.43.0
+

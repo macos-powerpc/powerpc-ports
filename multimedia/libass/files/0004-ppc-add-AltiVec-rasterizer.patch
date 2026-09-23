@@ -1,0 +1,347 @@
+From 39fa02911d2c0ab6674d81aa518dfd8286d13faf Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 22 Sep 2026 22:48:43 +0000
+Subject: [PATCH 4/7] ppc: add AltiVec rasterizer
+
+All four tile functions for both tile sizes, generated from one template
+header like the C version.  The C reference computes in int16_t
+throughout, so the modular 16-bit vector operations are an exact
+transcription; vec_packsu implements its final FFMIN(val, 255) clamp.
+update_border_line needs a per-lane (x * w) >> 16, which is assembled
+from vec_mule/vec_mulo and one permute picking the high halfwords.
+---
+ libass/ppc/rasterizer_altivec.c          |  37 +++
+ libass/ppc/rasterizer_altivec_template.h | 277 +++++++++++++++++++++++
+ 2 files changed, 314 insertions(+)
+ create mode 100644 libass/ppc/rasterizer_altivec.c
+ create mode 100644 libass/ppc/rasterizer_altivec_template.h
+
+diff --git a/libass/ppc/rasterizer_altivec.c b/libass/ppc/rasterizer_altivec.c
+new file mode 100644
+index 0000000..a0b1e77
+--- /dev/null
++++ b/libass/ppc/rasterizer_altivec.c
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <assert.h>
++
++#include "ass_rasterizer.h"
++
++#include "altivec_utils.h"
++
++
++#define ALIGNMENT  16
++
++#define TILE_SIZE  16
++#include "rasterizer_altivec_template.h"
++#undef TILE_SIZE
++
++#define TILE_SIZE  32
++#include "rasterizer_altivec_template.h"
++#undef TILE_SIZE
+diff --git a/libass/ppc/rasterizer_altivec_template.h b/libass/ppc/rasterizer_altivec_template.h
+new file mode 100644
+index 0000000..7c6cb55
+--- /dev/null
++++ b/libass/ppc/rasterizer_altivec_template.h
+@@ -0,0 +1,277 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#if   TILE_SIZE == 16
++#define SUFFIX(name)  name ## 16_altivec
++#define TILE_ORDER    4
++#elif TILE_SIZE == 32
++#define SUFFIX(name)  name ## 32_altivec
++#define TILE_ORDER    5
++#else
++#error Unsupported tile size
++#endif
++
++// int16_t resp. uint8_t vectors needed for one tile row
++#define TILE_VECS   (TILE_SIZE / 8)
++#define TILE_BVECS  (TILE_SIZE / 16)
++
++#define FULL_VALUE  (1 << (14 - TILE_ORDER))
++#define RESCALE_AB(ab, scale) \
++    (((ab) * (int64_t) (scale) + ((int64_t) 1 << (45 + TILE_ORDER))) >> (46 + TILE_ORDER))
++#define RESCALE_C(c, scale) \
++    (((int32_t) ((c) >> (7 + TILE_ORDER)) * (int64_t) (scale) + ((int64_t) 1 << 44)) >> 45)
++
++
++void SUFFIX(ass_fill_solid_tile)(uint8_t *buf, ptrdiff_t stride, int set)
++{
++    ASSUME(!((uintptr_t) buf % ALIGNMENT) && !(stride % ALIGNMENT));
++
++    v_u8 value = set ? (v_u8) vec_splat_s8(-1) : ass_zero_u8();
++    for (int y = 0; y < TILE_SIZE; y++) {
++        for (int i = 0; i < TILE_BVECS; i++)
++            vec_st(value, 16 * i, buf);
++        buf += stride;
++    }
++}
++
++
++/*
++ * Halfplane Filling Function
++ *
++ * See c/rasterizer_template.h for the algorithm.  All of the arithmetic is
++ * done in int16_t there, so the modular 16-bit vector operations below are
++ * an exact transcription; (c1 + c2) can not overflow because both are
++ * clamped to [0, FULL_VALUE] first.
++ */
++
++void SUFFIX(ass_fill_halfplane_tile)(uint8_t *buf, ptrdiff_t stride,
++                                     int32_t a, int32_t b, int64_t c, int32_t scale)
++{
++    ASSUME(!((uintptr_t) buf % ALIGNMENT) && !(stride % ALIGNMENT));
++
++    int16_t aa = RESCALE_AB(a, scale), bb = RESCALE_AB(b, scale);
++    int16_t cc = RESCALE_C(c, scale) + FULL_VALUE / 2 - ((aa + bb) >> 1);
++
++    int16_t abs_a = aa < 0 ? -aa : aa;
++    int16_t abs_b = bb < 0 ? -bb : bb;
++    int16_t delta = (FFMIN(abs_a, abs_b) + 2) >> 2;
++
++    // va[i] holds aa * x for the eight columns of vector i
++    v_s16 va[TILE_VECS];
++    const v_s16 index = (v_s16) {0, 1, 2, 3, 4, 5, 6, 7};
++    for (int i = 0; i < TILE_VECS; i++) {
++        v_s16 x = vec_add(index, vec_splats((signed short) (8 * i)));
++        va[i] = vec_mladd(vec_splats(aa), x, ass_zero_s16());
++    }
++
++    // c1 = cc - (aa * x - delta), c2 = cc - (aa * x + delta)
++    v_s16 vc1 = vec_splats((signed short) (cc + delta));
++    v_s16 vc2 = vec_splats((signed short) (cc - delta));
++    const v_s16 vbb = vec_splats(bb);
++    const v_s16 zero = ass_zero_s16();
++    const v_s16 full = vec_splats((signed short) FULL_VALUE);
++
++    for (int y = 0; y < TILE_SIZE; y++) {
++        for (int i = 0; i < TILE_VECS; i += 2) {
++            v_s16 res[2];
++            for (int j = 0; j < 2; j++) {
++                v_s16 c1 = vec_sub(vc1, va[i + j]);
++                v_s16 c2 = vec_sub(vc2, va[i + j]);
++                c1 = vec_min(vec_max(c1, zero), full);
++                c2 = vec_min(vec_max(c2, zero), full);
++                res[j] = vec_sra(vec_add(c1, c2), vec_splat_u16(7 - TILE_ORDER));
++            }
++            vec_st(vec_packsu(res[0], res[1]), 8 * i, buf);
++        }
++        buf += stride;
++        vc1 = vec_sub(vc1, vbb);
++        vc2 = vec_sub(vc2, vbb);
++    }
++}
++
++
++/*
++ * Generic Filling Function
++ *
++ * See c/rasterizer_template.h.  The per-segment bookkeeping is kept scalar
++ * and identical to the C version; only the inner loops over the tile columns
++ * are vectorized.
++ */
++
++// Render top/bottom line of the trapezoid with antialiasing
++static inline void SUFFIX(update_border_line)(v_s16 res[TILE_VECS],
++                                              int16_t abs_a, const v_s16 va[TILE_VECS],
++                                              int16_t b, int16_t abs_b,
++                                              int16_t c, int up, int dn)
++{
++    int16_t size = dn - up;
++    int16_t w = FULL_VALUE + (size << (8 - TILE_ORDER)) - abs_a;
++    w = FFMIN(w, FULL_VALUE) << (2 * TILE_ORDER - 5);
++
++    int16_t dc_b = abs_b * (int32_t) size >> 6;
++    int16_t dc = (FFMIN(abs_a, dc_b) + 2) >> 2;
++
++    int16_t base = (int32_t) b * (int16_t) (up + dn) >> 7;
++    int16_t offs1 = size - ((base + dc) * (int32_t) w >> 16);
++    int16_t offs2 = size - ((base - dc) * (int32_t) w >> 16);
++
++    size <<= 1;
++    const v_s16 vw = vec_splats(w);
++    const v_s16 vc = vec_splats(c);
++    const v_s16 vo1 = vec_splats(offs1), vo2 = vec_splats(offs2);
++    const v_s16 vsize = vec_splats(size);
++    const v_s16 zero = ass_zero_s16();
++
++    for (int i = 0; i < TILE_VECS; i++) {
++        // like the NEON and SSE2 backends, (c - va[x]) is kept in 16 bits
++        v_s16 cw = ass_mulhi_s16(vec_sub(vc, va[i]), vw);
++        v_s16 c1 = vec_add(cw, vo1);
++        v_s16 c2 = vec_add(cw, vo2);
++        c1 = vec_min(vec_max(c1, zero), vsize);
++        c2 = vec_min(vec_max(c2, zero), vsize);
++        res[i] = vec_add(res[i], vec_add(c1, c2));
++    }
++}
++
++void SUFFIX(ass_fill_generic_tile)(uint8_t *restrict buf, ptrdiff_t stride,
++                                   const struct segment *restrict line, size_t n_lines,
++                                   int winding)
++{
++    ASSUME(!((uintptr_t) buf % ALIGNMENT) && !(stride % ALIGNMENT));
++
++    v_s16 res[TILE_SIZE][TILE_VECS];
++    const v_s16 zero = ass_zero_s16();
++    for (int y = 0; y < TILE_SIZE; y++)
++        for (int i = 0; i < TILE_VECS; i++)
++            res[y][i] = zero;
++    int16_t delta[TILE_SIZE + 2] = {0};
++
++    const v_s16 index = (v_s16) {0, 1, 2, 3, 4, 5, 6, 7};
++    const v_s16 full = vec_splats((signed short) FULL_VALUE);
++
++    const struct segment *end = line + n_lines;
++    for (; line != end; ++line) {
++        assert(line->y_min >= 0 && line->y_min < 64 << TILE_ORDER);
++        assert(line->y_max > 0 && line->y_max <= 64 << TILE_ORDER);
++        assert(line->y_min <= line->y_max);
++
++        int16_t up_delta = line->flags & SEGFLAG_DN ? 4 : 0;
++        int16_t dn_delta = up_delta;
++        if (!line->x_min && (line->flags & SEGFLAG_EXACT_LEFT)) dn_delta ^= 4;
++        if (line->flags & SEGFLAG_UL_DR) {
++            int16_t tmp = up_delta;
++            up_delta = dn_delta;
++            dn_delta = tmp;
++        }
++
++        int up = line->y_min >> 6, dn = line->y_max >> 6;
++        int16_t up_pos = line->y_min & 63;
++        int16_t up_delta1 = up_delta * up_pos;
++        int16_t dn_pos = line->y_max & 63;
++        int16_t dn_delta1 = dn_delta * dn_pos;
++        delta[up + 1] -= up_delta1;
++        delta[up] -= (up_delta << 6) - up_delta1;
++        delta[dn + 1] += dn_delta1;
++        delta[dn] += (dn_delta << 6) - dn_delta1;
++        if (line->y_min == line->y_max)
++            continue;
++
++        int16_t a = RESCALE_AB(line->a, line->scale);
++        int16_t b = RESCALE_AB(line->b, line->scale);
++        int16_t c = RESCALE_C(line->c, line->scale) - (a >> 1) - b * up;
++
++        v_s16 va[TILE_VECS];
++        for (int i = 0; i < TILE_VECS; i++) {
++            v_s16 x = vec_add(index, vec_splats((signed short) (8 * i)));
++            va[i] = vec_mladd(vec_splats(a), x, zero);
++        }
++        int16_t abs_a = a < 0 ? -a : a;
++        int16_t abs_b = b < 0 ? -b : b;
++        int16_t dc = (FFMIN(abs_a, abs_b) + 2) >> 2;
++        int16_t base = FULL_VALUE / 2 - (b >> 1);
++        int16_t dc1 = base + dc;
++        int16_t dc2 = base - dc;
++
++        if (up_pos) {
++            if (dn == up) {
++                SUFFIX(update_border_line)(res[up], abs_a, va, b, abs_b, c, up_pos, dn_pos);
++                continue;
++            }
++            SUFFIX(update_border_line)(res[up], abs_a, va, b, abs_b, c, up_pos, 64);
++            up++;
++            c -= b;
++        }
++        v_s16 vc1 = vec_splats((signed short) (c + dc1));
++        v_s16 vc2 = vec_splats((signed short) (c + dc2));
++        const v_s16 vb = vec_splats(b);
++        for (int y = up; y < dn; y++) {
++            for (int i = 0; i < TILE_VECS; i++) {
++                v_s16 c1 = vec_sub(vc1, va[i]);
++                v_s16 c2 = vec_sub(vc2, va[i]);
++                c1 = vec_min(vec_max(c1, zero), full);
++                c2 = vec_min(vec_max(c2, zero), full);
++                res[y][i] = vec_add(res[y][i],
++                                    vec_sra(vec_add(c1, c2),
++                                            vec_splat_u16(7 - TILE_ORDER)));
++            }
++            vc1 = vec_sub(vc1, vb);
++            vc2 = vec_sub(vc2, vb);
++            c -= b;
++        }
++        if (dn_pos)
++            SUFFIX(update_border_line)(res[dn], abs_a, va, b, abs_b, c, 0, dn_pos);
++    }
++
++    int16_t cur = 256 * (int8_t) winding;
++    for (int y = 0; y < TILE_SIZE; y++) {
++        cur += delta[y];
++        v_s16 vcur = vec_splats(cur);
++        for (int i = 0; i < TILE_VECS; i += 2) {
++            v_s16 val[2];
++            for (int j = 0; j < 2; j++) {
++                v_s16 v = vec_add(res[y][i + j], vcur);
++                val[j] = vec_max(v, vec_sub(zero, v));
++            }
++            vec_st(vec_packsu(val[0], val[1]), 8 * i, buf);
++        }
++        buf += stride;
++    }
++}
++
++
++void SUFFIX(ass_merge_tile)(uint8_t *restrict buf, ptrdiff_t stride,
++                            const uint8_t *restrict tile)
++{
++    ASSUME(!((uintptr_t) buf % ALIGNMENT) && !(stride % ALIGNMENT));
++
++    for (int y = 0; y < TILE_SIZE; y++) {
++        for (int i = 0; i < TILE_BVECS; i++)
++            vec_st(vec_max(vec_ld(16 * i, buf), vec_ld(16 * i, tile)), 16 * i, buf);
++        buf += stride;
++        tile += TILE_SIZE;
++    }
++}
++
++
++#undef SUFFIX
++#undef TILE_ORDER
++#undef TILE_VECS
++#undef TILE_BVECS
++#undef FULL_VALUE
++#undef RESCALE_AB
++#undef RESCALE_C
+-- 
+2.43.0
+

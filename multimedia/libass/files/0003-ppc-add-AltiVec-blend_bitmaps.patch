@@ -1,0 +1,426 @@
+From c742b62bb2cc31ad2efd62e93889fa913f505d1e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 22 Sep 2026 22:48:43 +0000
+Subject: [PATCH 3/7] ppc: add AltiVec blend_bitmaps
+
+altivec_utils.h collects the shared helpers: unaligned loads built from
+vec_lvsl, lane windows and deinterleaves expressed as vec_perm rather
+than vec_sld, the exact floor halving add base VMX lacks, and the
+byte-lane masks used for row tails.
+
+add_bitmaps/imul_bitmaps take an unaligned dst, but vec_st can only
+write aligned quadwords, so the loops walk the aligned blocks covering
+the row and shift the source into place instead; bytes outside the row
+segment are masked to zero, which makes both operations the identity
+there, exactly as the NEON backend does.  mul_bitmaps masks its result
+instead and writes zeros past width.
+---
+ libass/ppc/altivec_utils.h         | 186 ++++++++++++++++++++++++++
+ libass/ppc/blend_bitmaps_altivec.c | 202 +++++++++++++++++++++++++++++
+ 2 files changed, 388 insertions(+)
+ create mode 100644 libass/ppc/altivec_utils.h
+ create mode 100644 libass/ppc/blend_bitmaps_altivec.c
+
+diff --git a/libass/ppc/altivec_utils.h b/libass/ppc/altivec_utils.h
+new file mode 100644
+index 0000000..3630416
+--- /dev/null
++++ b/libass/ppc/altivec_utils.h
+@@ -0,0 +1,186 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef LIBASS_PPC_ALTIVEC_UTILS_H
++#define LIBASS_PPC_ALTIVEC_UTILS_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * Only base AltiVec (VMX) is used here: no VSX, no 64-bit lanes and no
++ * instruction introduced after the PPC970, so the result runs on every
++ * G4/G5/e6500/POWER4+ part.
++ *
++ * The lane layout of vec_ld/vec_st, vec_lvsl and the byte patterns below is
++ * written for big-endian PowerPC.  Little-endian would need vec_xl/vec_xst
++ * (VSX) or an entirely different set of permute patterns, so it is rejected
++ * here and disabled in both build systems.
++ */
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
++#error "The libass AltiVec backend requires a big-endian PowerPC target"
++#endif
++
++#include <altivec.h>
++
++/*
++ * Some altivec.h implementations (clang's, and GCC's with
++ * -maltivec=...-compatible modes) define these as object-like macros.
++ * Undefine them again so that a later <stdbool.h> or C++ header is not
++ * affected; the __-prefixed spellings are used throughout this backend.
++ */
++#ifdef vector
++#undef vector
++#endif
++#ifdef pixel
++#undef pixel
++#endif
++#ifdef bool
++#undef bool
++#endif
++
++typedef __vector unsigned char  v_u8;
++typedef __vector signed char    v_s8;
++typedef __vector unsigned short v_u16;
++typedef __vector signed short   v_s16;
++typedef __vector unsigned int   v_u32;
++typedef __vector signed int     v_s32;
++
++#define ASS_IOTA8 \
++    ((v_u8) {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})
++
++static inline v_u8 ass_zero_u8(void)
++{
++    return vec_splat_u8(0);
++}
++
++static inline v_u16 ass_zero_u16(void)
++{
++    return (v_u16) vec_splat_u16(0);
++}
++
++static inline v_s16 ass_zero_s16(void)
++{
++    return vec_splat_s16(0);
++}
++
++/* Load 16 bytes from a possibly unaligned address.
++ *
++ * vec_ld ignores the low four address bits, so the two aligned quadwords
++ * overlapping [p, p+16) are fetched and recombined.  Using offset 15 rather
++ * than 16 means no memory past the second quadword is touched, i.e. at most
++ * 15 bytes beyond p+15 are read, which every caller here has slack for. */
++static inline v_u8 ass_ldu_u8(const uint8_t *p)
++{
++    return vec_perm(vec_ld(0, p), vec_ld(15, p), vec_lvsl(0, p));
++}
++
++/* Byte window [s, s+16) of the concatenation (a, b); 0 <= s <= 16. */
++static inline v_u8 ass_sld_u8(v_u8 a, v_u8 b, int s)
++{
++    return vec_perm(a, b, vec_add(ASS_IOTA8, vec_splats((unsigned char) s)));
++}
++
++/* 16-bit lane window [s, s+8) of the concatenation (a, b); 0 <= s <= 8. */
++static inline v_s16 ass_sld_s16(v_s16 a, v_s16 b, int s)
++{
++    return (v_s16) ass_sld_u8((v_u8) a, (v_u8) b, 2 * s);
++}
++
++static inline v_u16 ass_sld_u16(v_u16 a, v_u16 b, int s)
++{
++    return (v_u16) ass_sld_u8((v_u8) a, (v_u8) b, 2 * s);
++}
++
++/* Even (0, 2, 4, 6) resp. odd 16-bit lanes of a and b, concatenated. */
++static inline v_s16 ass_even_s16(v_s16 a, v_s16 b)
++{
++    static const v_u8 perm = {0, 1, 4, 5, 8, 9, 12, 13,
++                              16, 17, 20, 21, 24, 25, 28, 29};
++    return (v_s16) vec_perm((v_u8) a, (v_u8) b, perm);
++}
++
++static inline v_s16 ass_odd_s16(v_s16 a, v_s16 b)
++{
++    static const v_u8 perm = {2, 3, 6, 7, 10, 11, 14, 15,
++                              18, 19, 22, 23, 26, 27, 30, 31};
++    return (v_s16) vec_perm((v_u8) a, (v_u8) b, perm);
++}
++
++/* Zero-extend the low resp. high eight bytes to 16-bit lanes. */
++static inline v_u16 ass_unpack_lo_u8(v_u8 v)
++{
++    return (v_u16) vec_mergeh(ass_zero_u8(), v);
++}
++
++static inline v_u16 ass_unpack_hi_u8(v_u8 v)
++{
++    return (v_u16) vec_mergel(ass_zero_u8(), v);
++}
++
++/* High byte of every 16-bit lane of a and b, i.e. a truncating (x >> 8). */
++static inline v_u8 ass_pack_hi8(v_u16 a, v_u16 b)
++{
++    static const v_u8 perm = {0, 2, 4, 6, 8, 10, 12, 14,
++                              16, 18, 20, 22, 24, 26, 28, 30};
++    return vec_perm((v_u8) a, (v_u8) b, perm);
++}
++
++/* High halfword of every 32-bit lane, with e holding the products of the
++ * even and o those of the odd 16-bit lanes (the vec_mule/vec_mulo split).
++ * This is an exact arithmetic (x >> 16) for each lane. */
++static inline v_s16 ass_pack_hi16(v_s32 e, v_s32 o)
++{
++    static const v_u8 perm = {0, 1, 16, 17, 4, 5, 20, 21,
++                              8, 9, 24, 25, 12, 13, 28, 29};
++    return (v_s16) vec_perm((v_u8) e, (v_u8) o, perm);
++}
++
++/* (a * b) >> 16 per 16-bit lane, signed. */
++static inline v_s16 ass_mulhi_s16(v_s16 a, v_s16 b)
++{
++    return ass_pack_hi16(vec_mule(a, b), vec_mulo(a, b));
++}
++
++/* Exact (a + b) >> 1 without 16-bit overflow.  vec_avg computes (a+b+1)>>1
++ * with 17-bit precision, so subtracting the lost carry bit yields the
++ * floor halving add AltiVec lacks (NEON's uhadd). */
++static inline v_u16 ass_hadd_u16(v_u16 a, v_u16 b)
++{
++    return vec_sub(vec_avg(a, b),
++                   vec_and(vec_xor(a, b), (v_u16) vec_splat_u16(1)));
++}
++
++/* 0xFF in byte lanes [lo, hi), 0 elsewhere; 0 <= lo <= 16, 0 <= hi <= 16. */
++static inline v_u8 ass_byte_mask(int lo, int hi)
++{
++    v_u8 idx = ASS_IOTA8;
++    v_u8 m_lo = (v_u8) vec_cmpgt(vec_splats((unsigned char) lo), idx);
++    v_u8 m_hi = (v_u8) vec_cmpgt(vec_splats((unsigned char) hi), idx);
++    return vec_andc(m_hi, m_lo);
++}
++
++/* Store the eight bytes of v that sit at byte offset (p & 15) to p.
++ * p must be 8-byte aligned; nothing outside [p, p+8) is written. */
++static inline void ass_store8(v_u8 v, uint8_t *p)
++{
++    vec_ste((v_u32) v, 0, (unsigned int *) p);
++    vec_ste((v_u32) v, 4, (unsigned int *) p);
++}
++
++#endif /* LIBASS_PPC_ALTIVEC_UTILS_H */
+diff --git a/libass/ppc/blend_bitmaps_altivec.c b/libass/ppc/blend_bitmaps_altivec.c
+new file mode 100644
+index 0000000..7f9e1d0
+--- /dev/null
++++ b/libass/ppc/blend_bitmaps_altivec.c
+@@ -0,0 +1,202 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ass_utils.h"
++
++#include "altivec_utils.h"
++
++
++#define ALIGNMENT  16
++
++/*
++ * dst of add_bitmaps/imul_bitmaps and both sources of mul_bitmaps may be
++ * unaligned, but vec_st can only write aligned quadwords.  The loops below
++ * therefore iterate over the *aligned* 16-byte blocks covering the row
++ * segment and shift the source into place instead.  Bytes of the first and
++ * last block that fall outside [dst, dst + width) are turned into a no-op by
++ * masking the source to zero there:
++ *   add:  dst + 0                 == dst
++ *   imul: (dst * 255 + 255) >> 8  == dst
++ * For mul_bitmaps, whose dst is aligned but which must write zeros past
++ * width (like the C and NEON versions do), the result is masked instead.
++ *
++ * Rows start aligned and strides are multiples of 16, so rounding the row
++ * segment outwards to block boundaries never leaves the row.
++ */
++
++static inline const uint8_t *align_down(const uint8_t *p)
++{
++    return (const uint8_t *) ((uintptr_t) p & ~(uintptr_t) (ALIGNMENT - 1));
++}
++
++/* The aligned block at a, or zero if it lies entirely outside [lo, end).
++ * Such a block only ever feeds output bytes that are masked away, and
++ * skipping it keeps the loads inside the source bitmap. */
++static inline v_u8 load_block(const uint8_t *a, const uint8_t *lo,
++                              const uint8_t *end)
++{
++    if (a < lo || a >= end)
++        return ass_zero_u8();
++    return vec_ld(0, a);
++}
++
++static inline v_u8 edge_mask(size_t k, size_t chunks, size_t head, size_t tail)
++{
++    if (k == 0)
++        return ass_byte_mask((int) head, chunks == 1 ? (int) tail : ALIGNMENT);
++    if (k + 1 == chunks)
++        return ass_byte_mask(0, (int) tail);
++    return (v_u8) vec_splat_s8(-1);
++}
++
++
++void ass_add_bitmaps_altivec(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                             const uint8_t *restrict src, ptrdiff_t src_stride,
++                             size_t width, size_t height)
++{
++    ASSUME(!(dst_stride % ALIGNMENT));
++    ASSUME(!(src_stride % ALIGNMENT));
++    ASSUME(width > 0 && height > 0);
++
++    size_t head = (uintptr_t) dst & (ALIGNMENT - 1);
++    size_t chunks = (head + width + ALIGNMENT - 1) / ALIGNMENT;
++    size_t tail = head + width - ALIGNMENT * (chunks - 1);
++
++    uint8_t *dp0 = dst - head;
++    const v_u8 perm = vec_lvsl(0, src - head);
++    const uint8_t *sa0 = align_down(src - head);
++    const uint8_t *lo = align_down(src), *end = src + width;
++
++    for (size_t y = 0; y < height; y++) {
++        const uint8_t *sa = sa0;
++        uint8_t *dp = dp0;
++        v_u8 cur = load_block(sa, lo, end);
++        for (size_t k = 0; k < chunks; k++) {
++            v_u8 nxt = load_block(sa + ALIGNMENT, lo, end);
++            v_u8 s = vec_and(vec_perm(cur, nxt, perm),
++                             edge_mask(k, chunks, head, tail));
++            vec_st(vec_adds(vec_ld(0, dp), s), 0, dp);
++            cur = nxt;
++            sa += ALIGNMENT;
++            dp += ALIGNMENT;
++        }
++        dp0 += dst_stride;
++        sa0 += src_stride;
++        lo  += src_stride;
++        end += src_stride;
++    }
++}
++
++void ass_imul_bitmaps_altivec(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                              const uint8_t *restrict src, ptrdiff_t src_stride,
++                              size_t width, size_t height)
++{
++    ASSUME(!(dst_stride % ALIGNMENT));
++    ASSUME(!(src_stride % ALIGNMENT));
++    ASSUME(width > 0 && height > 0);
++
++    size_t head = (uintptr_t) dst & (ALIGNMENT - 1);
++    size_t chunks = (head + width + ALIGNMENT - 1) / ALIGNMENT;
++    size_t tail = head + width - ALIGNMENT * (chunks - 1);
++
++    uint8_t *dp0 = dst - head;
++    const v_u8 perm = vec_lvsl(0, src - head);
++    const uint8_t *sa0 = align_down(src - head);
++    const uint8_t *lo = align_down(src), *end = src + width;
++    const v_u16 bias = vec_splats((unsigned short) 255);
++
++    for (size_t y = 0; y < height; y++) {
++        const uint8_t *sa = sa0;
++        uint8_t *dp = dp0;
++        v_u8 cur = load_block(sa, lo, end);
++        for (size_t k = 0; k < chunks; k++) {
++            v_u8 nxt = load_block(sa + ALIGNMENT, lo, end);
++            v_u8 s = vec_and(vec_perm(cur, nxt, perm),
++                             edge_mask(k, chunks, head, tail));
++            v_u8 n = vec_nor(s, s);  // 255 - src, and 255 (identity) outside
++            v_u8 d = vec_ld(0, dp);
++            v_u16 rl = vec_mladd(ass_unpack_lo_u8(d), ass_unpack_lo_u8(n), bias);
++            v_u16 rh = vec_mladd(ass_unpack_hi_u8(d), ass_unpack_hi_u8(n), bias);
++            vec_st(ass_pack_hi8(rl, rh), 0, dp);
++            cur = nxt;
++            sa += ALIGNMENT;
++            dp += ALIGNMENT;
++        }
++        dp0 += dst_stride;
++        sa0 += src_stride;
++        lo  += src_stride;
++        end += src_stride;
++    }
++}
++
++void ass_mul_bitmaps_altivec(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                             const uint8_t *restrict src1, ptrdiff_t src1_stride,
++                             const uint8_t *restrict src2, ptrdiff_t src2_stride,
++                             size_t width, size_t height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT) && !(dst_stride % ALIGNMENT));
++    ASSUME(!(src1_stride % ALIGNMENT));
++    ASSUME(!(src2_stride % ALIGNMENT));
++    ASSUME(width > 0 && height > 0);
++
++    size_t chunks = (width + ALIGNMENT - 1) / ALIGNMENT;
++    size_t tail = width - ALIGNMENT * (chunks - 1);
++
++    const v_u8 perm1 = vec_lvsl(0, src1), perm2 = vec_lvsl(0, src2);
++    const uint8_t *sa1 = align_down(src1), *sa2 = align_down(src2);
++    const uint8_t *lo1 = sa1, *end1 = src1 + width;
++    const uint8_t *lo2 = sa2, *end2 = src2 + width;
++    const v_u16 bias = vec_splats((unsigned short) 255);
++
++    for (size_t y = 0; y < height; y++) {
++        const uint8_t *a1 = sa1, *a2 = sa2;
++        uint8_t *dp = dst;
++        v_u8 cur1 = load_block(a1, lo1, end1);
++        v_u8 cur2 = load_block(a2, lo2, end2);
++        for (size_t k = 0; k < chunks; k++) {
++            v_u8 nxt1 = load_block(a1 + ALIGNMENT, lo1, end1);
++            v_u8 nxt2 = load_block(a2 + ALIGNMENT, lo2, end2);
++            v_u8 s1 = vec_perm(cur1, nxt1, perm1);
++            v_u8 s2 = vec_perm(cur2, nxt2, perm2);
++            v_u16 rl = vec_mladd(ass_unpack_lo_u8(s1), ass_unpack_lo_u8(s2), bias);
++            v_u16 rh = vec_mladd(ass_unpack_hi_u8(s1), ass_unpack_hi_u8(s2), bias);
++            v_u8 r = ass_pack_hi8(rl, rh);
++            if (k + 1 == chunks)
++                r = vec_and(r, ass_byte_mask(0, (int) tail));
++            vec_st(r, 0, dp);
++            cur1 = nxt1;
++            cur2 = nxt2;
++            a1 += ALIGNMENT;
++            a2 += ALIGNMENT;
++            dp += ALIGNMENT;
++        }
++        dst  += dst_stride;
++        sa1  += src1_stride;
++        lo1  += src1_stride;
++        end1 += src1_stride;
++        sa2  += src2_stride;
++        lo2  += src2_stride;
++        end2 += src2_stride;
++    }
++}
+-- 
+2.43.0
+

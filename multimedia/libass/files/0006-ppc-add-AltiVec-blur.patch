@@ -1,0 +1,484 @@
+From e57b06f2018570dae037bf579dcb058b481d3c88 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 22 Sep 2026 22:48:44 +0000
+Subject: [PATCH 6/7] ppc: add AltiVec blur
+
+A stripe line is exactly one vector at alignment 16, so copy_line and
+the zero line of c/blur_template.h become a load and a zero vector.
+
+shrink_func sums four 15-bit values in int32, which does not fit in
+16-bit lanes; it uses the same halving add chain as the NEON backend,
+with the floor halving add synthesised from vec_avg.  expand_func and
+stripe_pack/unpack are literal transcriptions because the C code already
+computes in wrapping uint16_t.  The parametric filters accumulate into
+two 32-bit vectors fed by vec_mule/vec_mulo.
+---
+ libass/ppc/blur_altivec.c | 456 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 456 insertions(+)
+ create mode 100644 libass/ppc/blur_altivec.c
+
+diff --git a/libass/ppc/blur_altivec.c b/libass/ppc/blur_altivec.c
+new file mode 100644
+index 0000000..e1cb663
+--- /dev/null
++++ b/libass/ppc/blur_altivec.c
+@@ -0,0 +1,456 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ass_utils.h"
++
++#include "altivec_utils.h"
++
++
++#define ALIGNMENT     16
++#define STRIPE_WIDTH  (ALIGNMENT / 2)
++#define STRIPE_MASK   (STRIPE_WIDTH - 1)
++
++/*
++ * A stripe line is exactly one 16-byte vector here, so c/blur_template.h's
++ * copy_line() becomes a single load and its zero_line a zero vector.
++ */
++static inline v_s16 load_line(const int16_t *ptr, size_t offs, size_t size)
++{
++    if (offs >= size)
++        return ass_zero_s16();
++    return vec_ld(0, ptr + offs);
++}
++
++/*
++ * Unpack/Pack Functions
++ */
++
++void ass_stripe_unpack16_altivec(int16_t *restrict dst, const uint8_t *restrict src,
++                                 ptrdiff_t src_stride, size_t width, size_t height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT) && !(src_stride % ALIGNMENT));
++    ASSUME(width > 0 && height > 0);
++
++    for (size_t y = 0; y < height; y++) {
++        int16_t *ptr = dst;
++        size_t x = 0;
++        while (x < width) {
++            // x is a multiple of 16 here, so one aligned load covers two stripes
++            v_u8 b = vec_ld((long) x, src);
++            v_u16 v = ass_unpack_lo_u8(b);
++            // ((src << 7 | src >> 1) + 1) >> 1
++            v = vec_sr(vec_add(vec_or(vec_sl(v, vec_splat_u16(7)),
++                                      vec_sr(v, vec_splat_u16(1))),
++                               (v_u16) vec_splat_u16(1)), vec_splat_u16(1));
++            vec_st((v_s16) v, 0, ptr);
++            ptr += STRIPE_WIDTH * height;
++            x += STRIPE_WIDTH;
++            if (x >= width)
++                break;
++            v = ass_unpack_hi_u8(b);
++            v = vec_sr(vec_add(vec_or(vec_sl(v, vec_splat_u16(7)),
++                                      vec_sr(v, vec_splat_u16(1))),
++                               (v_u16) vec_splat_u16(1)), vec_splat_u16(1));
++            vec_st((v_s16) v, 0, ptr);
++            ptr += STRIPE_WIDTH * height;
++            x += STRIPE_WIDTH;
++        }
++        dst += STRIPE_WIDTH;
++        src += src_stride;
++    }
++}
++
++// (src - (src >> 8) + dither) >> 6, in wrapping 16-bit arithmetic
++static inline v_u16 pack_pixels(v_s16 v, v_s16 dither)
++{
++    v_s16 t = vec_add(vec_sub(v, vec_sra(v, vec_splat_u16(8))), dither);
++    return vec_sr((v_u16) t, vec_splat_u16(6));
++}
++
++void ass_stripe_pack16_altivec(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                               const int16_t *restrict src, size_t width, size_t height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT) && !(dst_stride % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(width > 0 && height > 0);
++
++    static const v_s16 dither[2] = {
++        { 8, 40,  8, 40,  8, 40,  8, 40},
++        {56, 24, 56, 24, 56, 24, 56, 24},
++    };
++
++    size_t step = STRIPE_WIDTH * height;
++    size_t stripes = (width + STRIPE_MASK) / STRIPE_WIDTH;
++
++    uint8_t *ptr = dst;
++    size_t s = 0;
++    // two adjacent stripes make up one aligned 16-byte destination vector
++    for (; s + 1 < stripes; s += 2) {
++        const int16_t *s0 = src + s * step, *s1 = s0 + step;
++        uint8_t *p = ptr;
++        for (size_t y = 0; y < height; y++) {
++            v_u16 a = pack_pixels(vec_ld(0, s0), dither[y & 1]);
++            v_u16 b = pack_pixels(vec_ld(0, s1), dither[y & 1]);
++            vec_st(vec_pack(a, b), 0, p);
++            s0 += STRIPE_WIDTH;
++            s1 += STRIPE_WIDTH;
++            p += dst_stride;
++        }
++        ptr += 2 * STRIPE_WIDTH;
++    }
++    if (s < stripes) {
++        const int16_t *s0 = src + s * step;
++        uint8_t *p = ptr;
++        for (size_t y = 0; y < height; y++) {
++            v_u16 a = pack_pixels(vec_ld(0, s0), dither[y & 1]);
++            // the result is replicated into both halves, so it is in place
++            // for ass_store8() whether p is 0 or 8 modulo 16
++            ass_store8(vec_pack(a, a), p);
++            s0 += STRIPE_WIDTH;
++            p += dst_stride;
++        }
++        ptr += STRIPE_WIDTH;
++    }
++
++    size_t left = (size_t) dst_stride - stripes * STRIPE_WIDTH;
++    for (size_t y = 0; y < height; y++) {
++        uint8_t *p = ptr;
++        size_t n = left;
++        if (n && ((uintptr_t) p & (ALIGNMENT - 1))) {
++            ass_store8(ass_zero_u8(), p);
++            p += STRIPE_WIDTH;
++            n -= STRIPE_WIDTH;
++        }
++        for (size_t i = 0; i < n; i += ALIGNMENT)
++            vec_st(ass_zero_u8(), (long) i, p);
++        ptr += dst_stride;
++    }
++}
++
++/*
++ * Contract Filters
++ *
++ * Contract image by factor 2 with kernel [1, 5, 10, 10, 5, 1].
++ *
++ * The C version sums four 15-bit values in int32; in 16-bit lanes that
++ * overflows, so the same halving-add chain the NEON backend uses is applied
++ * here.  ass_hadd_u16() is an exact floor((a + b) / 2) with 17 bits of
++ * intermediate precision, which base AltiVec lacks as a single instruction.
++ */
++static inline v_s16 shrink_func(v_s16 p1p, v_s16 p1n, v_s16 z0p,
++                                v_s16 z0n, v_s16 n1p, v_s16 n1n)
++{
++    v_u16 a = vec_add((v_u16) p1p, (v_u16) n1n);
++    v_u16 b = vec_add((v_u16) p1n, (v_u16) n1p);
++    v_u16 c = vec_add((v_u16) z0p, (v_u16) z0n);
++    v_u16 r = ass_hadd_u16(a, b);
++    r = ass_hadd_u16(r, c);
++    r = ass_hadd_u16(r, b);
++    r = ass_hadd_u16(r, c);
++    // (r + z0p + z0n + 2) >> 2 == (hadd(r, c) + 1) >> 1
++    return (v_s16) vec_sr(vec_add(r, (v_u16) vec_splat_u16(1)), vec_splat_u16(1));
++}
++
++void ass_shrink_horz16_altivec(int16_t *restrict dst, const int16_t *restrict src,
++                               size_t src_width, size_t src_height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_width = (src_width + 5) >> 1;
++    size_t size = ((src_width + STRIPE_MASK) & ~(size_t) STRIPE_MASK) * src_height;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    size_t offs = 0;
++    for (size_t x = 0; x < dst_width; x += STRIPE_WIDTH) {
++        for (size_t y = 0; y < src_height; y++) {
++            v_s16 l0 = load_line(src, offs - step, size);
++            v_s16 l1 = load_line(src, offs, size);
++            v_s16 l2 = load_line(src, offs + step, size);
++
++            // even/odd columns of the 24-element window ptr[-8..15]
++            v_s16 ea = ass_even_s16(l0, l0), oa = ass_odd_s16(l0, l0);
++            v_s16 eb = ass_even_s16(l1, l2), ob = ass_odd_s16(l1, l2);
++
++            vec_st(shrink_func(ass_sld_s16(ea, eb, 6), ass_sld_s16(oa, ob, 6),
++                               ass_sld_s16(ea, eb, 7), ass_sld_s16(oa, ob, 7),
++                               eb, ob), 0, dst);
++            dst  += STRIPE_WIDTH;
++            offs += STRIPE_WIDTH;
++        }
++        offs += step;
++    }
++}
++
++void ass_shrink_vert16_altivec(int16_t *restrict dst, const int16_t *restrict src,
++                               size_t src_width, size_t src_height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_height = (src_height + 5) >> 1;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        size_t offs = 0;
++        for (size_t y = 0; y < dst_height; y++) {
++            v_s16 p1p = load_line(src, offs - 4 * STRIPE_WIDTH, step);
++            v_s16 p1n = load_line(src, offs - 3 * STRIPE_WIDTH, step);
++            v_s16 z0p = load_line(src, offs - 2 * STRIPE_WIDTH, step);
++            v_s16 z0n = load_line(src, offs - 1 * STRIPE_WIDTH, step);
++            v_s16 n1p = load_line(src, offs - 0 * STRIPE_WIDTH, step);
++            v_s16 n1n = load_line(src, offs + 1 * STRIPE_WIDTH, step);
++            vec_st(shrink_func(p1p, p1n, z0p, z0n, n1p, n1n), 0, dst);
++            dst  += 1 * STRIPE_WIDTH;
++            offs += 2 * STRIPE_WIDTH;
++        }
++        src += step;
++    }
++}
++
++/*
++ * Expand Filters
++ *
++ * Expand image by factor 2 with kernel [5, 10, 1], [1, 10, 5].
++ * The C version already computes in wrapping uint16_t, so this is a literal
++ * transcription.
++ */
++static inline void expand_func(v_s16 *rp, v_s16 *rn,
++                               v_s16 p1, v_s16 z0, v_s16 n1)
++{
++    v_u16 one = (v_u16) vec_splat_u16(1);
++    v_u16 p = (v_u16) p1, z = (v_u16) z0, n = (v_u16) n1;
++    v_u16 r = vec_sr(vec_add(vec_sr(vec_add(p, n), one), z), one);
++    *rp = (v_s16) vec_sr(vec_add(vec_add(vec_sr(vec_add(r, p), one), z), one), one);
++    *rn = (v_s16) vec_sr(vec_add(vec_add(vec_sr(vec_add(r, n), one), z), one), one);
++}
++
++void ass_expand_horz16_altivec(int16_t *restrict dst, const int16_t *restrict src,
++                               size_t src_width, size_t src_height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_width = 2 * src_width + 4;
++    size_t size = ((src_width + STRIPE_MASK) & ~(size_t) STRIPE_MASK) * src_height;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    size_t offs = 0;
++    for (size_t x = STRIPE_WIDTH; x < dst_width; x += 2 * STRIPE_WIDTH) {
++        for (size_t y = 0; y < src_height; y++) {
++            v_s16 l0 = load_line(src, offs - step, size);
++            v_s16 l1 = load_line(src, offs, size);
++            v_s16 rp, rn;
++            expand_func(&rp, &rn, ass_sld_s16(l0, l1, 6), ass_sld_s16(l0, l1, 7), l1);
++            vec_st(vec_mergeh(rp, rn), 0, dst);
++            vec_st(vec_mergel(rp, rn), 2 * (long) step, dst);
++            dst  += STRIPE_WIDTH;
++            offs += STRIPE_WIDTH;
++        }
++        dst += step;
++    }
++    if ((dst_width - 1) & STRIPE_WIDTH)
++        return;
++
++    for (size_t y = 0; y < src_height; y++) {
++        v_s16 l0 = load_line(src, offs - step, size);
++        v_s16 l1 = load_line(src, offs, size);
++        v_s16 rp, rn;
++        expand_func(&rp, &rn, ass_sld_s16(l0, l1, 6), ass_sld_s16(l0, l1, 7), l1);
++        vec_st(vec_mergeh(rp, rn), 0, dst);
++        dst  += STRIPE_WIDTH;
++        offs += STRIPE_WIDTH;
++    }
++}
++
++void ass_expand_vert16_altivec(int16_t *restrict dst, const int16_t *restrict src,
++                               size_t src_width, size_t src_height)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_height = 2 * src_height + 4;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        size_t offs = 0;
++        for (size_t y = 0; y < dst_height; y += 2) {
++            v_s16 p1 = load_line(src, offs - 2 * STRIPE_WIDTH, step);
++            v_s16 z0 = load_line(src, offs - 1 * STRIPE_WIDTH, step);
++            v_s16 n1 = load_line(src, offs - 0 * STRIPE_WIDTH, step);
++            v_s16 rp, rn;
++            expand_func(&rp, &rn, p1, z0, n1);
++            vec_st(rp, 0, dst);
++            vec_st(rn, ALIGNMENT, dst);
++            dst  += 2 * STRIPE_WIDTH;
++            offs += 1 * STRIPE_WIDTH;
++        }
++        src += step;
++    }
++}
++
++/*
++ * Main Parametric Filters
++ *
++ * Perform 1D convolution with kernel [..., c2, c1, c0, d, c0, c1, c2, ...],
++ * cN = param[N], d = 1 - 2 * (c0 + c1 + c2 + ...).
++ *
++ * acc is a pair of 32-bit accumulators holding the even and the odd 16-bit
++ * lanes, as produced by vec_mule/vec_mulo; ass_pack_hi16() reassembles
++ * (acc >> 16) into one 16-bit vector.
++ *
++ * The loops over the filter taps must be fully unrolled: only then are the
++ * window offsets and the parameter indices compile-time constants, so that
++ * the permute patterns become literals and the splatted parameters stay in
++ * registers.  GCC does not unroll them on its own at -O2, hence the pragmas.
++ */
++
++// elements [m, m + 8) of the 24-element window (a, b, c); 0 <= m <= 16
++static inline v_s16 blur_window(v_s16 a, v_s16 b, v_s16 c, int m)
++{
++    return m <= STRIPE_WIDTH ? ass_sld_s16(a, b, m)
++                             : ass_sld_s16(b, c, m - STRIPE_WIDTH);
++}
++
++static inline void load_params(v_s16 p[8], const int16_t *param, const int n)
++{
++    #pragma GCC unroll 8
++    for (int i = 0; i < 8; i++)
++        p[i] = i < n ? vec_splats(param[i]) : ass_zero_s16();
++}
++
++static inline void blur_horz(int16_t *restrict dst, const int16_t *restrict src,
++                             size_t src_width, size_t src_height,
++                             const int16_t *restrict param, const int n)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_width = src_width + 2 * n;
++    size_t size = ((src_width + STRIPE_MASK) & ~(size_t) STRIPE_MASK) * src_height;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    v_s16 p[8];
++    load_params(p, param, n);
++    const v_s32 bias = vec_splats((signed int) 0x8000);
++    const int two_lines = 2 * n > STRIPE_WIDTH;
++
++    size_t offs = 0;
++    for (size_t x = 0; x < dst_width; x += STRIPE_WIDTH) {
++        for (size_t y = 0; y < src_height; y++) {
++            // window elements [0, 24) are ptr[-16] .. ptr[7]
++            v_s16 l0 = two_lines ? load_line(src, offs - 2 * step, size)
++                                 : ass_zero_s16();
++            v_s16 l1 = load_line(src, offs - step, size);
++            v_s16 l2 = load_line(src, offs, size);
++
++            v_s16 center = blur_window(l0, l1, l2, 2 * STRIPE_WIDTH - n);
++            v_s32 acc_e = bias, acc_o = bias;
++            #pragma GCC unroll 8
++            for (int i = n; i > 0; i--) {
++                v_s16 d1 = vec_sub(blur_window(l0, l1, l2, 2 * STRIPE_WIDTH - n - i),
++                                   center);
++                v_s16 d2 = vec_sub(blur_window(l0, l1, l2, 2 * STRIPE_WIDTH - n + i),
++                                   center);
++                acc_e = vec_add(acc_e, vec_mule(d1, p[i - 1]));
++                acc_o = vec_add(acc_o, vec_mulo(d1, p[i - 1]));
++                acc_e = vec_add(acc_e, vec_mule(d2, p[i - 1]));
++                acc_o = vec_add(acc_o, vec_mulo(d2, p[i - 1]));
++            }
++            vec_st(vec_add(center, ass_pack_hi16(acc_e, acc_o)), 0, dst);
++
++            dst  += STRIPE_WIDTH;
++            offs += STRIPE_WIDTH;
++        }
++    }
++}
++
++static inline void blur_vert(int16_t *restrict dst, const int16_t *restrict src,
++                             size_t src_width, size_t src_height,
++                             const int16_t *restrict param, const int n)
++{
++    ASSUME(!((uintptr_t) dst % ALIGNMENT));
++    ASSUME(!((uintptr_t) src % ALIGNMENT));
++    ASSUME(src_width > 0 && src_height > 0);
++
++    size_t dst_height = src_height + 2 * n;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    v_s16 p[8];
++    load_params(p, param, n);
++    const v_s32 bias = vec_splats((signed int) 0x8000);
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        size_t offs = 0;
++        for (size_t y = 0; y < dst_height; y++) {
++            v_s32 acc_e = bias, acc_o = bias;
++            v_s16 center = load_line(src, offs - n * STRIPE_WIDTH, step);
++            #pragma GCC unroll 8
++            for (int i = n; i > 0; i--) {
++                v_s16 line1 = load_line(src, offs - (n + i) * STRIPE_WIDTH, step);
++                v_s16 line2 = load_line(src, offs - (n - i) * STRIPE_WIDTH, step);
++                v_s16 d1 = vec_sub(line1, center);
++                v_s16 d2 = vec_sub(line2, center);
++                acc_e = vec_add(acc_e, vec_mule(d1, p[i - 1]));
++                acc_o = vec_add(acc_o, vec_mulo(d1, p[i - 1]));
++                acc_e = vec_add(acc_e, vec_mule(d2, p[i - 1]));
++                acc_o = vec_add(acc_o, vec_mulo(d2, p[i - 1]));
++            }
++            vec_st(vec_add(center, ass_pack_hi16(acc_e, acc_o)), 0, dst);
++
++            dst  += STRIPE_WIDTH;
++            offs += STRIPE_WIDTH;
++        }
++        src += step;
++    }
++}
++
++#define PARAM_BLUR(n) \
++    void ass_blur ## n ## _horz16_altivec(int16_t *restrict dst, \
++                                          const int16_t *restrict src, \
++                                          size_t src_width, size_t src_height, \
++                                          const int16_t *restrict param) \
++    { \
++        blur_horz(dst, src, src_width, src_height, param, n); \
++    } \
++    \
++    void ass_blur ## n ## _vert16_altivec(int16_t *restrict dst, \
++                                          const int16_t *restrict src, \
++                                          size_t src_width, size_t src_height, \
++                                          const int16_t *restrict param) \
++    { \
++        blur_vert(dst, src, src_width, src_height, param, n); \
++    }
++
++PARAM_BLUR(4)
++PARAM_BLUR(5)
++PARAM_BLUR(6)
++PARAM_BLUR(7)
++PARAM_BLUR(8)
+-- 
+2.43.0
+
