@@ -1,0 +1,149 @@
+From 33244ea2a8132e452ea3cee241dec5a6c8d6fe48 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 25 Sep 2026 19:24:57 +0000
+Subject: [PATCH] image (Apple): add pre-10.9 ImageIO decode path without
+ vImage
+
+The ImageIO logo backend introduced in 2.69.0 decodes through
+vImageBuffer_InitWithCGImage(), which is only available on 10.9+.
+On older targets render the CGImage into a premultiplied RGBA
+CGBitmapContext (which also scales it) and un-premultiply by hand.
+
+Also guard the frame-timing property keys that older SDKs lack:
+kCGImagePropertyGIFUnclampedDelayTime (10.7+) and the
+kCGImagePropertyAPNG* keys (10.10+).
+---
+ src/logo/image/imageio.c | 75 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 72 insertions(+), 3 deletions(-)
+
+diff --git a/src/logo/image/imageio.c b/src/logo/image/imageio.c
+index 3d3086d95..cddc2ede5 100644
+--- a/src/logo/image/imageio.c
++++ b/src/logo/image/imageio.c
+@@ -2,9 +2,18 @@
+ #include "common/mallocHelper.h"
+ #include "common/apple/cf_helpers.h"
+ 
++#include <AvailabilityMacros.h>
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1090
+ #include <Accelerate/Accelerate.h>
++#endif
+ #include <CoreFoundation/CoreFoundation.h>
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 101200
++// CoreGraphics and ImageIO are sub-frameworks of ApplicationServices on older systems
++// and cannot be included directly
++#include <ApplicationServices/ApplicationServices.h>
++#else
+ #include <ImageIO/ImageIO.h>
++#endif
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Shared with the still path
+@@ -35,6 +44,56 @@ static bool imageIOResolveTargetSize(FFLogoRequestData* requestData, uint32_t so
+     return true;
+ }
+ 
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1090
++// vImageBuffer_InitWithCGImage() and vImage_CGImageFormat are 10.9+. Render through a
++// CGBitmapContext instead: it decodes, color-converts and scales in one call.
++static bool imageIOConvert(CGImageRef image, uint32_t width, uint32_t height, uint8_t** outPixels, const char** error) {
++    const size_t stride = (size_t) width * 4;
++    // Zeroed, so that whatever the image does not cover stays transparent
++    uint8_t* pixels = (uint8_t*) calloc(stride, height);
++    if (pixels == nullptr) {
++        if (error) {
++            *error = "out of memory";
++        }
++        return false;
++    }
++
++    // Bitmap contexts only support premultiplied alpha. kCGBitmapByteOrder32Big keeps the bytes
++    // in R,G,B,A order regardless of the host byte order.
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGContextRef context = CGBitmapContextCreate(pixels, width, height, 8, stride, colorSpace,
++        (CGBitmapInfo) kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
++    CGColorSpaceRelease(colorSpace);
++    if (context == nullptr) {
++        free(pixels);
++        if (error) {
++            *error = "failed to create the bitmap context";
++        }
++        return false;
++    }
++
++    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
++    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat) width, (CGFloat) height), image);
++    CGContextRelease(context);
++
++    // Un-premultiply so the result matches the kitty f=32 / chafa
++    // CHAFA_PIXEL_RGBA8_UNASSOCIATED contract
++    for (size_t i = 0; i < stride * height; i += 4) {
++        const uint32_t alpha = pixels[i + 3];
++        if (alpha == 0) {
++            pixels[i] = pixels[i + 1] = pixels[i + 2] = 0;
++        } else if (alpha != 255) {
++            for (size_t c = 0; c < 3; ++c) {
++                const uint32_t value = ((uint32_t) pixels[i + c] * 255u + alpha / 2u) / alpha;
++                pixels[i + c] = (uint8_t) (value > 255u ? 255u : value);
++            }
++        }
++    }
++
++    *outPixels = pixels;
++    return true;
++}
++#else
+ // Decodes one CGImage into tightly packed straight (unassociated) RGBA8888 at width x height.
+ // Both paths need exactly this -- the still path once, the animation path once per frame.
+ static bool imageIOConvert(CGImageRef image, uint32_t width, uint32_t height, uint8_t** outPixels, const char** error) {
+@@ -148,6 +207,7 @@ static bool imageIOConvert(CGImageRef image, uint32_t width, uint32_t height, ui
+     *outPixels = pixels;
+     return true;
+ }
++#endif
+ 
+ bool ffImageCreateImageIO(FFLogoRequestData* requestData, FFImageBuffer* out, const char** error) {
+     FF_CFTYPE_AUTO_RELEASE CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+@@ -266,13 +326,20 @@ static int32_t imageIOFrameDelayCs(CFDictionaryRef frameProperties) {
+     // A GIF keeps its timing in the GIF dictionary, an animated PNG in the PNG one, and the two
+     // are never both present.
+     CFDictionaryRef gif = imageIOSubdict(frameProperties, kCGImagePropertyGIFDictionary);
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 101000
+     CFDictionaryRef png = imageIOSubdict(frameProperties, kCGImagePropertyPNGDictionary);
++#endif
+ 
+     double seconds = 0;
+-    if (imageIODictGetDouble(gif, kCGImagePropertyGIFUnclampedDelayTime, &seconds) ||
+-        imageIODictGetDouble(gif, kCGImagePropertyGIFDelayTime, &seconds) ||
++    if (
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
++        imageIODictGetDouble(gif, kCGImagePropertyGIFUnclampedDelayTime, &seconds) ||
++#endif
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 101000 // Animated PNG keys are 10.10+
+         imageIODictGetDouble(png, kCGImagePropertyAPNGUnclampedDelayTime, &seconds) ||
+-        imageIODictGetDouble(png, kCGImagePropertyAPNGDelayTime, &seconds)) {
++        imageIODictGetDouble(png, kCGImagePropertyAPNGDelayTime, &seconds) ||
++#endif
++        imageIODictGetDouble(gif, kCGImagePropertyGIFDelayTime, &seconds)) {
+         if (seconds > 0) {
+             return (int32_t) lround(seconds * 100.0);
+         }
+@@ -312,6 +379,7 @@ static int32_t imageIOLoopCount(CGImageSourceRef source) {
+         return loops > INT32_MAX ? INT32_MAX : (int32_t) loops;
+     }
+ 
++#if MAC_OS_X_VERSION_MIN_REQUIRED >= 101000
+     if (imageIODictGetInt(imageIOSubdict(properties, kCGImagePropertyPNGDictionary), kCGImagePropertyAPNGLoopCount, &value)) {
+         if (value == 0) {
+             return 0;
+@@ -319,6 +387,7 @@ static int32_t imageIOLoopCount(CGImageSourceRef source) {
+ 
+         return value > INT32_MAX ? INT32_MAX : (int32_t) value;
+     }
++#endif
+ 
+     return -1;
+ }
+-- 
+2.43.0
+
