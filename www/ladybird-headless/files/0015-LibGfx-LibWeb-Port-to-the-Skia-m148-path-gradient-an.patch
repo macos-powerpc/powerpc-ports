@@ -1,0 +1,653 @@
+From 77ae705eb5d2257ed3ee9163ec67a04003bfa8d6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 24 Sep 2026 22:08:58 +0000
+Subject: [PATCH 15/21] LibGfx+LibWeb: Port to the Skia m148 path, gradient and
+ span APIs
+
+Skia m148 removes several APIs that Ladybird uses:
+
+- SkPath lost all of its editing methods (moveTo, lineTo, arcTo, addPath,
+  offset, transform, ...) and SkPath::ArcSize; paths are built with
+  SkPathBuilder. PathImplSkia now keeps an SkPathBuilder and a cached
+  immutable SkPath, which is dropped on every edit and snapshotted again
+  on the next read. Copies start with the cache filled, so a copy handed
+  to another thread is never written to by a read.
+- SkFont::getPath(SkGlyphID, SkPath*) is gone; use the std::optional
+  overload. SkTextUtils::GetPath() still replaces its output path, so
+  text() keeps assigning the whole path as before.
+- SkGradientShader is replaced by SkGradient and the SkShaders::*Gradient
+  factories, which only take SkColor4f. Gradients that used SkColor now
+  convert with to_skia_color4f(), which is exact, and keep the default
+  interpolation (the old flags value of 0).
+- SK_SUPPORT_UNSPANNED_APIS no longer exists; pass SkSpans to
+  SkDashPathEffect::Make() and SkFont::textToGlyphs(), and use
+  SkFont::getWidth() for a single glyph.
+
+The path and span changes also build against m144; the gradient API is
+m148 only.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ Libraries/LibGfx/PainterSkia.cpp              |  23 ++--
+ Libraries/LibGfx/PathSkia.cpp                 | 103 ++++++++++--------
+ Libraries/LibGfx/PathSkia.h                   |  12 +-
+ .../LibWeb/Painting/DisplayListPlayerSkia.cpp |  67 ++++++------
+ 4 files changed, 117 insertions(+), 88 deletions(-)
+
+diff --git a/Libraries/LibGfx/PainterSkia.cpp b/Libraries/LibGfx/PainterSkia.cpp
+index 23f17b84..6c0c5b18 100644
+--- a/Libraries/LibGfx/PainterSkia.cpp
++++ b/Libraries/LibGfx/PainterSkia.cpp
+@@ -8,7 +8,6 @@
+  */
+ 
+ #define AK_DONT_REPLACE_STD
+-#define SK_SUPPORT_UNSPANNED_APIS
+ 
+ #include <AK/GenericShorthands.h>
+ #include <AK/OwnPtr.h>
+@@ -26,7 +25,7 @@
+ #include <core/SkPathEffect.h>
+ #include <effects/SkBlurMaskFilter.h>
+ #include <effects/SkDashPathEffect.h>
+-#include <effects/SkGradientShader.h>
++#include <effects/SkGradient.h>
+ 
+ namespace Gfx {
+ 
+@@ -55,29 +54,31 @@ static void apply_paint_style(SkPaint& paint, PaintStyle const& style)
+     } else if (auto const& linear_gradient = as_if<Gfx::CanvasLinearGradientPaintStyle>(style)) {
+         auto const& color_stops = linear_gradient->color_stops();
+ 
+-        Vector<SkColor> colors;
++        Vector<SkColor4f> colors;
+         colors.ensure_capacity(color_stops.size());
+         Vector<SkScalar> positions;
+         positions.ensure_capacity(color_stops.size());
+         for (auto const& color_stop : color_stops) {
+-            colors.append(to_skia_color(color_stop.color));
++            colors.append(to_skia_color4f(color_stop.color));
+             positions.append(color_stop.position);
+         }
+ 
+         Array points { to_skia_point(linear_gradient->start_point()), to_skia_point(linear_gradient->end_point()) };
+ 
+         SkMatrix matrix;
+-        auto shader = SkGradientShader::MakeLinear(points.data(), colors.data(), positions.data(), color_stops.size(), SkTileMode::kClamp, 0, &matrix);
++        SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, SkTileMode::kClamp);
++        SkGradient gradient(gradient_colors, {});
++        auto shader = SkShaders::LinearGradient(points.data(), gradient, &matrix);
+         paint.setShader(shader);
+     } else if (auto const* radial_gradient = as_if<CanvasRadialGradientPaintStyle>(style)) {
+         auto const& color_stops = radial_gradient->color_stops();
+ 
+-        Vector<SkColor> colors;
++        Vector<SkColor4f> colors;
+         colors.ensure_capacity(color_stops.size());
+         Vector<SkScalar> positions;
+         positions.ensure_capacity(color_stops.size());
+         for (auto const& color_stop : color_stops) {
+-            colors.append(to_skia_color(color_stop.color));
++            colors.append(to_skia_color4f(color_stop.color));
+             positions.append(color_stop.position);
+         }
+ 
+@@ -90,7 +91,9 @@ static void apply_paint_style(SkPaint& paint, PaintStyle const& style)
+         auto end_sk_point = to_skia_point(end_center);
+ 
+         SkMatrix matrix;
+-        auto shader = SkGradientShader::MakeTwoPointConical(start_sk_point, start_radius, end_sk_point, end_radius, colors.data(), positions.data(), color_stops.size(), SkTileMode::kClamp, 0, &matrix);
++        SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, SkTileMode::kClamp);
++        SkGradient gradient(gradient_colors, {});
++        auto shader = SkShaders::TwoPointConicalGradient(start_sk_point, start_radius, end_sk_point, end_radius, gradient, &matrix);
+         paint.setShader(shader);
+     } else if (auto const* canvas_pattern = as_if<CanvasPatternPaintStyle>(style)) {
+         auto image = canvas_pattern->image();
+@@ -234,7 +237,7 @@ void PainterSkia::stroke_path(Gfx::Path const& path, Gfx::Color color, float thi
+     paint.setStrokeCap(to_skia_cap(cap_style));
+     paint.setStrokeJoin(to_skia_join(join_style));
+     paint.setStrokeMiter(miter_limit);
+-    paint.setPathEffect(SkDashPathEffect::Make(dash_array.data(), dash_array.size(), dash_offset));
++    paint.setPathEffect(SkDashPathEffect::Make({ dash_array.data(), dash_array.size() }, dash_offset));
+     paint.setBlender(to_skia_blender(compositing_and_blending_operator));
+     auto sk_path = to_skia_path(path);
+     impl().with_canvas([&](auto& canvas) {
+@@ -277,7 +280,7 @@ void PainterSkia::stroke_path(Gfx::Path const& path, Gfx::PaintStyle const& pain
+     paint.setStrokeCap(to_skia_cap(cap_style));
+     paint.setStrokeJoin(to_skia_join(join_style));
+     paint.setStrokeMiter(miter_limit);
+-    paint.setPathEffect(SkDashPathEffect::Make(dash_array.data(), dash_array.size(), dash_offset));
++    paint.setPathEffect(SkDashPathEffect::Make({ dash_array.data(), dash_array.size() }, dash_offset));
+     paint.setBlender(to_skia_blender(compositing_and_blending_operator));
+     impl().with_canvas([&](auto& canvas) {
+         canvas.drawPath(sk_path, paint);
+diff --git a/Libraries/LibGfx/PathSkia.cpp b/Libraries/LibGfx/PathSkia.cpp
+index 0579f08d..0709a754 100644
+--- a/Libraries/LibGfx/PathSkia.cpp
++++ b/Libraries/LibGfx/PathSkia.cpp
+@@ -5,7 +5,6 @@
+  */
+ 
+ #define AK_DONT_REPLACE_STD
+-#define SK_SUPPORT_UNSPANNED_APIS
+ 
+ #include <AK/TypeCasts.h>
+ #include <AK/Utf16View.h>
+@@ -17,6 +16,7 @@
+ #include <LibGfx/TextLayout.h>
+ #include <core/SkFont.h>
+ #include <core/SkPath.h>
++#include <core/SkPathBuilder.h>
+ #include <core/SkPathMeasure.h>
+ #include <core/SkTextBlob.h>
+ #include <pathops/SkPathOps.h>
+@@ -31,38 +31,52 @@ NonnullOwnPtr<Gfx::PathImplSkia> PathImplSkia::create()
+ }
+ 
+ PathImplSkia::PathImplSkia()
+-    : m_path(adopt_own(*new SkPath))
++    : m_builder(adopt_own(*new SkPathBuilder))
+ {
+ }
+ 
+ PathImplSkia::PathImplSkia(PathImplSkia const& other)
+     : m_last_move_to(other.m_last_move_to)
++    , m_builder(adopt_own(*new SkPathBuilder(*other.m_builder)))
+     , m_path(adopt_own(*new SkPath(other.sk_path())))
+ {
+ }
+ 
+ PathImplSkia::~PathImplSkia() = default;
+ 
++SkPath const& PathImplSkia::sk_path() const
++{
++    if (!m_path)
++        m_path = adopt_own(*new SkPath(m_builder->snapshot()));
++    return *m_path;
++}
++
++SkPathBuilder& PathImplSkia::builder()
++{
++    m_path = nullptr;
++    return *m_builder;
++}
++
+ void PathImplSkia::clear()
+ {
+-    m_path->reset();
++    builder().reset();
+ }
+ 
+ void PathImplSkia::move_to(Gfx::FloatPoint const& point)
+ {
+     m_last_move_to = point;
+-    m_path->moveTo(point.x(), point.y());
++    builder().moveTo(point.x(), point.y());
+ }
+ 
+ void PathImplSkia::line_to(Gfx::FloatPoint const& point)
+ {
+-    m_path->lineTo(point.x(), point.y());
++    builder().lineTo(point.x(), point.y());
+ }
+ 
+ void PathImplSkia::close()
+ {
+-    m_path->close();
+-    m_path->moveTo(m_last_move_to.x(), m_last_move_to.y());
++    builder().close();
++    builder().moveTo(m_last_move_to.x(), m_last_move_to.y());
+ }
+ 
+ void PathImplSkia::elliptical_arc_to(FloatPoint point, FloatSize radii, float x_axis_rotation, bool large_arc, bool sweep)
+@@ -71,33 +85,36 @@ void PathImplSkia::elliptical_arc_to(FloatPoint point, FloatSize radii, float x_
+     SkScalar skWidth = SkFloatToScalar(radii.width());
+     SkScalar skHeight = SkFloatToScalar(radii.height());
+     SkScalar skXRotation = SkFloatToScalar(sk_float_radians_to_degrees(x_axis_rotation));
+-    SkPath::ArcSize skLargeArc = large_arc ? SkPath::kLarge_ArcSize : SkPath::kSmall_ArcSize;
++    SkPathBuilder::ArcSize skLargeArc = large_arc ? SkPathBuilder::kLarge_ArcSize : SkPathBuilder::kSmall_ArcSize;
+     SkPathDirection skSweep = sweep ? SkPathDirection::kCW : SkPathDirection::kCCW;
+-    m_path->arcTo(skWidth, skHeight, skXRotation, skLargeArc, skSweep, skPoint.x(), skPoint.y());
++    builder().arcTo({ skWidth, skHeight }, skXRotation, skLargeArc, skSweep, skPoint);
+ }
+ 
+ void PathImplSkia::arc_to(FloatPoint point, float radius, bool large_arc, bool sweep)
+ {
+     SkPoint skPoint = SkPoint::Make(point.x(), point.y());
+     SkScalar skRadius = SkFloatToScalar(radius);
+-    SkPath::ArcSize skLargeArc = large_arc ? SkPath::kLarge_ArcSize : SkPath::kSmall_ArcSize;
++    SkPathBuilder::ArcSize skLargeArc = large_arc ? SkPathBuilder::kLarge_ArcSize : SkPathBuilder::kSmall_ArcSize;
+     SkPathDirection skSweep = sweep ? SkPathDirection::kCW : SkPathDirection::kCCW;
+-    m_path->arcTo(skRadius, skRadius, 0, skLargeArc, skSweep, skPoint.x(), skPoint.y());
++    builder().arcTo({ skRadius, skRadius }, 0, skLargeArc, skSweep, skPoint);
+ }
+ 
+ void PathImplSkia::quadratic_bezier_curve_to(FloatPoint through, FloatPoint point)
+ {
+-    m_path->quadTo(through.x(), through.y(), point.x(), point.y());
++    builder().quadTo(through.x(), through.y(), point.x(), point.y());
+ }
+ 
+ void PathImplSkia::cubic_bezier_curve_to(FloatPoint c1, FloatPoint c2, FloatPoint p2)
+ {
+-    m_path->cubicTo(c1.x(), c1.y(), c2.x(), c2.y(), p2.x(), p2.y());
++    builder().cubicTo(c1.x(), c1.y(), c2.x(), c2.y(), p2.x(), p2.y());
+ }
+ 
+ void PathImplSkia::text(Utf8View const& string, Font const& font)
+ {
+-    SkTextUtils::GetPath(string.as_string().characters_without_null_termination(), string.as_string().length(), SkTextEncoding::kUTF8, last_point().x(), last_point().y(), font.skia_font(1), m_path.ptr());
++    // GetPath() replaces the whole path with the text outline.
++    SkPath text_path;
++    SkTextUtils::GetPath(string.as_string().characters_without_null_termination(), string.as_string().length(), SkTextEncoding::kUTF8, last_point().x(), last_point().y(), font.skia_font(1), &text_path);
++    builder() = text_path;
+ }
+ 
+ void PathImplSkia::text(Utf16View const& string, Font const& font)
+@@ -107,26 +124,28 @@ void PathImplSkia::text(Utf16View const& string, Font const& font)
+         return;
+     }
+ 
+-    SkTextUtils::GetPath(string.utf16_span().data(), string.length_in_code_units() * sizeof(char16_t), SkTextEncoding::kUTF16, last_point().x(), last_point().y(), font.skia_font(1), m_path.ptr());
++    SkPath text_path;
++    SkTextUtils::GetPath(string.utf16_span().data(), string.length_in_code_units() * sizeof(char16_t), SkTextEncoding::kUTF16, last_point().x(), last_point().y(), font.skia_font(1), &text_path);
++    builder() = text_path;
+ }
+ 
+ void PathImplSkia::glyph_run(GlyphRun const& glyph_run)
+ {
+     auto sk_font = glyph_run.font().skia_font(1);
+-    m_path->setFillType(SkPathFillType::kWinding);
++    auto& path_builder = builder();
++    path_builder.setFillType(SkPathFillType::kWinding);
+     auto font_ascent = glyph_run.font().pixel_metrics().ascent;
+     for (auto const& glyph : glyph_run.glyphs()) {
+-        SkPath glyph_path;
+-        if (!sk_font.getPath(static_cast<SkGlyphID>(glyph.glyph_id), &glyph_path))
++        auto glyph_path = sk_font.getPath(static_cast<SkGlyphID>(glyph.glyph_id));
++        if (!glyph_path.has_value())
+             continue;
+-        glyph_path.offset(glyph.position.x(), glyph.position.y() + font_ascent);
+-        m_path->addPath(glyph_path);
++        path_builder.addPath(*glyph_path, glyph.position.x(), glyph.position.y() + font_ascent);
+     }
+ }
+ 
+ void PathImplSkia::offset(Gfx::FloatPoint const& offset)
+ {
+-    m_path->offset(offset.x(), offset.y());
++    builder().offset(offset.x(), offset.y());
+ }
+ 
+ template<typename TextToGlyphs>
+@@ -148,11 +167,8 @@ static NonnullOwnPtr<PathImpl> place_text_along_impl(SkPath const& path, Font co
+ 
+     for (size_t i = 0; i < length_in_code_points; ++i) {
+         SkGlyphID glyph = run_buffer.glyphs[i];
+-        SkPath glyph_path;
+-        sk_font.getPath(glyph, &glyph_path);
+-
+-        SkScalar advance;
+-        sk_font.getWidths(&glyph, 1, &advance);
++        auto glyph_path = sk_font.getPath(glyph).value_or(SkPath());
++        SkScalar advance = sk_font.getWidth(glyph);
+ 
+         SkPoint position;
+         SkVector tangent;
+@@ -168,8 +184,7 @@ static NonnullOwnPtr<PathImpl> place_text_along_impl(SkPath const& path, Font co
+         matrix.setTranslate(position.x(), position.y());
+         matrix.preRotate(SkRadiansToDegrees(std::atan2(tangent.y(), tangent.x())));
+ 
+-        glyph_path.transform(matrix);
+-        output_path->sk_path().addPath(glyph_path);
++        output_path->builder().addPath(glyph_path, matrix);
+ 
+         accumulated_distance += advance;
+     }
+@@ -181,8 +196,8 @@ NonnullOwnPtr<PathImpl> PathImplSkia::place_text_along(Utf8View const& text, Fon
+ {
+     auto length_in_code_points = text.length();
+ 
+-    return place_text_along_impl(*m_path, font, length_in_code_points, [&](auto const& sk_font, auto const& run_buffer) {
+-        sk_font.textToGlyphs(text.as_string().characters_without_null_termination(), text.as_string().length(), SkTextEncoding::kUTF8, run_buffer.glyphs, length_in_code_points);
++    return place_text_along_impl(sk_path(), font, length_in_code_points, [&](auto const& sk_font, auto const& run_buffer) {
++        sk_font.textToGlyphs(text.as_string().characters_without_null_termination(), text.as_string().length(), SkTextEncoding::kUTF8, { run_buffer.glyphs, length_in_code_points });
+     });
+ }
+ 
+@@ -193,50 +208,52 @@ NonnullOwnPtr<PathImpl> PathImplSkia::place_text_along(Utf16View const& text, Fo
+ 
+     auto length_in_code_points = text.length_in_code_points();
+ 
+-    return place_text_along_impl(*m_path, font, length_in_code_points, [&](auto const& sk_font, auto const& run_buffer) {
+-        sk_font.textToGlyphs(text.utf16_span().data(), text.length_in_code_units() * sizeof(char16_t), SkTextEncoding::kUTF16, run_buffer.glyphs, length_in_code_points);
++    return place_text_along_impl(sk_path(), font, length_in_code_points, [&](auto const& sk_font, auto const& run_buffer) {
++        sk_font.textToGlyphs(text.utf16_span().data(), text.length_in_code_units() * sizeof(char16_t), SkTextEncoding::kUTF16, { run_buffer.glyphs, length_in_code_points });
+     });
+ }
+ 
+ void PathImplSkia::append_path(Gfx::Path const& other)
+ {
+-    m_path->addPath(static_cast<PathImplSkia const&>(other.impl()).sk_path());
++    builder().addPath(static_cast<PathImplSkia const&>(other.impl()).sk_path());
+ }
+ 
+ void PathImplSkia::intersect(Gfx::Path const& other)
+ {
+-    Op(*m_path, static_cast<PathImplSkia const&>(other.impl()).sk_path(), SkPathOp::kIntersect_SkPathOp, m_path.ptr());
++    SkPath result;
++    if (Op(sk_path(), static_cast<PathImplSkia const&>(other.impl()).sk_path(), SkPathOp::kIntersect_SkPathOp, &result))
++        builder() = result;
+ }
+ 
+ bool PathImplSkia::is_empty() const
+ {
+-    return m_path->isEmpty();
++    return sk_path().isEmpty();
+ }
+ 
+ Gfx::FloatPoint PathImplSkia::last_point() const
+ {
+-    SkPoint last {};
+-    if (!m_path->getLastPt(&last))
++    auto last = sk_path().getLastPt();
++    if (!last.has_value())
+         return {};
+-    return { last.fX, last.fY };
++    return { last->fX, last->fY };
+ }
+ 
+ Gfx::FloatRect PathImplSkia::bounding_box() const
+ {
+-    auto bounds = m_path->getBounds();
++    auto bounds = sk_path().getBounds();
+     return { bounds.fLeft, bounds.fTop, bounds.fRight - bounds.fLeft, bounds.fBottom - bounds.fTop };
+ }
+ 
+ bool PathImplSkia::contains(FloatPoint point, Gfx::WindingRule winding_rule) const
+ {
+-    SkPath temp_path = *m_path;
++    SkPath temp_path = sk_path();
+     temp_path.setFillType(to_skia_path_fill_type(winding_rule));
+     return temp_path.contains(point.x(), point.y());
+ }
+ 
+ void PathImplSkia::set_fill_type(Gfx::WindingRule winding_rule)
+ {
+-    m_path->setFillType(to_skia_path_fill_type(winding_rule));
++    builder().setFillType(to_skia_path_fill_type(winding_rule));
+ }
+ 
+ NonnullOwnPtr<PathImpl> PathImplSkia::clone() const
+@@ -251,13 +268,13 @@ NonnullOwnPtr<PathImpl> PathImplSkia::copy_transformed(Gfx::AffineTransform cons
+         transform.a(), transform.c(), transform.e(),
+         transform.b(), transform.d(), transform.f(),
+         0, 0, 1);
+-    new_path->sk_path().transform(matrix);
++    new_path->builder().transform(matrix);
+     return new_path;
+ }
+ 
+ String PathImplSkia::to_svg_string() const
+ {
+-    auto svg_string = SkParsePath::ToSVGString(*m_path);
++    auto svg_string = SkParsePath::ToSVGString(sk_path());
+     return MUST(String::from_utf8(StringView { svg_string.c_str(), svg_string.size() }));
+ }
+ 
+diff --git a/Libraries/LibGfx/PathSkia.h b/Libraries/LibGfx/PathSkia.h
+index 5ee0e843..2dd7dff7 100644
+--- a/Libraries/LibGfx/PathSkia.h
++++ b/Libraries/LibGfx/PathSkia.h
+@@ -6,9 +6,11 @@
+ 
+ #pragma once
+ 
++#include <AK/OwnPtr.h>
+ #include <LibGfx/Path.h>
+ 
+ class SkPath;
++class SkPathBuilder;
+ 
+ namespace Gfx {
+ 
+@@ -47,15 +49,19 @@ public:
+ 
+     virtual String to_svg_string() const override;
+ 
+-    SkPath const& sk_path() const { return *m_path; }
+-    SkPath& sk_path() { return *m_path; }
++    // Skia edits paths only through SkPathBuilder. Every mutation goes through builder(), which drops the
++    // cached immutable SkPath; sk_path() snapshots the builder again on the next read. Copies start with
++    // the cache filled, so a copy handed to another thread is never written to by a read.
++    SkPath const& sk_path() const;
++    SkPathBuilder& builder();
+ 
+ private:
+     PathImplSkia();
+     PathImplSkia(PathImplSkia const& other);
+ 
+     Gfx::FloatPoint m_last_move_to;
+-    NonnullOwnPtr<SkPath> m_path;
++    NonnullOwnPtr<SkPathBuilder> m_builder;
++    mutable OwnPtr<SkPath> m_path;
+ };
+ 
+ }
+diff --git a/Libraries/LibWeb/Painting/DisplayListPlayerSkia.cpp b/Libraries/LibWeb/Painting/DisplayListPlayerSkia.cpp
+index 1b07be07..25cb2056 100644
+--- a/Libraries/LibWeb/Painting/DisplayListPlayerSkia.cpp
++++ b/Libraries/LibWeb/Painting/DisplayListPlayerSkia.cpp
+@@ -5,7 +5,6 @@
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
+-#define SK_SUPPORT_UNSPANNED_APIS
+ 
+ #include <core/SkBitmap.h>
+ #include <core/SkBlurTypes.h>
+@@ -14,11 +13,12 @@
+ #include <core/SkFont.h>
+ #include <core/SkMaskFilter.h>
+ #include <core/SkPath.h>
++#include <core/SkPathBuilder.h>
+ #include <core/SkPathEffect.h>
+ #include <core/SkRRect.h>
+ #include <core/SkSurface.h>
+ #include <effects/SkDashPathEffect.h>
+-#include <effects/SkGradientShader.h>
++#include <effects/SkGradient.h>
+ #include <effects/SkImageFilters.h>
+ #include <effects/SkLumaColorFilter.h>
+ #include <gpu/ganesh/GrDirectContext.h>
+@@ -223,34 +223,34 @@ void DisplayListPlayerSkia::translate(Translate const& command)
+     canvas.translate(command.delta.x(), command.delta.y());
+ }
+ 
+-static SkGradientShader::Interpolation to_skia_interpolation(CSS::InterpolationMethod interpolation_method)
++static SkGradient::Interpolation to_skia_interpolation(CSS::InterpolationMethod interpolation_method)
+ {
+-    SkGradientShader::Interpolation interpolation;
++    SkGradient::Interpolation interpolation;
+ 
+     switch (interpolation_method.color_space) {
+     case CSS::GradientSpace::sRGB:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kSRGB;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kSRGB;
+         break;
+     case CSS::GradientSpace::sRGBLinear:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kSRGBLinear;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kSRGBLinear;
+         break;
+     case CSS::GradientSpace::Lab:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kLab;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kLab;
+         break;
+     case CSS::GradientSpace::OKLab:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kOKLab;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kOKLab;
+         break;
+     case CSS::GradientSpace::HSL:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kHSL;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kHSL;
+         break;
+     case CSS::GradientSpace::HWB:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kHWB;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kHWB;
+         break;
+     case CSS::GradientSpace::LCH:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kLCH;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kLCH;
+         break;
+     case CSS::GradientSpace::OKLCH:
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kOKLCH;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kOKLCH;
+         break;
+     case CSS::GradientSpace::DisplayP3:
+     case CSS::GradientSpace::A98RGB:
+@@ -259,26 +259,26 @@ static SkGradientShader::Interpolation to_skia_interpolation(CSS::InterpolationM
+     case CSS::GradientSpace::XYZD50:
+     case CSS::GradientSpace::XYZD65:
+         dbgln("FIXME: Unsupported gradient color space");
+-        interpolation.fColorSpace = SkGradientShader::Interpolation::ColorSpace::kOKLab;
++        interpolation.fColorSpace = SkGradient::Interpolation::ColorSpace::kOKLab;
+         break;
+     }
+ 
+     switch (interpolation_method.hue_method) {
+     case CSS::HueMethod::Shorter:
+-        interpolation.fHueMethod = SkGradientShader::Interpolation::HueMethod::kShorter;
++        interpolation.fHueMethod = SkGradient::Interpolation::HueMethod::kShorter;
+         break;
+     case CSS::HueMethod::Longer:
+-        interpolation.fHueMethod = SkGradientShader::Interpolation::HueMethod::kLonger;
++        interpolation.fHueMethod = SkGradient::Interpolation::HueMethod::kLonger;
+         break;
+     case CSS::HueMethod::Increasing:
+-        interpolation.fHueMethod = SkGradientShader::Interpolation::HueMethod::kIncreasing;
++        interpolation.fHueMethod = SkGradient::Interpolation::HueMethod::kIncreasing;
+         break;
+     case CSS::HueMethod::Decreasing:
+-        interpolation.fHueMethod = SkGradientShader::Interpolation::HueMethod::kDecreasing;
++        interpolation.fHueMethod = SkGradient::Interpolation::HueMethod::kDecreasing;
+         break;
+     }
+ 
+-    interpolation.fInPremul = SkGradientShader::Interpolation::InPremul::kYes;
++    interpolation.fInPremul = SkGradient::Interpolation::InPremul::kYes;
+ 
+     return interpolation;
+ }
+@@ -316,7 +316,8 @@ void DisplayListPlayerSkia::paint_linear_gradient(PaintLinearGradient const& com
+ 
+     auto color_space = SkColorSpace::MakeSRGB();
+     auto interpolation = to_skia_interpolation(linear_gradient_data.interpolation_method);
+-    auto shader = SkGradientShader::MakeLinear(points.data(), colors.data(), color_space, positions.data(), positions.size(), SkTileMode::kRepeat, interpolation, &matrix);
++    SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, SkTileMode::kRepeat, color_space);
++    auto shader = SkShaders::LinearGradient(points.data(), SkGradient(gradient_colors, interpolation), &matrix);
+ 
+     SkPaint paint;
+     paint.setDither(true);
+@@ -417,10 +418,8 @@ void DisplayListPlayerSkia::paint_inner_box_shadow(PaintInnerBoxShadow const& co
+     auto outer_rect = to_skia_rrect(outer_shadow_rect, corner_radii);
+     auto inner_rect = to_skia_rrect(inner_shadow_rect, inner_rect_corner_radii);
+ 
+-    SkPath outer_path;
+-    outer_path.addRRect(outer_rect);
+-    SkPath inner_path;
+-    inner_path.addRRect(inner_rect);
++    auto outer_path = SkPathBuilder().addRRect(outer_rect).detach();
++    auto inner_path = SkPathBuilder().addRRect(inner_rect).detach();
+ 
+     SkPath result_path;
+     if (!Op(outer_path, inner_path, SkPathOp::kDifference_SkPathOp, &result_path)) {
+@@ -485,13 +484,13 @@ static SkPaint paint_style_to_skia_paint(Painting::SVGGradientPaintStyle const&
+ 
+     auto const& color_stops = paint_style.color_stops();
+ 
+-    Vector<SkColor> colors;
++    Vector<SkColor4f> colors;
+     colors.ensure_capacity(color_stops.size());
+     Vector<SkScalar> positions;
+     positions.ensure_capacity(color_stops.size());
+ 
+     for (auto const& color_stop : color_stops) {
+-        colors.append(to_skia_color(color_stop.color));
++        colors.append(to_skia_color4f(color_stop.color));
+         positions.append(color_stop.position);
+     }
+ 
+@@ -501,6 +500,8 @@ static SkPaint paint_style_to_skia_paint(Painting::SVGGradientPaintStyle const&
+         matrix = matrix * to_skia_matrix(gradient_transform.value());
+ 
+     auto tile_mode = to_skia_tile_mode(paint_style.spread_method());
++    SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, tile_mode);
++    SkGradient gradient(gradient_colors, {});
+ 
+     sk_sp<SkShader> shader;
+     if (is<SVGLinearGradientPaintStyle>(paint_style)) {
+@@ -510,7 +511,7 @@ static SkPaint paint_style_to_skia_paint(Painting::SVGGradientPaintStyle const&
+             to_skia_point(linear_gradient_paint_style.start_point()),
+             to_skia_point(linear_gradient_paint_style.end_point()),
+         };
+-        shader = SkGradientShader::MakeLinear(points.data(), colors.data(), positions.data(), color_stops.size(), tile_mode, 0, &matrix);
++        shader = SkShaders::LinearGradient(points.data(), gradient, &matrix);
+     } else if (is<SVGRadialGradientPaintStyle>(paint_style)) {
+         auto const& radial_gradient_paint_style = static_cast<SVGRadialGradientPaintStyle const&>(paint_style);
+ 
+@@ -520,7 +521,7 @@ static SkPaint paint_style_to_skia_paint(Painting::SVGGradientPaintStyle const&
+         auto start_radius = radial_gradient_paint_style.start_radius();
+         auto end_radius = radial_gradient_paint_style.end_radius();
+ 
+-        shader = SkGradientShader::MakeTwoPointConical(start_center, start_radius, end_center, end_radius, colors.data(), positions.data(), color_stops.size(), tile_mode, 0, &matrix);
++        shader = SkShaders::TwoPointConicalGradient(start_center, start_radius, end_center, end_radius, gradient, &matrix);
+     }
+     paint.setShader(shader);
+     if (paint_style.color_space() == Gfx::InterpolationColorSpace::LinearRGB) {
+@@ -566,7 +567,7 @@ void DisplayListPlayerSkia::stroke_path(StrokePath const& command)
+     paint.setStrokeCap(to_skia_cap(command.cap_style));
+     paint.setStrokeJoin(to_skia_join(command.join_style));
+     paint.setStrokeMiter(command.miter_limit);
+-    paint.setPathEffect(SkDashPathEffect::Make(command.dash_array.data(), command.dash_array.size(), command.dash_offset));
++    paint.setPathEffect(SkDashPathEffect::Make({ command.dash_array.data(), command.dash_array.size() }, command.dash_offset));
+     surface().canvas().drawPath(path, paint);
+ }
+ 
+@@ -611,7 +612,7 @@ void DisplayListPlayerSkia::draw_line(DrawLine const& command)
+         auto dot_count = floor(length / (static_cast<float>(command.thickness) * 2));
+         auto interval = length / dot_count;
+         SkScalar intervals[] = { 0, interval };
+-        paint.setPathEffect(SkDashPathEffect::Make(intervals, 2, 0));
++        paint.setPathEffect(SkDashPathEffect::Make({ intervals, 2 }, 0));
+         paint.setStrokeCap(SkPaint::Cap::kRound_Cap);
+ 
+         // NOTE: As Skia doesn't render a dot exactly at the end of a line, we need
+@@ -626,7 +627,7 @@ void DisplayListPlayerSkia::draw_line(DrawLine const& command)
+         auto dash_count = floor(length / static_cast<float>(command.thickness) / 4) * 2 + 1;
+         auto interval = length / dash_count;
+         SkScalar intervals[] = { interval, interval };
+-        paint.setPathEffect(SkDashPathEffect::Make(intervals, 2, 0));
++        paint.setPathEffect(SkDashPathEffect::Make({ intervals, 2 }, 0));
+ 
+         auto direction = to - from;
+         direction.normalize();
+@@ -698,7 +699,8 @@ void DisplayListPlayerSkia::paint_radial_gradient(PaintRadialGradient const& com
+ 
+     auto color_space = SkColorSpace::MakeSRGB();
+     auto interpolation = to_skia_interpolation(radial_gradient_data.interpolation_method);
+-    auto shader = SkGradientShader::MakeRadial(center, size.height(), colors.data(), color_space, positions.data(), positions.size(), tile_mode, interpolation, &matrix);
++    SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, tile_mode, color_space);
++    auto shader = SkShaders::RadialGradient(center, size.height(), SkGradient(gradient_colors, interpolation), &matrix);
+ 
+     SkPaint paint;
+     paint.setDither(true);
+@@ -730,7 +732,8 @@ void DisplayListPlayerSkia::paint_conic_gradient(PaintConicGradient const& comma
+     matrix.setRotate(-90 + conic_gradient_data.start_angle, center.x(), center.y());
+     auto color_space = SkColorSpace::MakeSRGB();
+     auto interpolation = to_skia_interpolation(conic_gradient_data.interpolation_method);
+-    auto shader = SkGradientShader::MakeSweep(center.x(), center.y(), colors.data(), color_space, positions.data(), positions.size(), SkTileMode::kRepeat, 0, 360, interpolation, &matrix);
++    SkGradient::Colors gradient_colors({ colors.data(), colors.size() }, { positions.data(), positions.size() }, SkTileMode::kRepeat, color_space);
++    auto shader = SkShaders::SweepGradient(to_skia_point(center), 0, 360, SkGradient(gradient_colors, interpolation), &matrix);
+ 
+     SkPaint paint;
+     paint.setDither(true);

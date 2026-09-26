@@ -1,0 +1,158 @@
+From 8c32fa2ee39ebaf356ca2b65d72154450d454bfa Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 24 Sep 2026 20:32:51 +0000
+Subject: [PATCH 08/21] AK: Provide a software binary16 where the compiler has
+ no _Float16
+
+GCC only offers _Float16 on some targets (not on PowerPC). Everything
+that uses f16 (Float16Array, DataView, Math.f16round, the formatter)
+only converts between f16 and double, so a two-byte class with IEEE 754
+binary16 layout and round-to-nearest-even conversions covers it. The
+built-in type is still used wherever the compiler provides it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ AK/NumericLimits.h | 10 +++++
+ AK/Types.h         | 99 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 109 insertions(+)
+
+diff --git a/AK/NumericLimits.h b/AK/NumericLimits.h
+index c36f05e1..2eb33703 100644
+--- a/AK/NumericLimits.h
++++ b/AK/NumericLimits.h
+@@ -145,6 +145,7 @@ struct NumericLimits<long double> {
+ 
+ template<>
+ struct NumericLimits<f16> {
++#ifdef __FLT16_MANT_DIG__
+     static constexpr f16 lowest() { return -__FLT16_MAX__; }
+     static constexpr f16 min_normal() { return __FLT16_MIN__; }
+     static constexpr f16 min_denormal() { return __FLT16_DENORM_MIN__; }
+@@ -152,6 +153,15 @@ struct NumericLimits<f16> {
+     static constexpr f16 epsilon() { return __FLT16_EPSILON__; }
+     static constexpr bool is_signed() { return true; }
+     static constexpr size_t digits() { return __FLT16_MANT_DIG__; }
++#else
++    static constexpr f16 lowest() { return f16(-65504.0); }
++    static constexpr f16 min_normal() { return f16(6.103515625e-05); }
++    static constexpr f16 min_denormal() { return f16(5.9604644775390625e-08); }
++    static constexpr f16 max() { return f16(65504.0); }
++    static constexpr f16 epsilon() { return f16(0.0009765625); }
++    static constexpr bool is_signed() { return true; }
++    static constexpr size_t digits() { return 11; }
++#endif
+ };
+ 
+ }
+diff --git a/AK/Types.h b/AK/Types.h
+index 104679f1..c4d397e5 100644
+--- a/AK/Types.h
++++ b/AK/Types.h
+@@ -17,8 +17,107 @@ using i32 = __INT32_TYPE__;
+ using i16 = __INT16_TYPE__;
+ using i8 = __INT8_TYPE__;
+ 
++#ifdef __FLT16_MANT_DIG__
+ using f16 = _Float16;
+ static_assert(__FLT16_MANT_DIG__ == 11 && __FLT16_MAX_EXP__ == 16);
++#else
++// The compiler has no _Float16 for this target (e.g. GCC on PowerPC). This is a software IEEE 754
++// binary16 with the same size, memory layout and round-to-nearest-even conversions; it only converts
++// to and from double, since that is all the code base needs (arithmetic happens in double).
++class f16 {
++public:
++    constexpr f16() = default;
++
++    constexpr f16(double value)
++        : m_bits(from_double(value))
++    {
++    }
++
++    constexpr operator double() const { return to_double(m_bits); }
++    constexpr explicit operator float() const { return static_cast<float>(to_double(m_bits)); }
++
++    constexpr f16 operator-() const
++    {
++        f16 negated;
++        negated.m_bits = static_cast<u16>(m_bits ^ 0x8000);
++        return negated;
++    }
++
++private:
++    static constexpr u64 shift_right_rounding_to_nearest_even(u64 value, unsigned shift)
++    {
++        if (shift == 0)
++            return value;
++        if (shift > 63)
++            return 0;
++        u64 result = value >> shift;
++        u64 remainder = value & ((1ULL << shift) - 1);
++        u64 half = 1ULL << (shift - 1);
++        if (remainder > half || (remainder == half && (result & 1)))
++            ++result;
++        return result;
++    }
++
++    static constexpr u16 from_double(double value)
++    {
++        u64 bits = __builtin_bit_cast(u64, value);
++        u16 sign = static_cast<u16>((bits >> 48) & 0x8000);
++        u64 magnitude = bits & 0x7fffffffffffffffULL;
++        if (magnitude > 0x7ff0000000000000ULL)
++            return static_cast<u16>(sign | 0x7e00); // NaN
++        if (magnitude == 0x7ff0000000000000ULL)
++            return static_cast<u16>(sign | 0x7c00); // Infinity
++        u64 biased_exponent = magnitude >> 52;
++        if (biased_exponent == 0)
++            return sign; // Zero, or a double subnormal far below the smallest half subnormal.
++        int exponent = static_cast<int>(biased_exponent) - 1023;
++        u64 mantissa = magnitude & ((1ULL << 52) - 1);
++        if (exponent > 15)
++            return static_cast<u16>(sign | 0x7c00);
++        if (exponent >= -14) {
++            u64 half_mantissa = shift_right_rounding_to_nearest_even(mantissa, 42);
++            unsigned half_exponent = static_cast<unsigned>(exponent + 15);
++            if (half_mantissa == 0x400) {
++                half_mantissa = 0;
++                ++half_exponent;
++            }
++            if (half_exponent >= 31)
++                return static_cast<u16>(sign | 0x7c00);
++            return static_cast<u16>(sign | (half_exponent << 10) | half_mantissa);
++        }
++        // Subnormal half: the value in units of 2^-24, rounded. A carry into bit 10 is the smallest normal.
++        u64 significand = (1ULL << 52) | mantissa;
++        unsigned shift = static_cast<unsigned>(28 - exponent);
++        return static_cast<u16>(sign | shift_right_rounding_to_nearest_even(significand, shift));
++    }
++
++    static constexpr double to_double(u16 bits)
++    {
++        u64 sign = static_cast<u64>(bits & 0x8000) << 48;
++        u64 exponent = (bits >> 10) & 0x1f;
++        u64 mantissa = bits & 0x3ff;
++        u64 result = 0;
++        if (exponent == 31) {
++            result = sign | 0x7ff0000000000000ULL | (mantissa ? ((mantissa << 42) | (1ULL << 51)) : 0);
++        } else if (exponent == 0) {
++            if (mantissa == 0)
++                return __builtin_bit_cast(double, sign);
++            unsigned shift = 0;
++            while (!(mantissa & 0x400)) {
++                mantissa <<= 1;
++                ++shift;
++            }
++            result = sign | (static_cast<u64>(1009 - shift) << 52) | ((mantissa & 0x3ff) << 42);
++        } else {
++            result = sign | ((exponent - 15 + 1023) << 52) | (mantissa << 42);
++        }
++        return __builtin_bit_cast(double, result);
++    }
++
++    u16 m_bits { 0 };
++};
++static_assert(sizeof(f16) == 2);
++#endif
+ 
+ using f32 = float;
+ static_assert(__FLT_MANT_DIG__ == 24 && __FLT_MAX_EXP__ == 128);

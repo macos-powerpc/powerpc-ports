@@ -1,0 +1,259 @@
+From 2102f99abfd8c989dbd6ac247915e5b478304ada Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 25 Sep 2026 22:27:56 +0000
+Subject: [PATCH] LibJS+LibWeb: Convert typed array elements that native code
+ touches
+
+Typed arrays store their elements little-endian on every host (the
+isLittleEndian default of GetValueFromBuffer/SetValueInBuffer), but some
+native code read or wrote TypedArray::data() in host order, which swaps
+the bytes of every multi-byte element on big-endian hosts:
+
+- DOMMatrix(ReadOnly).fromFloat32Array/fromFloat64Array read, and
+  toFloat32Array/toFloat64Array wrote, host-order floats and doubles.
+- AnalyserNode.getFloatFrequencyData/getFloatTimeDomainData wrote
+  host-order floats.
+- Atomics.add/sub operated on the stored bytes as host-order integers,
+  and Atomics.compareExchange encoded its operands in host order, so the
+  comparison with the stored bytes never matched.
+- The typed array printer (console, js REPL) showed swapped values.
+
+Add convert_between_host_and_typed_array_order(), which swaps on
+big-endian hosts only and also handles f16, and use it at those places.
+Nothing changes on little-endian hosts.
+---
+ Libraries/LibJS/Print.cpp                     |  3 +-
+ Libraries/LibJS/Runtime/AtomicsObject.cpp     | 14 +++++---
+ .../LibJS/Runtime/TypedArrayElementOrder.h    | 32 +++++++++++++++++++
+ Libraries/LibWeb/Geometry/DOMMatrix.cpp       | 15 +++++++--
+ .../LibWeb/Geometry/DOMMatrixReadOnly.cpp     | 19 +++++++++--
+ Libraries/LibWeb/WebAudio/AnalyserNode.cpp    |  5 +--
+ 6 files changed, 77 insertions(+), 11 deletions(-)
+ create mode 100644 Libraries/LibJS/Runtime/TypedArrayElementOrder.h
+
+diff --git a/Libraries/LibJS/Print.cpp b/Libraries/LibJS/Print.cpp
+index 63e6a5ef..13a7b661 100644
+--- a/Libraries/LibJS/Print.cpp
++++ b/Libraries/LibJS/Print.cpp
+@@ -56,6 +56,7 @@
+ #include <LibJS/Runtime/Temporal/PlainYearMonth.h>
+ #include <LibJS/Runtime/Temporal/ZonedDateTime.h>
+ #include <LibJS/Runtime/TypedArray.h>
++#include <LibJS/Runtime/TypedArrayElementOrder.h>
+ #include <LibJS/Runtime/Value.h>
+ #include <LibJS/Runtime/WeakMap.h>
+ #include <LibJS/Runtime/WeakRef.h>
+@@ -480,7 +481,7 @@ ErrorOr<void> print_typed_array(JS::PrintContext& print_context, JS::TypedArrayB
+         for (size_t i = 0; i < length; ++i) {                                            \
+             if (i > 0)                                                                   \
+                 TRY(js_out(print_context, ", "));                                        \
+-            TRY(print_number(print_context, data[i]));                                   \
++            TRY(print_number(print_context, JS::convert_between_host_and_typed_array_order(data[i]))); \
+             if (++printed_count > 100 && i < length) {                                   \
+                 TRY(js_out(print_context, ", ..."));                                     \
+                 break;                                                                   \
+diff --git a/Libraries/LibJS/Runtime/AtomicsObject.cpp b/Libraries/LibJS/Runtime/AtomicsObject.cpp
+index ed8d1ff3..786c2bd5 100644
+--- a/Libraries/LibJS/Runtime/AtomicsObject.cpp
++++ b/Libraries/LibJS/Runtime/AtomicsObject.cpp
+@@ -20,6 +20,7 @@
+ #include <LibJS/Runtime/AtomicsObject.h>
+ #include <LibJS/Runtime/GlobalObject.h>
+ #include <LibJS/Runtime/TypedArray.h>
++#include <LibJS/Runtime/TypedArrayElementOrder.h>
+ #include <LibJS/Runtime/Value.h>
+ #include <LibJS/Runtime/ValueInlines.h>
+ 
+@@ -210,9 +211,12 @@ static ThrowCompletionOr<Value> perform_atomic_operation(VM& vm, TypedArrayBase&
+         } else {
+             using U = Conditional<IsSame<ClampedU8, T>, u8, T>;
+ 
+-            auto* x = reinterpret_cast<U*>(x_bytes.data());
+-            auto* y = reinterpret_cast<U*>(y_bytes.data());
+-            operation(x, *y);
++            // Both operands arrive in the buffer's little-endian storage order; add and sub need them in host order.
++            auto* x_storage = reinterpret_cast<U*>(x_bytes.data());
++            U x = convert_between_host_and_typed_array_order(*x_storage);
++            U y = convert_between_host_and_typed_array_order(*reinterpret_cast<U*>(y_bytes.data()));
++            operation(&x, y);
++            *x_storage = convert_between_host_and_typed_array_order(x);
+ 
+             return x_bytes;
+         }
+@@ -326,7 +330,9 @@ static ThrowCompletionOr<Value> atomic_compare_exchange_impl(VM& vm, TypedArrayB
+     // 8. Let elementSize be TypedArrayElementSize(typedArray).
+ 
+     // 9. Let isLittleEndian be the value of the [[LittleEndian]] field of the surrounding agent's Agent Record.
+-    static constexpr bool is_little_endian = AK::HostIsLittleEndian;
++    // NB: Typed arrays are stored little-endian on every host (see TypedArrayElementOrder.h), so the expected and
++    //     replacement bytes have to be too, or the comparison with the stored bytes fails on big-endian hosts.
++    static constexpr bool is_little_endian = true;
+ 
+     // 10. Let expectedBytes be NumericToRawBytes(elementType, expected, isLittleEndian).
+     auto expected_bytes = MUST(ByteBuffer::create_uninitialized(sizeof(T)));
+diff --git a/Libraries/LibJS/Runtime/TypedArrayElementOrder.h b/Libraries/LibJS/Runtime/TypedArrayElementOrder.h
+new file mode 100644
+index 00000000..707995e0
+--- /dev/null
++++ b/Libraries/LibJS/Runtime/TypedArrayElementOrder.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (c) 2026, the Ladybird developers.
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++#pragma once
++
++#include <AK/BitCast.h>
++#include <AK/Endian.h>
++#include <AK/Types.h>
++
++namespace JS {
++
++// Typed array elements are stored little-endian on every host: that is the [[LittleEndian]] value GetValueFromBuffer
++// and SetValueInBuffer default to, and what WebAssembly memory and web content expect. Native code that reads or
++// writes elements through TypedArray::data() converts them with this; it swaps bytes on big-endian hosts only, and is
++// its own inverse. Unlike AK's helpers it also handles the 2-byte f16.
++template<typename T>
++ALWAYS_INLINE T convert_between_host_and_typed_array_order(T value)
++{
++    if constexpr (AK::HostIsLittleEndian || sizeof(T) == 1)
++        return value;
++    else if constexpr (sizeof(T) == 2)
++        return bit_cast<T>(__builtin_bswap16(bit_cast<u16>(value)));
++    else if constexpr (sizeof(T) == 4)
++        return bit_cast<T>(__builtin_bswap32(bit_cast<u32>(value)));
++    else
++        return bit_cast<T>(__builtin_bswap64(bit_cast<u64>(value)));
++}
++
++}
+diff --git a/Libraries/LibWeb/Geometry/DOMMatrix.cpp b/Libraries/LibWeb/Geometry/DOMMatrix.cpp
+index 8ac0c5b4..9ee2a54c 100644
+--- a/Libraries/LibWeb/Geometry/DOMMatrix.cpp
++++ b/Libraries/LibWeb/Geometry/DOMMatrix.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <LibJS/Runtime/TypedArray.h>
++#include <LibJS/Runtime/TypedArrayElementOrder.h>
+ #include <LibWeb/Bindings/DOMMatrixPrototype.h>
+ #include <LibWeb/Bindings/Intrinsics.h>
+ #include <LibWeb/Geometry/DOMMatrix.h>
+@@ -166,7 +167,12 @@ WebIDL::ExceptionOr<GC::Ref<DOMMatrix>> DOMMatrix::from_float32_array(JS::VM& vm
+ 
+     auto& realm = *vm.current_realm();
+     auto& float32_array = static_cast<JS::Float32Array&>(*array32->raw_object());
+-    ReadonlySpan<float> elements = float32_array.data();
++    // Typed array elements are stored little-endian; bring them into host order.
++    Vector<float, 16> elements;
++    if (auto data = float32_array.data(); data.size() == 6 || data.size() == 16) {
++        for (auto element : data)
++            elements.append(JS::convert_between_host_and_typed_array_order(element));
++    }
+ 
+     // If array32 has 6 elements, return the result of invoking create a 2d matrix of type DOMMatrixReadOnly or DOMMatrix as appropriate, with a sequence of numbers taking the values from array32 in the provided order.
+     if (elements.size() == 6)
+@@ -191,7 +197,12 @@ WebIDL::ExceptionOr<GC::Ref<DOMMatrix>> DOMMatrix::from_float64_array(JS::VM& vm
+ 
+     auto& realm = *vm.current_realm();
+     auto& float64_array = static_cast<JS::Float64Array&>(*array64->raw_object());
+-    ReadonlySpan<double> elements = float64_array.data();
++    // Typed array elements are stored little-endian; bring them into host order.
++    Vector<double, 16> elements;
++    if (auto data = float64_array.data(); data.size() == 6 || data.size() == 16) {
++        for (auto element : data)
++            elements.append(JS::convert_between_host_and_typed_array_order(element));
++    }
+ 
+     // If array64 has 6 elements, return the result of invoking create a 2d matrix of type DOMMatrixReadOnly or DOMMatrix as appropriate, with a sequence of numbers taking the values from array64 in the provided order.
+     if (elements.size() == 6)
+diff --git a/Libraries/LibWeb/Geometry/DOMMatrixReadOnly.cpp b/Libraries/LibWeb/Geometry/DOMMatrixReadOnly.cpp
+index 594dba90..26eee037 100644
+--- a/Libraries/LibWeb/Geometry/DOMMatrixReadOnly.cpp
++++ b/Libraries/LibWeb/Geometry/DOMMatrixReadOnly.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <LibJS/Runtime/TypedArray.h>
++#include <LibJS/Runtime/TypedArrayElementOrder.h>
+ #include <LibWeb/Bindings/DOMMatrixReadOnlyPrototype.h>
+ #include <LibWeb/CSS/ComputedProperties.h>
+ #include <LibWeb/CSS/Parser/Parser.h>
+@@ -237,7 +238,12 @@ WebIDL::ExceptionOr<GC::Ref<DOMMatrixReadOnly>> DOMMatrixReadOnly::from_float32_
+ 
+     auto& realm = *vm.current_realm();
+     auto& float32_array = static_cast<JS::Float32Array&>(*array32->raw_object());
+-    ReadonlySpan<float> elements = float32_array.data();
++    // Typed array elements are stored little-endian; bring them into host order.
++    Vector<float, 16> elements;
++    if (auto data = float32_array.data(); data.size() == 6 || data.size() == 16) {
++        for (auto element : data)
++            elements.append(JS::convert_between_host_and_typed_array_order(element));
++    }
+ 
+     // If array32 has 6 elements, return the result of invoking create a 2d matrix of type DOMMatrixReadOnly or DOMMatrix as appropriate, with a sequence of numbers taking the values from array32 in the provided order.
+     if (elements.size() == 6)
+@@ -262,7 +268,12 @@ WebIDL::ExceptionOr<GC::Ref<DOMMatrixReadOnly>> DOMMatrixReadOnly::from_float64_
+ 
+     auto& realm = *vm.current_realm();
+     auto& float64_array = static_cast<JS::Float64Array&>(*array64->raw_object());
+-    ReadonlySpan<double> elements = float64_array.data();
++    // Typed array elements are stored little-endian; bring them into host order.
++    Vector<double, 16> elements;
++    if (auto data = float64_array.data(); data.size() == 6 || data.size() == 16) {
++        for (auto element : data)
++            elements.append(JS::convert_between_host_and_typed_array_order(element));
++    }
+ 
+     // If array64 has 6 elements, return the result of invoking create a 2d matrix of type DOMMatrixReadOnly or DOMMatrix as appropriate, with a sequence of numbers taking the values from array64 in the provided order.
+     if (elements.size() == 6)
+@@ -534,6 +545,8 @@ GC::Ref<JS::Float32Array> DOMMatrixReadOnly::to_float32_array() const
+         static_cast<float>(m21()), static_cast<float>(m22()), static_cast<float>(m23()), static_cast<float>(m24()),
+         static_cast<float>(m31()), static_cast<float>(m32()), static_cast<float>(m33()), static_cast<float>(m34()),
+         static_cast<float>(m41()), static_cast<float>(m42()), static_cast<float>(m43()), static_cast<float>(m44()) };
++    for (auto& element : elements)
++        element = JS::convert_between_host_and_typed_array_order(element);
+     auto bytes = MUST(ByteBuffer::copy(elements, sizeof(elements)));
+     auto array_buffer = JS::ArrayBuffer::create(realm(), move(bytes));
+     return JS::Float32Array::create(realm(), sizeof(elements) / sizeof(float), array_buffer);
+@@ -547,6 +560,8 @@ GC::Ref<JS::Float64Array> DOMMatrixReadOnly::to_float64_array() const
+         m21(), m22(), m23(), m24(),
+         m31(), m32(), m33(), m34(),
+         m41(), m42(), m43(), m44() };
++    for (auto& element : elements)
++        element = JS::convert_between_host_and_typed_array_order(element);
+     auto bytes = MUST(ByteBuffer::copy(elements, sizeof(elements)));
+     auto array_buffer = JS::ArrayBuffer::create(realm(), move(bytes));
+     return JS::Float64Array::create(realm(), sizeof(elements) / sizeof(double), array_buffer);
+diff --git a/Libraries/LibWeb/WebAudio/AnalyserNode.cpp b/Libraries/LibWeb/WebAudio/AnalyserNode.cpp
+index 9f162dfc..e27bed90 100644
+--- a/Libraries/LibWeb/WebAudio/AnalyserNode.cpp
++++ b/Libraries/LibWeb/WebAudio/AnalyserNode.cpp
+@@ -10,6 +10,7 @@
+ #include <AK/Vector.h>
+ #include <LibJS/Runtime/ArrayBuffer.h>
+ #include <LibJS/Runtime/TypedArray.h>
++#include <LibJS/Runtime/TypedArrayElementOrder.h>
+ #include <LibWeb/Bindings/AnalyserNodePrototype.h>
+ #include <LibWeb/Bindings/Intrinsics.h>
+ #include <LibWeb/WebAudio/AnalyserNode.h>
+@@ -155,7 +156,7 @@ WebIDL::ExceptionOr<void> AnalyserNode::get_float_frequency_data(GC::Root<WebIDL
+ 
+     size_t floats_to_write = min(output_array.data().size(), frequency_bin_count());
+     for (size_t i = 0; i < floats_to_write; i++) {
+-        output_array.data()[i] = frequency_data[i];
++        output_array.data()[i] = JS::convert_between_host_and_typed_array_order(frequency_data[i]);
+     }
+ 
+     return {};
+@@ -220,7 +221,7 @@ WebIDL::ExceptionOr<void> AnalyserNode::get_float_time_domain_data(GC::Root<WebI
+ 
+     size_t floats_to_write = min(output_array.data().size(), frequency_bin_count());
+     for (size_t i = 0; i < floats_to_write; i++) {
+-        output_array.data()[i] = time_domain_data[i];
++        output_array.data()[i] = JS::convert_between_host_and_typed_array_order(time_domain_data[i]);
+     }
+ 
+     return {};

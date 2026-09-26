@@ -1,0 +1,724 @@
+From cab3e9925a1d274686cf53c1776d4b20e31af329 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 24 Sep 2026 18:58:07 +0000
+Subject: [PATCH 05/21] LibJS+LibWasm+LibGfx+AK: Fix 32-bit and big-endian host
+ assumptions
+
+32-bit hosts:
+- PropertyKey kept an 8-byte union (u64 numeric keys) while asserting
+  it is pointer-sized. Keep the 8-byte storage everywhere, route all
+  whole-key copies through it, and on 32-bit hosts put the tag and the
+  low index bits in the word that m_bits aliases (the high word on
+  big-endian hosts) with the remaining index bits in the other word.
+- Shape's exact size assertion only holds with 64-bit pointers; use an
+  upper bound on 32-bit hosts.
+- LibWasm converted Module pointers to and from u64 with bit_cast, which
+  requires equal sizes; go through FlatPtr.
+- The WASI flag overlays used bool bit-fields; on ABIs with a 4-byte
+  bool (Darwin PowerPC) those are allocated in 4-byte units and change
+  the overlay size, so use u8 bit-fields.
+
+Big-endian hosts:
+- WebAssembly linear memory is little-endian, but the store path relied
+  on a LittleEndian<> round trip that cancels itself out for integers
+  (and would not even compile for v128). Make ConvertToRaw produce the
+  host bit pattern and serialize once in store_value(); assemble v128
+  loads from two little-endian halves.
+- AK::LittleEndian/BigEndian converted floating-point values
+  numerically instead of by bit pattern, and could not handle 16-byte
+  integers (LittleEndian<u128> is used by the Wasm parser and LibDNS).
+  Swap floats as their bits and multi-word integers per word.
+- DataView/TypedArray raw byte conversion reversed bytes based on the
+  requested order alone; compare it with the host order instead, and
+  never "reverse" a single byte.
+- The Matroska float reader overlaid a float on the high half of a u64
+  union; take the low bits explicitly.
+- The ICO directory structures are little-endian on disk; read them
+  through LittleEndian<> instead of plain integers.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ AK/ByteStringImpl.cpp                         |   2 +-
+ AK/ByteStringImpl.h                           |   4 +-
+ AK/Endian.h                                   |  24 +++-
+ Libraries/LibGfx/ImageFormats/ICOLoader.cpp   |  21 ++--
+ Libraries/LibJS/Runtime/ArrayBuffer.h         |   8 +-
+ Libraries/LibJS/Runtime/PropertyKey.h         |  73 +++++++++---
+ Libraries/LibJS/Runtime/Shape.h               |   4 +
+ .../LibMedia/Containers/Matroska/Reader.cpp   |  15 +--
+ .../LibWasm/AbstractMachine/AbstractMachine.h |   4 +-
+ .../AbstractMachine/BytecodeInterpreter.cpp   |  43 +++++++-
+ Libraries/LibWasm/Wasi.h                      | 104 +++++++++---------
+ 11 files changed, 206 insertions(+), 96 deletions(-)
+
+diff --git a/AK/ByteStringImpl.cpp b/AK/ByteStringImpl.cpp
+index 90eb183a..63443f6e 100644
+--- a/AK/ByteStringImpl.cpp
++++ b/AK/ByteStringImpl.cpp
+@@ -20,7 +20,7 @@ struct EmptyByteStringImpl {
+     // Members from ByteStringImpl
+     size_t length { 0 };
+     unsigned hash { 0 };
+-    bool has_hash { false };
++    u8 has_hash { false };
+     char inline_buffer[1] { '\0' };
+ 
+     constexpr EmptyByteStringImpl() = default;
+diff --git a/AK/ByteStringImpl.h b/AK/ByteStringImpl.h
+index cc3d5ff8..6f2e6492 100644
+--- a/AK/ByteStringImpl.h
++++ b/AK/ByteStringImpl.h
+@@ -90,7 +90,9 @@ private:
+ 
+     size_t m_length { 0 };
+     mutable unsigned m_hash { 0 };
+-    mutable bool m_has_hash { false };
++    // u8 rather than bool: the static empty-string mirror relies on this layout ending with padding,
++    // which a 4-byte bool (Darwin PowerPC) would remove.
++    mutable u8 m_has_hash { false };
+     char m_inline_buffer[0];
+ };
+ 
+diff --git a/AK/Endian.h b/AK/Endian.h
+index 71435e6d..595538e0 100644
+--- a/AK/Endian.h
++++ b/AK/Endian.h
+@@ -6,6 +6,9 @@
+ 
+ #pragma once
+ 
++#include <AK/Array.h>
++#include <AK/BigIntBase.h>
++#include <AK/BitCast.h>
+ #include <AK/Format.h>
+ #include <AK/Forward.h>
+ #include <AK/Platform.h>
+@@ -29,7 +32,17 @@ ALWAYS_INLINE constexpr T convert_between_host_and_little_endian(T value)
+ {
+     if constexpr (HostIsLittleEndian || sizeof(T) == 1)
+         return value;
+-    else if constexpr (sizeof(T) == 8)
++    else if constexpr (IsFloatingPoint<T>)
++        // Swap the bit pattern, not the numeric value.
++        return bit_cast<T>(convert_between_host_and_little_endian(bit_cast<Conditional<sizeof(T) == 4, u32, u64>>(value)));
++    else if constexpr (sizeof(T) == 16) {
++        // Multi-word integers keep their words in ascending significance on every host, so only the
++        // bytes within each word change place.
++        auto words = bit_cast<Array<NativeWord, 16 / sizeof(NativeWord)>>(value);
++        for (auto& word : words)
++            word = convert_between_host_and_little_endian(word);
++        return bit_cast<T>(words);
++    } else if constexpr (sizeof(T) == 8)
+         return static_cast<T>(__builtin_bswap64(static_cast<u64>(value)));
+     else if constexpr (sizeof(T) == 4)
+         return static_cast<T>(__builtin_bswap32(static_cast<u32>(value)));
+@@ -44,7 +57,14 @@ ALWAYS_INLINE constexpr T convert_between_host_and_big_endian(T value)
+ {
+     if constexpr (sizeof(T) == 1 || !HostIsLittleEndian)
+         return value;
+-    else if constexpr (sizeof(T) == 8)
++    else if constexpr (IsFloatingPoint<T>)
++        return bit_cast<T>(convert_between_host_and_big_endian(bit_cast<Conditional<sizeof(T) == 4, u32, u64>>(value)));
++    else if constexpr (sizeof(T) == 16) {
++        auto words = bit_cast<Array<NativeWord, 16 / sizeof(NativeWord)>>(value);
++        for (auto& word : words)
++            word = convert_between_host_and_big_endian(word);
++        return bit_cast<T>(words);
++    } else if constexpr (sizeof(T) == 8)
+         return static_cast<T>(__builtin_bswap64(static_cast<u64>(value)));
+     else if constexpr (sizeof(T) == 4)
+         return static_cast<T>(__builtin_bswap32(static_cast<u32>(value)));
+diff --git a/Libraries/LibGfx/ImageFormats/ICOLoader.cpp b/Libraries/LibGfx/ImageFormats/ICOLoader.cpp
+index 071b22b8..19df51aa 100644
+--- a/Libraries/LibGfx/ImageFormats/ICOLoader.cpp
++++ b/Libraries/LibGfx/ImageFormats/ICOLoader.cpp
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <AK/Debug.h>
++#include <AK/Endian.h>
+ #include <AK/MemoryStream.h>
+ #include <AK/Types.h>
+ #include <LibGfx/ImageFormats/BMPLoader.h>
+@@ -18,11 +19,11 @@ enum class IconType : u16 {
+     CUR = 2,
+ };
+ 
+-// FIXME: This is in little-endian order. Maybe need a NetworkOrdered<T> equivalent eventually.
++// The on-disk structures are little-endian.
+ struct ICONDIR {
+-    u16 must_be_0 = 0;
+-    IconType type = IconType::ICO;
+-    u16 image_count = 0;
++    LittleEndian<u16> must_be_0 { 0 };
++    LittleEndian<u16> type { to_underlying(IconType::ICO) };
++    LittleEndian<u16> image_count { 0 };
+ };
+ static_assert(AssertSize<ICONDIR, 6>());
+ 
+@@ -31,10 +32,10 @@ struct ICONDIRENTRY {
+     u8 height;
+     u8 color_count;
+     u8 reserved_0;
+-    u16 planes;
+-    u16 bits_per_pixel;
+-    u32 size;
+-    u32 offset;
++    LittleEndian<u16> planes;
++    LittleEndian<u16> bits_per_pixel;
++    LittleEndian<u32> size;
++    LittleEndian<u32> offset;
+ };
+ static_assert(AssertSize<ICONDIRENTRY, 16>());
+ 
+@@ -83,10 +84,10 @@ struct ICOLoadingContext {
+ static ErrorOr<size_t> decode_ico_header(Stream& stream, IconType& out_type)
+ {
+     auto header = TRY(stream.read_value<ICONDIR>());
+-    if (header.must_be_0 != 0 || (header.type != IconType::ICO && header.type != IconType::CUR))
++    if (header.must_be_0 != 0 || (header.type != to_underlying(IconType::ICO) && header.type != to_underlying(IconType::CUR)))
+         return Error::from_string_literal("Invalid ICO/CUR header");
+ 
+-    out_type = header.type;
++    out_type = static_cast<IconType>(static_cast<u16>(header.type));
+     return { header.image_count };
+ }
+ 
+diff --git a/Libraries/LibJS/Runtime/ArrayBuffer.h b/Libraries/LibJS/Runtime/ArrayBuffer.h
+index c1a114e2..aba99e9f 100644
+--- a/Libraries/LibJS/Runtime/ArrayBuffer.h
++++ b/Libraries/LibJS/Runtime/ArrayBuffer.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <AK/ByteBuffer.h>
++#include <AK/Endian.h>
+ #include <AK/Function.h>
+ #include <AK/Variant.h>
+ #include <LibJS/Export.h>
+@@ -196,7 +197,9 @@ static Value raw_bytes_to_numeric(VM& vm, Bytes raw_value, bool is_little_endian
+     //    NOTE: Used in step 7, but not needed with our implementation of that step.
+ 
+     // 2. If isLittleEndian is false, reverse the order of the elements of rawBytes.
+-    if (!is_little_endian) {
++    // NOTE: The bytes are copied into a host-order value below, so what actually needs reversing is
++    //       a requested order that differs from the host's.
++    if (raw_value.size() > 1 && is_little_endian != AK::HostIsLittleEndian) {
+         VERIFY(raw_value.size() % 2 == 0);
+         for (size_t i = 0; i < raw_value.size() / 2; ++i)
+             swap(raw_value[i], raw_value[raw_value.size() - 1 - i]);
+@@ -329,7 +332,8 @@ static void numeric_to_raw_bytes(VM& vm, Value value, bool is_little_endian, Byt
+     using UnderlyingBufferDataType = Conditional<IsSame<ClampedU8, T>, u8, T>;
+     VERIFY(raw_bytes.size() == sizeof(UnderlyingBufferDataType));
+     auto flip_if_needed = [&]() {
+-        if (is_little_endian)
++        // The bytes start out in host order; only a differing requested order needs a swap.
++        if (sizeof(UnderlyingBufferDataType) == 1 || is_little_endian == AK::HostIsLittleEndian)
+             return;
+         VERIFY(sizeof(UnderlyingBufferDataType) % 2 == 0);
+         for (size_t i = 0; i < sizeof(UnderlyingBufferDataType) / 2; ++i)
+diff --git a/Libraries/LibJS/Runtime/PropertyKey.h b/Libraries/LibJS/Runtime/PropertyKey.h
+index 4bb954d8..c18d74ce 100644
+--- a/Libraries/LibJS/Runtime/PropertyKey.h
++++ b/Libraries/LibJS/Runtime/PropertyKey.h
+@@ -36,6 +36,45 @@ public:
+     static constexpr uintptr_t SYMBOL_FLAG = 2;
+     static constexpr uintptr_t NUMBER_FLAG = 3;
+ 
++    // The tag lives in the low bits of the word that m_bits aliases. On 64-bit hosts that word is the
++    // whole 8-byte storage. Numeric keys need 34 bits (a u32 index past the two tag bits), so the
++    // storage stays 8 bytes on 32-bit hosts too; there m_bits aliases only the first word of
++    // m_number (the high word on big-endian hosts), which therefore carries the tag and the low 30
++    // index bits while the other word holds the remaining two.
++#if defined(AK_ARCH_64_BIT)
++    static constexpr u64 number_storage(u32 index) { return static_cast<u64>(index) << 2 | NUMBER_FLAG; }
++    static constexpr u32 number_from_storage(u64 storage) { return static_cast<u32>(storage >> 2); }
++    static constexpr u64 pointer_storage(uintptr_t bits) { return bits; }
++#else
++    static constexpr u64 join_words(u32 first_word, u32 second_word)
++    {
++#    if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++        return static_cast<u64>(first_word) << 32 | second_word;
++#    else
++        return static_cast<u64>(second_word) << 32 | first_word;
++#    endif
++    }
++    static constexpr u32 first_word(u64 storage)
++    {
++#    if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++        return static_cast<u32>(storage >> 32);
++#    else
++        return static_cast<u32>(storage);
++#    endif
++    }
++    static constexpr u32 second_word(u64 storage)
++    {
++#    if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++        return static_cast<u32>(storage);
++#    else
++        return static_cast<u32>(storage >> 32);
++#    endif
++    }
++    static constexpr u64 number_storage(u32 index) { return join_words(index << 2 | NUMBER_FLAG, index >> 30); }
++    static constexpr u32 number_from_storage(u64 storage) { return first_word(storage) >> 2 | second_word(storage) << 30; }
++    static constexpr u64 pointer_storage(uintptr_t bits) { return join_words(bits, 0); }
++#endif
++
+     bool is_string() const { return (m_bits & 3) == NORMAL_STRING_FLAG || (m_bits & 3) == SHORT_STRING_FLAG; }
+     bool is_number() const { return (m_bits & 3) == NUMBER_FLAG; }
+     bool is_symbol() const { return (m_bits & 3) == SYMBOL_FLAG; }
+@@ -44,18 +83,22 @@ public:
+ 
+     PropertyKey(PropertyKey const& other)
+     {
+-        if (other.is_string())
++        if (other.is_string()) {
++            m_number = 0;
+             new (&m_string) Utf16FlyString(other.m_string);
+-        else
+-            m_bits = other.m_bits;
++        } else {
++            m_number = other.m_number;
++        }
+     }
+ 
+     PropertyKey(PropertyKey&& other) noexcept
+     {
+-        if (other.is_string())
++        if (other.is_string()) {
++            m_number = 0;
+             new (&m_string) Utf16FlyString(move(other.m_string));
+-        else
+-            m_bits = exchange(other.m_bits, 0);
++        } else {
++            m_number = exchange(other.m_number, 0);
++        }
+     }
+ 
+     template<Integral T>
+@@ -66,11 +109,12 @@ public:
+         VERIFY(index >= 0);
+         if constexpr (NumericLimits<T>::max() >= NumericLimits<u32>::max()) {
+             if (index >= NumericLimits<u32>::max()) {
++                m_number = 0;
+                 new (&m_string) Utf16FlyString { Utf16String::number(index) };
+                 return;
+             }
+         }
+-        m_number = static_cast<u64>(index) << 2 | NUMBER_FLAG;
++        m_number = number_storage(static_cast<u32>(index));
+     }
+ 
+     PropertyKey(Utf16FlyString string, StringMayBeNumber string_may_be_number = StringMayBeNumber::Yes)
+@@ -79,12 +123,13 @@ public:
+             if (!string.is_empty() && !(string.code_unit_at(0) == '0' && string.length_in_code_units() > 1)) {
+                 auto property_index = string.to_number<u32>(TrimWhitespace::No);
+                 if (property_index.has_value() && property_index.value() < NumericLimits<u32>::max()) {
+-                    m_number = static_cast<u64>(property_index.release_value()) << 2 | NUMBER_FLAG;
++                    m_number = number_storage(property_index.release_value());
+                     return;
+                 }
+             }
+         }
+ 
++        m_number = 0;
+         new (&m_string) Utf16FlyString(move(string));
+     }
+ 
+@@ -95,7 +140,7 @@ public:
+ 
+     PropertyKey(GC::Ref<Symbol> symbol)
+     {
+-        m_bits = reinterpret_cast<uintptr_t>(symbol.ptr()) | SYMBOL_FLAG;
++        m_number = pointer_storage(reinterpret_cast<uintptr_t>(symbol.ptr()) | SYMBOL_FLAG);
+     }
+ 
+     PropertyKey& operator=(PropertyKey const& other)
+@@ -127,7 +172,7 @@ public:
+     u32 as_number() const
+     {
+         VERIFY(is_number());
+-        return m_number >> 2;
++        return number_from_storage(m_number);
+     }
+ 
+     Utf16FlyString const& as_string() const
+@@ -139,7 +184,7 @@ public:
+     Symbol const* as_symbol() const
+     {
+         VERIFY(is_symbol());
+-        return reinterpret_cast<Symbol const*>(m_bits & ~3ULL);
++        return reinterpret_cast<Symbol const*>(m_bits & ~static_cast<uintptr_t>(3));
+     }
+ 
+     Value to_value(VM& vm) const
+@@ -186,11 +231,11 @@ private:
+     };
+ 
+     explicit PropertyKey(ShouldMakeEmptyOptional)
+-        : m_bits(0)
++        : m_number(0)
+     {
+     }
+ 
+-    [[nodiscard]] bool is_empty_optional() const { return m_bits == 0; }
++    [[nodiscard]] bool is_empty_optional() const { return m_number == 0; }
+ 
+     union {
+         Utf16FlyString m_string;
+@@ -200,7 +245,7 @@ private:
+     };
+ };
+ 
+-static_assert(sizeof(PropertyKey) == sizeof(uintptr_t));
++static_assert(sizeof(PropertyKey) == sizeof(u64));
+ 
+ }
+ 
+diff --git a/Libraries/LibJS/Runtime/Shape.h b/Libraries/LibJS/Runtime/Shape.h
+index ca75a084..602aae49 100644
+--- a/Libraries/LibJS/Runtime/Shape.h
++++ b/Libraries/LibJS/Runtime/Shape.h
+@@ -148,7 +148,11 @@ private:
+ };
+ 
+ #if !defined(AK_OS_WINDOWS)
++#    if defined(AK_ARCH_64_BIT)
+ static_assert(sizeof(Shape) == 96, "Keep the size of JS::Shape down!");
++#    else
++static_assert(sizeof(Shape) <= 96, "Keep the size of JS::Shape down!");
++#    endif
+ #endif
+ 
+ }
+diff --git a/Libraries/LibMedia/Containers/Matroska/Reader.cpp b/Libraries/LibMedia/Containers/Matroska/Reader.cpp
+index 4e9287f9..f9e31348 100644
+--- a/Libraries/LibMedia/Containers/Matroska/Reader.cpp
++++ b/Libraries/LibMedia/Containers/Matroska/Reader.cpp
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
++#include <AK/BitCast.h>
+ #include <AK/Debug.h>
+ #include <AK/Function.h>
+ #include <AK/IntegralMath.h>
+@@ -1368,18 +1369,14 @@ DecoderErrorOr<double> Streamer::read_float()
+     if (length != 4u && length != 8u)
+         return DecoderError::format(DecoderErrorCategory::Invalid, "Float size must be 4 or 8 bytes");
+ 
+-    union {
+-        u64 value;
+-        float float_value;
+-        double double_value;
+-    } read_data;
+-    read_data.value = 0;
++    u64 value = 0;
+     for (size_t i = 0; i < length; i++) {
+-        read_data.value = (read_data.value << 8u) + TRY(read_octet());
++        value = (value << 8u) + TRY(read_octet());
+     }
++    // The bits sit in the low end of the assembled integer on every host.
+     if (length == 4u)
+-        return read_data.float_value;
+-    return read_data.double_value;
++        return bit_cast<float>(static_cast<u32>(value));
++    return bit_cast<double>(value);
+ }
+ 
+ DecoderErrorOr<void> Streamer::read_unknown_element()
+diff --git a/Libraries/LibWasm/AbstractMachine/AbstractMachine.h b/Libraries/LibWasm/AbstractMachine/AbstractMachine.h
+index db2d42b3..1dd4dff3 100644
+--- a/Libraries/LibWasm/AbstractMachine/AbstractMachine.h
++++ b/Libraries/LibWasm/AbstractMachine/AbstractMachine.h
+@@ -157,7 +157,7 @@ public:
+         // 4: null exnref
+         // 5: exnref
+         ref.ref().visit(
+-            [&](Reference::Func const& func) { m_value = u128(bit_cast<u64>(func.address), bit_cast<u64>(func.source_module.ptr())); },
++            [&](Reference::Func const& func) { m_value = u128(bit_cast<u64>(func.address), static_cast<u64>(bit_cast<FlatPtr>(func.source_module.ptr()))); },
+             [&](Reference::Extern const& func) { m_value = u128(bit_cast<u64>(func.address), 1); },
+             [&](Reference::Null const& null) { m_value = u128(0, null.type.kind() == ValueType::Kind::FunctionReference ? 2 : null.type.kind() == ValueType::Kind::ExceptionReference ? 4
+                                                                                                                                                                                       : 3); },
+@@ -199,7 +199,7 @@ public:
+         if constexpr (IsSame<T, Reference>) {
+             switch (m_value.high() & 3) {
+             case 0:
+-                return Reference { Reference::Func { bit_cast<FunctionAddress>(m_value.low()), bit_cast<Wasm::Module*>(m_value.high()) } };
++                return Reference { Reference::Func { bit_cast<FunctionAddress>(m_value.low()), bit_cast<Wasm::Module*>(static_cast<FlatPtr>(m_value.high())) } };
+             case 1:
+                 return Reference { Reference::Extern { bit_cast<ExternAddress>(m_value.low()) } };
+             case 2:
+diff --git a/Libraries/LibWasm/AbstractMachine/BytecodeInterpreter.cpp b/Libraries/LibWasm/AbstractMachine/BytecodeInterpreter.cpp
+index d5450815..424fea67 100644
+--- a/Libraries/LibWasm/AbstractMachine/BytecodeInterpreter.cpp
++++ b/Libraries/LibWasm/AbstractMachine/BytecodeInterpreter.cpp
+@@ -5,6 +5,7 @@
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
++#include <AK/Array.h>
+ #include <AK/Bitmap.h>
+ #include <AK/ByteReader.h>
+ #include <AK/Debug.h>
+@@ -61,22 +62,23 @@ constexpr auto regname = [](auto regnum) -> ByteString {
+     return ByteString::formatted("reg{}", to_underlying(regnum));
+ };
+ 
++// Produces the host-order bit pattern of a value; store_value() serializes it little-endian.
+ template<typename T>
+ struct ConvertToRaw {
+     T operator()(T value)
+     {
+-        return LittleEndian<T>(value);
++        return value;
+     }
+ };
+ 
+ template<>
+ struct ConvertToRaw<float> {
+-    u32 operator()(float value) const { return bit_cast<LittleEndian<u32>>(value); }
++    u32 operator()(float value) const { return bit_cast<u32>(value); }
+ };
+ 
+ template<>
+ struct ConvertToRaw<double> {
+-    u64 operator()(double value) const { return bit_cast<LittleEndian<u64>>(value); }
++    u64 operator()(double value) const { return bit_cast<u64>(value); }
+ };
+ 
+ #define TRAP_IF_NOT(x, ...)                                                                    \
+@@ -5446,13 +5448,37 @@ bool BytecodeInterpreter::pop_and_store(Configuration& configuration, Instructio
+     return store_value(configuration, instruction, value, 1, addresses);
+ }
+ 
++// WebAssembly linear memory is little-endian regardless of the host byte order, so a value is
++// serialized explicitly instead of copying its in-memory representation.
++template<typename T>
++static Array<u8, sizeof(T)> to_little_endian_bytes(T value)
++{
++    Array<u8, sizeof(T)> bytes;
++    if constexpr (AK::HostIsLittleEndian) {
++        memcpy(bytes.data(), &value, sizeof(T));
++    } else if constexpr (IsSame<T, u128>) {
++        auto low = AK::convert_between_host_and_little_endian(value.low());
++        auto high = AK::convert_between_host_and_little_endian(value.high());
++        memcpy(bytes.data(), &low, sizeof(low));
++        memcpy(bytes.data() + sizeof(low), &high, sizeof(high));
++    } else if constexpr (IsFloatingPoint<T>) {
++        auto swapped = AK::convert_between_host_and_little_endian(bit_cast<Conditional<sizeof(T) == 4, u32, u64>>(value));
++        memcpy(bytes.data(), &swapped, sizeof(swapped));
++    } else {
++        auto swapped = AK::convert_between_host_and_little_endian(value);
++        memcpy(bytes.data(), &swapped, sizeof(swapped));
++    }
++    return bytes;
++}
++
+ template<typename StoreT>
+ bool BytecodeInterpreter::store_value(Configuration& configuration, Instruction const& instruction, StoreT value, size_t address_source, SourcesAndDestination const& addresses)
+ {
+     auto& memarg = instruction.arguments().unsafe_get<Instruction::MemoryArgument>();
+     dbgln_if(WASM_TRACE_DEBUG, "stack({}) -> temporary({}b)", value, sizeof(StoreT));
+     auto base = configuration.take_source<SourceAddressMix::Any>(address_source, addresses.sources).template to<i32>();
+-    return store_to_memory(configuration, memarg, { &value, sizeof(StoreT) }, base);
++    auto bytes = to_little_endian_bytes(value);
++    return store_to_memory(configuration, memarg, bytes.span(), base);
+ }
+ 
+ template<size_t N>
+@@ -5523,6 +5549,15 @@ double BytecodeInterpreter::read_value<double>(ReadonlyBytes data)
+     return bit_cast<double>(read_value<u64>(data));
+ }
+ 
++template<>
++u128 BytecodeInterpreter::read_value<u128>(ReadonlyBytes data)
++{
++    // A v128 is stored little-endian as well; assemble it from two little-endian halves, since the
++    // generic byte-swap helper only handles values of up to 64 bits.
++    VERIFY(sizeof(u128) <= data.size());
++    return u128(read_value<u64>(data), read_value<u64>(data.slice(sizeof(u64))));
++}
++
+ CompiledInstructions try_compile_instructions(Expression const& expression, Span<FunctionType const> functions)
+ {
+     CompiledInstructions result;
+diff --git a/Libraries/LibWasm/Wasi.h b/Libraries/LibWasm/Wasi.h
+index 1da615b0..a30dcd5f 100644
+--- a/Libraries/LibWasm/Wasi.h
++++ b/Libraries/LibWasm/Wasi.h
+@@ -208,37 +208,39 @@ enum class Errno : u16 {
+ struct Rights {
+     using CompatibleType = u64;
+ 
++    // Bit-fields are u8 rather than bool: on ABIs with a 4-byte bool (Darwin PowerPC) bool bit-fields
++    // would be allocated in 4-byte units and change the size of these overlays.
+     struct Bits {
+-        bool fd_datasync : 1;
+-        bool fd_read : 1;
+-        bool fd_seek : 1;
+-        bool fd_fdstat_set_flags : 1;
+-        bool fd_sync : 1;
+-        bool fd_tell : 1;
+-        bool fd_write : 1;
+-        bool fd_advise : 1;
+-        bool fd_allocate : 1;
+-        bool path_create_directory : 1;
+-        bool path_create_file : 1;
+-        bool path_link_source : 1;
+-        bool path_link_target : 1;
+-        bool path_open : 1;
+-        bool fd_readdir : 1;
+-        bool path_readlink : 1;
+-        bool path_rename_source : 1;
+-        bool path_rename_target : 1;
+-        bool path_filestat_get : 1;
+-        bool path_filestat_set_size : 1;
+-        bool path_filestat_set_times : 1;
+-        bool fd_filestat_get : 1;
+-        bool fd_filestat_set_size : 1;
+-        bool fd_filestat_set_times : 1;
+-        bool path_symlink : 1;
+-        bool path_remove_directory : 1;
+-        bool path_unlink_file : 1;
+-        bool poll_fd_readwrite : 1;
+-        bool sock_shutdown : 1;
+-        bool sock_accept : 1;
++        u8 fd_datasync : 1;
++        u8 fd_read : 1;
++        u8 fd_seek : 1;
++        u8 fd_fdstat_set_flags : 1;
++        u8 fd_sync : 1;
++        u8 fd_tell : 1;
++        u8 fd_write : 1;
++        u8 fd_advise : 1;
++        u8 fd_allocate : 1;
++        u8 path_create_directory : 1;
++        u8 path_create_file : 1;
++        u8 path_link_source : 1;
++        u8 path_link_target : 1;
++        u8 path_open : 1;
++        u8 fd_readdir : 1;
++        u8 path_readlink : 1;
++        u8 path_rename_source : 1;
++        u8 path_rename_target : 1;
++        u8 path_filestat_get : 1;
++        u8 path_filestat_set_size : 1;
++        u8 path_filestat_set_times : 1;
++        u8 fd_filestat_get : 1;
++        u8 fd_filestat_set_size : 1;
++        u8 fd_filestat_set_times : 1;
++        u8 path_symlink : 1;
++        u8 path_remove_directory : 1;
++        u8 path_unlink_file : 1;
++        u8 poll_fd_readwrite : 1;
++        u8 sock_shutdown : 1;
++        u8 sock_accept : 1;
+ 
+         u8 _unused1 : 2;
+         u32 _unused2 : 32;
+@@ -330,11 +332,11 @@ struct FDFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool append : 1;
+-        bool dsync : 1;
+-        bool nonblock : 1;
+-        bool rsync : 1;
+-        bool sync : 1;
++        u8 append : 1;
++        u8 dsync : 1;
++        u8 nonblock : 1;
++        u8 rsync : 1;
++        u8 sync : 1;
+ 
+         u8 _unused1 : 3;
+         u8 _unused2 : 8;
+@@ -371,10 +373,10 @@ struct FSTFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool atim : 1;
+-        bool atim_now : 1;
+-        bool mtim : 1;
+-        bool mtim_now : 1;
++        u8 atim : 1;
++        u8 atim_now : 1;
++        u8 mtim : 1;
++        u8 mtim_now : 1;
+ 
+         u8 _unused1 : 4;
+         u8 _unused2 : 8;
+@@ -397,7 +399,7 @@ struct LookupFlags {
+     using CompatibleType = u32;
+ 
+     struct Bits {
+-        bool symlink_follow : 1;
++        u8 symlink_follow : 1;
+ 
+         u8 _unused1 : 7;
+         u8 _unused2 : 8;
+@@ -421,10 +423,10 @@ struct OFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool creat : 1;
+-        bool directory : 1;
+-        bool excl : 1;
+-        bool trunc : 1;
++        u8 creat : 1;
++        u8 directory : 1;
++        u8 excl : 1;
++        u8 trunc : 1;
+ 
+         u8 _unused1 : 4;
+         u8 _unused2 : 8;
+@@ -475,7 +477,7 @@ struct EventRWFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool fd_readwrite_hangup : 1;
++        u8 fd_readwrite_hangup : 1;
+ 
+         u8 _unused1 : 7;
+         u8 _unused2 : 8;
+@@ -521,7 +523,7 @@ struct SubClockFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool subscription_clock_abstime : 1;
++        u8 subscription_clock_abstime : 1;
+ 
+         u8 _unused1 : 7;
+         u8 _unused2 : 8;
+@@ -621,8 +623,8 @@ struct RIFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool recv_peek : 1;
+-        bool recv_waitall : 1;
++        u8 recv_peek : 1;
++        u8 recv_waitall : 1;
+ 
+         u8 _unused1 : 6;
+         u8 _unused2 : 8;
+@@ -642,7 +644,7 @@ struct ROFlags {
+     using CompatibleType = u16;
+ 
+     struct Bits {
+-        bool recv_data_truncated : 1;
++        u8 recv_data_truncated : 1;
+ 
+         u8 _unused1 : 7;
+         u8 _unused2 : 8;
+@@ -665,8 +667,8 @@ struct SDFlags {
+     using CompatibleType = u8;
+ 
+     struct Bits {
+-        bool rd : 1;
+-        bool wr : 1;
++        u8 rd : 1;
++        u8 wr : 1;
+ 
+         u8 _unused : 6;
+     };

@@ -1,0 +1,673 @@
+From f68353adc5b3277b46790f9eedf068f38d1af790 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 24 Sep 2026 19:02:55 +0000
+Subject: [PATCH 06/21] Meta+Everywhere: Add LADYBIRD_LEGACY_MACOS for macOS
+ without Metal or IOSurface
+
+Metal never existed on PowerPC and the IOSurface framework only appeared
+in 10.6, yet every `#ifdef AK_OS_MACOS` in the GPU path assumed both.
+With LADYBIRD_LEGACY_MACOS=ON the build:
+
+- defines AK_MACOS_HAS_IOSURFACE / AK_MACOS_HAS_METAL only when not in
+  legacy mode, and gates the Metal Skia backend, the IOSurface backing
+  stores, the WebGL (Metal-ANGLE) context and the related helper-process
+  plumbing on those macros, falling back to CPU painting and no WebGL
+  exactly like a Linux build without Vulkan;
+- leaves MetalContext.mm and IOSurface.cpp out of the build and drops
+  the Metal and IOSurface framework links (CoreFoundation, CoreServices,
+  Foundation and Accelerate stay), compiling TimeZoneWatcherMacOS.mm
+  (pure CoreFoundation C API) as C++ for GCC;
+- uses fontconfig for fonts instead of CoreText, with the macOS system
+  font directories added to the search path;
+- falls back to pthread_mach_thread_np() and the Component Manager
+  audio APIs when the deployment target is older than 10.6 (the audio
+  fallback is untested), and shims MSG_NOSIGNAL for SDKs older than
+  10.13.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ AK/Format.cpp                                      | 10 ++++++++++
+ AK/Platform.h                                      |  7 +++++++
+ Libraries/LibCore/CMakeLists.txt                   | 10 ++++++++--
+ Libraries/LibCore/IOSurface.h                      |  4 ++++
+ Libraries/LibCore/Socket.h                         |  5 +++++
+ Libraries/LibGfx/CMakeLists.txt                    |  6 ++++--
+ Libraries/LibGfx/Font/FontDatabase.cpp             |  6 ++++++
+ Libraries/LibGfx/Font/TypefaceSkia.cpp             |  4 ++--
+ Libraries/LibGfx/MetalContext.h                    |  4 ++--
+ Libraries/LibGfx/PaintingSurface.cpp               |  6 +++---
+ Libraries/LibGfx/PaintingSurface.h                 |  4 ++--
+ Libraries/LibGfx/SkiaBackendContext.cpp            |  4 ++--
+ Libraries/LibGfx/SkiaBackendContext.h              |  4 ++--
+ .../LibMedia/Audio/PlaybackStreamAudioUnit.cpp     | 13 +++++++++++++
+ Libraries/LibWeb/HTML/Navigable.cpp                |  2 +-
+ Libraries/LibWeb/HTML/TraversableNavigable.h       |  2 +-
+ Libraries/LibWeb/Painting/BackingStoreManager.cpp  |  6 +++---
+ Libraries/LibWeb/Painting/BackingStoreManager.h    |  2 +-
+ Libraries/LibWeb/WebGL/OpenGLContext.cpp           | 14 +++++++-------
+ Libraries/LibWeb/WebGL/OpenGLContext.h             |  2 +-
+ Libraries/LibWebView/Application.cpp               |  2 ++
+ Libraries/LibWebView/Plugins/FontPlugin.cpp        |  2 +-
+ Libraries/LibWebView/ViewImplementation.cpp        |  4 ++--
+ Libraries/LibWebView/ViewImplementation.h          |  4 ++--
+ Meta/CMake/common_compile_options.cmake            |  4 ++++
+ Meta/CMake/fontconfig.cmake                        |  2 +-
+ Meta/CMake/lagom_options.cmake                     |  1 +
+ Services/RequestServer/RequestPipe.cpp             |  5 +++++
+ Services/WebContent/main.cpp                       |  2 +-
+ 29 files changed, 103 insertions(+), 38 deletions(-)
+
+diff --git a/AK/Format.cpp b/AK/Format.cpp
+index 6e6e97f3..524adc69 100644
+--- a/AK/Format.cpp
++++ b/AK/Format.cpp
+@@ -23,6 +23,10 @@
+ #include <string.h>
+ #include <time.h>
+ 
++#if defined(AK_OS_MACOS)
++#    include <AvailabilityMacros.h>
++#endif
++
+ #if defined(AK_OS_SERENITY)
+ #    include <serenity.h>
+ #endif
+@@ -1318,7 +1322,13 @@ static auto current_thread_id()
+     return GetCurrentThreadId();
+ #elif defined(AK_OS_MACOS)
+     u64 thread_id { 0 };
++#    if MAC_OS_X_VERSION_MIN_REQUIRED < 1060 || AK_IS_ARCH_PPC() || AK_IS_ARCH_PPC64()
++    // pthread_threadid_np() is a 10.6+ API that the PowerPC libSystem (10.5, and the PowerPC build of
++    // 10.6 whether native or under Rosetta) never got; use the Mach thread port there instead.
++    thread_id = pthread_mach_thread_np(pthread_self());
++#    else
+     pthread_threadid_np(nullptr, &thread_id);
++#    endif
+     return thread_id;
+ #else
+     return Empty();
+diff --git a/AK/Platform.h b/AK/Platform.h
+index ac6b7d8e..d82d42fb 100644
+--- a/AK/Platform.h
++++ b/AK/Platform.h
+@@ -92,6 +92,13 @@
+ #    define AK_OS_BSD_GENERIC
+ #endif
+ 
++// Metal and IOSurface only exist on 64-bit Intel and Apple-silicon macOS. Builds for PowerPC or for
++// SDKs older than 10.11 opt out with LADYBIRD_LEGACY_MACOS and fall back to CPU painting.
++#if defined(AK_OS_MACOS) && !defined(LADYBIRD_LEGACY_MACOS)
++#    define AK_MACOS_HAS_IOSURFACE
++#    define AK_MACOS_HAS_METAL
++#endif
++
+ #if defined(__IOS__)
+ #    define AK_OS_IOS
+ #    define AK_OS_BSD_GENERIC
+diff --git a/Libraries/LibCore/CMakeLists.txt b/Libraries/LibCore/CMakeLists.txt
+index 3f6eabd2..80e6606f 100644
+--- a/Libraries/LibCore/CMakeLists.txt
++++ b/Libraries/LibCore/CMakeLists.txt
+@@ -104,6 +104,10 @@ if (LINUX OR BSD)
+     list(APPEND SOURCES TimeZoneWatcherUnix.cpp)
+ elseif (APPLE AND NOT IOS)
+     list(APPEND SOURCES TimeZoneWatcherMacOS.mm)
++    if (LADYBIRD_LEGACY_MACOS)
++        # TimeZoneWatcherMacOS.mm uses only the CoreFoundation C API, so GCC can compile it as C++.
++        set_source_files_properties(TimeZoneWatcherMacOS.mm PROPERTIES LANGUAGE CXX)
++    endif()
+ elseif (WIN32)
+     list(APPEND SOURCES TimeZoneWatcherWindows.cpp)
+ else()
+@@ -114,7 +118,7 @@ if (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "GNU")
+     list(APPEND SOURCES MachPort.cpp)
+ endif()
+ 
+-if (APPLE)
++if (APPLE AND NOT LADYBIRD_LEGACY_MACOS)
+     list(APPEND SOURCES IOSurface.cpp)
+ endif()
+ 
+@@ -139,7 +143,9 @@ if (APPLE)
+     target_link_libraries(LibCore PUBLIC "-framework CoreFoundation")
+     target_link_libraries(LibCore PUBLIC "-framework CoreServices")
+     target_link_libraries(LibCore PUBLIC "-framework Foundation")
+-    target_link_libraries(LibCore PUBLIC "-framework IOSurface")
++    if (NOT LADYBIRD_LEGACY_MACOS)
++        target_link_libraries(LibCore PUBLIC "-framework IOSurface")
++    endif()
+ endif()
+ 
+ if (WIN32)
+diff --git a/Libraries/LibCore/IOSurface.h b/Libraries/LibCore/IOSurface.h
+index 9fc77480..666ec811 100644
+--- a/Libraries/LibCore/IOSurface.h
++++ b/Libraries/LibCore/IOSurface.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#ifdef AK_MACOS_HAS_IOSURFACE
++
+ #include <AK/Forward.h>
+ #include <AK/Noncopyable.h>
+ #include <AK/OwnPtr.h>
+@@ -44,3 +46,5 @@ private:
+ };
+ 
+ }
++
++#endif
+diff --git a/Libraries/LibCore/Socket.h b/Libraries/LibCore/Socket.h
+index 85e5e2c4..599b75c8 100644
+--- a/Libraries/LibCore/Socket.h
++++ b/Libraries/LibCore/Socket.h
+@@ -14,6 +14,11 @@
+ #include <LibCore/Notifier.h>
+ #include <LibCore/SocketAddress.h>
+ 
++// SDKs older than macOS 10.13 don't define MSG_NOSIGNAL; SO_NOSIGPIPE is used instead on those systems.
++#ifndef MSG_NOSIGNAL
++#    define MSG_NOSIGNAL 0
++#endif
++
+ namespace Core {
+ 
+ /// The Socket class is the base class for all concrete BSD-style socket
+diff --git a/Libraries/LibGfx/CMakeLists.txt b/Libraries/LibGfx/CMakeLists.txt
+index 23e09a26..3c1ee826 100644
+--- a/Libraries/LibGfx/CMakeLists.txt
++++ b/Libraries/LibGfx/CMakeLists.txt
+@@ -61,7 +61,7 @@ set(SOURCES
+     YUVData.cpp
+ )
+ 
+-if (APPLE)
++if (APPLE AND NOT LADYBIRD_LEGACY_MACOS)
+     list(APPEND SOURCES MetalContext.mm)
+ endif()
+ 
+@@ -150,7 +150,9 @@ else()
+ endif()
+ 
+ if (APPLE)
+-    target_link_libraries(LibCore PUBLIC "-framework Metal")
++    if (NOT LADYBIRD_LEGACY_MACOS)
++        target_link_libraries(LibCore PUBLIC "-framework Metal")
++    endif()
+     target_link_libraries(LibCore PUBLIC "-framework Accelerate")
+ endif()
+ 
+diff --git a/Libraries/LibGfx/Font/FontDatabase.cpp b/Libraries/LibGfx/Font/FontDatabase.cpp
+index c506cdee..b04ab8ac 100644
+--- a/Libraries/LibGfx/Font/FontDatabase.cpp
++++ b/Libraries/LibGfx/Font/FontDatabase.cpp
+@@ -85,6 +85,12 @@ ErrorOr<Vector<String>> FontDatabase::font_directories()
+         paths.append(TRY(String::from_utf8(StringView { dir_cstring, strlen(dir_cstring) })));
+     }
+     FcStrListDone(dirs);
++#    if defined(AK_OS_MACOS)
++    // A MacPorts fontconfig.conf may not know about the system font directories, so search them too.
++    paths.append("/System/Library/Fonts"_string);
++    paths.append("/Library/Fonts"_string);
++    paths.append(TRY(String::formatted("{}/Library/Fonts"sv, Core::StandardPaths::home_directory())));
++#    endif
+     return paths;
+ 
+ #elif defined(AK_OS_HAIKU)
+diff --git a/Libraries/LibGfx/Font/TypefaceSkia.cpp b/Libraries/LibGfx/Font/TypefaceSkia.cpp
+index 4e25724f..80e0cc6f 100644
+--- a/Libraries/LibGfx/Font/TypefaceSkia.cpp
++++ b/Libraries/LibGfx/Font/TypefaceSkia.cpp
+@@ -22,7 +22,7 @@
+ #    include <ports/SkFontScanner_FreeType.h>
+ #endif
+ 
+-#ifdef AK_OS_MACOS
++#if defined(AK_OS_MACOS) && !defined(USE_FONTCONFIG)
+ #    include <ports/SkFontMgr_mac_ct.h>
+ #endif
+ 
+@@ -37,7 +37,7 @@ struct TypefaceSkia::Impl {
+ static SkFontMgr& font_manager()
+ {
+     if (!s_font_manager) {
+-#ifdef AK_OS_MACOS
++#if defined(AK_OS_MACOS) && !defined(USE_FONTCONFIG)
+         if (Gfx::FontDatabase::the().system_font_provider_name() != "FontConfig"sv) {
+             s_font_manager = SkFontMgr_New_CoreText(nullptr);
+         }
+diff --git a/Libraries/LibGfx/MetalContext.h b/Libraries/LibGfx/MetalContext.h
+index aefaae6d..7c32e7bd 100644
+--- a/Libraries/LibGfx/MetalContext.h
++++ b/Libraries/LibGfx/MetalContext.h
+@@ -6,8 +6,8 @@
+ 
+ #pragma once
+ 
+-#if !defined(AK_OS_MACOS)
+-static_assert(false, "This file must only be used for macOS");
++#ifndef AK_MACOS_HAS_METAL
++static_assert(false, "This file must only be used for macOS builds with Metal");
+ #endif
+ 
+ #include <AK/Forward.h>
+diff --git a/Libraries/LibGfx/PaintingSurface.cpp b/Libraries/LibGfx/PaintingSurface.cpp
+index d1dd5913..f42128d6 100644
+--- a/Libraries/LibGfx/PaintingSurface.cpp
++++ b/Libraries/LibGfx/PaintingSurface.cpp
+@@ -14,7 +14,7 @@
+ #include <gpu/ganesh/GrDirectContext.h>
+ #include <gpu/ganesh/SkSurfaceGanesh.h>
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
+ #elif defined(USE_VULKAN_IMAGES)
+ #    include <gpu/ganesh/vk/GrVkBackendSurface.h>
+@@ -30,7 +30,7 @@ struct PaintingSurface::Impl {
+     RefPtr<Bitmap> bitmap;
+ };
+ 
+-#if defined(AK_OS_MACOS) || defined(USE_VULKAN_IMAGES)
++#if defined(AK_MACOS_HAS_METAL) || defined(USE_VULKAN_IMAGES)
+ static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
+ {
+     switch (origin) {
+@@ -125,7 +125,7 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::wrap_bitmap(Bitmap& bitmap)
+     return adopt_ref(*new PaintingSurface(make<Impl>(RefPtr<SkiaBackendContext> {}, size, surface, bitmap)));
+ }
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_iosurface(Core::IOSurfaceHandle&& iosurface_handle, NonnullRefPtr<SkiaBackendContext> context, Origin origin)
+ {
+     context->lock();
+diff --git a/Libraries/LibGfx/PaintingSurface.h b/Libraries/LibGfx/PaintingSurface.h
+index 66b919e0..72a068e6 100644
+--- a/Libraries/LibGfx/PaintingSurface.h
++++ b/Libraries/LibGfx/PaintingSurface.h
+@@ -14,7 +14,7 @@
+ #include <LibGfx/Size.h>
+ #include <LibGfx/SkiaBackendContext.h>
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ #    include <LibGfx/MetalContext.h>
+ #endif
+ 
+@@ -35,7 +35,7 @@ public:
+     static NonnullRefPtr<PaintingSurface> create_with_size(RefPtr<SkiaBackendContext> context, IntSize size, BitmapFormat color_type, AlphaType alpha_type);
+     static NonnullRefPtr<PaintingSurface> wrap_bitmap(Bitmap&);
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+     static NonnullRefPtr<PaintingSurface> create_from_iosurface(Core::IOSurfaceHandle&&, NonnullRefPtr<SkiaBackendContext>, Origin = Origin::TopLeft);
+ #endif
+ 
+diff --git a/Libraries/LibGfx/SkiaBackendContext.cpp b/Libraries/LibGfx/SkiaBackendContext.cpp
+index 86b46a88..6718cc2a 100644
+--- a/Libraries/LibGfx/SkiaBackendContext.cpp
++++ b/Libraries/LibGfx/SkiaBackendContext.cpp
+@@ -18,7 +18,7 @@
+ #    include <gpu/vk/VulkanExtensions.h>
+ #endif
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ #    include <gpu/ganesh/GrBackendSurface.h>
+ #    include <gpu/ganesh/mtl/GrMtlBackendContext.h>
+ #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
+@@ -89,7 +89,7 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
+ }
+ #endif
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ class SkiaMetalBackendContext final : public SkiaBackendContext {
+     AK_MAKE_NONCOPYABLE(SkiaMetalBackendContext);
+     AK_MAKE_NONMOVABLE(SkiaMetalBackendContext);
+diff --git a/Libraries/LibGfx/SkiaBackendContext.h b/Libraries/LibGfx/SkiaBackendContext.h
+index 9b1fc0eb..1646221d 100644
+--- a/Libraries/LibGfx/SkiaBackendContext.h
++++ b/Libraries/LibGfx/SkiaBackendContext.h
+@@ -14,7 +14,7 @@
+ #    include <LibGfx/VulkanContext.h>
+ #endif
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ #    include <LibGfx/MetalContext.h>
+ #endif
+ 
+@@ -35,7 +35,7 @@ public:
+     static RefPtr<SkiaBackendContext> create_vulkan_context(const VulkanContext& vulkan_context);
+ #endif
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+     static RefPtr<SkiaBackendContext> create_metal_context(NonnullRefPtr<MetalContext>);
+ #endif
+ 
+diff --git a/Libraries/LibMedia/Audio/PlaybackStreamAudioUnit.cpp b/Libraries/LibMedia/Audio/PlaybackStreamAudioUnit.cpp
+index 10c0f074..db31bc56 100644
+--- a/Libraries/LibMedia/Audio/PlaybackStreamAudioUnit.cpp
++++ b/Libraries/LibMedia/Audio/PlaybackStreamAudioUnit.cpp
+@@ -16,6 +16,11 @@
+ 
+ #include <AudioToolbox/AudioFormat.h>
+ #include <AudioUnit/AudioUnit.h>
++#include <AvailabilityMacros.h>
++
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1060
++#    include <CoreServices/CoreServices.h>
++#endif
+ 
+ namespace Audio {
+ 
+@@ -169,8 +174,16 @@ public:
+         component_description.componentFlags = 0;
+         component_description.componentFlagsMask = 0;
+ 
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1060
++        // NOTE: Untested. AudioComponentFindNext/AudioComponentInstanceNew are 10.6+; on older SDKs use the
++        // Component Manager equivalents. AudioComponentDescription and ComponentDescription share the same
++        // five UInt32 fields, and AudioUnit is a ComponentInstance there.
++        auto* component = FindNextComponent(nullptr, reinterpret_cast<ComponentDescription*>(&component_description));
++        AU_TRY(OpenAComponent(component, &state->m_audio_unit));
++#else
+         auto* component = AudioComponentFindNext(NULL, &component_description);
+         AU_TRY(AudioComponentInstanceNew(component, &state->m_audio_unit));
++#endif
+ 
+         auto description = TRY(get_audio_unit_property<AudioStreamBasicDescription>(state->m_audio_unit, kAudioUnitProperty_StreamFormat));
+ 
+diff --git a/Libraries/LibWeb/HTML/Navigable.cpp b/Libraries/LibWeb/HTML/Navigable.cpp
+index b9e077ed..1e616f85 100644
+--- a/Libraries/LibWeb/HTML/Navigable.cpp
++++ b/Libraries/LibWeb/HTML/Navigable.cpp
+@@ -149,7 +149,7 @@ static RefPtr<Gfx::SkiaBackendContext> g_cached_skia_backend_context;
+ static RefPtr<Gfx::SkiaBackendContext> get_skia_backend_context()
+ {
+     if (!g_cached_skia_backend_context) {
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+         auto metal_context = Gfx::get_metal_context();
+         g_cached_skia_backend_context = Gfx::SkiaBackendContext::create_metal_context(*metal_context);
+ #elif USE_VULKAN
+diff --git a/Libraries/LibWeb/HTML/TraversableNavigable.h b/Libraries/LibWeb/HTML/TraversableNavigable.h
+index e2c23ee2..a9f416c3 100644
+--- a/Libraries/LibWeb/HTML/TraversableNavigable.h
++++ b/Libraries/LibWeb/HTML/TraversableNavigable.h
+@@ -18,7 +18,7 @@
+ #include <LibWeb/Page/Page.h>
+ #include <LibWeb/StorageAPI/StorageShed.h>
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_METAL
+ #    include <LibGfx/MetalContext.h>
+ #endif
+ 
+diff --git a/Libraries/LibWeb/Painting/BackingStoreManager.cpp b/Libraries/LibWeb/Painting/BackingStoreManager.cpp
+index 86c39d5b..3b8cfffa 100644
+--- a/Libraries/LibWeb/Painting/BackingStoreManager.cpp
++++ b/Libraries/LibWeb/Painting/BackingStoreManager.cpp
+@@ -11,7 +11,7 @@
+ #include <LibWeb/Painting/BackingStoreManager.h>
+ #include <WebContent/PageClient.h>
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ #    include <LibCore/IOSurface.h>
+ #    include <LibCore/MachPort.h>
+ #    include <LibCore/Platform/MachMessageTypes.h>
+@@ -21,7 +21,7 @@ namespace Web::Painting {
+ 
+ GC_DEFINE_ALLOCATOR(BackingStoreManager);
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ static Optional<Core::MachPort> s_browser_mach_port;
+ void BackingStoreManager::set_browser_mach_port(Core::MachPort&& port)
+ {
+@@ -55,7 +55,7 @@ void BackingStoreManager::reallocate_backing_stores(Gfx::IntSize size)
+     RefPtr<Gfx::PaintingSurface> front_store;
+     RefPtr<Gfx::PaintingSurface> back_store;
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+     if (skia_backend_context && s_browser_mach_port.has_value()) {
+         auto back_iosurface = Core::IOSurfaceHandle::create(size.width(), size.height());
+         auto back_iosurface_port = back_iosurface.create_mach_port();
+diff --git a/Libraries/LibWeb/Painting/BackingStoreManager.h b/Libraries/LibWeb/Painting/BackingStoreManager.h
+index d2acd2db..38da47a1 100644
+--- a/Libraries/LibWeb/Painting/BackingStoreManager.h
++++ b/Libraries/LibWeb/Painting/BackingStoreManager.h
+@@ -15,7 +15,7 @@ class WEB_API BackingStoreManager : public JS::Cell {
+     GC_DECLARE_ALLOCATOR(BackingStoreManager);
+ 
+ public:
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+     static void set_browser_mach_port(Core::MachPort&&);
+ #endif
+ 
+diff --git a/Libraries/LibWeb/WebGL/OpenGLContext.cpp b/Libraries/LibWeb/WebGL/OpenGLContext.cpp
+index 8a94dfa3..0b4dcf6e 100644
+--- a/Libraries/LibWeb/WebGL/OpenGLContext.cpp
++++ b/Libraries/LibWeb/WebGL/OpenGLContext.cpp
+@@ -25,7 +25,7 @@ extern "C" {
+ #include <GLES3/gl3.h>
+ 
+ // Enable WebGL if we're on MacOS and can use Metal or if we can use shareable Vulkan images
+-#if defined(AK_OS_MACOS) || defined(USE_VULKAN_IMAGES)
++#if defined(AK_MACOS_HAS_METAL) || defined(USE_VULKAN_IMAGES)
+ #    define ENABLE_WEBGL 1
+ #endif
+ 
+@@ -95,7 +95,7 @@ void OpenGLContext::free_surface_resources()
+ #    endif
+ 
+     if (m_impl->surface != EGL_NO_SURFACE) {
+-#    ifdef AK_OS_MACOS
++#    ifdef AK_MACOS_HAS_IOSURFACE
+         eglReleaseTexImage(m_impl->display, m_impl->surface, EGL_BACK_BUFFER);
+ #    endif
+         eglDestroySurface(m_impl->display, m_impl->surface);
+@@ -134,7 +134,7 @@ OwnPtr<OpenGLContext> OpenGLContext::create(NonnullRefPtr<Gfx::SkiaBackendContex
+ #ifdef ENABLE_WEBGL
+     EGLAttrib display_attributes[] = {
+         EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+-#    if defined(AK_OS_MACOS)
++#    if defined(AK_MACOS_HAS_METAL)
+         EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
+ #    elif defined(USE_VULKAN_IMAGES)
+         EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE,
+@@ -163,7 +163,7 @@ OwnPtr<OpenGLContext> OpenGLContext::create(NonnullRefPtr<Gfx::SkiaBackendContex
+     }
+ 
+     EGLint texture_target;
+-#    if defined(AK_OS_MACOS)
++#    if defined(AK_MACOS_HAS_METAL)
+     eglGetConfigAttrib(display, config, EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &texture_target);
+     VERIFY(texture_target == EGL_TEXTURE_RECTANGLE_ANGLE || texture_target == EGL_TEXTURE_2D);
+ #    elif defined(USE_VULKAN_IMAGES)
+@@ -281,7 +281,7 @@ void OpenGLContext::clear_buffer_to_default_values()
+ #endif
+ }
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ void OpenGLContext::allocate_iosurface_painting_surface()
+ {
+     auto iosurface = Core::IOSurfaceHandle::create(m_size.width(), m_size.height());
+@@ -391,7 +391,7 @@ void OpenGLContext::allocate_painting_surface_if_needed()
+ 
+     VERIFY(!m_size.is_empty());
+ 
+-#    if defined(AK_OS_MACOS)
++#    if defined(AK_MACOS_HAS_IOSURFACE)
+     allocate_iosurface_painting_surface();
+ #    elif defined(USE_VULKAN_IMAGES)
+     allocate_vkimage_painting_surface();
+@@ -438,7 +438,7 @@ void OpenGLContext::present(bool preserve_drawing_buffer)
+     // With Metal, glFlush flushes the command buffer, but without waiting for it to be scheduled or completed.
+     // eglWaitUntilWorkScheduledANGLE flushes the command buffer, and waits until it has been scheduled, hence the name.
+     // eglWaitUntilWorkScheduledANGLE only has an effect on CGL and Metal backends, so we only use it on macOS.
+-#    if defined(AK_OS_MACOS)
++#    if defined(AK_MACOS_HAS_METAL)
+     eglWaitUntilWorkScheduledANGLE(m_impl->display);
+ #    elif defined(USE_VULKAN_IMAGES)
+     // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
+diff --git a/Libraries/LibWeb/WebGL/OpenGLContext.h b/Libraries/LibWeb/WebGL/OpenGLContext.h
+index 47671cd8..11dde5bb 100644
+--- a/Libraries/LibWeb/WebGL/OpenGLContext.h
++++ b/Libraries/LibWeb/WebGL/OpenGLContext.h
+@@ -55,7 +55,7 @@ private:
+     WebGLVersion m_webgl_version;
+ 
+     void free_surface_resources();
+-#if defined(AK_OS_MACOS)
++#if defined(AK_MACOS_HAS_IOSURFACE)
+     void allocate_iosurface_painting_surface();
+ #elif defined(USE_VULKAN_IMAGES)
+     void allocate_vkimage_painting_surface();
+diff --git a/Libraries/LibWebView/Application.cpp b/Libraries/LibWebView/Application.cpp
+index 277eb9f9..2b7aa5f9 100644
+--- a/Libraries/LibWebView/Application.cpp
++++ b/Libraries/LibWebView/Application.cpp
+@@ -93,10 +93,12 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
+     m_mach_port_server->on_receive_child_mach_port = [this](auto pid, auto port) {
+         set_process_mach_port(pid, move(port));
+     };
++#    ifdef AK_MACOS_HAS_IOSURFACE
+     m_mach_port_server->on_receive_backing_stores = [](MachPortServer::BackingStoresMessage message) {
+         if (auto view = WebContentClient::view_for_pid_and_page_id(message.pid, message.page_id); view.has_value())
+             view->did_allocate_iosurface_backing_stores(message.front_backing_store_id, move(message.front_backing_store_port), message.back_backing_store_id, move(message.back_backing_store_port));
+     };
++#    endif
+ #endif
+ 
+     Vector<ByteString> raw_urls;
+diff --git a/Libraries/LibWebView/Plugins/FontPlugin.cpp b/Libraries/LibWebView/Plugins/FontPlugin.cpp
+index 2339c74a..8ad72698 100644
+--- a/Libraries/LibWebView/Plugins/FontPlugin.cpp
++++ b/Libraries/LibWebView/Plugins/FontPlugin.cpp
+@@ -44,7 +44,7 @@ FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_p
+     if (is_layout_test_mode) {
+         m_symbol_font_names = { "Noto Emoji"_fly_string };
+     } else {
+-#ifdef AK_OS_MACOS
++#if defined(AK_OS_MACOS) && !defined(USE_FONTCONFIG)
+         m_symbol_font_names = { "Apple Color Emoji"_fly_string, "Apple Symbols"_fly_string };
+ #else
+         m_symbol_font_names = { "Noto Color Emoji"_fly_string, "Noto Sans Symbols"_fly_string };
+diff --git a/Libraries/LibWebView/ViewImplementation.cpp b/Libraries/LibWebView/ViewImplementation.cpp
+index 3f30d500..ff631463 100644
+--- a/Libraries/LibWebView/ViewImplementation.cpp
++++ b/Libraries/LibWebView/ViewImplementation.cpp
+@@ -21,7 +21,7 @@
+ #include <LibWebView/UserAgent.h>
+ #include <LibWebView/ViewImplementation.h>
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ #    include <LibCore/IOSurface.h>
+ #    include <LibCore/MachPort.h>
+ #endif
+@@ -571,7 +571,7 @@ void ViewImplementation::did_allocate_backing_stores(Badge<WebContentClient>, i3
+     m_client_state.back_bitmap.id = back_bitmap_id;
+ }
+ 
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+ void ViewImplementation::did_allocate_iosurface_backing_stores(i32 front_id, Core::MachPort&& front_port, i32 back_id, Core::MachPort&& back_port)
+ {
+     if (m_client_state.has_usable_bitmap) {
+diff --git a/Libraries/LibWebView/ViewImplementation.h b/Libraries/LibWebView/ViewImplementation.h
+index c452aaa0..4d02211c 100644
+--- a/Libraries/LibWebView/ViewImplementation.h
++++ b/Libraries/LibWebView/ViewImplementation.h
+@@ -154,7 +154,7 @@ public:
+     void did_update_navigation_buttons_state(Badge<WebContentClient>, bool back_enabled, bool forward_enabled) const;
+ 
+     void did_allocate_backing_stores(Badge<WebContentClient>, i32 front_bitmap_id, Gfx::ShareableBitmap const&, i32 back_bitmap_id, Gfx::ShareableBitmap const&);
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+     void did_allocate_iosurface_backing_stores(i32 front_bitmap_id, Core::MachPort&&, i32 back_bitmap_id, Core::MachPort&&);
+ #endif
+ 
+@@ -303,7 +303,7 @@ protected:
+         i32 id { -1 };
+         Web::DevicePixelSize last_painted_size;
+         RefPtr<Gfx::Bitmap const> bitmap;
+-#ifdef AK_OS_MACOS
++#ifdef AK_MACOS_HAS_IOSURFACE
+         void* iosurface_ref { nullptr };
+ #endif
+     };
+diff --git a/Meta/CMake/common_compile_options.cmake b/Meta/CMake/common_compile_options.cmake
+index 89686a17..5c64b868 100644
+--- a/Meta/CMake/common_compile_options.cmake
++++ b/Meta/CMake/common_compile_options.cmake
+@@ -68,6 +68,10 @@ elseif (NOT CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|am
+     add_cxx_compile_options(-march=native)
+ endif()
+ 
++if (APPLE AND LADYBIRD_LEGACY_MACOS)
++    add_cxx_compile_definitions(LADYBIRD_LEGACY_MACOS=1)
++endif()
++
+ add_cxx_compile_options(-Wcast-qual)
+ add_cxx_compile_options(-Wformat=2)
+ add_cxx_compile_options(-Wimplicit-fallthrough)
+diff --git a/Meta/CMake/fontconfig.cmake b/Meta/CMake/fontconfig.cmake
+index dcbbe1ff..900c5c52 100644
+--- a/Meta/CMake/fontconfig.cmake
++++ b/Meta/CMake/fontconfig.cmake
+@@ -1,6 +1,6 @@
+ include_guard()
+ 
+-if (NOT APPLE AND NOT ANDROID AND NOT WIN32)
++if ((NOT APPLE AND NOT ANDROID AND NOT WIN32) OR (APPLE AND LADYBIRD_LEGACY_MACOS))
+     find_package(Fontconfig REQUIRED)
+     set(HAS_FONTCONFIG ON CACHE BOOL "" FORCE)
+     add_cxx_compile_definitions(USE_FONTCONFIG=1)
+diff --git a/Meta/CMake/lagom_options.cmake b/Meta/CMake/lagom_options.cmake
+index df366415..6eb63cb2 100644
+--- a/Meta/CMake/lagom_options.cmake
++++ b/Meta/CMake/lagom_options.cmake
+@@ -34,3 +34,4 @@ endif()
+ # Takes precedence over ENABLE_QT and the native frontends: a toolkit-free ladybird binary that only
+ # offers the headless modes and WebDriver. Useful where no supported GUI toolkit is available.
+ ladybird_option(ENABLE_HEADLESS_UI OFF CACHE BOOL "Build the toolkit-free ladybird frontend (headless modes and WebDriver only)")
++ladybird_option(LADYBIRD_LEGACY_MACOS OFF CACHE BOOL "Build for macOS without Metal/IOSurface (PowerPC or pre-10.11 SDKs): CPU painting, no WebGL, fontconfig fonts")
+diff --git a/Services/RequestServer/RequestPipe.cpp b/Services/RequestServer/RequestPipe.cpp
+index 591b3f85..57bbf84d 100644
+--- a/Services/RequestServer/RequestPipe.cpp
++++ b/Services/RequestServer/RequestPipe.cpp
+@@ -12,6 +12,11 @@
+ #    include <AK/Windows.h>
+ #endif
+ 
++// SDKs older than macOS 10.13 don't define MSG_NOSIGNAL; SO_NOSIGPIPE is used instead on those systems.
++#ifndef MSG_NOSIGNAL
++#    define MSG_NOSIGNAL 0
++#endif
++
+ namespace RequestServer {
+ 
+ RequestPipe::RequestPipe(int const reader_fd, int const writer_fd)
+diff --git a/Services/WebContent/main.cpp b/Services/WebContent/main.cpp
+index b2ae1112..6346a1eb 100644
+--- a/Services/WebContent/main.cpp
++++ b/Services/WebContent/main.cpp
+@@ -181,7 +181,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
+ 
+         // FIXME: For some reason, our implementation of IOSurface does not work on Intel macOS. Remove this conditional
+         //        compilation when that is resolved.
+-#    if ARCH(AARCH64)
++#    if ARCH(AARCH64) && defined(AK_MACOS_HAS_IOSURFACE)
+         Web::Painting::BackingStoreManager::set_browser_mach_port(move(server_port));
+ #    endif
+     }
