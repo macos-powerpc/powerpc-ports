@@ -1,0 +1,364 @@
+From 1726a99e8ae2f405bbd2e02b346e2a1334546998 Mon Sep 17 00:00:00 2001
+From: Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+Date: Wed, 29 Apr 2026 20:08:01 +0200
+Subject: [PATCH 32/32] LibWeb: Push fetch body chunks directly into the byte
+ stream controller
+
+Previously, each chunk was delivered through a pull promise. Every pull
+allocated around seven GC objects (the pull promise, its capability, and
+the reaction handlers from react_to_promise) and none of them did
+anything useful. The pull algorithm is now a no-op, and
+FetchedDataReceiver enqueues bytes into the controller as they arrive.
+
+(cherry picked from commit 6830b60e7594f424ba9af00e610a7a2d38688bf9)
+
+Backport note: this also removes the pull-promise bookkeeping whose
+VERIFY(!m_has_unfulfilled_promise) in set_pending_promise() aborted
+WebContent on MacRumors when a response body was piped through the
+handover TransformStream. Upstream moved MAX_SNIFF_BYTES from Bodies.cpp
+into Bodies.h for this; the backport defines the same constant locally in
+FetchedDataReceiver.cpp instead, so the 300+ files that include Bodies.h
+need not be rebuilt.
+---
+ .../Fetch/Fetching/FetchedDataReceiver.cpp    | 178 +++++++-----------
+ .../Fetch/Fetching/FetchedDataReceiver.h      |  25 +--
+ Libraries/LibWeb/Fetch/Fetching/Fetching.cpp  |   9 +-
+ 3 files changed, 81 insertions(+), 131 deletions(-)
+
+diff --git a/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.cpp b/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.cpp
+index 359de877..8c171ad0 100644
+--- a/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.cpp
++++ b/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.cpp
+@@ -7,19 +7,25 @@
+ 
+ #include <LibGC/Function.h>
+ #include <LibHTTP/Cache/MemoryCache.h>
++#include <LibJS/Runtime/ArrayBuffer.h>
++#include <LibJS/Runtime/TypedArray.h>
+ #include <LibWeb/Bindings/ExceptionOrUtils.h>
+ #include <LibWeb/Fetch/Fetching/FetchedDataReceiver.h>
+ #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
+ #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+ #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+-#include <LibWeb/Fetch/Infrastructure/Task.h>
+-#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
+ #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
++#include <LibWeb/Platform/EventLoopPlugin.h>
++#include <LibWeb/Streams/ReadableByteStreamController.h>
+ #include <LibWeb/Streams/ReadableStream.h>
+-#include <LibWeb/WebIDL/Promise.h>
++#include <LibWeb/Streams/ReadableStreamOperations.h>
+ 
+ namespace Web::Fetch::Fetching {
+ 
++// https://mimesniff.spec.whatwg.org/#reading-the-resource-header
++// NB: The same limit as the one in Fetch/Infrastructure/HTTP/Bodies.cpp.
++static constexpr size_t MAX_SNIFF_BYTES = 1445;
++
+ GC_DEFINE_ALLOCATOR(FetchedDataReceiver);
+ 
+ FetchedDataReceiver::FetchedDataReceiver(GC::Ref<Infrastructure::FetchParams const> fetch_params, GC::Ref<Streams::ReadableStream> stream, RefPtr<HTTP::MemoryCache> http_cache)
+@@ -35,11 +41,13 @@ void FetchedDataReceiver::set_body(GC::Ref<Fetch::Infrastructure::Body> body)
+ {
+     m_body = body;
+     // Flush any bytes that were buffered before the body was set
+-    if (!m_buffer.is_empty())
+-        m_body->append_sniff_bytes(m_buffer);
++    if (!m_pre_body_sniff_buffer.is_empty()) {
++        m_body->append_sniff_bytes(m_pre_body_sniff_buffer);
++        m_pre_body_sniff_buffer.clear();
++    }
+     // If the stream already completed before the body was set,
+     // we missed the set_sniff_bytes_complete() call in handle_network_bytes.
+-    if (m_lifecycle_state != LifecycleState::Receiving)
++    if (m_network_complete)
+         m_body->set_sniff_bytes_complete();
+ }
+ 
+@@ -50,152 +58,106 @@ void FetchedDataReceiver::visit_edges(Visitor& visitor)
+     visitor.visit(m_response);
+     visitor.visit(m_body);
+     visitor.visit(m_stream);
+-    visitor.visit(m_pending_promise);
+-}
+-
+-void FetchedDataReceiver::set_pending_promise(GC::Ref<WebIDL::Promise> promise)
+-{
+-    VERIFY(!m_pending_promise);
+-    VERIFY(!m_has_unfulfilled_promise);
+-    m_pending_promise = promise;
+-
+-    if (!buffer_is_eof()) {
+-        pull_bytes_into_stream();
+-    } else if (m_lifecycle_state == LifecycleState::ReadyToClose) {
+-        close_stream();
+-    }
+ }
+ 
+ // This implements the parallel steps of the pullAlgorithm in HTTP-network-fetch.
+ // https://fetch.spec.whatwg.org/#ref-for-in-parallel⑤
+ void FetchedDataReceiver::handle_network_bytes(ReadonlyBytes bytes, NetworkState state)
+ {
+-    VERIFY(m_lifecycle_state == LifecycleState::Receiving);
+-
+     if (state == NetworkState::Complete) {
+         VERIFY(bytes.is_empty());
+-        m_lifecycle_state = LifecycleState::CompletePending;
++        m_network_complete = true;
+         // Mark sniff bytes as complete when the stream ends
+         if (m_body)
+             m_body->set_sniff_bytes_complete();
+-    }
+ 
+-    if (state == NetworkState::Ongoing) {
+-        m_buffer.append(bytes);
+-        // Capture bytes for MIME sniffing
+-        if (m_body)
+-            m_body->append_sniff_bytes(bytes);
++        // 2. Otherwise, if the bytes transmission for response’s message body is done normally and stream is readable,
++        //    then close stream, and abort these in-parallel steps.
++        Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this]() {
++            close_stream();
++        }));
++        return;
+     }
+ 
+-    if (!m_pending_promise) {
+-        if (m_lifecycle_state == LifecycleState::CompletePending && buffer_is_eof() && !m_has_unfulfilled_promise)
+-            m_lifecycle_state = LifecycleState::ReadyToClose;
++    if (state == NetworkState::Error)
+         return;
+-    }
+ 
+     // 1. If one or more bytes have been transmitted from response’s message body, then:
+-    if (!bytes.is_empty()) {
+-        // 1. Let bytes be the transmitted bytes.
++    if (bytes.is_empty())
++        return;
+ 
+-        // FIXME: 2. Let codings be the result of extracting header list values given `Content-Encoding` and response’s header list.
+-        // FIXME: 3. Increase response’s body info’s encoded size by bytes’s length.
+-        // FIXME: 4. Set bytes to the result of handling content codings given codings and bytes.
+-        // FIXME: 5. Increase response’s body info’s decoded size by bytes’s length.
+-        // FIXME: 6. If bytes is failure, then terminate fetchParams’s controller.
++    // 1. Let bytes be the transmitted bytes.
+ 
+-        // 7. Append bytes to buffer.
+-        pull_bytes_into_stream();
++    // FIXME: 2. Let codings be the result of extracting header list values given `Content-Encoding` and response’s header list.
++    // FIXME: 3. Increase response’s body info’s encoded size by bytes’s length.
++    // FIXME: 4. Set bytes to the result of handling content codings given codings and bytes.
++    // FIXME: 5. Increase response’s body info’s decoded size by bytes’s length.
++    // FIXME: 6. If bytes is failure, then terminate fetchParams’s controller.
+ 
+-        // FIXME: 8. If the size of buffer is larger than an upper limit chosen by the user agent, ask the user agent
+-        //           to suspend the ongoing fetch.
+-        return;
+-    }
+-    // 2. Otherwise, if the bytes transmission for response’s message body is done normally and stream is readable,
+-    //    then close stream, and abort these in-parallel steps.
+-    if (m_stream->is_readable()) {
+-        VERIFY(m_lifecycle_state == LifecycleState::CompletePending);
+-        close_stream();
++    // Capture bytes for MIME sniffing
++    if (m_body) {
++        m_body->append_sniff_bytes(bytes);
++    } else if (m_pre_body_sniff_buffer.size() < MAX_SNIFF_BYTES) {
++        auto space_remaining = MAX_SNIFF_BYTES - m_pre_body_sniff_buffer.size();
++        m_pre_body_sniff_buffer.append(bytes.slice(0, min(bytes.size(), space_remaining)));
+     }
++
++    if (m_http_cache)
++        m_cache_buffer.append(bytes);
++
++    // 7. Append bytes to buffer.
++    enqueue_into_stream(bytes);
++
++    // FIXME: 8. If the size of buffer is larger than an upper limit chosen by the user agent, ask the user agent
++    //           to suspend the ongoing fetch.
+ }
+ 
+ // This implements the parallel steps of the pullAlgorithm in HTTP-network-fetch.
+ // https://fetch.spec.whatwg.org/#ref-for-in-parallel④
+-void FetchedDataReceiver::pull_bytes_into_stream()
++void FetchedDataReceiver::enqueue_into_stream(ReadonlyBytes bytes)
+ {
+-    VERIFY(m_lifecycle_state == LifecycleState::Receiving || m_lifecycle_state == LifecycleState::CompletePending);
+-
+     // FIXME: 1. If the size of buffer is smaller than a lower limit chosen by the user agent and the ongoing fetch
+     //           is suspended, resume the fetch.
+ 
+-    // 2. Wait until buffer is not empty.
+-    // NB: It would be nice to avoid a copy here, but ReadableStream::pull_from_bytes currently requires an allocated
+-    //     ByteBuffer to create a JS::ArrayBuffer.
+-    auto bytes = copy_unpulled_bytes();
+-    VERIFY(!bytes.is_empty());
+-
+-    // 3. Queue a fetch task to run the following steps, with fetchParams’s task destination.
+-    VERIFY(!m_has_unfulfilled_promise);
+-    m_has_unfulfilled_promise = true;
+-
+-    Infrastructure::queue_fetch_task(
+-        m_fetch_params->controller(),
+-        m_fetch_params->task_destination(),
+-        GC::create_function(heap(), [this, bytes = move(bytes), pending_promise = m_pending_promise]() mutable {
+-            m_has_unfulfilled_promise = false;
+-            VERIFY(m_lifecycle_state == LifecycleState::Receiving || m_lifecycle_state == LifecycleState::CompletePending);
+-
+-            HTML::TemporaryExecutionContext execution_context { m_stream->realm(), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+-
+-            // 1. Pull from bytes buffer into stream.
+-            if (auto result = m_stream->pull_from_bytes(move(bytes)); result.is_error()) {
+-                auto throw_completion = Bindings::exception_to_throw_completion(m_stream->vm(), result.release_error());
+-
+-                dbgln("FetchedDataReceiver: Stream error pulling bytes");
+-                HTML::report_exception(throw_completion, m_stream->realm());
+-
+-                return;
+-            }
++    if (!m_stream->is_readable())
++        return;
+ 
+-            // 2. If stream is errored, then terminate fetchParams’s controller.
+-            if (m_stream->is_errored())
+-                m_fetch_params->controller()->terminate();
++    auto& realm = m_stream->realm();
++    HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+ 
+-            // 3. Resolve promise with undefined.
+-            WebIDL::resolve_promise(m_stream->realm(), *pending_promise, JS::js_undefined());
++    // 1. Pull from bytes buffer into stream.
++    auto byte_buffer = MUST(ByteBuffer::copy(bytes));
++    auto array_buffer = JS::ArrayBuffer::create(realm, move(byte_buffer));
++    auto view = JS::Uint8Array::create(realm, array_buffer->byte_length(), *array_buffer);
+ 
+-            if (m_lifecycle_state == LifecycleState::CompletePending && buffer_is_eof())
+-                m_lifecycle_state = LifecycleState::ReadyToClose;
+-        }));
++    auto& controller = m_stream->controller()->get<GC::Ref<Streams::ReadableByteStreamController>>();
+ 
+-    m_pending_promise = {};
++    if (auto result = Streams::readable_byte_stream_controller_enqueue(*controller, view); result.is_error()) {
++        auto throw_completion = Bindings::exception_to_throw_completion(realm.vm(), result.release_error());
++        // 2. If stream is errored, then terminate fetchParams’s controller.
++        Streams::readable_byte_stream_controller_error(*controller, throw_completion.value());
++        m_fetch_params->controller()->terminate();
++    }
+ }
+ 
+ void FetchedDataReceiver::close_stream()
+ {
+-    VERIFY(m_has_unfulfilled_promise == 0);
+-    VERIFY(buffer_is_eof());
+-
+-    WebIDL::resolve_promise(m_stream->realm(), *m_pending_promise, JS::js_undefined());
+-    m_pending_promise = {};
+-    m_lifecycle_state = LifecycleState::Closed;
+-    m_stream->close();
+-
+     if (m_http_cache) {
+         auto request = m_fetch_params->request();
+-
+-        if (m_response && request->cache_mode() != HTTP::CacheMode::NoStore)
+-            m_http_cache->finalize_entry(request->current_url(), request->method(), request->header_list(), m_response->status(), m_response->header_list(), move(m_buffer));
++        if (m_stream->is_readable() && !m_fetch_params->is_canceled()
++            && m_response && request->cache_mode() != HTTP::CacheMode::NoStore) {
++            m_http_cache->finalize_entry(request->current_url(), request->method(), request->header_list(), m_response->status(), m_response->header_list(), move(m_cache_buffer));
++        }
+ 
+         m_http_cache.clear();
+     }
+-}
+ 
+-ByteBuffer FetchedDataReceiver::copy_unpulled_bytes()
+-{
+-    auto bytes = MUST(m_buffer.slice(m_pulled_bytes, m_buffer.size() - m_pulled_bytes));
+-    m_pulled_bytes += bytes.size();
++    if (!m_stream->is_readable())
++        return;
+ 
+-    return bytes;
++    HTML::TemporaryExecutionContext execution_context { m_stream->realm(), HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
++
++    m_stream->close();
+ }
+ 
+ }
+diff --git a/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.h b/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.h
+index 25267004..0cf07576 100644
+--- a/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.h
++++ b/Libraries/LibWeb/Fetch/Fetching/FetchedDataReceiver.h
+@@ -22,8 +22,6 @@ class FetchedDataReceiver final : public JS::Cell {
+ public:
+     virtual ~FetchedDataReceiver() override;
+ 
+-    void set_pending_promise(GC::Ref<WebIDL::Promise>);
+-
+     void set_response(GC::Ref<Fetch::Infrastructure::Response const> response) { m_response = response; }
+     void set_body(GC::Ref<Fetch::Infrastructure::Body> body);
+ 
+@@ -39,32 +37,25 @@ private:
+ 
+     virtual void visit_edges(Visitor& visitor) override;
+ 
+-    void pull_bytes_into_stream();
++    void enqueue_into_stream(ReadonlyBytes);
+     void close_stream();
+ 
+-    bool buffer_is_eof() const { return m_pulled_bytes == m_buffer.size(); }
+-    ByteBuffer copy_unpulled_bytes();
+-
+     GC::Ref<Infrastructure::FetchParams const> m_fetch_params;
+     GC::Ptr<Fetch::Infrastructure::Response const> m_response;
+     GC::Ptr<Fetch::Infrastructure::Body> m_body;
+ 
+     GC::Ref<Streams::ReadableStream> m_stream;
+-    GC::Ptr<WebIDL::Promise> m_pending_promise;
+ 
+     RefPtr<HTTP::MemoryCache> m_http_cache;
+ 
+-    ByteBuffer m_buffer;
+-    size_t m_pulled_bytes { 0 };
++    // Bytes received before set_body() is called. Held only until the body is attached and these
++    // are flushed into the body's MIME-sniff buffer.
++    ByteBuffer m_pre_body_sniff_buffer;
+ 
+-    enum class LifecycleState {
+-        Receiving,
+-        CompletePending,
+-        ReadyToClose,
+-        Closed,
+-    };
+-    LifecycleState m_lifecycle_state { LifecycleState::Receiving };
+-    bool m_has_unfulfilled_promise { false };
++    // Whole-response buffer retained only when m_http_cache is non-null, for finalize_entry().
++    ByteBuffer m_cache_buffer;
++
++    bool m_network_complete { false };
+ };
+ 
+ }
+diff --git a/Libraries/LibWeb/Fetch/Fetching/Fetching.cpp b/Libraries/LibWeb/Fetch/Fetching/Fetching.cpp
+index 8adfd40e..14007634 100644
+--- a/Libraries/LibWeb/Fetch/Fetching/Fetching.cpp
++++ b/Libraries/LibWeb/Fetch/Fetching/Fetching.cpp
+@@ -2088,16 +2088,13 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
+     auto fetched_data_receiver = realm.create<FetchedDataReceiver>(fetch_params, stream, move(http_cache));
+ 
+     // 11. Let pullAlgorithm be the following steps:
+-    auto pull_algorithm = GC::create_function(realm.heap(), [&realm, fetched_data_receiver]() {
++    auto pull_algorithm = GC::create_function(realm.heap(), [&realm]() {
+         // 1. Let promise be a new promise.
+-        auto promise = WebIDL::create_promise(realm);
+-
+         // 2. Run the following steps in parallel:
+-        // NOTE: This is handled by FetchedDataReceiver.
+-        fetched_data_receiver->set_pending_promise(promise);
++        // NOTE: This is handled by FetchedDataReceiver, which pushes bytes into the controller as they arrive.
+ 
+         // 3. Return promise.
+-        return promise;
++        return WebIDL::create_resolved_promise(realm, JS::js_undefined());
+     });
+ 
+     // 12. Let cancelAlgorithm be an algorithm that aborts fetchParams’s controller with reason, given reason.
