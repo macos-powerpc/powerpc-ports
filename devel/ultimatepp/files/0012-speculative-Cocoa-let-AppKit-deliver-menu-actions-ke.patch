@@ -1,0 +1,162 @@
+From 1195708bf2e76e1756d95bc1cf8b3fe950bb6c2c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 28 Sep 2026 20:32:04 +0000
+Subject: [PATCH 12/15] [speculative] Cocoa: let AppKit deliver menu actions,
+ keep items until then
+
+Needs the previous patch (highlight tracking per menu).
+
+Untested guess at why "action/target dispatch doesn't work": it is not
+the compiler. Items are removed from the menu in menuDidClose: (upstream
+does that too). Current AppKit holds on to the chosen item and sends its
+action afterwards; the Carbon based NSMenu of 10.5/10.6 probably looks
+the item up after the menu is closed, and finds nothing.
+
+- Remove the items in the next pass of the run loop instead of in
+  menuDidClose:.
+- Keep the fallback for now, but make it self-calibrating. AppKit is
+  seen to deliver the action of an item chosen from a menu when
+  menuItemAction: is called either for the item that the fallback has
+  just invoked (delivery after menuDidClose:, the duplicate is ignored),
+  or for an item of a menu that is still open (delivery before
+  menuDidClose:). The fallback is not used from then on, so only real
+  selections run commands, however the menu was dismissed.
+
+To test: as for the previous patch. In addition, after the first
+command was chosen from a menu, open a menu, highlight an item with
+arrow keys and dismiss the menu by clicking outside: nothing should
+run. If commands of context menus stop working after a command of the
+main menu was used (or the other way round), actions are delivered for
+one kind of menu only; drop the patch.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ uppsrc/CtrlLib/MacMenu.mm | 55 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/uppsrc/CtrlLib/MacMenu.mm b/uppsrc/CtrlLib/MacMenu.mm
+index b8eff2b..80fafa8 100644
+--- a/uppsrc/CtrlLib/MacMenu.mm
++++ b/uppsrc/CtrlLib/MacMenu.mm
+@@ -30,6 +30,16 @@ static Upp::CocoMenuBar      *CocoMenuItemGetBar(id nsitem);
+ // it with CocoMenuItemGetBar before use.
+ static id                     CocoMenuGetHighlighted(NSMenu *menu);
+ static void                   CocoMenuSetHighlighted(NSMenu *menu, id nsitem);
++// Whether menu is between menuWillOpen: and menuDidClose:
++static bool                   CocoMenuIsOpen(NSMenu *menu);
++static void                   CocoMenuSetOpen(NSMenu *menu, bool open);
++
++// The item invoked by the fallback in menuDidClose: (not retained, only compared).
++// When AppKit is seen to deliver the action of an item chosen from a menu, that is either
++// of the very item that the fallback has just invoked, or of an item of a menu that is not
++// closed yet, actions do get delivered on this system and the fallback is not used anymore.
++static id   sFallbackItem;
++static bool sActionsDelivered;
+ 
+ static void CocoMenuRemoveAllItems(NSMenu *menu)
+ { // -[NSMenu removeAllItems] is 10.6+
+@@ -45,6 +55,7 @@ static void CocoMenuRemoveAllItems(NSMenu *menu)
+ @interface CocoMenuDelegate : NSObject<NSMenuDelegate>
+ - (void)menuItemAction:(id)sender;
+ - (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item;
++- (void)menuCleanup:(id)menu;
+ @end
+ 
+ // Global delegate instance - shared by all menus
+@@ -191,6 +202,7 @@ struct CocoMenuLink {
+ 	void             *menu; // NSMenu, used as the key only
+ 	Upp::CocoMenuBar *bar;
+ 	id                highlighted;
++	bool              open;
+ };
+ 
+ // Plain list rather than a container: it has to work while static objects are destroyed
+@@ -242,6 +254,21 @@ static void CocoMenuSetHighlighted(NSMenu *menu, id nsitem)
+ 		m->highlighted = nsitem;
+ }
+ 
++static bool CocoMenuIsOpen(NSMenu *menu)
++{
++	Upp::Mutex::Lock __(sCocoMenuLinkMutex);
++	CocoMenuLink *m = sCocoMenuFind((void *)menu);
++	return m && m->open;
++}
++
++static void CocoMenuSetOpen(NSMenu *menu, bool open)
++{
++	Upp::Mutex::Lock __(sCocoMenuLinkMutex);
++	CocoMenuLink *m = sCocoMenuFind((void *)menu);
++	if(m)
++		m->open = open;
++}
++
+ static void CocoMenuRemoveBar(Upp::CocoMenuBar *p)
+ {
+ 	sCocoMenuRemove(NULL, p);
+@@ -256,6 +283,7 @@ static void CocoMenuSetPtr(NSMenu *menu, Upp::CocoMenuBar *p)
+ 		m->menu = (void *)menu;
+ 		m->bar = p;
+ 		m->highlighted = nil;
++		m->open = false;
+ 		m->next = sCocoMenuLinks;
+ 		sCocoMenuLinks = m;
+ 	}
+@@ -433,6 +461,13 @@ void CocoMenuBar::New() {
+ 
+ - (void)menuItemAction:(id)sender {
+ 	Upp::GuiLock __;
++	if(sender == sFallbackItem) { // delivered after menuDidClose:, the fallback has done it
++		sFallbackItem = nil;
++		sActionsDelivered = true;
++		return;
++	}
++	if(CocoMenuIsOpen([(NSMenuItem *)sender menu])) // delivered before menuDidClose:
++		sActionsDelivered = true;
+ 	Upp::CocoMenuBar *bar = CocoMenuItemGetBar(sender);
+ 	if(bar)
+ 		bar->MenuAction(sender);
+@@ -448,7 +483,9 @@ void CocoMenuBar::New() {
+ }
+ 
+ - (void)menuWillOpen:(NSMenu *)menu {
++	sFallbackItem = nil;
+ 	CocoMenuSetHighlighted(menu, nil);
++	CocoMenuSetOpen(menu, true);
+ 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+ 	Upp::Event<Upp::Bar&> *proc = CocoMenuGetProc(menu);
+ 	if(ptr && ptr->dockmenu)
+@@ -469,21 +506,29 @@ void CocoMenuBar::New() {
+ 	// item that is highlighted when the menu closes.
+ 	NSMenuItem *item = (NSMenuItem *)CocoMenuGetHighlighted(menu);
+ 	CocoMenuSetHighlighted(menu, nil);
++	CocoMenuSetOpen(menu, false);
+ 	NSEvent *e = [NSApp currentEvent];
+ 	if(e && [e type] == NSEventTypeKeyDown && [e keyCode] == 53) // closed by Esc (kVK_Escape)
+ 		item = nil;
+-	if(item) {
++	if(item && !sActionsDelivered) {
+ 		Upp::GuiLock __;
+ 		Upp::CocoMenuBar *bar = CocoMenuItemGetBar(item); // NULL if item does not exist anymore
+ 		if(bar && [item isEnabled]) {
+-			// should the action get delivered as well, do not do it twice
+-			[item setTarget:nil];
+-			[item setAction:NULL];
++			// should the action get delivered as well, menuItemAction: ignores it
++			sFallbackItem = item;
+ 			bar->MenuAction(item);
+ 		}
+ 	}
+ 
+-	CocoMenuRemoveAllItems(menu);
++	// AppKit finds the chosen item to send its action only after the menu is closed, so the
++	// items have to be still there. Remove them in the next pass of the run loop.
++	[self performSelector:@selector(menuCleanup:) withObject:menu afterDelay:0];
++}
++
++- (void)menuCleanup:(id)menu {
++	sFallbackItem = nil;
++	if(!CocoMenuIsOpen(menu)) // unless it was opened again meanwhile
++		CocoMenuRemoveAllItems(menu);
+ }
+ 
+ @end

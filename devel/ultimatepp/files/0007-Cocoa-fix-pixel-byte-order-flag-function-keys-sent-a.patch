@@ -1,0 +1,333 @@
+From 0dfeb3a83334cc312f515e37ac9acdc7f4e952d9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 28 Sep 2026 20:28:03 +0000
+Subject: [PATCH 07/15] Cocoa: fix pixel byte order flag, function keys sent as
+ text, menu fallback
+
+- CocoImage.mm: RGBA is { a, r, g, b } in memory on any Mac, which is
+  alpha-first big-endian for CoreGraphics regardless of the CPU.
+  kCGBitmapByteOrder32Host only happened to be right on PowerPC and
+  swaps channels on Intel. Use kCGBitmapByteOrder32Big, and
+  CGBitmapContextCreate unconditionally (it is the same thing as
+  CGBitmapContextCreateWithData without a release callback).
+- CocoProc.mm: the manual key dispatch in keyDown: runs whenever
+  insertText: was not called, which is the case for every non-text key.
+  Arrows, Home/End, F-keys, forward delete etc. have 'characters' in
+  0xF700..0xF8FF, so they were dispatched as characters and inserted
+  into edit widgets. Skip keys with the function flag or in that range.
+- MacMenu.mm: before the item tracked for the menuDidClose: fallback is
+  used, check that it still belongs to a live CocoMenuBar; do not fire
+  when the menu was closed by Esc; clear target/action of the item
+  before invoking it, so that the command cannot run twice if the
+  action gets delivered by AppKit as well. Drop unused
+  menuItemWasClicked. Remove menu items through a helper that does not
+  depend on -removeAllItems (10.6).
+- CocoApp.mm: remove the session-wide CGEventTap. Its only effect was
+  calling SyncPopupFocus, which acts only on popups with IsCocoActive(),
+  and Ctrl::PopUp never creates such. Guard the event monitors with
+  __BLOCKS__ rather than __clang__.
+- CocoWin.mm: remove NSLog calls from SwizzleNSWindowMethods.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ uppsrc/CtrlCore/CocoApp.mm   | 58 +++---------------------------------
+ uppsrc/CtrlCore/CocoImage.mm | 19 ++++--------
+ uppsrc/CtrlCore/CocoMM.h     |  1 +
+ uppsrc/CtrlCore/CocoProc.mm  |  8 ++++-
+ uppsrc/CtrlCore/CocoWin.mm   |  7 -----
+ uppsrc/CtrlLib/MacMenu.mm    | 56 +++++++++++++++++++++++-----------
+ 6 files changed, 57 insertions(+), 92 deletions(-)
+
+diff --git a/uppsrc/CtrlCore/CocoApp.mm b/uppsrc/CtrlCore/CocoApp.mm
+index 6a1f482..930ada3 100644
+--- a/uppsrc/CtrlCore/CocoApp.mm
++++ b/uppsrc/CtrlCore/CocoApp.mm
+@@ -4,9 +4,6 @@
+ 
+ #ifdef GUI_COCOA
+ 
+-// For CGEventTap (GCC block workaround)
+-#include <ApplicationServices/ApplicationServices.h>
+-
+ @interface AppDelegate : NSObject<NSApplicationDelegate>
+ {
+ }
+@@ -72,52 +69,6 @@ void SyncPopupFocus(NSWindow *win)
+ 	}
+ }
+ 
+-#ifndef __clang__
+-// CGEventTap callback for GCC (replaces block-based NSEvent monitors)
+-// This provides global and local mouse event monitoring without using blocks
+-static CFMachPortRef sEventTap = NULL;
+-static CFRunLoopSourceRef sEventTapSource = NULL;
+-
+-static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
+-{
+-	if(type == kCGEventLeftMouseDown) {
+-		// Get the window under the mouse for local events
+-		// For global events (outside our app), win will be NULL
+-		CGPoint location = CGEventGetLocation(event);
+-		// Check if the event is in our application
+-		ProcessSerialNumber psn;
+-		GetCurrentProcess(&psn);
+-		ProcessSerialNumber frontPsn;
+-		GetFrontProcess(&frontPsn);
+-		Boolean sameProcess = false;
+-		SameProcess(&psn, &frontPsn, &sameProcess);
+-
+-		SyncPopupFocus(sameProcess ? [NSApp keyWindow] : NULL);
+-	}
+-	// Return event unchanged to allow normal processing
+-	return event;
+-}
+-
+-static void SetupEventTap()
+-{
+-	// Create event tap for left mouse down events
+-	CGEventMask eventMask = CGEventMaskBit(kCGEventLeftMouseDown);
+-	sEventTap = CGEventTapCreate(kCGSessionEventTap,
+-	                              kCGHeadInsertEventTap,
+-	                              kCGEventTapOptionListenOnly,  // Don't modify events
+-	                              eventMask,
+-	                              EventTapCallback,
+-	                              NULL);
+-	if(sEventTap) {
+-		sEventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, sEventTap, 0);
+-		if(sEventTapSource) {
+-			CFRunLoopAddSource(CFRunLoopGetMain(), sEventTapSource, kCFRunLoopCommonModes);
+-			CGEventTapEnable(sEventTap, true);
+-		}
+-	}
+-}
+-#endif
+-
+ extern const char *sClipFmtsRTF;
+ 
+ id menubar;
+@@ -172,11 +123,10 @@ void CocoInit(int argc, const char **argv, const char **envptr)
+ 
+ 	GUI_DblClickTime_Write(1000 * [NSEvent doubleClickInterval]);
+ 
+-#ifndef __clang__
+-	// GCC: use CGEventTap instead of block-based NSEvent monitors
+-	SetupEventTap();
+-#else
+-	// Clang: use block-based event monitors
++#ifdef __BLOCKS__
++	// Event monitors need blocks (and 10.6). Without them, the local monitor is replaced by
++	// the SyncPopupFocus call in MMImp::MouseDownEvent. The global one has no replacement:
++	// SyncPopupFocus only acts on popups with IsCocoActive(), which Ctrl::PopUp never sets.
+ 	[NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown)
+ 	  handler:^(NSEvent *e) {
+ 	      SyncPopupFocus(NULL);
+diff --git a/uppsrc/CtrlCore/CocoImage.mm b/uppsrc/CtrlCore/CocoImage.mm
+index a8a2963..06caaad 100644
+--- a/uppsrc/CtrlCore/CocoImage.mm
++++ b/uppsrc/CtrlCore/CocoImage.mm
+@@ -21,8 +21,9 @@ CGImageRef createCGImage(const Image& img)
+ 	                               ReleaseImageData);
+ 	static CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB(); // TODO: This is probably wrong...
+ 	Upp::Size isz = img.GetSize();
+-	// On big-endian (PowerPC), we need to specify byte order explicitly
+-	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
++	// RGBA is { a, r, g, b } in memory on any Mac, that is "alpha first, big-endian" for
++	// CoreGraphics regardless of CPU (do not use kCGBitmapByteOrder32Host here)
++	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Big;
+     CGImageRef cg_img = CGImageCreate(isz.cx, isz.cy, 8, 32, isz.cx * sizeof(RGBA),
+                                       colorSpace, bitmapInfo,
+                                       dataProvider, 0, false, kCGRenderingIntentDefault);
+@@ -333,19 +334,11 @@ void ImageDraw::Init(int cx, int cy)
+ 
+ 	static CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+ 
+-	// On big-endian (PowerPC), we need to specify byte order explicitly
+-	// kCGBitmapByteOrder32Host resolves to the correct order for the platform
+-	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host;
+-#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1060 && !defined(__ppc__)
+-	// CGBitmapContextCreateWithData available in 10.6+, but may have issues on PPC
+-	SystemDraw::Init(CGBitmapContextCreateWithData(~ib, cx, cy, 8, cx * sizeof(RGBA),
+-	                                               colorSpace, bitmapInfo,
+-	                                               NULL, NULL), NULL);
+-#else
+-	// Fallback for 10.5 and PowerPC 10.6: use CGBitmapContextCreate
++	// See createCGImage for the pixel format. CGBitmapContextCreate is the same thing as
++	// CGBitmapContextCreateWithData (10.6) without the release callback.
++	CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Big;
+ 	SystemDraw::Init(CGBitmapContextCreate(~ib, cx, cy, 8, cx * sizeof(RGBA),
+ 	                                       colorSpace, bitmapInfo), NULL);
+-#endif
+ 	CGContextTranslateCTM(cgHandle, 0, cy);
+ 	if(IsUHDMode()) {
+ 		CGContextScaleCTM(cgHandle, 2, -2);
+diff --git a/uppsrc/CtrlCore/CocoMM.h b/uppsrc/CtrlCore/CocoMM.h
+index 0f0f90c..5799a53 100644
+--- a/uppsrc/CtrlCore/CocoMM.h
++++ b/uppsrc/CtrlCore/CocoMM.h
+@@ -28,6 +28,7 @@
+   #define NSEventModifierFlagCommand   NSCommandKeyMask
+   #define NSEventModifierFlagCapsLock  NSAlphaShiftKeyMask
+   #define NSEventModifierFlagNumericPad NSNumericPadKeyMask
++  #define NSEventModifierFlagFunction  NSFunctionKeyMask
+ 
+   #define NSEventTypeKeyDown           NSKeyDown
+   #define NSEventTypeKeyUp             NSKeyUp
+diff --git a/uppsrc/CtrlCore/CocoProc.mm b/uppsrc/CtrlCore/CocoProc.mm
+index 8d9f5bf..cbe1393 100644
+--- a/uppsrc/CtrlCore/CocoProc.mm
++++ b/uppsrc/CtrlCore/CocoProc.mm
+@@ -475,7 +475,13 @@ struct MMImp {
+ 			// Printable, non-command character that interpretKeyEvents: did not deliver.
+ 			// Space is deliberately excluded: it is delivered by KeyEvent's special-case
+ 			// below, matching the original design.
+-			if(ch >= 32 && ch != 127 && ch != ' ' &&
++			// Arrows, Home, End, F-keys, forward delete etc. have 'characters' too, in the
++			// range 0xF700..0xF8FF (NSUpArrowFunctionKey...), and they never go through
++			// insertText:. They are keys, KeyEvent below delivers them; they are not text.
++			// (0xF8FF itself is Apple logo, which is text.)
++			bool fnkey = ([e modifierFlags] & NSEventModifierFlagFunction) ||
++			             (ch >= 0xF700 && ch < 0xF8FF);
++			if(ch >= 32 && ch != 127 && ch != ' ' && !fnkey &&
+ 			   !([e modifierFlags] & (NSEventModifierFlagCommand | NSEventModifierFlagControl))) {
+ 				Upp::Ctrl *ctrl = CocoViewGetCtrl(self);
+ 				if(ctrl)
+diff --git a/uppsrc/CtrlCore/CocoWin.mm b/uppsrc/CtrlCore/CocoWin.mm
+index e146938..d014a1a 100644
+--- a/uppsrc/CtrlCore/CocoWin.mm
++++ b/uppsrc/CtrlCore/CocoWin.mm
+@@ -57,7 +57,6 @@ static void SwizzleNSWindowMethods()
+ 	if(swizzled) return;
+ 	swizzled = true;
+ 
+-	NSLog(@"SwizzleNSWindowMethods: swizzling NSWindow methods");
+ 	Class windowClass = [NSWindow class];
+ 
+ 	// Swizzle canBecomeKeyWindow
+@@ -65,9 +64,6 @@ static void SwizzleNSWindowMethods()
+ 	if(origKey) {
+ 		sOriginalCanBecomeKeyWindow = method_getImplementation(origKey);
+ 		method_setImplementation(origKey, (IMP)Swizzled_canBecomeKeyWindow);
+-		NSLog(@"SwizzleNSWindowMethods: canBecomeKeyWindow swizzled, orig=%p new=%p", sOriginalCanBecomeKeyWindow, Swizzled_canBecomeKeyWindow);
+-	} else {
+-		NSLog(@"SwizzleNSWindowMethods: canBecomeKeyWindow NOT FOUND");
+ 	}
+ 
+ 	// Swizzle canBecomeMainWindow
+@@ -75,9 +71,6 @@ static void SwizzleNSWindowMethods()
+ 	if(origMain) {
+ 		sOriginalCanBecomeMainWindow = method_getImplementation(origMain);
+ 		method_setImplementation(origMain, (IMP)Swizzled_canBecomeMainWindow);
+-		NSLog(@"SwizzleNSWindowMethods: canBecomeMainWindow swizzled");
+-	} else {
+-		NSLog(@"SwizzleNSWindowMethods: canBecomeMainWindow NOT FOUND");
+ 	}
+ }
+ 
+diff --git a/uppsrc/CtrlLib/MacMenu.mm b/uppsrc/CtrlLib/MacMenu.mm
+index 5289dad..b53c21e 100644
+--- a/uppsrc/CtrlLib/MacMenu.mm
++++ b/uppsrc/CtrlLib/MacMenu.mm
+@@ -27,9 +27,18 @@ static Upp::Event<Upp::Bar&> *CocoMenuGetProc(NSMenu *menu);
+ // CocoMenuBar that owns the menu item, NULL if there is none (anymore)
+ static Upp::CocoMenuBar      *CocoMenuItemGetBar(id nsitem);
+ 
+-// Track last selected menu item for GCC ObjC runtime workaround
++// Last highlighted menu item, for the fallback in menuDidClose:. It is not retained,
++// check it with CocoMenuItemGetBar before use.
+ static NSMenuItem *lastSelectedMenuItem = nil;
+-static BOOL menuItemWasClicked = NO;
++
++static void CocoMenuRemoveAllItems(NSMenu *menu)
++{ // -[NSMenu removeAllItems] is 10.6+
++	if([menu respondsToSelector:@selector(removeAllItems)])
++		[menu performSelector:@selector(removeAllItems)];
++	else
++		while([menu numberOfItems] > 0)
++			[menu removeItemAtIndex:0];
++}
+ 
+ // Delegate object to handle NSMenuDelegate methods (menuWillOpen/menuDidClose)
+ // Also handles menu item actions since GCC ObjC runtime doesn't dispatch action/target properly
+@@ -202,13 +211,19 @@ static void sCocoMenuRemove(void *menu, Upp::CocoMenuBar *bar)
+ 	}
+ }
+ 
++static CocoMenuLink *sCocoMenuFind(void *menu)
++{ // to be called with sCocoMenuLinkMutex locked
++	for(CocoMenuLink *m = sCocoMenuLinks; m; m = m->next)
++		if(m->menu == menu)
++			return m;
++	return NULL;
++}
++
+ static Upp::CocoMenuBar *CocoMenuGetPtr(NSMenu *menu)
+ {
+ 	Upp::Mutex::Lock __(sCocoMenuLinkMutex);
+-	for(CocoMenuLink *m = sCocoMenuLinks; m; m = m->next)
+-		if(m->menu == (void *)menu)
+-			return m->bar;
+-	return NULL;
++	CocoMenuLink *m = sCocoMenuFind((void *)menu);
++	return m ? m->bar : NULL;
+ }
+ 
+ static void CocoMenuRemoveBar(Upp::CocoMenuBar *p)
+@@ -258,7 +273,7 @@ void CocoMenuBar::Set(Event<Bar&> bar)
+ 	bar(*this);
+ 	if(!CheckedIsSame()) {
+ 		ClearItems();
+-		[cocomenu removeAllItems];
++		CocoMenuRemoveAllItems(cocomenu);
+ 		bar(*this);
+ 	}
+ 	lock--;
+@@ -415,14 +430,13 @@ void CocoMenuBar::New() {
+ 
+ - (void)menuWillOpen:(NSMenu *)menu {
+ 	lastSelectedMenuItem = nil;
+-	menuItemWasClicked = NO;
+ 	Upp::CocoMenuBar *ptr = CocoMenuGetPtr(menu);
+ 	Upp::Event<Upp::Bar&> *proc = CocoMenuGetProc(menu);
+ 	if(ptr && ptr->dockmenu)
+ 		return;
+ 	if(ptr && proc && *proc) {
+ 		ptr->ClearItems();
+-		[menu removeAllItems];
++		CocoMenuRemoveAllItems(menu);
+ 		(*proc)(*ptr);
+ 	}
+ }
+@@ -432,17 +446,25 @@ void CocoMenuBar::New() {
+ 	if(ptr && ptr->dockmenu)
+ 		return;
+ 
+-	// GCC ObjC runtime workaround: action/target dispatch doesn't work,
+-	// so we manually invoke the action for the highlighted item when menu closes
+-	if(lastSelectedMenuItem && [lastSelectedMenuItem isEnabled]) {
++	// The action of the selected item is not delivered here, so invoke the action of the
++	// item that was highlighted last when the menu closes.
++	NSMenuItem *item = lastSelectedMenuItem;
++	lastSelectedMenuItem = nil;
++	NSEvent *e = [NSApp currentEvent];
++	if(e && [e type] == NSEventTypeKeyDown && [e keyCode] == 53) // closed by Esc (kVK_Escape)
++		item = nil;
++	if(item) {
+ 		Upp::GuiLock __;
+-		Upp::CocoMenuBar *bar = CocoMenuItemGetBar(lastSelectedMenuItem);
+-		if(bar)
+-			bar->MenuAction(lastSelectedMenuItem);
+-		lastSelectedMenuItem = nil;
++		Upp::CocoMenuBar *bar = CocoMenuItemGetBar(item); // NULL if item does not exist anymore
++		if(bar && [item isEnabled]) {
++			// should the action get delivered as well, do not do it twice
++			[item setTarget:nil];
++			[item setAction:NULL];
++			bar->MenuAction(item);
++		}
+ 	}
+ 
+-	[menu removeAllItems];
++	CocoMenuRemoveAllItems(menu);
+ }
+ 
+ @end
