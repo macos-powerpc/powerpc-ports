@@ -1,0 +1,435 @@
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Subject: [PATCH] osxkeychain: use the SecKeychain API before Mac OS X 10.7
+
+Since 9abe31f5f1 (osxkeychain: replace deprecated SecKeychain API,
+2024-02-17) the helper uses the SecItem API, which cannot be used with
+the Mac OS X 10.6 SDK or older (kSecClass, kSecAttr* and friends are
+undeclared; 10.5 has no SecItem API at all).
+
+Instead of reverting the helper to its git 2.44 state, which loses
+password_expiry_utc/oauth_refresh_token storage, the state[] store skip,
+erasing all/only matching items, updating an existing item on store,
+locking and error reporting, keep the upstream code and add a backend
+built on the SecKeychain API (available since 10.2), selected when the
+deployment target is older than 10.7:
+
+  get    SecKeychainSearchCreateFromAttributes + SecKeychainItemCopyContent
+  store  SecKeychainAddInternetPassword, on errSecDuplicateItem
+         SecKeychainItemModifyAttributesAndData on the matching items
+  erase  SecKeychainItemDelete on every matching item (only those with
+         a matching password, if one is given)
+
+Unknown attributes match anything, as with the SecItem queries, and
+items are stored in the same format, so credentials remain usable
+across an OS upgrade. On 10.7 and later the preprocessed source is
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../osxkeychain/git-credential-osxkeychain.c       | 345 ++++++++++++++++++++-
+ 1 file changed, 338 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/credential/osxkeychain/git-credential-osxkeychain.c b/contrib/credential/osxkeychain/git-credential-osxkeychain.c
+index b180267..9f3363f 100644
+--- a/contrib/credential/osxkeychain/git-credential-osxkeychain.c
++++ b/contrib/credential/osxkeychain/git-credential-osxkeychain.c
+@@ -1,13 +1,32 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <AvailabilityMacros.h>
+ #include <Security/Security.h>
+ #include "git-compat-util.h"
+ #include "strbuf.h"
+ #include "wrapper.h"
+ 
++/*
++ * The SecItem API cannot be used with the Mac OS X 10.6 SDK or older;
++ * fall back to the SecKeychain API there. Both APIs operate on the same
++ * keychain items, and credentials are stored in the same format.
++ */
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070
++#define USE_SECKEYCHAIN_API
++#ifndef MAC_OS_X_VERSION_10_6
++#define errSecSuccess 0 /* not in the 10.5 SDK */
++#endif
++#endif
++
+ #define ENCODING kCFStringEncodingUTF8
++#ifdef USE_SECKEYCHAIN_API
++static SecProtocolType protocol;
++#define PROTOCOL(p) kSecProtocolType##p
++#else
+ static CFStringRef protocol; /* Stores constant strings - not memory managed */
++#define PROTOCOL(p) kSecAttrProtocol##p
++#endif
+ static CFStringRef host;
+ static CFNumberRef port;
+ static CFStringRef path;
+@@ -51,6 +70,7 @@ static void clear_credential(void)
+ 
+ #define STRING_WITH_LENGTH(s) s, sizeof(s) - 1
+ 
++#ifndef USE_SECKEYCHAIN_API
+ static CFDictionaryRef create_dictionary(CFAllocatorRef allocator, ...)
+ {
+ 	va_list args;
+@@ -86,6 +106,7 @@ static CFDictionaryRef create_dictionary(CFAllocatorRef allocator, ...)
+ 			  kSecAttrAuthenticationType, \
+ 			  kSecAttrAuthenticationTypeDefault, \
+ 			  __VA_ARGS__);
++#endif
+ 
+ static void write_item(const char *what, const char *buf, size_t len)
+ {
+@@ -154,6 +175,315 @@ static void encode_state_seen(struct strbuf *sb)
+ 	write_item_strbuf_cfdata(sb, "password", password);
+ }
+ 
++#ifdef USE_SECKEYCHAIN_API
++/*
++ * The SecKeychain equivalent of CREATE_SEC_ATTRIBUTES(): attributes we
++ * do not know match any value.
++ */
++struct keychain_query {
++	char *host;
++	char *username;
++	char *path;
++	UInt16 port;
++	UInt32 port_attr;
++	SecAuthenticationType auth_type;
++	SecKeychainAttribute attr[6];
++	SecKeychainAttributeList list;
++};
++
++static char *cfstring_to_utf8(CFStringRef ref)
++{
++	CFIndex len;
++	char *buf;
++
++	if (!ref)
++		return NULL;
++	len = CFStringGetMaximumSizeForEncoding(CFStringGetLength(ref),
++						ENCODING) + 1;
++	buf = xmalloc(len);
++	if (!CFStringGetCString(ref, buf, len, ENCODING))
++		die("failed to convert string to UTF-8");
++	return buf;
++}
++
++static void add_query_attr(struct keychain_query *q, SecKeychainAttrType tag,
++			   void *data, size_t len)
++{
++	SecKeychainAttribute *attr = &q->attr[q->list.count++];
++
++	attr->tag = tag;
++	attr->length = len;
++	attr->data = data;
++}
++
++static void keychain_query_init(struct keychain_query *q)
++{
++	memset(q, 0, sizeof(*q));
++	q->list.attr = q->attr;
++
++	q->host = cfstring_to_utf8(host);
++	q->username = cfstring_to_utf8(username);
++	q->path = cfstring_to_utf8(path);
++	if (port) {
++		CFNumberGetValue(port, kCFNumberShortType, &q->port);
++		q->port_attr = q->port;
++	}
++	q->auth_type = kSecAuthenticationTypeDefault;
++
++	if (q->host)
++		add_query_attr(q, kSecServerItemAttr,
++			       q->host, strlen(q->host));
++	if (q->username)
++		add_query_attr(q, kSecAccountItemAttr,
++			       q->username, strlen(q->username));
++	if (q->path)
++		add_query_attr(q, kSecPathItemAttr,
++			       q->path, strlen(q->path));
++	if (port)
++		add_query_attr(q, kSecPortItemAttr,
++			       &q->port_attr, sizeof(q->port_attr));
++	if (protocol)
++		add_query_attr(q, kSecProtocolItemAttr,
++			       &protocol, sizeof(protocol));
++	add_query_attr(q, kSecAuthenticationTypeItemAttr,
++		       &q->auth_type, sizeof(q->auth_type));
++}
++
++static void keychain_query_release(struct keychain_query *q)
++{
++	free(q->host);
++	free(q->username);
++	free(q->path);
++}
++
++/*
++ * Collect up to "limit" (0 for all) matching items into a new array.
++ * Returns errSecItemNotFound if there are none.
++ */
++static OSStatus find_items(struct keychain_query *q, CFIndex limit,
++			   CFArrayRef *items)
++{
++	CFMutableArrayRef found;
++	SecKeychainSearchRef search;
++	SecKeychainItemRef item;
++	OSStatus result;
++
++	result = SecKeychainSearchCreateFromAttributes(NULL,
++			kSecInternetPasswordItemClass, &q->list, &search);
++	if (result)
++		return result;
++
++	found = CFArrayCreateMutable(kCFAllocatorDefault, 0,
++				     &kCFTypeArrayCallBacks);
++	while ((!limit || CFArrayGetCount(found) < limit) &&
++	       !(result = SecKeychainSearchCopyNext(search, &item))) {
++		CFArrayAppendValue(found, item);
++		CFRelease(item);
++	}
++	CFRelease(search);
++
++	/* The search ends with errSecItemNotFound */
++	if (result == errSecItemNotFound && CFArrayGetCount(found))
++		result = errSecSuccess;
++	if (result) {
++		CFRelease(found);
++		return result;
++	}
++
++	*items = found;
++	return errSecSuccess;
++}
++
++static OSStatus find_internet_password(void)
++{
++	struct keychain_query q;
++	CFArrayRef items;
++	SecKeychainAttribute account = { kSecAccountItemAttr, 0, NULL };
++	SecKeychainAttributeList account_list = { 1, &account };
++	SecKeychainAttributeList *attrs = username ? NULL : &account_list;
++	UInt32 len;
++	void *data;
++	OSStatus result;
++
++	keychain_query_init(&q);
++	result = find_items(&q, 1, &items);
++	if (result)
++		goto out;
++
++	result = SecKeychainItemCopyContent(
++			(SecKeychainItemRef)CFArrayGetValueAtIndex(items, 0),
++			NULL, attrs, &len, &data);
++	CFRelease(items);
++	if (result)
++		goto out;
++
++	password = CFDataCreate(kCFAllocatorDefault, data, len);
++
++	write_item("password", data, len);
++	if (attrs) {
++		if (account.data)
++			username = CFStringCreateWithBytes(kCFAllocatorDefault,
++							   account.data,
++							   account.length,
++							   ENCODING, false);
++		write_item("username", account.data ? account.data : "",
++			   account.length);
++	}
++
++	SecKeychainItemFreeContent(attrs, data);
++
++	write_item("capability[]", "state", strlen("state"));
++	{
++		struct strbuf sb;
++
++		strbuf_init(&sb, 1024);
++		encode_state_seen(&sb);
++		write_item("state[]", sb.buf, strlen(sb.buf));
++		strbuf_release(&sb);
++	}
++
++out:
++	keychain_query_release(&q);
++
++	/* We consider not found to not be an error */
++	if (result == errSecItemNotFound)
++		result = errSecSuccess;
++
++	return result;
++}
++
++static OSStatus delete_item(SecKeychainItemRef item)
++{
++	UInt32 len;
++	void *data;
++	const char *line;
++	OSStatus result;
++
++	if (!password)
++		return SecKeychainItemDelete(item);
++
++	/* We only want to delete items with a matching password */
++	result = SecKeychainItemCopyContent(item, NULL, NULL, &len, &data);
++	if (result)
++		return result;
++
++	/* Don't match appended metadata */
++	line = memchr(data, '\n', len);
++	if (line)
++		len = line - (const char *)data;
++
++	if ((CFIndex)len == CFDataGetLength(password) &&
++	    !memcmp(data, CFDataGetBytePtr(password), len))
++		result = SecKeychainItemDelete(item);
++
++	SecKeychainItemFreeContent(NULL, data);
++
++	return result;
++}
++
++static OSStatus delete_internet_password(void)
++{
++	struct keychain_query q;
++	CFArrayRef items;
++	OSStatus result;
++
++	/*
++	 * Require at least a protocol and host for removal, which is what git
++	 * will give us; if you want to do something more fancy, use the
++	 * Keychain manager.
++	 */
++	if (!protocol || !host)
++		return -1;
++
++	keychain_query_init(&q);
++	result = find_items(&q, 0, &items);
++	if (!result) {
++		for (CFIndex i = 0; !result && i < CFArrayGetCount(items); i++)
++			result = delete_item((SecKeychainItemRef)
++					     CFArrayGetValueAtIndex(items, i));
++
++		CFRelease(items);
++	}
++	keychain_query_release(&q);
++
++	/* We consider not found to not be an error */
++	if (result == errSecItemNotFound)
++		result = errSecSuccess;
++
++	return result;
++}
++
++static OSStatus add_internet_password(void)
++{
++	struct keychain_query q;
++	CFMutableDataRef data;
++	CFArrayRef items;
++	OSStatus result;
++
++	/* Only store complete credentials */
++	if (!protocol || !host || !username || !password)
++		return -1;
++
++	if (state_seen) {
++		struct strbuf sb;
++
++		strbuf_init(&sb, 1024);
++		encode_state_seen(&sb);
++		if (!strcmp(state_seen, sb.buf)) {
++			strbuf_release(&sb);
++			return errSecSuccess;
++		}
++		strbuf_release(&sb);
++	}
++
++	data = CFDataCreateMutableCopy(kCFAllocatorDefault, 0, password);
++	if (password_expiry_utc) {
++		CFDataAppendBytes(data,
++		    (const UInt8 *)STRING_WITH_LENGTH("\npassword_expiry_utc="));
++		CFDataAppendBytes(data,
++				  CFDataGetBytePtr(password_expiry_utc),
++				  CFDataGetLength(password_expiry_utc));
++	}
++	if (oauth_refresh_token) {
++		CFDataAppendBytes(data,
++		    (const UInt8 *)STRING_WITH_LENGTH("\noauth_refresh_token="));
++		CFDataAppendBytes(data,
++				  CFDataGetBytePtr(oauth_refresh_token),
++				  CFDataGetLength(oauth_refresh_token));
++	}
++
++	keychain_query_init(&q);
++	result = SecKeychainAddInternetPassword(NULL, /* default keychain */
++			strlen(q.host), q.host,
++			0, NULL, /* security domain */
++			strlen(q.username), q.username,
++			q.path ? strlen(q.path) : 0, q.path,
++			q.port, protocol, q.auth_type,
++			CFDataGetLength(data), CFDataGetBytePtr(data),
++			NULL);
++	if (result == errSecDuplicateItem) {
++		result = find_items(&q, 0, &items);
++		if (!result) {
++			for (CFIndex i = 0; !result && i < CFArrayGetCount(items); i++)
++				result = SecKeychainItemModifyAttributesAndData(
++						(SecKeychainItemRef)
++						CFArrayGetValueAtIndex(items, i),
++						NULL,
++						CFDataGetLength(data),
++						CFDataGetBytePtr(data));
++
++			CFRelease(items);
++		}
++	}
++	keychain_query_release(&q);
++
++	CFRelease(data);
++
++	return result;
++}
++
++#else /* !USE_SECKEYCHAIN_API */
++
+ static void find_username_in_item(CFDictionaryRef item)
+ {
+ 	CFStringRef account_ref;
+@@ -387,6 +717,7 @@ static OSStatus add_internet_password(void)
+ 
+ 	return result;
+ }
++#endif /* !USE_SECKEYCHAIN_API */
+ 
+ static void read_credential(void)
+ {
+@@ -408,19 +739,19 @@ static void read_credential(void)
+ 
+ 		if (!strcmp(buf, "protocol")) {
+ 			if (!strcmp(v, "imap"))
+-				protocol = kSecAttrProtocolIMAP;
++				protocol = PROTOCOL(IMAP);
+ 			else if (!strcmp(v, "imaps"))
+-				protocol = kSecAttrProtocolIMAPS;
++				protocol = PROTOCOL(IMAPS);
+ 			else if (!strcmp(v, "ftp"))
+-				protocol = kSecAttrProtocolFTP;
++				protocol = PROTOCOL(FTP);
+ 			else if (!strcmp(v, "ftps"))
+-				protocol = kSecAttrProtocolFTPS;
++				protocol = PROTOCOL(FTPS);
+ 			else if (!strcmp(v, "https"))
+-				protocol = kSecAttrProtocolHTTPS;
++				protocol = PROTOCOL(HTTPS);
+ 			else if (!strcmp(v, "http"))
+-				protocol = kSecAttrProtocolHTTP;
++				protocol = PROTOCOL(HTTP);
+ 			else if (!strcmp(v, "smtp"))
+-				protocol = kSecAttrProtocolSMTP;
++				protocol = PROTOCOL(SMTP);
+ 			else {
+ 				/* we don't yet handle other protocols */
+ 				clear_credential();
