@@ -1,0 +1,853 @@
+--- include/GLSLANG/ShaderLang.h.orig
++++ include/GLSLANG/ShaderLang.h
+@@ -323,6 +323,11 @@
+     // variable initialization is turned on.
+     uint64_t dontUseLoopsToInitializeVariables : 1;
+ 
++    // Unroll for loops in fragment shaders whose loop index indexes an array or a matrix, so that
++    // all such indices become constants.  Works around GLSL compilers without dynamic indexing in
++    // fragment shaders (Mac OS X 10.5 on GeForce 6/7).
++    uint64_t unrollFragmentShaderIndexingLoops : 1;
++
+     // Don't use D3D constant register zero when allocating space for uniforms. This is targeted to
+     // work around a bug in NVIDIA D3D driver version 388.59 where in very specific cases the driver
+     // would not handle constant register zero correctly. Only has an effect on HLSL translation.
+--- include/platform/autogen/FeaturesGL_autogen.h.orig
++++ include/platform/autogen/FeaturesGL_autogen.h
+@@ -182,6 +182,12 @@
+         &members,
+     };
+ 
++    FeatureInfo unrollFragmentShaderIndexingLoops = {
++        "unrollFragmentShaderIndexingLoops",
++        FeatureCategory::OpenGLWorkarounds,
++        &members,
++    };
++
+     FeatureInfo clampFragDepth = {
+         "clampFragDepth",
+         FeatureCategory::OpenGLWorkarounds,
+--- include/platform/gl_features.json.orig
++++ include/platform/gl_features.json
+@@ -209,6 +209,15 @@
+             ],
+             "issue": "http://crbug.com/809422"
+         },
++        {
++            "name": "unroll_fragment_shader_indexing_loops",
++            "category": "Workarounds",
++            "description": [
++                "Unroll for loops in fragment shaders whose loop index indexes an array or a matrix. ",
++                "The GLSL compiler of Mac OS X 10.5 draws nothing for dynamically indexed uniform ",
++                "arrays in fragment shaders on GeForce 6/7."
++            ]
++        },
+         {
+             "name": "clamp_frag_depth",
+             "category": "Workarounds",
+--- samples/shader_translator/shader_translator.cpp.orig
++++ samples/shader_translator/shader_translator.cpp
+@@ -121,6 +121,9 @@
+                 case 'r':
+                     compileOptions.useIR = true;
+                     break;
++                case 'U':
++                    compileOptions.unrollFragmentShaderIndexingLoops = true;
++                    break;
+                 case 's':
+                     if (argv[0][2] == '=')
+                     {
+@@ -442,6 +445,7 @@
+         "       -u       : print active attribs, uniforms, varyings and program outputs\n"
+         "       -g       : include debug info in the output\n"
+         "       -r       : use the IR instead of AST\n"
++        "       -U       : unroll fragment shader loops that index arrays or matrices\n"
+         "       -s=e2    : use GLES2 spec (this is by default)\n"
+         "       -s=e3    : use GLES3 spec\n"
+         "       -s=e31   : use GLES31 spec (in development)\n"
+--- src/compiler.gni.orig
++++ src/compiler.gni
+@@ -191,6 +191,8 @@
+   "src/compiler/translator/tree_ops/SimplifyLoopConditions.h",
+   "src/compiler/translator/tree_ops/SplitSequenceOperator.cpp",
+   "src/compiler/translator/tree_ops/SplitSequenceOperator.h",
++  "src/compiler/translator/tree_ops/UnrollIndexingLoops.cpp",
++  "src/compiler/translator/tree_ops/UnrollIndexingLoops.h",
+   "src/compiler/translator/tree_ops/UseGeneratedNamesForAnonymousStructs.cpp",
+   "src/compiler/translator/tree_ops/UseGeneratedNamesForAnonymousStructs.h",
+   "src/compiler/translator/tree_ops/glsl/ExpandFragmentOutputsToVec4.h",
+--- src/compiler/translator/Compiler.cpp.orig
++++ src/compiler/translator/Compiler.cpp
+@@ -44,6 +44,7 @@
+ #include "compiler/translator/tree_ops/SeparateDeclarations.h"
+ #include "compiler/translator/tree_ops/SimplifyLoopConditions.h"
+ #include "compiler/translator/tree_ops/SplitSequenceOperator.h"
++#include "compiler/translator/tree_ops/UnrollIndexingLoops.h"
+ #include "compiler/translator/tree_ops/glsl/RewriteRepeatedAssignToSwizzled.h"
+ #include "compiler/translator/tree_ops/glsl/UseInterfaceBlockFields.h"
+ #include "compiler/translator/tree_ops/glsl/WrapStructConstructors.h"
+@@ -1041,6 +1042,15 @@
+         }
+     }
+ 
++    // Must run before ClampIndirectIndices: the indices it makes constant are clamped by itself.
++    if (compileOptions.unrollFragmentShaderIndexingLoops && mShaderType == GL_FRAGMENT_SHADER)
++    {
++        if (!UnrollIndexingLoops(this, root, &mSymbolTable))
++        {
++            return false;
++        }
++    }
++
+     if (compileOptions.clampIndirectArrayBounds)
+     {
+         if (!ClampIndirectIndices(this, root, &mSymbolTable, mExtensionBehavior))
+--- /dev/null
++++ src/compiler/translator/tree_ops/UnrollIndexingLoops.cpp
+@@ -0,0 +1,651 @@
++//
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++// UnrollIndexingLoops.cpp: Unroll for loops whose loop index is used to index an array or a
++// matrix, so that every such index becomes a constant.
++//
++
++#include "compiler/translator/tree_ops/UnrollIndexingLoops.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++#include "compiler/translator/Compiler.h"
++#include "compiler/translator/Diagnostics.h"
++#include "compiler/translator/InfoSink.h"
++#include "compiler/translator/IntermNode.h"
++#include "compiler/translator/StaticType.h"
++#include "compiler/translator/SymbolTable.h"
++#include "compiler/translator/tree_ops/FoldExpressions.h"
++#include "compiler/translator/tree_util/IntermNode_util.h"
++#include "compiler/translator/tree_util/IntermTraverse.h"
++#include "compiler/translator/tree_util/ReplaceVariable.h"
++
++namespace sh
++{
++
++namespace
++{
++
++// A loop is not unrolled into more copies of its body than this.
++constexpr size_t kMaxIterations = 1024;
++// The number of nodes that unrolling may add to one shader.  Two nested loops of 64 iterations with
++// a one-line body still fit.
++constexpr uint64_t kMaxUnrolledNodes = 64 * 1024;
++
++size_t CountNodes(TIntermNode *root)
++{
++    size_t count                     = 0;
++    std::vector<TIntermNode *> stack = {root};
++    while (!stack.empty())
++    {
++        TIntermNode *node = stack.back();
++        stack.pop_back();
++        ++count;
++        for (size_t childIndex = 0; childIndex < node->getChildCount(); ++childIndex)
++        {
++            TIntermNode *child = node->getChildNode(childIndex);
++            if (child != nullptr)
++            {
++                stack.push_back(child);
++            }
++        }
++    }
++    return count;
++}
++
++bool GetIntConstant(TIntermTyped *node, int64_t *valueOut)
++{
++    const TConstantUnion *value = node->getConstantValue();
++    if (value == nullptr || node->getBasicType() != EbtInt || !node->getType().isScalar())
++    {
++        return false;
++    }
++    *valueOut = value->getIConst();
++    return true;
++}
++
++bool IsVariable(TIntermNode *node, const TVariable *variable)
++{
++    TIntermSymbol *symbol = node->getAsSymbolNode();
++    return symbol != nullptr && symbol->uniqueId() == variable->uniqueId();
++}
++
++bool Compare(TOperator op, int64_t left, int64_t right)
++{
++    switch (op)
++    {
++        case EOpLessThan:
++            return left < right;
++        case EOpLessThanEqual:
++            return left <= right;
++        case EOpGreaterThan:
++            return left > right;
++        case EOpGreaterThanEqual:
++            return left >= right;
++        case EOpEqual:
++            return left == right;
++        case EOpNotEqual:
++            return left != right;
++        default:
++            UNREACHABLE();
++            return false;
++    }
++}
++
++// Finds the loop index and the values it takes if |loop| has the form
++//
++//     for (int i = constant; i relop constant; i++, i--, ++i, --i, i += constant or i -= constant)
++//
++// Returns false for any other loop, and for loops that run too often or overflow the index.
++bool GetLoopIterations(TIntermLoop *loop, const TVariable **indexOut, std::vector<int> *valuesOut)
++{
++    if (loop->getType() != ELoopFor || loop->getInit() == nullptr ||
++        loop->getCondition() == nullptr || loop->getExpression() == nullptr)
++    {
++        return false;
++    }
++
++    TIntermDeclaration *init = loop->getInit()->getAsDeclarationNode();
++    if (init == nullptr || init->getSequence()->size() != 1)
++    {
++        return false;
++    }
++    TIntermBinary *initializer = init->getSequence()->front()->getAsBinaryNode();
++    if (initializer == nullptr || initializer->getOp() != EOpInitialize)
++    {
++        return false;
++    }
++    TIntermSymbol *indexSymbol = initializer->getLeft()->getAsSymbolNode();
++    if (indexSymbol == nullptr || indexSymbol->getBasicType() != EbtInt ||
++        !indexSymbol->getType().isScalar())
++    {
++        return false;
++    }
++    const TVariable *index = &indexSymbol->variable();
++    int64_t start          = 0;
++    if (!GetIntConstant(initializer->getRight(), &start))
++    {
++        return false;
++    }
++
++    TIntermBinary *condition = loop->getCondition()->getAsBinaryNode();
++    // AddAndTrueToLoopCondition may have turned the condition into "condition && true".
++    if (condition != nullptr && condition->getOp() == EOpLogicalAnd)
++    {
++        const TConstantUnion *right = condition->getRight()->getConstantValue();
++        bool isTrue = right != nullptr && condition->getRight()->getBasicType() == EbtBool &&
++                      right->getBConst();
++        condition   = isTrue ? condition->getLeft()->getAsBinaryNode() : nullptr;
++    }
++    if (condition == nullptr || !IsVariable(condition->getLeft(), index))
++    {
++        return false;
++    }
++    const TOperator relation = condition->getOp();
++    if (relation != EOpLessThan && relation != EOpLessThanEqual && relation != EOpGreaterThan &&
++        relation != EOpGreaterThanEqual && relation != EOpEqual && relation != EOpNotEqual)
++    {
++        return false;
++    }
++    int64_t limit = 0;
++    if (!GetIntConstant(condition->getRight(), &limit))
++    {
++        return false;
++    }
++
++    int64_t step                    = 0;
++    TIntermTyped *expression        = loop->getExpression();
++    TIntermUnary *unaryExpression   = expression->getAsUnaryNode();
++    TIntermBinary *binaryExpression = expression->getAsBinaryNode();
++    if (unaryExpression != nullptr && IsVariable(unaryExpression->getOperand(), index))
++    {
++        switch (unaryExpression->getOp())
++        {
++            case EOpPostIncrement:
++            case EOpPreIncrement:
++                step = 1;
++                break;
++            case EOpPostDecrement:
++            case EOpPreDecrement:
++                step = -1;
++                break;
++            default:
++                return false;
++        }
++    }
++    else if (binaryExpression != nullptr && IsVariable(binaryExpression->getLeft(), index) &&
++             (binaryExpression->getOp() == EOpAddAssign ||
++              binaryExpression->getOp() == EOpSubAssign))
++    {
++        if (!GetIntConstant(binaryExpression->getRight(), &step))
++        {
++            return false;
++        }
++        if (binaryExpression->getOp() == EOpSubAssign)
++        {
++            step = -step;
++        }
++    }
++    else
++    {
++        return false;
++    }
++
++    valuesOut->clear();
++    for (int64_t value = start; Compare(relation, value, limit); value += step)
++    {
++        if (valuesOut->size() == kMaxIterations || value < std::numeric_limits<int32_t>::min() ||
++            value > std::numeric_limits<int32_t>::max())
++        {
++            return false;
++        }
++        valuesOut->push_back(static_cast<int>(value));
++    }
++
++    *indexOut = index;
++    return true;
++}
++
++// Finds out whether the body of a loop indexes an array or a matrix with an expression that
++// contains the loop index, whether it writes the loop index, and whether it can be copied.
++class LoopBodyAnalyzer : public TLValueTrackingTraverser
++{
++  public:
++    LoopBodyAnalyzer(const TVariable *index, TSymbolTable *symbolTable)
++        : TLValueTrackingTraverser(true, true, true, symbolTable), mIndex(index)
++    {}
++
++    bool indexesWithLoopIndex() const { return mIndexesWithLoopIndex; }
++    bool writesLoopIndex() const { return mWritesLoopIndex; }
++    bool canBeCopied() const { return mCanBeCopied; }
++
++    void visitSymbol(TIntermSymbol *node) override
++    {
++        if (node->uniqueId() != mIndex->uniqueId())
++        {
++            return;
++        }
++        if (isLValueRequiredHere())
++        {
++            mWritesLoopIndex = true;
++        }
++        if (mIndexDepth > 0)
++        {
++            mIndexesWithLoopIndex = true;
++        }
++    }
++
++    bool visitBinary(Visit visit, TIntermBinary *node) override
++    {
++        if (node->getOp() != EOpIndexIndirect)
++        {
++            return true;
++        }
++        const TType &indexedType = node->getLeft()->getType();
++        if (!indexedType.isArray() && !indexedType.isMatrix())
++        {
++            return true;
++        }
++        // The index, the right child, is traversed between the in-visit and the post-visit.
++        if (visit == InVisit)
++        {
++            ++mIndexDepth;
++        }
++        else if (visit == PostVisit)
++        {
++            --mIndexDepth;
++        }
++        return true;
++    }
++
++    bool visitDeclaration(Visit visit, TIntermDeclaration *node) override
++    {
++        // A struct defined in the body would be defined again in every copy.
++        TIntermTyped *declarator = node->getSequence()->front()->getAsTyped();
++        if (declarator != nullptr && declarator->getType().isStructSpecifier())
++        {
++            mCanBeCopied = false;
++        }
++        return true;
++    }
++
++    bool visitSwitch(Visit visit, TIntermSwitch *node) override
++    {
++        // A break in a switch belongs to the switch; keep it simple and leave such loops alone.
++        mCanBeCopied = false;
++        return false;
++    }
++
++  private:
++    const TVariable *mIndex;
++    int mIndexDepth            = 0;
++    bool mIndexesWithLoopIndex = false;
++    bool mWritesLoopIndex      = false;
++    bool mCanBeCopied          = true;
++};
++
++// Finds the break and continue statements that belong to the loop whose body is |block|.
++void FindBranches(TIntermBlock *block, bool *hasBreakOut, bool *hasContinueOut)
++{
++    for (TIntermNode *statement : *block->getSequence())
++    {
++        if (TIntermBranch *branch = statement->getAsBranchNode())
++        {
++            if (branch->getFlowOp() == EOpBreak)
++            {
++                *hasBreakOut = true;
++            }
++            else if (branch->getFlowOp() == EOpContinue)
++            {
++                *hasContinueOut = true;
++            }
++        }
++        else if (TIntermBlock *nestedBlock = statement->getAsBlock())
++        {
++            FindBranches(nestedBlock, hasBreakOut, hasContinueOut);
++        }
++        else if (TIntermIfElse *ifElse = statement->getAsIfElseNode())
++        {
++            FindBranches(ifElse->getTrueBlock(), hasBreakOut, hasContinueOut);
++            if (ifElse->getFalseBlock() != nullptr)
++            {
++                FindBranches(ifElse->getFalseBlock(), hasBreakOut, hasContinueOut);
++            }
++        }
++        // A break or continue in a nested loop belongs to that loop.
++    }
++}
++
++// Replaces break and continue in one copy of a loop body by setting a flag, and skips the rest of
++// the copy once a flag is set.
++class BranchRewriter
++{
++  public:
++    BranchRewriter(const TVariable *breakFlag, const TVariable *continueFlag)
++        : mBreakFlag(breakFlag), mContinueFlag(continueFlag)
++    {}
++
++    // Returns whether |block| may set a flag.
++    bool rewrite(TIntermBlock *block)
++    {
++        TIntermSequence *statements = block->getSequence();
++        for (size_t statementIndex = 0; statementIndex < statements->size(); ++statementIndex)
++        {
++            TIntermNode *statement = (*statements)[statementIndex];
++            bool setsFlag          = false;
++
++            if (TIntermBranch *branch = statement->getAsBranchNode())
++            {
++                const TVariable *flag = nullptr;
++                if (branch->getFlowOp() == EOpBreak)
++                {
++                    flag = mBreakFlag;
++                }
++                else if (branch->getFlowOp() == EOpContinue)
++                {
++                    flag = mContinueFlag;
++                }
++                if (flag != nullptr)
++                {
++                    (*statements)[statementIndex] =
++                        CreateTempAssignmentNode(flag, CreateBoolNode(true));
++                    setsFlag = true;
++                }
++            }
++            else if (TIntermBlock *nestedBlock = statement->getAsBlock())
++            {
++                setsFlag = rewrite(nestedBlock);
++            }
++            else if (TIntermIfElse *ifElse = statement->getAsIfElseNode())
++            {
++                const bool trueBlockSetsFlag = rewrite(ifElse->getTrueBlock());
++                const bool falseBlockSetsFlag =
++                    ifElse->getFalseBlock() != nullptr && rewrite(ifElse->getFalseBlock());
++                setsFlag = trueBlockSetsFlag || falseBlockSetsFlag;
++            }
++
++            if (setsFlag)
++            {
++                if (statementIndex + 1 < statements->size())
++                {
++                    TIntermBlock *rest = new TIntermBlock();
++                    for (size_t restIndex = statementIndex + 1; restIndex < statements->size();
++                         ++restIndex)
++                    {
++                        rest->appendStatement((*statements)[restIndex]);
++                    }
++                    statements->resize(statementIndex + 1);
++                    rewrite(rest);
++                    statements->push_back(new TIntermIfElse(createNoFlagSet(), rest, nullptr));
++                }
++                return true;
++            }
++        }
++        return false;
++    }
++
++  private:
++    TIntermTyped *createNoFlagSet() const
++    {
++        TIntermTyped *noFlagSet = nullptr;
++        for (const TVariable *flag : {mBreakFlag, mContinueFlag})
++        {
++            if (flag == nullptr)
++            {
++                continue;
++            }
++            TIntermTyped *notSet =
++                new TIntermUnary(EOpLogicalNot, CreateTempSymbolNode(flag), nullptr);
++            noFlagSet =
++                noFlagSet != nullptr ? new TIntermBinary(EOpLogicalAnd, noFlagSet, notSet) : notSet;
++        }
++        return noFlagSet;
++    }
++
++    const TVariable *mBreakFlag;
++    const TVariable *mContinueFlag;
++};
++
++// Turns indirect indexing with an index that has become constant into direct indexing, with the
++// index clamped to the size of the indexed array, matrix or vector.
++class DirectIndexTraverser : public TIntermTraverser
++{
++  public:
++    DirectIndexTraverser() : TIntermTraverser(true, false, false) {}
++
++    bool visitBinary(Visit visit, TIntermBinary *node) override
++    {
++        if (node->getOp() != EOpIndexIndirect)
++        {
++            return true;
++        }
++        int64_t index = 0;
++        if (!GetIntConstant(node->getRight(), &index))
++        {
++            return true;
++        }
++
++        const TType &indexedType = node->getLeft()->getType();
++        int64_t size             = 0;
++        if (indexedType.isArray())
++        {
++            size = indexedType.getOutermostArraySize();
++        }
++        else if (indexedType.isMatrix())
++        {
++            size = indexedType.getCols();
++        }
++        else if (indexedType.isVector())
++        {
++            size = indexedType.getNominalSize();
++        }
++        if (size <= 0)
++        {
++            return true;
++        }
++        index = std::clamp<int64_t>(index, 0, size - 1);
++
++        // Children of the replaced node are still traversed and may be replaced; the queue
++        // redirects those replacements to the new node, which shares the left child.
++        queueReplacement(new TIntermBinary(EOpIndexDirect, node->getLeft(),
++                                           CreateIndexNode(static_cast<int>(index))),
++                         OriginalNode::IS_DROPPED);
++        return true;
++    }
++};
++
++TIntermConstantUnion *CreateIndexValue(const TType &indexType, int value)
++{
++    TConstantUnion *constant = new TConstantUnion[1];
++    constant[0].setIConst(value);
++    TType type(indexType);
++    type.setQualifier(EvqConst);
++    return new TIntermConstantUnion(constant, type);
++}
++
++class IndexingLoopUnroller
++{
++  public:
++    IndexingLoopUnroller(TCompiler *compiler, TSymbolTable *symbolTable)
++        : mCompiler(compiler), mSymbolTable(symbolTable), mDiagnostics(mDiagnosticsSink)
++    {}
++
++    // Unrolls the loops in |block|, inner loops first.
++    bool unrollInBlock(TIntermBlock *block)
++    {
++        for (TIntermNode *&statement : *block->getSequence())
++        {
++            if (TIntermFunctionDefinition *definition = statement->getAsFunctionDefinition())
++            {
++                if (!unrollInBlock(definition->getBody()))
++                {
++                    return false;
++                }
++            }
++            else if (TIntermBlock *nestedBlock = statement->getAsBlock())
++            {
++                if (!unrollInBlock(nestedBlock))
++                {
++                    return false;
++                }
++            }
++            else if (TIntermIfElse *ifElse = statement->getAsIfElseNode())
++            {
++                if (!unrollInBlock(ifElse->getTrueBlock()) ||
++                    (ifElse->getFalseBlock() != nullptr && !unrollInBlock(ifElse->getFalseBlock())))
++                {
++                    return false;
++                }
++            }
++            else if (TIntermSwitch *switchNode = statement->getAsSwitchNode())
++            {
++                if (!unrollInBlock(switchNode->getStatementList()))
++                {
++                    return false;
++                }
++            }
++            else if (TIntermLoop *loop = statement->getAsLoopNode())
++            {
++                if (!unrollInBlock(loop->getBody()))
++                {
++                    return false;
++                }
++                TIntermBlock *unrolled = nullptr;
++                if (!unroll(loop, &unrolled))
++                {
++                    return false;
++                }
++                if (unrolled != nullptr)
++                {
++                    statement = unrolled;
++                }
++            }
++        }
++        return true;
++    }
++
++  private:
++    // Sets |unrolledOut| to the replacement of |loop|, or leaves it null if |loop| stays.
++    bool unroll(TIntermLoop *loop, TIntermBlock **unrolledOut)
++    {
++        const TVariable *index = nullptr;
++        std::vector<int> values;
++        if (!GetLoopIterations(loop, &index, &values))
++        {
++            return true;
++        }
++
++        TIntermBlock *body = loop->getBody();
++        LoopBodyAnalyzer analyzer(index, mSymbolTable);
++        body->traverse(&analyzer);
++        if (!analyzer.indexesWithLoopIndex() || analyzer.writesLoopIndex() ||
++            !analyzer.canBeCopied())
++        {
++            return true;
++        }
++
++        const uint64_t addedNodes = static_cast<uint64_t>(CountNodes(body)) * values.size();
++        if (addedNodes > kMaxUnrolledNodes - mUnrolledNodes)
++        {
++            return true;
++        }
++        mUnrolledNodes += addedNodes;
++
++        bool hasBreak    = false;
++        bool hasContinue = false;
++        FindBranches(body, &hasBreak, &hasContinue);
++        const TType *boolType = StaticType::GetBasic<EbtBool, EbpUndefined>();
++        const TVariable *breakFlag =
++            hasBreak && !values.empty() ? CreateTempVariable(mSymbolTable, boolType) : nullptr;
++        const TVariable *continueFlag =
++            hasContinue && !values.empty() ? CreateTempVariable(mSymbolTable, boolType) : nullptr;
++
++        TIntermBlock *unrolled = new TIntermBlock();
++        if (breakFlag != nullptr)
++        {
++            unrolled->appendStatement(
++                CreateTempInitDeclarationNode(breakFlag, CreateBoolNode(false)));
++        }
++        if (continueFlag != nullptr)
++        {
++            unrolled->appendStatement(CreateTempDeclarationNode(continueFlag));
++        }
++
++        BranchRewriter branchRewriter(breakFlag, continueFlag);
++        for (size_t iteration = 0; iteration < values.size(); ++iteration)
++        {
++            TIntermBlock *copy = body->deepCopy();
++
++            // Give the variables declared in the copy their own symbols, and substitute the value
++            // of the loop index.
++            VariableReplacementMap replacements;
++            GetDeclaratorReplacements(mSymbolTable, copy, &replacements);
++            replacements[index->uniqueId()] = CreateIndexValue(index->getType(), values[iteration]);
++            if (!ReplaceVariables(mCompiler, copy, replacements))
++            {
++                return false;
++            }
++
++            if (!FoldExpressions(mCompiler, copy, &mDiagnostics))
++            {
++                return false;
++            }
++            DirectIndexTraverser directIndexTraverser;
++            copy->traverse(&directIndexTraverser);
++            if (!directIndexTraverser.updateTree(mCompiler, copy))
++            {
++                return false;
++            }
++
++            if (breakFlag != nullptr || continueFlag != nullptr)
++            {
++                branchRewriter.rewrite(copy);
++            }
++            if (continueFlag != nullptr)
++            {
++                copy->insertStatement(
++                    0, CreateTempAssignmentNode(continueFlag, CreateBoolNode(false)));
++            }
++
++            if (breakFlag != nullptr && iteration > 0)
++            {
++                TIntermTyped *notBroken =
++                    new TIntermUnary(EOpLogicalNot, CreateTempSymbolNode(breakFlag), nullptr);
++                unrolled->appendStatement(new TIntermIfElse(notBroken, copy, nullptr));
++            }
++            else
++            {
++                unrolled->appendStatement(copy);
++            }
++        }
++
++        *unrolledOut = unrolled;
++        return true;
++    }
++
++    TCompiler *mCompiler;
++    TSymbolTable *mSymbolTable;
++    // Folding the copies can warn about code that never runs; such warnings are not shown.
++    TInfoSinkBase mDiagnosticsSink;
++    TDiagnostics mDiagnostics;
++    uint64_t mUnrolledNodes = 0;
++};
++
++}  // anonymous namespace
++
++bool UnrollIndexingLoops(TCompiler *compiler, TIntermBlock *root, TSymbolTable *symbolTable)
++{
++    IndexingLoopUnroller unroller(compiler, symbolTable);
++    if (!unroller.unrollInBlock(root))
++    {
++        return false;
++    }
++    return compiler->validateAST(root);
++}
++
++}  // namespace sh
+--- /dev/null
++++ src/compiler/translator/tree_ops/UnrollIndexingLoops.h
+@@ -0,0 +1,37 @@
++//
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++//
++// UnrollIndexingLoops.h: Unroll for loops whose loop index is used to index an array or a matrix,
++// so that every such index becomes a constant.  Works around GLSL compilers that cannot index
++// arrays dynamically in fragment shaders (Mac OS X 10.5 on GeForce 6/7: the draw writes nothing).
++//
++// Only loops of the ESSL 1.00 Appendix A form are unrolled:
++//
++//     for (int i = constant; i relop constant; i++, i--, ++i, --i, i += constant or i -= constant)
++//
++// where i is not written in the body.  break and continue are rewritten with flags, so the result
++// contains no loop.  Constant indices produced this way are clamped to the size of the indexed
++// array, as ClampIndirectIndices would have done at run time.
++//
++
++#ifndef COMPILER_TRANSLATOR_TREEOPS_UNROLLINDEXINGLOOPS_H_
++#define COMPILER_TRANSLATOR_TREEOPS_UNROLLINDEXINGLOOPS_H_
++
++#include "common/angleutils.h"
++
++namespace sh
++{
++
++class TCompiler;
++class TIntermBlock;
++class TSymbolTable;
++
++[[nodiscard]] bool UnrollIndexingLoops(TCompiler *compiler,
++                                       TIntermBlock *root,
++                                       TSymbolTable *symbolTable);
++
++}  // namespace sh
++
++#endif  // COMPILER_TRANSLATOR_TREEOPS_UNROLLINDEXINGLOOPS_H_
+--- src/libANGLE/renderer/gl/ShaderGL.cpp.orig
++++ src/libANGLE/renderer/gl/ShaderGL.cpp
+@@ -180,6 +180,11 @@
+         options->dontUseLoopsToInitializeVariables = true;
+     }
+ 
++    if (features.unrollFragmentShaderIndexingLoops.enabled)
++    {
++        options->unrollFragmentShaderIndexingLoops = true;
++    }
++
+     if (features.clampFragDepth.enabled)
+     {
+         options->clampFragDepth = true;
+--- src/libANGLE/renderer/gl/renderergl_utils.cpp.orig
++++ src/libANGLE/renderer/gl/renderergl_utils.cpp
+@@ -2383,9 +2383,17 @@
+ 
+     ANGLE_FEATURE_CONDITION(features, clampPointSize, IsAndroid() || isNvidia);
+ 
++    // The OpenGL of Mac OS X 10.5 (OpenGL 2.x, also used by the PowerPC build of 10.6) cannot
++    // index uniform arrays dynamically in fragment shaders on GeForce 6/7: the draw writes nothing,
++    // without an error. ATI cards are untested.
++    const bool isLegacyAppleGL = IsApple() && functions->standard == STANDARD_GL_DESKTOP &&
++                                 !functions->isAtLeastGL(gl::Version(3, 0));
++    ANGLE_FEATURE_CONDITION(features, unrollFragmentShaderIndexingLoops, isLegacyAppleGL);
++
+     // Ported from gpu_driver_bug_list.json (#246, #258)
++    // The loops would index the initialized array with the loop index, see above.
+     ANGLE_FEATURE_CONDITION(features, dontUseLoopsToInitializeVariables,
+-                            (!isMesa && isQualcomm) || (isIntel && IsApple()));
++                            (!isMesa && isQualcomm) || (isIntel && IsApple()) || isLegacyAppleGL);
+ 
+     ANGLE_FEATURE_CONDITION(features, avoidBindFragDataLocation, !isMesa && isQualcomm);
+ 
+--- util/autogen/angle_features_autogen.cpp.orig
++++ util/autogen/angle_features_autogen.cpp
+@@ -500,6 +500,7 @@
+     {Feature::UnfoldShortCircuits, "unfoldShortCircuits"},
+     {Feature::UnpackLastRowSeparatelyForPaddingInclusion, "unpackLastRowSeparatelyForPaddingInclusion"},
+     {Feature::UnpackOverlappingRowsSeparatelyUnpackBuffer, "unpackOverlappingRowsSeparatelyUnpackBuffer"},
++    {Feature::UnrollFragmentShaderIndexingLoops, "unrollFragmentShaderIndexingLoops"},
+     {Feature::UnsizedSRGBReadPixelsDoesntTransform, "unsizedSRGBReadPixelsDoesntTransform"},
+     {Feature::UploadDataToIosurfacesWithStagingBuffers, "uploadDataToIosurfacesWithStagingBuffers"},
+     {Feature::UploadOversizedMipLevelsViaUnpackBuffer, "uploadOversizedMipLevelsViaUnpackBuffer"},
+--- util/autogen/angle_features_autogen.h.orig
++++ util/autogen/angle_features_autogen.h
+@@ -500,6 +500,7 @@
+     UnfoldShortCircuits,
+     UnpackLastRowSeparatelyForPaddingInclusion,
+     UnpackOverlappingRowsSeparatelyUnpackBuffer,
++    UnrollFragmentShaderIndexingLoops,
+     UnsizedSRGBReadPixelsDoesntTransform,
+     UploadDataToIosurfacesWithStagingBuffers,
+     UploadOversizedMipLevelsViaUnpackBuffer,

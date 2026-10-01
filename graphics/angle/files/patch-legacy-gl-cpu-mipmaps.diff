@@ -1,0 +1,248 @@
+--- include/platform/autogen/FeaturesGL_autogen.h.orig
++++ include/platform/autogen/FeaturesGL_autogen.h
+@@ -656,6 +656,12 @@
+         &members,
+     };
+ 
++    FeatureInfo generateMipmapOnCPU = {
++        "generateMipmapOnCPU",
++        FeatureCategory::OpenGLWorkarounds,
++        &members,
++    };
++
+     FeatureInfo avoidBindFragDataLocation = {
+         "avoidBindFragDataLocation",
+         FeatureCategory::OpenGLWorkarounds,
+--- include/platform/gl_features.json.orig
++++ include/platform/gl_features.json
+@@ -856,6 +856,15 @@
+             ],
+             "issue": "https://crbug.com/40279678"
+         },
++        {
++            "name": "generate_mipmap_on_CPU",
++            "category": "Workarounds",
++            "description": [
++                "Generate mipmaps on the CPU instead of with glGenerateMipmap. ",
++                "glGenerateMipmapEXT of Mac OS X 10.5 leaves a quadrant of mip level 1 black ",
++                "on GeForce 6/7."
++            ]
++        },
+         {
+             "name": "avoid_bind_frag_data_location",
+             "category": "Workarounds",
+--- src/libANGLE/renderer/gl/TextureGL.cpp.orig
++++ src/libANGLE/renderer/gl/TextureGL.cpp
+@@ -10,6 +10,7 @@
+ #include "common/mathutil.h"
+ #include "common/unsafe_buffers.h"
+ 
++#include "common/MemoryBuffer.h"
+ #include "common/bitset_utils.h"
+ #include "common/debug.h"
+ #include "common/mathutil.h"
+@@ -22,6 +23,7 @@
+ #include "libANGLE/angletypes.h"
+ #include "libANGLE/formatutils.h"
+ #include "libANGLE/queryconversions.h"
++#include "libANGLE/renderer/Format.h"
+ #include "libANGLE/renderer/gl/BlitGL.h"
+ #include "libANGLE/renderer/gl/BufferGL.h"
+ #include "libANGLE/renderer/gl/ContextGL.h"
+@@ -1885,6 +1887,10 @@
+     {
+         ANGLE_TRY(useTempForNonZeroBaseLevelGenmipmap(context));
+     }
++    else if (features.generateMipmapOnCPU.enabled && canGenerateMipmapOnCPU(context))
++    {
++        ANGLE_TRY(generateMipmapOnCPU(context));
++    }
+     else if (getType() == gl::TextureType::_2D &&
+              ((baseLevelInternalFormat.colorEncoding == GL_SRGB &&
+                features.decodeEncodeSRGBForGenerateMipmap.enabled) ||
+@@ -1929,6 +1935,138 @@
+     return angle::Result::Continue;
+ }
+ 
++bool TextureGL::canGenerateMipmapOnCPU(const gl::Context *context) const
++{
++    const FunctionsGL *functions      = GetFunctionsGL(context);
++    const angle::FeaturesGL &features = GetFeaturesGL(context);
++
++    if ((getType() != gl::TextureType::_2D && getType() != gl::TextureType::CubeMap) ||
++        functions->getTexImage == nullptr)
++    {
++        return false;
++    }
++
++    const gl::InternalFormat &baseLevelInternalFormat = *mState.getBaseLevelDesc().format.info;
++    const angle::Format &format                       = angle::Format::Get(
++        angle::Format::InternalFormatToID(baseLevelInternalFormat.sizedInternalFormat));
++    if (format.mipGenerationFunction == nullptr || format.isBlock || format.depthBits > 0 ||
++        format.stencilBits > 0)
++    {
++        return false;
++    }
++
++    // The native texture must hold the data in the layout the mip function expects.
++    const LevelInfoGL &baseLevelInfo = getBaseLevelInfo();
++    if (baseLevelInfo.depthStencilWorkaround || baseLevelInfo.lumaWorkaround.enabled ||
++        baseLevelInfo.emulatedAlphaChannel)
++    {
++        return false;
++    }
++    const nativegl::TexSubImageFormat transfer = nativegl::GetTexSubImageFormat(
++        functions, features, baseLevelInternalFormat.format, baseLevelInternalFormat.type);
++    const gl::InternalFormat &transferFormat =
++        gl::GetInternalFormatInfo(transfer.format, transfer.type);
++    return transferFormat.internalFormat != GL_NONE &&
++           transferFormat.pixelBytes == format.pixelBytes;
++}
++
++// Reads the base level back and filters the other levels with the CPU.  Costs a readback (about
++// 20 ms on Mac OS X 10.5 whatever the size) per face, but needs neither glGenerateMipmap nor
++// rendering into the small levels.
++angle::Result TextureGL::generateMipmapOnCPU(const gl::Context *context)
++{
++    ContextGL *contextGL              = GetImplAs<ContextGL>(context);
++    const FunctionsGL *functions      = GetFunctionsGL(context);
++    StateManagerGL *stateManager      = GetStateManagerGL(context);
++    const angle::FeaturesGL &features = GetFeaturesGL(context);
++
++    const GLuint effectiveBaseLevel                   = mState.getEffectiveBaseLevel();
++    const GLuint maxLevel                             = mState.getMipmapMaxLevel();
++    const gl::ImageDesc &baseLevelDesc                = mState.getBaseLevelDesc();
++    const gl::InternalFormat &baseLevelInternalFormat = *baseLevelDesc.format.info;
++    const angle::Format &format                       = angle::Format::Get(
++        angle::Format::InternalFormatToID(baseLevelInternalFormat.sizedInternalFormat));
++    // The data travels in the format and type of the base level, and the new levels get its
++    // native internal format.
++    const nativegl::TexSubImageFormat transfer = nativegl::GetTexSubImageFormat(
++        functions, features, baseLevelInternalFormat.format, baseLevelInternalFormat.type);
++    const GLenum nativeInternalFormat = getBaseLevelInfo().nativeInternalFormat;
++
++    // Tightly packed rows, client memory on both sides.
++    gl::PixelPackState packState;
++    packState.alignment = 1;
++    ANGLE_TRY(stateManager->setPixelPackState(context, packState));
++    ANGLE_TRY(stateManager->setPixelPackBuffer(context, nullptr));
++    gl::PixelUnpackState unpackState;
++    unpackState.alignment = 1;
++    ANGLE_TRY(stateManager->setPixelUnpackState(context, unpackState));
++    ANGLE_TRY(stateManager->setPixelUnpackBuffer(context, nullptr));
++
++    stateManager->bindTexture(getType(), mTextureID);
++
++    const size_t pixelBytes = format.pixelBytes;
++    const size_t baseWidth  = static_cast<size_t>(baseLevelDesc.size.width);
++    const size_t baseHeight = static_cast<size_t>(baseLevelDesc.size.height);
++
++    std::vector<gl::TextureTarget> targets;
++    if (getType() == gl::TextureType::CubeMap)
++    {
++        for (gl::TextureTarget face : gl::AllCubeFaceTextureTargets())
++        {
++            targets.push_back(face);
++        }
++    }
++    else
++    {
++        targets.push_back(gl::NonCubeTextureTypeToTarget(getType()));
++    }
++
++    angle::MemoryBuffer source;
++    angle::MemoryBuffer destination;
++    for (gl::TextureTarget target : targets)
++    {
++        ANGLE_CHECK_GL_ALLOC(contextGL, source.resize(baseWidth * baseHeight * pixelBytes));
++        ANGLE_GL_TRY(context, functions->getTexImage(
++                                  ToGLenum(target), static_cast<GLint>(effectiveBaseLevel),
++                                  transfer.format, transfer.type, source.data()));
++
++        size_t width  = baseWidth;
++        size_t height = baseHeight;
++        for (GLuint level = effectiveBaseLevel + 1; level <= maxLevel; ++level)
++        {
++            const size_t mipWidth  = std::max<size_t>(width / 2, 1);
++            const size_t mipHeight = std::max<size_t>(height / 2, 1);
++            ANGLE_CHECK_GL_ALLOC(contextGL, destination.resize(mipWidth * mipHeight * pixelBytes));
++            format.mipGenerationFunction(width, height, 1, source.data(), width * pixelBytes,
++                                         width * height * pixelBytes, destination.data(),
++                                         mipWidth * pixelBytes, mipWidth * mipHeight * pixelBytes);
++
++            if (mState.getImmutableFormat())
++            {
++                ANGLE_GL_TRY(context,
++                             functions->texSubImage2D(
++                                 ToGLenum(target), static_cast<GLint>(level), 0, 0,
++                                 static_cast<GLsizei>(mipWidth), static_cast<GLsizei>(mipHeight),
++                                 transfer.format, transfer.type, destination.data()));
++            }
++            else
++            {
++                ANGLE_GL_TRY_ALWAYS_CHECK(
++                    context, functions->texImage2D(
++                                 ToGLenum(target), static_cast<GLint>(level), nativeInternalFormat,
++                                 static_cast<GLsizei>(mipWidth), static_cast<GLsizei>(mipHeight), 0,
++                                 transfer.format, transfer.type, destination.data()));
++            }
++
++            std::swap(source, destination);
++            width  = mipWidth;
++            height = mipHeight;
++        }
++    }
++
++    return angle::Result::Continue;
++}
++
+ angle::Result TextureGL::allocateMipmapLevelsForGeneration(const gl::Context *context)
+ {
+     const FunctionsGL *functions      = GetFunctionsGL(context);
+--- src/libANGLE/renderer/gl/TextureGL.h.orig
++++ src/libANGLE/renderer/gl/TextureGL.h
+@@ -284,6 +284,8 @@
+                                                const gl::Buffer *unpackBuffer,
+                                                const uint8_t *pixels);
+     angle::Result allocateMipmapLevelsForGeneration(const gl::Context *context);
++    bool canGenerateMipmapOnCPU(const gl::Context *context) const;
++    angle::Result generateMipmapOnCPU(const gl::Context *context);
+ 
+     angle::Result syncTextureStateSwizzle(const gl::Context *context,
+                                           const FunctionsGL *functions,
+--- src/libANGLE/renderer/gl/renderergl_utils.cpp.orig
++++ src/libANGLE/renderer/gl/renderergl_utils.cpp
+@@ -2731,6 +2731,13 @@
+     ANGLE_FEATURE_CONDITION(features, useIntermediateTextureForGenerateMipmap,
+                             IsPixel7OrPixel8(functions));
+ 
++    // glGenerateMipmapEXT of Mac OS X 10.5 (OpenGL 2.x, also used by the PowerPC build of 10.6)
++    // leaves the top right quadrant of mip level 1 black on GeForce 6/7. Drawing the levels is no
++    // way out there: square power-of-two textures up to 8x8 cannot be framebuffer attachments.
++    ANGLE_FEATURE_CONDITION(features, generateMipmapOnCPU,
++                            IsApple() && functions->standard == STANDARD_GL_DESKTOP &&
++                                !functions->isAtLeastGL(gl::Version(3, 0)));
++
+     // SRGB blending does not appear to work correctly on the Nexus 5 + other QC devices. Writing to
+     // an SRGB framebuffer with GL_FRAMEBUFFER_SRGB enabled and then reading back returns the same
+     // value. Disabling GL_FRAMEBUFFER_SRGB will then convert in the wrong direction.
+--- util/autogen/angle_features_autogen.cpp.orig
++++ util/autogen/angle_features_autogen.cpp
+@@ -227,6 +227,7 @@
+     {Feature::ForceTextureLodOffset4, "forceTextureLodOffset4"},
+     {Feature::ForceWaitForSubmissionToCompleteForQueryResult, "forceWaitForSubmissionToCompleteForQueryResult"},
+     {Feature::GenerateFragmentShadingRateAttchementWithCpu, "generateFragmentShadingRateAttchementWithCpu"},
++    {Feature::GenerateMipmapOnCPU, "generateMipmapOnCPU"},
+     {Feature::GenerateShareableShaders, "generateShareableShaders"},
+     {Feature::GetDimensionsIgnoresBaseLevel, "getDimensionsIgnoresBaseLevel"},
+     {Feature::HasBaseVertexInstancedDraw, "hasBaseVertexInstancedDraw"},
+--- util/autogen/angle_features_autogen.h.orig
++++ util/autogen/angle_features_autogen.h
+@@ -227,6 +227,7 @@
+     ForceTextureLodOffset4,
+     ForceWaitForSubmissionToCompleteForQueryResult,
+     GenerateFragmentShadingRateAttchementWithCpu,
++    GenerateMipmapOnCPU,
+     GenerateShareableShaders,
+     GetDimensionsIgnoresBaseLevel,
+     HasBaseVertexInstancedDraw,
