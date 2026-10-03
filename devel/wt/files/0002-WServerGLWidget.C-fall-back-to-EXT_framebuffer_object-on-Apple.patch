@@ -1,0 +1,190 @@
+Subject: [PATCH] WServerGLWidget.C: fall back to EXT_framebuffer_object on Apple
+
+Applies on top of 0001-WServerGLWidget.C-fix-Apple-GL-for-10.7.patch.
+
+Mac OS X 10.5 (OpenGL 2.x) has no ARB_framebuffer_object, so the server
+GL widget always threw "cannot create offscreen framebuffers". On 10.6
+libGL exports the ARB entry points, which glewExperimental takes as
+support even when the renderer does not advertise the extension.
+
+- Decide on the actual GL version / extension strings, and alias GLEW's
+  core framebuffer entry points to the EXT ones when only
+  EXT_framebuffer_object is available.
+- Only multisample when EXT_framebuffer_multisample + EXT_framebuffer_blit
+  (or ARB/core) are available and GL_MAX_SAMPLES >= 2; otherwise render
+  into a single-sampled FBO and read from it directly.
+- Run glewInit() once per process, since a later glewInit() would undo
+  the aliasing while other sessions render.
+- 10.4 SDK: CGLChoosePixelFormat() takes a long *npix.
+
+---
+diff --git src/Wt/WServerGLWidget.C src/Wt/WServerGLWidget.C
+index e9285c4..9112a21 100644
+--- src/Wt/WServerGLWidget.C
++++ src/Wt/WServerGLWidget.C
+@@ -8,6 +8,7 @@
+ #include "Wt/WWebWidget.h"
+ #include "Wt/Http/Response.h"
+ 
++#include <cstdlib>
+ #include <fstream>
+ 
+ #ifdef WT_WIN32
+@@ -107,6 +108,7 @@ private:
+   int width_, height_;
+   GLuint framebuffer_, renderbuffer_, depthbuffer_;
+   GLuint framebufferRead_, renderbufferRead_;
++  bool multisample_;
+ #endif
+ };
+ 
+@@ -247,10 +249,75 @@ void WServerGLWidgetImpl::resize(int width, int height)
+ #endif
+ 
+ #ifdef APPLE_GL
++namespace {
++  struct FramebufferSupport {
++    bool available;
++    bool multisample;
++  };
++
++  /*
++   * Mac OS X 10.5 has no ARB_framebuffer_object, and on 10.6 not every
++   * renderer advertises it although libGL exports its entry points. Fall
++   * back to EXT_framebuffer_object (with EXT_framebuffer_multisample and
++   * EXT_framebuffer_blit, if available) by pointing GLEW's core entry
++   * points to their EXT counterparts, which have identical signatures.
++   *
++   * With glewExperimental, the GLEW_* flags only tell whether the entry
++   * points exist, so the actual GL version and extension strings decide.
++   */
++  FramebufferSupport initFramebufferSupport()
++  {
++    FramebufferSupport result = { false, false };
++
++    // Experimental or glew doesn't work with core profile >= 3.2
++    glewExperimental = 1;
++    if (glewInit() != GLEW_OK)
++      return result;
++
++    const char *version = (const char *)glGetString(GL_VERSION);
++    bool coreFramebuffer = version && std::atoi(version) >= 3;
++
++    if (GLEW_ARB_framebuffer_object &&
++        (coreFramebuffer || glewGetExtension("GL_ARB_framebuffer_object"))) {
++      result.multisample = true;
++    } else if (glewGetExtension("GL_EXT_framebuffer_object")) {
++      glBindFramebuffer = glBindFramebufferEXT;
++      glBindRenderbuffer = glBindRenderbufferEXT;
++      glCheckFramebufferStatus = glCheckFramebufferStatusEXT;
++      glDeleteFramebuffers = glDeleteFramebuffersEXT;
++      glDeleteRenderbuffers = glDeleteRenderbuffersEXT;
++      glFramebufferRenderbuffer = glFramebufferRenderbufferEXT;
++      glFramebufferTexture2D = glFramebufferTexture2DEXT;
++      glGenFramebuffers = glGenFramebuffersEXT;
++      glGenRenderbuffers = glGenRenderbuffersEXT;
++      glGenerateMipmap = glGenerateMipmapEXT;
++      glRenderbufferStorage = glRenderbufferStorageEXT;
++
++      if (glewGetExtension("GL_EXT_framebuffer_multisample") &&
++          glewGetExtension("GL_EXT_framebuffer_blit")) {
++        glRenderbufferStorageMultisample = glRenderbufferStorageMultisampleEXT;
++        glBlitFramebuffer = glBlitFramebufferEXT;
++        result.multisample = true;
++      }
++    } else
++      return result;
++
++    if (result.multisample) {
++      GLint maxSamples = 0;
++      glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
++      result.multisample = maxSamples >= 2;
++    }
++
++    result.available = true;
++    return result;
++  }
++}
++
+ WServerGLWidgetImpl::WServerGLWidgetImpl(bool antialiasingEnabled):
+   width_(0),
+   height_(0),
+-  framebuffer_(-1)
++  framebuffer_(-1),
++  multisample_(true)
+ {
+   CGLPixelFormatAttribute attributes[4] = {
+     kCGLPFAAccelerated,   // no software rendering
+@@ -263,7 +330,11 @@ WServerGLWidgetImpl::WServerGLWidgetImpl(bool antialiasingEnabled):
+   };
+   CGLPixelFormatObj pix;
+   CGLError errorCode;
++#if MAC_OS_X_VERSION_MAX_ALLOWED < 1050
++  long num; // stores the number of possible pixel formats
++#else
+   GLint num; // stores the number of possible pixel formats
++#endif
+   CGLError err;
+ 
+   err = CGLChoosePixelFormat(attributes, &pix, &num);
+@@ -281,10 +352,12 @@ WServerGLWidgetImpl::WServerGLWidgetImpl(bool antialiasingEnabled):
+ 
+   makeCurrent();
+ 
+-  // Experimental or glew doesn't work with core profile >= 3.2
+-  glewExperimental = 1;
+-  GLenum res = glewInit();
+-  if (res == GLEW_OK && GLEW_ARB_framebuffer_object) {
++  // GLEW's entry points are shared by all contexts, and glewInit() would
++  // undo the EXT aliasing while other sessions render: initialize once.
++  static const FramebufferSupport framebufferSupport
++    = initFramebufferSupport();
++  if (framebufferSupport.available) {
++    multisample_ = framebufferSupport.multisample;
+     initializeRenderbuffers();
+   } else {
+     unmakeCurrent();
+@@ -318,7 +391,8 @@ void WServerGLWidgetImpl::unmakeCurrent()
+ 
+ #ifdef WIN32_GL
+ WServerGLWidgetImpl::WServerGLWidgetImpl(bool antialiasingEnabled)
+-  : framebuffer_(-1)
++  : framebuffer_(-1),
++    multisample_(true)
+ {
+   // Window properties
+   WNDCLASSEX wndClass;
+@@ -516,12 +590,18 @@ void WServerGLWidgetImpl::resize(int width, int height)
+   makeCurrent();
+   int status;
+   glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer_);
+-  glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA8, width, height);
++  if (multisample_)
++    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_RGBA8, width, height);
++  else
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_RENDERBUFFER, renderbuffer_);
+ 
+   glBindRenderbuffer(GL_RENDERBUFFER, depthbuffer_);
+-  glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_DEPTH_COMPONENT, width, height);
++  if (multisample_)
++    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 2, GL_DEPTH_COMPONENT, width, height);
++  else
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, width, height);
+   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                             GL_RENDERBUFFER, depthbuffer_);
+   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+@@ -544,6 +624,12 @@ void WServerGLWidgetImpl::resize(int width, int height)
+ 
+ void WServerGLWidgetImpl::initReadBuffer()
+ {
++  if (!multisample_) {
++    // nothing to resolve, read from the render target itself
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_);
++    return;
++  }
++
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer_);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebufferRead_);
+   glBlitFramebuffer(0,0,width_,height_,0,0,width_,height_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
