@@ -1,0 +1,137 @@
+From c80ed3cc77435ac86eb7c1fe5231279937d146a3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 2 Oct 2026 07:58:42 +0000
+Subject: [PATCH 27/31] hir_typeck: defer inherent methods that only match by
+ binding receiver ivars
+
+When a method call's receiver still contains inference variables, an
+inherent impl whose self type is more specific than the receiver (e.g.
+`impl<T> Either<T, T>` seen through `Either<Iter<T>, _>`, or
+`impl GetSpan<Span>` seen through `GetSpan<_>`) only matches by binding
+those ivars. Committing to it immediately pins the ivars, even though the
+expression that would have resolved them (a pending method call, a match
+arm) hasn't been processed yet, and the real type may select a trait
+method or an inherent method at a deeper autoderef level instead.
+
+rustc doesn't have this problem because it checks the earlier expressions
+first. Mirror that: outside fallback mode, when the matched inherent impl
+compares Fuzzy against the receiver, leave the node for a later revisit.
+Fallback mode (nothing else can make progress) commits as before, so
+`W(1).go()` with `impl W<u8>` and `Either::Left(dflt()).into_inner()`
+still resolve through the inherent impl.
+
+Hit by rayon 1.10.0 iter/extend.rs:62
+    let strs = match vecs {
+        Either::Left(vec) => Either::Left(vec.iter()),
+        Either::Right(list) => Either::Right(list.iter().flatten()),
+    };
+    strs.map(AsRef::as_ref)...
+where `either`'s inherent `impl<T> Either<T, T>::map` was chosen through
+`Either<slice::Iter<T>, _>` before `.flatten()` resolved the right arm:
+"Type mismatch between slice::iter::Iter<T> and Flatten<...>".
+And by ref-cast-impl 1.0.23 (quote_spanned!), where quote's autoref
+specialisation `get_span(span).__into_span()` picked `impl GetSpan<Span>`
+through `GetSpan<_>` before the argument type (DelimSpan) was known:
+"Type mismatch between Span and DelimSpan".
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_typeck/expr_cs.cpp       |  3 ++-
+ src/hir_typeck/expr_cs.hpp       |  2 +-
+ src/hir_typeck/expr_cs__enum.cpp | 28 +++++++++++++++++++++++-----
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index acc6f427..f44333f7 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1124,7 +1124,8 @@ namespace {
+                 )
+ 
+                 // TODO: If this is ambigious, and it's an inherent, and in fallback mode - fall down to the next trait method.
+-                if( !typecheck::visit_call_populate_cache(this->context, node.span(), node.m_method_path, node.m_cache) )
++                // NOTE: Outside fallback mode, an inherent impl that only matches by binding receiver ivars is deferred
++                if( !typecheck::visit_call_populate_cache(this->context, node.span(), node.m_method_path, node.m_cache, /*defer_fuzzy_inherent=*/!this->m_is_fallback) )
+                 {
+                     // Move the params back
+                     TU_MATCH(::HIR::Path::Data, (node.m_method_path.m_data), (e),
+diff --git a/src/hir_typeck/expr_cs.hpp b/src/hir_typeck/expr_cs.hpp
+index 832f1a6e..84859820 100644
+--- a/src/hir_typeck/expr_cs.hpp
++++ b/src/hir_typeck/expr_cs.hpp
+@@ -290,7 +290,7 @@ private:
+ 
+ namespace typecheck
+ {
+-    extern bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache) __attribute__((warn_unused_result));
++    extern bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, bool defer_fuzzy_inherent=false) __attribute__((warn_unused_result));
+ }
+ 
+ extern void Typecheck_Code_CS__EnumerateRules(Context& context, const typeck::ModuleState& ms, t_args& args, const ::HIR::TypeRef& result_type, ::HIR::ExprPtr& expr, ::std::unique_ptr<HIR::ExprNode>& root_ptr);
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 65e08591..2fd6f634 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -23,8 +23,8 @@ namespace
+ 
+ namespace typecheck
+ {
+-    bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache) __attribute__((warn_unused_result));
+-    bool visit_call_populate_cache_UfcsInherent(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, const ::HIR::Function*& fcn_ptr);
++    bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, bool defer_fuzzy_inherent) __attribute__((warn_unused_result));
++    bool visit_call_populate_cache_UfcsInherent(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, const ::HIR::Function*& fcn_ptr, bool defer_fuzzy_inherent);
+ 
+ 
+     class OwnedImplMatcher:
+@@ -216,7 +216,7 @@ namespace typecheck
+ 
+     /// (HELPER) Populate the cache for nodes that use visit_call
+     /// TODO: If the function has multiple mismatched options, tell the caller to try again later?
+-    bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache)
++    bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, bool defer_fuzzy_inherent)
+     {
+         TRACE_FUNCTION_FR(path, path);
+         assert(cache.m_arg_types.size() == 0);
+@@ -367,7 +367,7 @@ namespace typecheck
+             }
+         TU_ARMA(UfcsInherent, e) {
+             // NOTE: This case is kinda long, so it's refactored out into a helper
+-            if( !visit_call_populate_cache_UfcsInherent(context, sp, path, cache, fcn_ptr) ) {
++            if( !visit_call_populate_cache_UfcsInherent(context, sp, path, cache, fcn_ptr, defer_fuzzy_inherent) ) {
+                 return false;
+             }
+             }
+@@ -397,7 +397,7 @@ namespace typecheck
+ 
+         return true;
+     }
+-    bool visit_call_populate_cache_UfcsInherent(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, const ::HIR::Function*& fcn_ptr)
++    bool visit_call_populate_cache_UfcsInherent(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, const ::HIR::Function*& fcn_ptr, bool defer_fuzzy_inherent)
+     {
+         auto& e = path.m_data.as_UfcsInherent();
+ 
+@@ -424,6 +424,24 @@ namespace typecheck
+         }
+         assert(impl_ptr);
+         DEBUG("Found impl" << impl_ptr->m_params.fmt_args() << " " << impl_ptr->m_type);
++        if( defer_fuzzy_inherent )
++        {
++            // Does this impl only apply if ivars in the receiver resolve a particular way? (`impl Foo<Bar>` seen
++            // through `Foo<_>`, or `impl<T> E<T,T>` through `E<_,_>`). Committing now would bind those ivars, while
++            // the real types (still pending elsewhere) might instead select a trait method or a method at a deeper
++            // autoderef level. Wait for them; fallback mode commits as before.
++            ::HIR::PathParams   tmp_params;
++            tmp_params.m_lifetimes.resize( impl_ptr->m_params.m_lifetimes.size() );
++            tmp_params.m_types.resize( impl_ptr->m_params.m_types.size() );
++            tmp_params.m_values.resize( impl_ptr->m_params.m_values.size() );
++            OwnedImplMatcher matcher(tmp_params);
++            auto cmp = impl_ptr->m_type.match_test_generics_fuzz(sp, e.type, context.m_ivars.callback_resolve_infer(), matcher);
++            if( cmp == ::HIR::Compare::Fuzzy )
++            {
++                DEBUG("- Impl only matches by binding receiver ivars, deferring");
++                return false;
++            }
++        }
+         fix_param_count(sp, context, e.type, false, path, fcn_ptr->m_params,  e.params);
+         cache.m_fcn_params = &fcn_ptr->m_params;
+ 
