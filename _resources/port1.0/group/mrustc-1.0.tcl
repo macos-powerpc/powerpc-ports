@@ -403,11 +403,13 @@ proc rust::old_macos_compatibility {cname cversion} {
                 ${cargo.home}/macports/${cname}-${cversion}/rep/include/jemalloc/internal/quantum.h
         }
         "libc" {
-            # Add support for powerpc
-            reinplace "s|target_arch = \"arm\"\, target_arch = \"x86\"|target_arch = \"arm\"\, target_arch = \"powerpc\"\, target_arch = \"x86\"|" \
-                ${cargo.home}/macports/${cname}-${cversion}/src/unix/bsd/apple/mod.rs
-            reinplace "s|target_arch = \"x86_64\"\, target_arch = \"aarch64\"|target_arch = \"aarch64\"\, target_arch = \"powerpc64\"\, target_arch = \"x86_64\"|" \
-                ${cargo.home}/macports/${cname}-${cversion}/src/unix/bsd/apple/mod.rs
+            # Add support for powerpc. Later versions use pointer width instead of hardcoded archs.
+            if {[vercmp ${cversion} < 0.2.121]} {
+                reinplace "s|target_arch = \"arm\"\, target_arch = \"x86\"|target_arch = \"arm\"\, target_arch = \"powerpc\"\, target_arch = \"x86\"|" \
+                    ${cargo.home}/macports/${cname}-${cversion}/src/unix/bsd/apple/mod.rs
+                reinplace "s|target_arch = \"x86_64\"\, target_arch = \"aarch64\"|target_arch = \"aarch64\"\, target_arch = \"powerpc64\"\, target_arch = \"x86_64\"|" \
+                    ${cargo.home}/macports/${cname}-${cversion}/src/unix/bsd/apple/mod.rs
+            }
         }
         "libgit2-sys" {
             # libgit2-sys requires SSLCreateContext which is only available since macOS 10.8
