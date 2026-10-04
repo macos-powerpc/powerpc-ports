@@ -1,0 +1,194 @@
+From d2623ed8c71d3dbb8f4d43d1f80b24cd4d7e719b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 4 Oct 2026 06:23:57 +0000
+Subject: [PATCH 45/45] expand: give attribute proc macros every other attribute on
+ the item
+
+An attribute macro's input only included the attributes written after
+it (`get_attrs_after`). rustc includes every attribute still on the
+item, before and after; proc-macro-error's `#[proc_macro_error]` relies
+on that to find the `#[proc_macro_derive]` written above it, and emitted
+"#[proc_macro_error] attribute can be used only with procedural macros"
+for every clap_derive 3.x entry point. The output (which re-emits the
+received attributes) also lost the attributes written before the macro.
+
+Decorators now receive the item's whole attribute list, and the proc
+macro input visitor filters it: the attribute being expanded, `#[cfg]`
+(already evaluated), and `#[derive]`s that are already expanded (marked
+inert; derive macros never see any `#[derive]`) are skipped. The derive
+helper attribute filter for derive inputs is unchanged, so derive macros
+additionally see helper attributes written before the `#[derive]`.
+No builtin decorator reads the list.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/expand/mod.cpp        | 20 ++++++++++----------
+ src/expand/proc_macro.cpp | 25 +++++++++++++++++++++++--
+ src/expand/proc_macro.hpp |  6 ++++--
+ 3 files changed, 37 insertions(+), 14 deletions(-)
+
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 5d117159..af3d459f 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -198,7 +198,7 @@ void Expand_Attr(const ExpandState& es, const Span& sp, const ::AST::Attribute&
+                 {
+                     if( !i.is_None() )
+                     {
+-                        auto lex = ProcMacro_Invoke(sp, crate, this->mac_path, attr.data(), attrs, vis, path.nodes.back(), i);
++                        auto lex = ProcMacro_Invoke(sp, crate, this->mac_path, attr, attrs, vis, path.nodes.back(), i);
+                         if( lex ) {
+                             // TODO: `derive_where` returns its own attribute invocation in the output, between two other additions
+                             //   > This seems to so the derive (first attribute) can see the trait list? (does mrustc handle that properly? I think so)
+@@ -228,7 +228,7 @@ void Expand_Attr(const ExpandState& es, const Span& sp, const ::AST::Attribute&
+                 {
+                     if( !i.is_None() )
+                     {
+-                        auto lex = ProcMacro_Invoke(sp, crate, this->mac_path, attr.data(), attrs, vis, name, i);
++                        auto lex = ProcMacro_Invoke(sp, crate, this->mac_path, attr, attrs, vis, name, i);
+                         if( lex ) {
+                             i = AST::Item::make_None({});
+                             assert(g_current_mod);
+@@ -308,10 +308,11 @@ void Expand_Attrs_CfgAttr(AST::AttributeList& attrs)
+     }
+ }
+ namespace {
+-    slice<const AST::Attribute> get_attrs_after(const ::AST::AttributeList& attrs, const ::AST::Attribute& a) {
+-        const auto* start = &a + 1;
+-        const auto* end = &attrs.m_items.back()+1;
+-        return slice<const AST::Attribute>(start, end - start);
++    /// The item's attribute list as passed to decorators. Attribute/derive proc macros receive it as their input's
++    /// attributes (rustc passes every attribute still on the item, before and after the one being expanded), and skip the
++    /// invoking attribute and already-expanded macros themselves (see `ProcMacro_Invoke`).
++    slice<const AST::Attribute> get_all_attrs(const ::AST::AttributeList& attrs) {
++        return slice<const AST::Attribute>(attrs.m_items.data(), attrs.m_items.size());
+     }
+ }
+ void Expand_Attrs(
+@@ -321,8 +322,7 @@ void Expand_Attrs(
+ {
+     Expand_Attrs(es, attrs, stage,  [&](const Span& sp, const ExpandDecorator& d, const AST::Attribute& a){
+         if(!item.is_None()) {
+-            // Pass attributes _after_ this attribute
+-            d.handle(sp, a, es.crate, path, mod, mod_idx, get_attrs_after(attrs, a), vis, item);
++            d.handle(sp, a, es.crate, path, mod, mod_idx, get_all_attrs(attrs), vis, item);
+         }
+         });
+ }
+@@ -331,7 +331,7 @@ void Expand_Attrs(const ExpandState& es, const ::AST::AttributeList& attrs, Attr
+     g_current_mod = &mod;
+     Expand_Attrs(es, attrs, stage,  [&](const Span& sp, const auto& d, const AST::Attribute& a){
+         if(!item.is_None()) {
+-            d.handle(sp, a, es.crate, path, trait, get_attrs_after(attrs, a), item);
++            d.handle(sp, a, es.crate, path, trait, get_all_attrs(attrs), item);
+         }
+         });
+     g_current_mod = nullptr;
+@@ -341,7 +341,7 @@ void Expand_Attrs(const ExpandState& es, const ::AST::AttributeList& attrs, Attr
+     g_current_mod = &mod;
+     Expand_Attrs(es, attrs, stage,  [&](const Span& sp, const auto& d, const auto& a){
+         if(!item.is_None()) {
+-            d.handle(sp, a, es.crate, impl, name, get_attrs_after(attrs, a), vis, item);
++            d.handle(sp, a, es.crate, impl, name, get_all_attrs(attrs), vis, item);
+         }
+         });
+     g_current_mod = nullptr;
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 085aa8ae..b47ba097 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -466,6 +466,10 @@ namespace {
+         const Span& sp;
+         ProcMacroInv&   m_pmi;
+         bool emit_all_attrs;
++        /// The attribute macro being expanded (not part of its own input)
++        const ::AST::Attribute* invoking_attr = nullptr;
++        /// Input for a derive macro (which never sees `#[derive]` attributes)
++        bool is_derive_input = false;
+         Visitor(const Span& sp, ProcMacroInv& pmi):
+             sp(sp),
+             m_pmi(pmi)
+@@ -1219,10 +1223,23 @@ namespace {
+             this->visit_node(e.node());
+         }
+ 
++        /// Item-level attributes: everything rustc would leave on the item at this point
+         void visit_top_attrs(slice<const ::AST::Attribute>& attrs)
+         {
+             for(const auto& a : attrs)
+             {
++                if( &a == invoking_attr ) {
++                    continue;
++                }
++                // `#[cfg]` has already been evaluated (and would have removed the item if false)
++                if( a.name() == "cfg" ) {
++                    continue;
++                }
++                // `#[derive]`: never part of a derive macro's input. An attribute macro sees the derives still to be
++                // expanded (written after it), but not the ones already expanded (before it, marked inert)
++                if( a.name() == "derive" && (is_derive_input || a.is_inert()) ) {
++                    continue;
++                }
+                 this->visit_attr(a);
+             }
+         }
+@@ -1674,6 +1691,7 @@ namespace {
+ {
+     return ProcMacro_Invoke(sp, crate, mac_path, nullptr, [&](Visitor& v){
+         DEBUG("derive on struct");
++        v.is_derive_input = true;
+         v.visit_top_attrs(attrs);
+         v.visit_struct(item_name, vis, i);
+         });
+@@ -1682,6 +1700,7 @@ namespace {
+ {
+     return ProcMacro_Invoke(sp, crate, mac_path, nullptr, [&](Visitor& v){
+         DEBUG("derive on enum");
++        v.is_derive_input = true;
+         v.visit_top_attrs(attrs);
+         v.visit_enum(item_name, vis, i);
+         });
+@@ -1690,18 +1709,20 @@ namespace {
+ {
+     return ProcMacro_Invoke(sp, crate, mac_path, nullptr, [&](Visitor& v){
+         DEBUG("derive on union");
++        v.is_derive_input = true;
+         v.visit_top_attrs(attrs);
+         v.visit_union(item_name, vis, i);
+         });
+ }
+ // --- attribute
+ ::std::unique_ptr<TokenStream> ProcMacro_Invoke(
+-    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree& tt,
++    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const AST::Attribute& attr,
+     slice<const AST::Attribute> attrs, const AST::Visibility& vis, const RcString& item_name, const ::AST::Item& i
+     )
+ {
+-    return ProcMacro_Invoke(sp, crate, mac_path, &tt, [&](Visitor& v) {
++    return ProcMacro_Invoke(sp, crate, mac_path, &attr.data(), [&](Visitor& v) {
+         v.emit_all_attrs = true;
++        v.invoking_attr = &attr;
+         v.visit_top_attrs(attrs);
+         v.visit_item(item_name, vis, i);
+         });
+diff --git a/src/expand/proc_macro.hpp b/src/expand/proc_macro.hpp
+index d3628ee7..0177c309 100644
+--- a/src/expand/proc_macro.hpp
++++ b/src/expand/proc_macro.hpp
+@@ -14,12 +14,14 @@ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::A
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, slice<const AST::Attribute> attrs, const AST::Visibility& vis, const RcString& name, const ::AST::Union& i);
+ 
+ // Attribute macros
++// NOTE: `attrs` is the item's full attribute list (`attr` is the one being expanded, and is skipped along with
++// already-expanded `#[derive]`s and `#[cfg]`)
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(
+-    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree& tt,
++    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const AST::Attribute& attr,
+     slice<const AST::Attribute> attrs, const AST::Visibility& vis, const RcString& item_name, const ::AST::Item& i
+     );
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(
+-    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree& tt,
++    const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const AST::Attribute& attr,
+     slice<const AST::Attribute> attrs, const ::AST::ImplDef& i
+     );
+ 

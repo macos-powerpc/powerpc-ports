@@ -1,0 +1,81 @@
+From a8f8a12e695835a6012770fcee0d756504f02a31 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 4 Oct 2026 08:23:31 +0000
+Subject: [PATCH 49/49] hir_conv: implement the `discriminant_value` intrinsic in
+ constant evaluation
+
+`mem::discriminant` is a `const fn` (const-stable since 1.75) wrapping
+the `discriminant_value` intrinsic, which the evaluator didn't know:
+
+    MIR TODO: ::core::mem::discriminant<'static, Value> BB0/TERM:
+    Call intrinsic "discriminant_value"
+
+yaml_serde 0.10.4 reaches it from a non-const function: in
+`impl Hash for HashLikeValue`, `mem::discriminant(&STRING).hash(state)`
+autorefs the temporary, and the static-borrow promotion treats the
+`const fn` call on a constant as promotable, so the whole expression is
+evaluated at compile time.
+
+Decode the tag the same way the evaluator does for `Switch` (and
+codegen_c for the intrinsic): `Values` yields the stored discriminant,
+`Linear`/`NonZero` the variant index, non-enums 0, written as the
+`<T as DiscriminantKind>::Discriminant` type.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_conv/constant_evaluation.cpp | 42 ++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index fd9fa4ef..5ccd34e2 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -3003,6 +3003,48 @@ namespace HIR {
+                     // written as the tag byte (matches codegen_c's `.TAG = ...`)
+                     dst.write_uint(state, 8, U128(static_cast<uint8_t>(ord)));
+                 }
++                // `mem::discriminant` (a `const fn`; also reached when `&mem::discriminant(&CONST)` gets promoted)
++                else if( te->name == "discriminant_value" ) {
++                    auto ty = local_state.monomorph_expand(te->params.m_types.at(0));
++                    auto ptr_src = local_state.read_param_ptr(e.args.at(0));
++                    MIR_ASSERT(state, ptr_src.second && ptr_src.first >= EncodedLiteral::PTR_BASE, "`discriminant_value` of an invalid pointer");
++                    auto lit = ValueRef(ptr_src.second, ptr_src.first - EncodedLiteral::PTR_BASE);
++                    // Result type is `<T as DiscriminantKind>::Discriminant` (`isize`, or the enum's `repr` type)
++                    HIR::TypeRef    tmp;
++                    const auto& ret_ty = state.get_lvalue_type(tmp, e.ret_val);
++                    MIR_ASSERT(state, ret_ty.data().is_Primitive(), "`discriminant_value` returning non-primitive " << ret_ty);
++                    auto ti = TypeInfo::for_type(ret_ty);
++                    // Same tag decoding as `Switch` (and codegen_c): `Values` stores the declared discriminants, the other
++                    // modes have discriminant == variant index. Non-enums yield 0.
++                    uint64_t discr = 0;
++                    if( const auto* enm_repr = Target_GetTypeRepr(state.sp, resolve, ty) )
++                    {
++                        TU_MATCH_HDRA( (enm_repr->variants), { )
++                        TU_ARMA(None, _ve) {
++                            (void)_ve;
++                            }
++                        TU_ARMA(Linear, ve) {
++                            auto v = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size).truncate_u64();
++                            discr = (v < ve.offset) ? ve.field.index : v - ve.offset;
++                            }
++                        TU_ARMA(Values, ve) {
++                            discr = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size).truncate_u64();
++                            }
++                        TU_ARMA(NonZero, ve) {
++                            size_t ofs = enm_repr->get_offset(state.sp, resolve, ve.field);
++                            bool is_nonzero = false;
++                            for(size_t i = 0; i < ve.field.size; i ++) {
++                                if( lit.slice(ofs+i, 1).read_uint(state, 8).truncate_u64() != 0 ) {
++                                    is_nonzero = true;
++                                    break;
++                                }
++                            }
++                            discr = is_nonzero ? 1 - ve.zero_variant : ve.zero_variant;
++                            }
++                        }
++                    }
++                    dst.write_uint(state, ti.bits, U128(discr));
++                }
+                 else {
+                     MIR_TODO(state, "Call intrinsic \"" << te->name << "\" - " << terminator);
+                 }
