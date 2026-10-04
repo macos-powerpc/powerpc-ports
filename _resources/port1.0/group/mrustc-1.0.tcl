@@ -311,6 +311,15 @@ proc rust::old_macos_compatibility {cname cversion} {
                     ${cargo.home}/macports/${cname}-${cversion}/build.rs
             }
         }
+        "gmp-mpfr-sys" {
+            # GMP's configure auto-detects the host CPU; on a G5 it selects 64-bit
+            # limbs (abilist "mode64 mode32 32") that don't build with 32-bit CFLAGS.
+            # Pin the ABI to the Rust target instead of the host CPU.
+            if {[option configure.build_arch] eq "ppc"} {
+                reinplace {s|"../gmp-src/configure --enable-fat --disable-shared --with-pic"|"../gmp-src/configure --enable-fat --disable-shared --with-pic ABI=32"|} \
+                    ${cargo.home}/macports/${cname}-${cversion}/build.rs
+            }
+        }
         "kqueue" {
             if {[vercmp ${cversion} < 1.0.5] && "i386" in [option muniversal.architectures]} {
                 # see https://gitlab.com/worr/rust-kqueue/-/merge_requests/10
@@ -318,6 +327,15 @@ proc rust::old_macos_compatibility {cname cversion} {
                     ${cargo.home}/macports/${cname}-${cversion}/src/time.rs
                 cargo.offline_cmd-replace --frozen --offline
             }
+        }
+        "ptyprocess" {
+            # `ioctl`'s `request` argument is `c_ulong`, which is 32-bit on
+            # 32-bit targets (e.g. powerpc); ptyprocess casts the constant to
+            # a hard-coded `u64`, giving "Type mismatch between u32 and u64".
+            # `as _` lets the type be inferred, so it is correct on every arch.
+            # See src/lib.rs get_slave_name (macos).
+            reinplace "s|TIOCPTYGNAME as u64|TIOCPTYGNAME as _|g" \
+                ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
         }
         "rustix" {
             if {[vercmp ${cversion} < 0.38.31] && [vercmp ${cversion} >= 0.0] && ("i386" in [option muniversal.architectures] || "ppc" in [option muniversal.architectures])} {
