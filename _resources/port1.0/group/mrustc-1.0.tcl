@@ -54,7 +54,8 @@ options     cargo.bin \
             cargo.crates \
             cargo.offline_cmd \
             cargo.crates_github \
-            cargo.update
+            cargo.update \
+            mrustc.incremental
 
 set mrustc_root                 ${prefix}/libexec/mrustc
 
@@ -69,6 +70,17 @@ default     cargo.offline_cmd   {}
 # Some packags do not provide Cargo.lock,
 # so offer the option of running cargo-update
 default     cargo.update        {no}
+
+# Resume an interrupted build after the mrustc port itself was rebuilt. minicargo normally rebuilds every
+# crate whose rlib is older than the compiler or than the installed libstd; with this option only changed
+# sources and rebuilt dependencies trigger a rebuild (needs `port -o` as well, for the Portfile mtime):
+#   sudo port -o build <port> mrustc.incremental=yes
+default     mrustc.incremental  {no}
+pre-build {
+    if {[option mrustc.incremental]} {
+        build.env-append        MINICARGO_IGNTOOLS=1
+    }
+}
 
 # Use `--remap-path-prefix` to prevent build information from being included in installed binaries
 options     rust.remap
