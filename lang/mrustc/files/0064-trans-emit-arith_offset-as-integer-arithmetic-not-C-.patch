@@ -1,0 +1,60 @@
+From c4970ba3301be16a0be8a10aa8f89fea94c008b3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 14:55:27 +0000
+Subject: [PATCH 64/64] trans: emit `arith_offset` as integer arithmetic, not C
+ pointer arithmetic
+
+`<*const T>::wrapping_offset` (and `wrapping_add`/`wrapping_sub`) lower
+to the `arith_offset` intrinsic, which Rust defines for any offset. The
+C backend emitted it as `ptr + count`, which C only defines while the
+result stays inside the pointed-to object. GCC uses that: a non-null
+pointer plus an offset is non-null, so a later null check of the result
+is deleted. once_cell >= 1.13.1 relies on exactly this in its strict
+provenance polyfill (src/imp_std.rs, `strict::with_addr`):
+
+    let mut waiter = strict::map_addr(queue, |q| q & !STATE_MASK);
+    while !waiter.is_null() { let next = (*waiter).next; ... }
+
+With no waiters `queue` is the `RUNNING` tag (`1 as *mut Waiter`), so
+`waiter = (1 as *mut u8).wrapping_offset(-1)`, which is null. The
+preceding `assert_eq!(state, RUNNING)` tells GCC that `queue` is
+non-null, the `is_null` test is folded away, and the loop dereferences
+null (SIGBUS at address 8, the offset of `next`, in `Guard::drop` on
+powerpc-apple-darwin with GCC 16; GCC 13 on x86_64 does the same at
+`-O1` without `-fno-tree-sra`). once_cell 1.13.0 is fine because its
+queue was an integer and `(q & !STATE_MASK) as *const Waiter` is an
+int-to-pointer conversion GCC cannot see through.
+
+Emit `(T*)((uintptr_t)ptr + (uintptr_t)count * size_of::<T>())`, as
+`ptr_mask` already does. The size comes from the target layout, so
+a ZST stride is 0 rather than C's `sizeof` of 1. `offset` is left alone:
+Rust requires its result to be in bounds, so C's rule holds there.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/trans/codegen_c.cpp | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index e3c073b0..99d2e96b 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -6873,8 +6873,16 @@ namespace {
+             else if( name == "offset" ) {   // addition, with the reqirement that the resultant pointer be in bounds
+                 emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " + "; emit_param(e.args.at(1));
+             }
+-            else if( name == "arith_offset" ) { // addition, with no requirements
+-                emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " + "; emit_param(e.args.at(1));
++            else if( name == "arith_offset" ) { // addition, with no requirements (`wrapping_offset`)
++                // C pointer arithmetic is only defined within an object, so GCC treats `non_null + x` as non-null and
++                // deletes a later null check. once_cell >= 1.13.1 (`strict::with_addr`) does
++                // `(1 as *mut Waiter).wrapping_offset(-1)` and then tests the result for null. Rust defines the result for
++                // any offset, so do the arithmetic on integers (like `ptr_mask` below).
++                const auto& ity = params.m_types.at(0);
++                size_t size = 0, align = 0;
++                MIR_ASSERT(mir_res, Target_GetSizeAndAlignOf(mir_res.sp, m_resolve, ity, size, align), "arith_offset: unknown size of " << ity);
++                emit_lvalue(e.ret_val); m_of << " = ("; emit_ctype(ity); m_of << "*) ((uintptr_t)"; emit_param(e.args.at(0));
++                m_of << " + (uintptr_t)"; emit_param(e.args.at(1)); m_of << " * (uintptr_t)" << size << ")";
+             }
+             else if( name == "ptr_offset_from" ) {  // effectively subtraction
+                 emit_lvalue(e.ret_val); m_of << " = "; emit_param(e.args.at(0)); m_of << " - "; emit_param(e.args.at(1));

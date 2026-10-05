@@ -1,0 +1,85 @@
+From 4c322c8a390629eca1b5e8751d6f2ec5b9f7de0f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 08:36:56 +0000
+Subject: [PATCH 56/64] trans: don't pre-emit items whose signature is too
+ large for the target
+
+A library crate emits the concrete (non-generic) items named in the
+bodies of its saved generic functions, so that downstream
+instantiations can link to them. hex 0.4.3 implements `FromHex` for
+`[u8; 2147483648]` on 32-bit targets too; the generic `from_hex<T>`
+uses `?`, which names
+
+    <Result<[u8; 2147483648], FromHexError> as FromResidual<..>>::from_residual
+
+That got emitted, and its 2 GiB return type is more than GCC accepts
+for a 32-bit target (objects are limited to PTRDIFF_MAX):
+
+    error: size of array 'DATA' is too large
+
+rustc only computes a layout when it is needed, and rejects a type of
+2^31 bytes or more on a 32-bit target (2^61 on 64-bit) when it does.
+Nothing can instantiate such an item, so skip pre-emitting it when
+an argument or the return type is at least that large. Only types
+containing an array are measured, and erased/unresolved types are left
+alone.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/trans/enumerate.cpp | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index 8453693d..34eb08d4 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -201,6 +201,34 @@ TransList Trans_Enumerate_Main(const ::HIR::Crate& crate)
+ }
+ 
+ namespace {
++    /// Does the function's signature (instantiated by `ms`) pass or return a value too large to exist on the target?
++    /// - Same bound as rustc's `obj_size_bound`: 2^15, 2^31 or 2^61 bytes for 16/32/64-bit pointers (2^31 is also the
++    ///   C compiler's limit on 32-bit targets)
++    bool Trans_Enumerate_SignatureTooLarge(const StaticTraitResolve& resolve, const Span& sp, const ::HIR::Function& fcn, const MonomorphState& ms)
++    {
++        const auto ptr_bits = Target_GetPointerBits();
++        const uint64_t max_size = ptr_bits >= 64 ? (uint64_t(1) << 61) : (uint64_t(1) << (ptr_bits - 1));
++        auto is_too_large = [&](const ::HIR::TypeRef& ty_tpl) {
++            auto ty = resolve.monomorph_expand(sp, ty_tpl, ms);
++            // Only an array can make a type this large. Leave types that can't be measured here (erased/unresolved) alone.
++            bool has_array = false;
++            if( visit_ty_with(ty, [&](const ::HIR::TypeRef& t) {
++                    has_array |= t.data().is_Array();
++                    return t.data().is_ErasedType() || t.data().is_Infer() || t.data().is_Generic();
++                    }) )
++                return false;
++            if( !has_array )
++                return false;
++            size_t size, align;
++            return Target_GetSizeAndAlignOf(sp, resolve, ty, size, align) && size != SIZE_MAX && size >= max_size;
++            };
++        if( is_too_large(fcn.m_return) )
++            return true;
++        for(const auto& a : fcn.m_args)
++            if( is_too_large(a.second) )
++                return true;
++        return false;
++    }
+     void Trans_Enumerate_GenericFunctionItems(EnumState& state, const Span& sp, const ::HIR::Function& e, MonomorphStatePtr ms)
+     {
+         if( e.m_code.m_mir )
+@@ -223,6 +251,13 @@ namespace {
+                     auto v = state.resolve.get_value(sp, *path, unused_ms, true);
+                     if( v.is_StructConstructor() || v.is_EnumConstructor() ) {
+                     }
++                    // Only emitted in case a downstream instantiation of this function needs it, so skip it if it can't
++                    // exist on this target - any instantiation would be rejected for the same reason.
++                    // - hex 0.4.3: `?` in `<[u8; 2147483648] as FromHex>::from_hex<T>` names
++                    //   `<Result<[u8; 2147483648], FromHexError> as FromResidual<..>>::from_residual`
++                    else if( v.is_Function() && Trans_Enumerate_SignatureTooLarge(state.resolve, sp, *v.as_Function(), unused_ms) ) {
++                        DEBUG("Path " << *path << " - Value too large for the target, not emitting");
++                    }
+                     else {
+                         auto p = ms.monomorph_path(sp, *path);
+                         state.rv.m_roots.push_back(p.clone());

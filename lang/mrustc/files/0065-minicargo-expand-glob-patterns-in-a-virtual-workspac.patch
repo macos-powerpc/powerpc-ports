@@ -1,0 +1,140 @@
+From 9b9107c0fd323188a3a0e2092927d74eb330d11e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 16:19:22 +0000
+Subject: [PATCH 65/65] minicargo: expand glob patterns in a virtual
+ workspace's member list
+
+Member selection for a virtual workspace root skipped any `members`
+entry containing `*`, so a workspace that lists its members only by
+pattern had no candidates at all. jql 9.0.3 has
+
+    [workspace]
+    members = ["crates/*"]
+
+and failed with
+
+    Virtual workspace root - unable to pick a member to build. Members:
+    EXCEPTION: Virtual workspace root: pass `--package <name>` to select a member
+
+Expand a pattern in the last path component against the entries of its
+parent directory (`*` and `?`, as cargo's glob does), sorted for a
+stable order; entries without a `Cargo.toml` are dropped by the existing
+check. A wildcard in a directory component is still unsupported and now
+warns. The selection heuristics are unchanged: for `jql-9.0.3` the
+member named like the directory (`jql`) is chosen, and `--package`
+still overrides.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tools/minicargo/main.cpp | 84 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index 612e24b6..8a765a4b 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -17,9 +17,66 @@
+ #include "build.h"
+ #include <toml.h>   // TomlFile (workspace)
+ #include <fstream>  // for workspace enumeration
++#include <algorithm>
++#include <functional>
++#ifdef _WIN32
++# include <Windows.h>
++#else
++# include <dirent.h>
++#endif
+ #include "cfg.hpp"
+ #include "resolve.h"
+ 
++namespace {
++    /// Call `cb` with the name of every entry of the directory `path` (except `.` and `..`)
++    void list_directory(const ::helpers::path& path, ::std::function<void(const char*)> cb)
++    {
++    #ifdef _WIN32
++        WIN32_FIND_DATA find_data;
++        HANDLE find_handle = FindFirstFile( (path / "*").str().c_str(), &find_data );
++        if( find_handle == INVALID_HANDLE_VALUE )
++            return ;
++        do {
++            if( strcmp(find_data.cFileName, ".") != 0 && strcmp(find_data.cFileName, "..") != 0 )
++                cb(find_data.cFileName);
++        } while( FindNextFile(find_handle, &find_data) );
++        FindClose(find_handle);
++    #else
++        auto* dp = opendir(path.str().c_str());
++        if( dp == nullptr )
++            return ;
++        while( const auto* dent = readdir(dp) )
++        {
++            if( strcmp(dent->d_name, ".") != 0 && strcmp(dent->d_name, "..") != 0 )
++                cb(dent->d_name);
++        }
++        closedir(dp);
++    #endif
++    }
++    /// Shell-style pattern match: `*` matches any run of characters, `?` any single character
++    bool glob_match(const char* pat, const char* s)
++    {
++        for( ; *pat; pat ++, s ++ )
++        {
++            if( *pat == '*' )
++            {
++                while( pat[1] == '*' )
++                    pat ++;
++                for( ; ; s ++ )
++                {
++                    if( glob_match(pat + 1, s) )
++                        return true;
++                    if( !*s )
++                        return false;
++                }
++            }
++            if( !*s || (*pat != '?' && *pat != *s) )
++                return false;
++        }
++        return *s == '\0';
++    }
++}
++
+ struct ProgramOptions
+ {
+     // Input (package) directory
+@@ -203,12 +260,35 @@ int main(int argc, const char* argv[])
+                     bool    has_bin;
+                 };
+                 ::std::vector<Candidate>    candidates;
++                // Expand glob members (`crates/*`, `crates/jql-*`): a pattern in the last path component matches
++                // the entries of its parent directory (only ones with a `Cargo.toml` are kept below)
++                // - e.g. jql 9.0.3 (`members = ["crates/*"]`)
++                ::std::vector<::std::string>    members;
+                 for(const auto& member : workspace_manifest.members())
+                 {
+-                    if( member.find('*') != ::std::string::npos ) {
+-                        // Glob members: not supported for auto-selection
++                    auto star = member.find('*');
++                    if( star == ::std::string::npos ) {
++                        members.push_back(member);
+                         continue;
+                     }
++                    auto slash = member.rfind('/');
++                    if( slash != ::std::string::npos && star < slash ) {
++                        ::std::cerr << "Warning: workspace member `" << member << "` has a wildcard in a directory component, ignored" << ::std::endl;
++                        continue;
++                    }
++                    auto parent = (slash == ::std::string::npos ? ::std::string() : member.substr(0, slash));
++                    auto pattern = member.substr(slash == ::std::string::npos ? 0 : slash + 1);
++                    ::std::vector<::std::string>    matches;
++                    list_directory(parent.empty() ? dir : dir / parent.c_str(), [&](const char* name) {
++                        if( glob_match(pattern.c_str(), name) )
++                            matches.push_back(parent.empty() ? ::std::string(name) : parent + "/" + name);
++                        });
++                    ::std::sort(matches.begin(), matches.end());
++                    DEBUG("Workspace member glob `" << member << "` -> " << matches);
++                    members.insert(members.end(), matches.begin(), matches.end());
++                }
++                for(const auto& member : members)
++                {
+                     auto member_dir = dir / member.c_str();
+                     auto member_toml = member_dir / "Cargo.toml";
+                     if( !::std::ifstream(member_toml.str()).is_open() )

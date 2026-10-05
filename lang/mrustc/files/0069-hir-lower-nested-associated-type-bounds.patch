@@ -1,0 +1,109 @@
+From 83544f44155fa6164b6f554bc530933b158bc762 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 18:46:23 +0000
+Subject: [PATCH 69/69] hir: lower nested associated type bounds
+
+A bound `T: Trait<Assoc: Bound>` is lowered to `T: Trait` plus
+`<T as Trait>::Assoc: Bound`. `Bound` was lowered with associated type
+bounds disallowed, so a nested one failed. rayon 1.12.0
+(src/iter/flatten_iter.rs) has
+
+    impl<I> ParallelIterator for FlattenIter<I>
+    where
+        I: ParallelIterator<Item: IntoIterator<Item: Send>>,
+
+    error:0: Associated type trait bounds not allowed here - ..::IntoIterator::<Item: ..::Send>
+
+Keep the nested bounds in the inner trait path and expand them
+recursively where generic bounds are lowered, so the example also yields
+`<<I as ParallelIterator>::Item as IntoIterator>::Item: Send`. Other
+contexts that allow associated type bounds (`impl Trait`) already keep
+them inside the trait path, nested ones included.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir/from_ast.cpp | 54 ++++++++++++++++++++++++++++----------------
+ 1 file changed, 34 insertions(+), 20 deletions(-)
+
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index cd330d1f..db911d9c 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -12,6 +12,7 @@
+ #include <ast/expr.hpp> // For shortcut in array size handling
+ #include <ast/crate.hpp>
+ #include "from_ast.hpp"
++#include <functional>
+ #include "visitor.hpp"
+ #include <macro_rules/macro_rules.hpp>
+ #include <hir/item_path.hpp>
+@@ -137,28 +138,39 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+                 mv$(bound_trait_path)
+                 }));
+ 
+-            for(auto& bound : tp_bounds)
+-            {
+-                const auto& name = bound.first;
+-                const auto& src_trait = bound.second.source_trait;
+-                const auto& params = bound.second.aty_params;
+-                for(auto& trait : bound.second.traits)
++            // An associated type bound (`T: Trait<Assoc: Bound>`) becomes a bound on the projection `<T as Trait>::Assoc`.
++            // `Bound` can carry associated type bounds of its own, which bound the next projection, and so on.
++            // - e.g. `I: ParallelIterator<Item: IntoIterator<Item: Send>>` (rayon 1.12.0)
++            ::std::function<void(const ::HIR::TypeRef&, ::std::map<RcString, ::HIR::TraitPath::AtyBound>&)>  add_aty_bounds;
++            add_aty_bounds = [&](const ::HIR::TypeRef& bounded_ty, ::std::map<RcString, ::HIR::TraitPath::AtyBound>& aty_bounds) {
++                for(auto& bound : aty_bounds)
+                 {
+-                    std::unique_ptr<HIR::GenericParams> hrls;
+-                    if( !e.outer_hrbs.empty() ) {
+-                        hrls = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
+-                    }
+-                    if( !e.inner_hrbs.empty() ) {
+-                        hrls = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
++                    const auto& name = bound.first;
++                    const auto& src_trait = bound.second.source_trait;
++                    const auto& params = bound.second.aty_params;
++                    for(auto& trait : bound.second.traits)
++                    {
++                        std::unique_ptr<HIR::GenericParams> hrls;
++                        if( !e.outer_hrbs.empty() ) {
++                            hrls = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
++                        }
++                        if( !e.inner_hrbs.empty() ) {
++                            hrls = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
++                        }
++                        auto aty_ty = ::HIR::TypeRef::new_path( ::HIR::Path(bounded_ty.clone(), src_trait.clone(), name, params.clone()), {} );
++                        auto inner_bounds = mv$(trait.m_trait_bounds);
++                        trait.m_trait_bounds.clear();
++                        rv.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
++                            std::move(hrls),
++                            aty_ty.clone(),
++                            std::move(trait)
++                            }));
++                        add_aty_bounds(aty_ty, inner_bounds);
+                     }
+-                    rv.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
+-                        std::move(hrls),
+-                        ::HIR::TypeRef::new_path( ::HIR::Path(type.clone(), src_trait.clone(), name, params.clone()), {} ),
+-                        std::move(trait)
+-                        }));
++                    bound.second.traits.clear();
+                 }
+-                bound.second.traits.clear();
+-            }
++                };
++            add_aty_bounds(type, tp_bounds);
+             }
+         TU_ARMA(MaybeTrait, e) {
+             auto type = LowerHIR_Type(e.type);
+@@ -874,7 +886,9 @@ namespace {
+                 //    ERROR(sp, E0000, "Unable to find source trait for " << b->first << " in " << bound_trait_path.m_path);
+                 auto it = rv.m_trait_bounds.insert(std::make_pair(name_args.first, ::HIR::TraitPath::AtyBound { std::move(src_trait), std::move(name_args.second), {} }));
+                 for(const auto& trait : assoc.second) {
+-                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, trait, {}, /*ignore_bounds*/false) );
++                    // The bound's own associated type bounds stay in its trait path (expanded by the caller, see
++                    // `LowerHIR_GenericParams`): `I: ParallelIterator<Item: IntoIterator<Item: Send>>` (rayon 1.12.0)
++                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, trait, {}, /*ignore_bounds*/true) );
+                 }
+ 
+             }

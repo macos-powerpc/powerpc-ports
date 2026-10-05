@@ -1,0 +1,292 @@
+From 1ed88c44cdb89fc2bdd68677ca4966ed2a0337fa Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 21:25:49 +0000
+Subject: [PATCH 73/73] resolve: a macro body only sees locals declared before
+ the macro's definition
+
+A `macro_rules!` body resolves its identifiers in the scope of the
+macro's definition. mrustc modelled this with hygiene contexts alone:
+a body identifier could see any local whose context is an ancestor of
+its own, and every local written directly in the enclosing function
+shares that context, whether it was declared before the `macro_rules!`
+item or in the arm that invokes the macro. simd-json 0.18.1
+(src/stage2.rs) has
+
+    let mut c: u8 = 0;
+    ...
+    macro_rules! object_continue { () => {{ update_char!(); match c { b',' => .. } }} }
+    ...
+    StackState::Object { last_start: l, cnt: c } => { ..; object_continue!(); }
+
+and the body's `c` resolved to the arm's `cnt: c` (a usize):
+
+    MACRO<..::object_continue> error:0: Failed to find an impl of
+        ::"core-0_0_0"::cmp::PartialEq<u8,> for usize
+
+Record where each `macro_rules!` is defined, tag every expansion's
+body hygiene with that position, and keep the declaration position of
+each local. When a body identifier can only see a local through an
+ancestor context, a local declared definitely later than the
+definition (same file, later position) is skipped. Everything parsed
+from one expansion reports its invocation's position, so an equal
+position (a macro defined inside an expansion using that expansion's
+locals) or another file keeps the previous behaviour. An exact hygiene
+match (0ab65260) is untouched, and macros deserialised from other
+crates record no position, so they resolve as before.
+
+The data lives in a side table keyed by hygiene (macro_rules/def_site.hpp)
+rather than in `Ident::Hygiene` itself, so the HIR format and the
+widely included headers are unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/macro_rules/def_site.hpp | 27 ++++++++++++++
+ src/macro_rules/eval.cpp     | 72 +++++++++++++++++++++++++++++++++++-
+ src/macro_rules/mod.cpp      |  2 +
+ src/macro_rules/parse.cpp    |  2 +
+ src/resolve/absolute.cpp     | 26 +++++++++----
+ 5 files changed, 121 insertions(+), 8 deletions(-)
+ create mode 100644 src/macro_rules/def_site.hpp
+
+diff --git a/src/macro_rules/def_site.hpp b/src/macro_rules/def_site.hpp
+new file mode 100644
+index 00000000..a7734bb4
+--- /dev/null
++++ b/src/macro_rules/def_site.hpp
+@@ -0,0 +1,27 @@
++/*
++ * MRustC - Rust Compiler
++ * - By John Hodge (Mutabah/thePowersGang)
++ *
++ * macro_rules/def_site.hpp
++ * - Definition-site scoping of the locals a `macro_rules!` body can see
++ *
++ * A macro body's identifiers are resolved in the scope of the macro's *definition*: a local that is in scope at the
++ * invocation but was declared after the `macro_rules!` item (e.g. a pattern binding in the arm that invokes the macro)
++ * must not be found. Hygiene contexts alone can't tell the two apart (both locals carry the enclosing function's
++ * context), so the definition position is recorded per expansion and compared with each local's declaration position.
++ */
++#pragma once
++#include <ident.hpp>
++#include <span.hpp>
++
++class MacroRules;
++
++/// Record where `rules` was defined (called when the `macro_rules!` item is parsed)
++extern void Macro_SetDefinitionSpan(const MacroRules& rules, const Span& sp);
++/// Drop the record for a destroyed `MacroRules`
++extern void Macro_ForgetDefinitionSpan(const MacroRules& rules);
++/// Record that tokens with hygiene `body_hygiene` come from the body of a macro defined at `def_sp` (no-op if unknown)
++extern void Macro_SetBodyDefinitionSite(const Ident::Hygiene& body_hygiene, const MacroRules& rules);
++/// Can an identifier with hygiene `use_ctx` see a local declared at `local_sp`?
++/// - True unless `use_ctx` is a known macro body and the local was declared at or after the macro's definition
++extern bool Macro_BodyCanSeeLocal(const Ident::Hygiene& use_ctx, const Span& local_sp);
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 469dbd12..96307bd8 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -11,11 +11,77 @@
+ #include <parse/ttstream.hpp>
+ #include <parse/common.hpp>
+ #include <limits.h>
++#include <map>
+ #include "pattern_checks.hpp"
+ #include <parse/interpolated_fragment.hpp>
+ #include <ast/expr.hpp>
+ #include <ast/crate.hpp>
+ #include <hir/hir.hpp>  // HIR::Crate
++#include "def_site.hpp"
++
++// --- Definition-site scoping of macro bodies (see def_site.hpp)
++namespace {
++    struct DefPos {
++        RcString    file;
++        unsigned int    line;
++        unsigned int    ofs;
++    };
++    ::std::map<const MacroRules*, Span>   g_macro_def_spans;
++    ::std::map<Ident::Hygiene, DefPos>   g_body_def_pos;
++    /// Source position of the outermost file span behind `sp`, if there is one
++    bool get_file_pos(const Span& sp, DefPos& out)
++    {
++        const Span* top = &sp;
++        while( top->get() && (*top)->parent_span != Span() ) {
++            top = &(*top)->parent_span;
++        }
++        if( const auto* ts = dynamic_cast<const SpanInner_Source*>(top->get()) ) {
++            if( ts->filename == "" )
++                return false;
++            out.file = ts->filename;
++            out.line = ts->start_line;
++            out.ofs = ts->start_ofs;
++            return true;
++        }
++        return false;
++    }
++}
++void Macro_SetDefinitionSpan(const MacroRules& rules, const Span& sp)
++{
++    g_macro_def_spans[&rules] = sp;
++}
++void Macro_ForgetDefinitionSpan(const MacroRules& rules)
++{
++    g_macro_def_spans.erase(&rules);
++}
++void Macro_SetBodyDefinitionSite(const Ident::Hygiene& body_hygiene, const MacroRules& rules)
++{
++    auto it = g_macro_def_spans.find(&rules);
++    if( it == g_macro_def_spans.end() )
++        return ;
++    DefPos  dp;
++    if( get_file_pos(it->second, dp) ) {
++        g_body_def_pos[body_hygiene] = dp;
++    }
++}
++bool Macro_BodyCanSeeLocal(const Ident::Hygiene& use_ctx, const Span& local_sp)
++{
++    auto it = g_body_def_pos.find(use_ctx);
++    if( it == g_body_def_pos.end() )
++        return true;
++    DefPos  lp;
++    if( !get_file_pos(local_sp, lp) )
++        return true;
++    // Positions are those of the outermost file span, so everything parsed from one macro expansion shares its
++    // invocation's position. Only a local that is definitely later (same file, later position) is hidden; an
++    // equal position or another file can't be ordered and keeps the previous behaviour.
++    const auto& dp = it->second;
++    if( lp.file != dp.file )
++        return true;
++    if( lp.line == dp.line && lp.ofs == dp.ofs )
++        return true;
++    return lp.line < dp.line || (lp.line == dp.line && lp.ofs < dp.ofs);
++}
+ 
+  // Map of: LoopIndex=>(Path=>Count)
+ typedef std::map<unsigned, std::map< std::vector<unsigned>, unsigned > >    loop_counts_t;
+@@ -513,6 +579,8 @@ public:
+ 
+     Position getPosition() const override;
+     Span outerSpan() const override { return m_invocation_span; }
++    /// Hygiene given to the tokens of the macro body
++    const Ident::Hygiene& body_hygiene() const { return m_hygiene; }
+     Ident::Hygiene realGetHygiene() const override;
+     AST::Edition realGetEdition() const override;
+     Token realGetToken() override;
+@@ -633,10 +701,12 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+     // Run through the expansion counting the number of times each fragment is used
+     Macro_InvokeRules_CountSubstUses(bound_tts, rule.m_contents);
+ 
+-    TokenStream* ret_ptr = new MacroExpander(
++    auto* ret_ptr = new MacroExpander(
+         name, sp, crate.m_edition, rules.m_is_macro_item, rules.m_hygiene, rule.m_contents, mv$(bound_tts), rules.m_source_crate == "" ? crate.m_crate_name_real : rules.m_source_crate,
+         rules.m_edition
+         );
++    // The body's identifiers resolve as if written at the macro's definition (see def_site.hpp)
++    Macro_SetBodyDefinitionSite(ret_ptr->body_hygiene(), rules);
+ 
+     return ::std::unique_ptr<TokenStream>( ret_ptr );
+ }
+diff --git a/src/macro_rules/mod.cpp b/src/macro_rules/mod.cpp
+index e5372c7d..b1fd1c60 100644
+--- a/src/macro_rules/mod.cpp
++++ b/src/macro_rules/mod.cpp
+@@ -13,6 +13,7 @@
+ #include <limits.h>
+ 
+ #include "pattern_checks.hpp"
++#include "def_site.hpp"
+ 
+ bool is_token_path(eTokenType tt) {
+     switch(tt)
+@@ -298,6 +299,7 @@ MacroRulesPtr::~MacroRulesPtr()
+ 
+ MacroRules::~MacroRules()
+ {
++    Macro_ForgetDefinitionSpan(*this);
+ }
+ MacroRulesArm::~MacroRulesArm()
+ {
+diff --git a/src/macro_rules/parse.cpp b/src/macro_rules/parse.cpp
+index 5552c220..a1a03067 100644
+--- a/src/macro_rules/parse.cpp
++++ b/src/macro_rules/parse.cpp
+@@ -7,6 +7,7 @@
+  */
+ #include <common.hpp>
+ #include "../parse/common.hpp"
++#include "def_site.hpp"
+ #include "../parse/parseerror.hpp"
+ #include "macro_rules.hpp"
+ #include "pattern_checks.hpp"
+@@ -624,6 +625,7 @@ namespace {
+         auto s = lex.point_span();
+         auto rv = MacroRulesPtr(new MacroRules( s->crate_name(), lex.get_edition() ));
+         rv->m_hygiene = lex.get_hygiene();
++        Macro_SetDefinitionSpan(*rv, s);
+         return rv;
+     }
+ }
+diff --git a/src/resolve/absolute.cpp b/src/resolve/absolute.cpp
+index 7df46bf2..67c72352 100644
+--- a/src/resolve/absolute.cpp
++++ b/src/resolve/absolute.cpp
+@@ -16,6 +16,7 @@
+ #include <ast/expr.hpp>
+ #include <main_bindings.hpp>
+ #include <hir/hir.hpp>
++#include <macro_rules/def_site.hpp>
+ 
+ #define FLAG_CONST_GENERIC  (1u << 31)
+ 
+@@ -70,6 +71,8 @@ namespace
+             unsigned int level;
+             // "Map" of names to function-level variable slots
+             ::std::vector< ::std::pair<Ident, unsigned int> > variables;
++            // Declaration position of each entry of `variables` (for definition-site scoping of macro bodies)
++            ::std::vector<Span> var_spans;
+             }),
+         (Generic, struct {
+             // Map of names to slots
+@@ -287,6 +290,7 @@ namespace
+                 auto& vb = m_name_context.back().as_VarBlock();
+                 assert(vb.level == m_block_level);
+                 vb.variables.push_back( ::std::make_pair(mv$(name), m_var_count) );
++                vb.var_spans.push_back( sp );
+                 m_var_count += 1;
+                 assert( m_var_count >= vb.variables.size() );
+                 return m_var_count - 1;
+@@ -719,19 +723,27 @@ namespace
+                         // ignore
+                     }
+                     else {
+-                        for( auto it2 = e.variables.rbegin(); it2 != e.variables.rend(); ++ it2 )
++                        for( size_t i = e.variables.size(); i -- > 0; )
+                         {
+-                            if( it2->first.name != name ) {
++                            const auto& var = e.variables[i];
++                            if( var.first.name != name ) {
+                                 continue ;
+                             }
+-                            DEBUG("> Match: Hygiene " << it2->first.hygiene << " check against src_context");
+-                            if( it2->first.hygiene == src_context ) {
++                            DEBUG("> Match: Hygiene " << var.first.hygiene << " check against src_context");
++                            if( var.first.hygiene == src_context ) {
+                                 ::AST::Path rv(name);
+-                                rv.bind_variable( it2->second );
++                                rv.bind_variable( var.second );
+                                 return rv;
+                             }
+-                            if( fallback_var == ~0u && it2->first.hygiene.is_visible(src_context) ) {
+-                                fallback_var = it2->second;
++                            if( fallback_var == ~0u && var.first.hygiene.is_visible(src_context) ) {
++                                // A macro body only sees locals declared before the macro's definition: a binding made
++                                // at the invocation (e.g. `StackState::Object { cnt: c } => { object_continue!() }` with
++                                // the body's `c` meaning the function's `let mut c: u8` - simd-json 0.18.1) is skipped
++                                if( i < e.var_spans.size() && !Macro_BodyCanSeeLocal(src_context, e.var_spans[i]) ) {
++                                    DEBUG("> Declared after the macro's definition, not visible to its body");
++                                    continue ;
++                                }
++                                fallback_var = var.second;
+                             }
+                         }
+                     }

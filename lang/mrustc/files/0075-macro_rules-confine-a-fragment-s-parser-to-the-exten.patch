@@ -1,0 +1,159 @@
+From 2a6dad8d9e40a08dbaf26e5be179b30403bee78b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 5 Oct 2026 22:32:25 +0000
+Subject: [PATCH 75/75] macro_rules: confine a fragment's parser to the extent
+ the matcher gave it
+
+yansi 1.0.1 src/condition.rs:319 `conditions! { feature = "detect-tty" is_tty(..), A: a, B: b, ... }`
+with the pattern `$feat:meta $($f:expr, ...),*` failed with "Unexpected token TOK_COMMA".
+
+Arm selection runs the speculative consumers (`consume_from_frag`), which stop a `meta`
+after `feature = "detect-tty"`, so the arm matches. The captures are then parsed with
+the real parsers from the same input stream, and `Parse_MetaItem`'s `name = ...` arm is
+deliberately greedy (an attribute value may be `concat!(..)` and the like): it swallows
+token trees until `,` / `;` / a closing delimiter, taking `is_tty(..)` with it. The next
+fragment, `$f:expr`, then started on the comma.
+
+Make the matcher's decision authoritative: record how many tokens each fragment consumed
+while matching, and parse each capture through a `FragmentTokenStream` view of the input
+that reports EOF at that boundary. A fragment that starts on the second half of a split
+token (`>` of `>>`, which the read-only stream fakes without counting) is credited that
+token, since the real parser puts the half back as a token of its own; a half left behind
+by the parser at the end is handed back the same way. Any larger leftover is now an error
+instead of a silent desync (or, for the last fragment, silently dropped input).
+
+Checked: the yansi shape; `$m:meta` before an ident, inside a `,*` loop, nested
+`cfg_attr(test, doc = "a")`, and as the last fragment; `Vec<$t:ty>` with `Vec<Vec<u8>>`;
+`$a:ty, $b:ty`; `$t:ty $r:tt` with the `tt` being the second half of `>>`; `$v:vis` matching
+nothing; `$e:expr $i:ident`; `$b:block`. Battery 24/24.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/macro_rules/eval.cpp | 69 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 96307bd8..37a9dd5a 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -845,6 +845,46 @@ namespace
+         size_t position() const {
+             return m_consume_count;
+         }
++        /// True if the next token is the second half of a split token (e.g. `>` from `>>`), which `position` doesn't count
++        bool has_faked_next() const {
++            return m_faked_next.type() != TOK_NULL;
++        }
++    };
++
++    /// A view of `inner` that ends (returns TOK_EOF) after `limit` tokens.
++    ///
++    /// The arm matcher decides where a fragment ends; the fragment's real parser is then confined to that extent so
++    /// a greedy parser (e.g. `Parse_MetaItem`'s `name = tokens...` arm) can't swallow the input that follows the fragment.
++    class FragmentTokenStream:
++        public TokenStream
++    {
++        TokenStream&    m_inner;
++        Span    m_parent_span;
++        size_t  m_remaining;
++        Position    m_last_pos;
++    public:
++        FragmentTokenStream(Span parent, TokenStream& inner, size_t limit):
++            TokenStream(inner.parse_state()),
++            m_inner(inner),
++            m_parent_span(parent),
++            m_remaining(limit)
++        {
++        }
++
++        Position getPosition() const override { return m_last_pos; }
++        Span outerSpan() const override { return m_parent_span; }
++    protected:
++        AST::Edition realGetEdition() const override { return m_inner.get_edition(); }
++        Ident::Hygiene realGetHygiene() const override { return m_inner.get_hygiene(); }
++        Token realGetToken() override {
++            if( m_remaining == 0 ) {
++                return Token(TOK_EOF);
++            }
++            m_remaining --;
++            auto tok = m_inner.getToken();
++            m_last_pos = tok.get_pos();
++            return tok;
++        }
+     };
+     bool consume_type(TokenStreamRO& lex);
+ 
+@@ -2106,11 +2146,13 @@ unsigned int Macro_InvokeRules_MatchPattern(const Span& sp, const MacroRules& ru
+     ASSERT_BUG(sp, rules.m_rules.size() > 0, "Empty macro_rules set");
+ 
+     ::std::vector< ::std::pair<size_t, ::std::vector<bool>> >    matches;
++    ::std::vector< ::std::vector<size_t> >  match_frag_lens;   // Token count of each fragment, in match order
+     ::std::vector< std::pair<size_t, eTokenType> >  fail_pos;
+     for(size_t i = 0; i < rules.m_rules.size(); i ++)
+     {
+         auto lex = TokenStreamRO(input);
+         auto arm_stream = MacroPatternStream(rules.m_rules[i].m_pattern);
++        ::std::vector<size_t>   frag_lens;
+ 
+         bool fail = false;
+         for(;;)
+@@ -2171,11 +2213,15 @@ unsigned int Macro_InvokeRules_MatchPattern(const Span& sp, const MacroRules& ru
+             else if( const auto* e = pat.opt_ExpectPat() )
+             {
+                 DEBUG("Arm " << i << " @" << pos << " ExpectPat(" << e->type << " => $" << e->idx << ")");
++                // A pending split-token half (`>` of `>>`) isn't counted by `position`, but the real parser will have
++                // put it back into the stream as a token of its own, so count it towards this fragment.
++                size_t start = lex.position() - (lex.has_faked_next() ? 1 : 0);
+                 if( !consume_from_frag(lex, e->type) )
+                 {
+                     fail = true;
+                     break;
+                 }
++                frag_lens.push_back( lex.position() - start );
+             }
+             else
+             {
+@@ -2187,6 +2233,7 @@ unsigned int Macro_InvokeRules_MatchPattern(const Span& sp, const MacroRules& ru
+         if( ! fail )
+         {
+             matches.push_back( ::std::make_pair(i, arm_stream.take_history()) );
++            match_frag_lens.push_back( mv$(frag_lens) );
+             DEBUG(i << " MATCHED");
+         }
+         else
+@@ -2209,6 +2256,8 @@ unsigned int Macro_InvokeRules_MatchPattern(const Span& sp, const MacroRules& ru
+         // NOTE: There can be multiple arms active, take the first.
+         auto i = matches[0].first;
+         const auto& history = matches[0].second;
++        const auto& frag_lens = match_frag_lens[0];
++        size_t frag_idx = 0;
+         DEBUG("Evalulating arm " << i);
+ 
+         auto lex = TTStreamO(sp, ParseState(), mv$(input));
+@@ -2250,7 +2299,25 @@ unsigned int Macro_InvokeRules_MatchPattern(const Span& sp, const MacroRules& ru
+             {
+                 DEBUG(i << " ExpectPat(" << e->type << " => $" << e->idx << ")");
+ 
+-                auto cap = Macro_HandlePatternCap(lex, e->type);
++                ASSERT_BUG(sp, frag_idx < frag_lens.size(), "More fragments captured than matched");
++                size_t frag_len = frag_lens[frag_idx++];
++                DEBUG("- " << frag_len << " tokens");
++                FragmentTokenStream frag_lex(sp, lex, frag_len);
++                auto cap = Macro_HandlePatternCap(frag_lex, e->type);
++                // The parser may leave the second half of a split token (`>` of `>>`) - hand it back. Anything more
++                // means it stopped short of where the matcher said the fragment ends.
++                ::std::vector<Token>    leftover;
++                while( frag_lex.lookahead(0) != TOK_EOF ) {
++                    leftover.push_back( frag_lex.getToken() );
++                }
++                if( leftover.size() > 1 ) {
++                    ERROR(sp, E0000, "Parsing the `" << e->type << "` fragment for $" << e->idx << " stopped " << leftover.size()
++                        << " tokens before where it was matched to end, at " << leftover.front());
++                }
++                if( leftover.size() == 1 ) {
++                    DEBUG("- Returning " << leftover.front() << " to the input");
++                    lex.putback( mv$(leftover.front()) );
++                }
+ 
+                 unsigned int cap_idx = captures.size();
+                 captures.push_back( mv$(cap) );
