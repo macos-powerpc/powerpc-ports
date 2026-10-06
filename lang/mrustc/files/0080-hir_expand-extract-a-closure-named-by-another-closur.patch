@@ -1,0 +1,138 @@
+From d5dd839035513903ab8f2a939de20eb4f72011d7 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 00:50:57 +0000
+Subject: [PATCH 80/80] hir_expand: extract a closure named by another
+ closure's types before that closure
+
+addr2line 0.25.1 src/unit.rs `ResUnit::dwarf_and_unit`, which returns
+`LookupResult<SimpleLookup<.., R, impl FnOnce(..) -> ..>>`:
+
+    let complete = |dwo| SimpleLookup::new_complete(map_dwo(dwo));
+    if let Some(dwo) = self.dwo.get() {
+        return complete(dwo);
+    }
+    ...
+    SimpleLookup::new_needs_load(.., move |dwo_dwarf| map_dwo(..))
+
+    unit.rs:55:34 error:0: Type mismatch
+     - LookupResult<SimpleLookup<Result<..>, R, closure#I_dwarf_and_unit_32<'M0,'M1,R>>>
+    != LookupResult<SimpleLookup<Result<..>, R, ::>>
+
+`complete`'s `F` is the `impl FnOnce` return type, so typecheck gives it the type of
+the closure on the last line. Closures are extracted in post-order, so when
+`complete` was extracted that later closure had no path yet. Rewriting `complete`'s
+signature and body replaced its node type with the empty `m_obj_path_base` (and
+a null struct pointer). Paths can't be assigned up front because each closure's
+generic list is built from the generics it actually uses.
+
+Before extracting a closure, scan its argument/return types, its body and its
+locals' and captures' types for closures from the same item that haven't been
+extracted yet, and extract those first. Closures whose extraction has already
+started (this one and its enclosing closures) are skipped, so a cycle falls back to
+the old behavior.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_expand/closures.cpp | 66 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/src/hir_expand/closures.cpp b/src/hir_expand/closures.cpp
+index 6852e630..a710b83a 100644
+--- a/src/hir_expand/closures.cpp
++++ b/src/hir_expand/closures.cpp
+@@ -688,6 +688,11 @@ namespace {
+         OutState&   m_out;
+         const char* m_new_type_suffix;
+ 
++        // Closures in this item's expression tree
++        ::std::set<const ::HIR::ExprNode_Closure*>  m_item_closures;
++        // Closures whose extraction has started (the current one and its enclosing closures)
++        ::std::vector<const ::HIR::ExprNode_Closure*>   m_closures_in_progress;
++
+     public:
+         ExprVisitor_Extract(const StaticTraitResolve& resolve, const ::HIR::TypeRef* self_type, const ::std::vector< ::HIR::TypeRef>& var_types, const ::HIR::ExprPtr& expr_ptr, OutState& out, const char* new_type_suffix):
+             m_resolve(resolve),
+@@ -701,6 +706,16 @@ namespace {
+ 
+         void visit_root(::HIR::ExprNode& root)
+         {
++            struct V: public ::HIR::ExprVisitorDef {
++                ::std::set<const ::HIR::ExprNode_Closure*>& out;
++                V(::std::set<const ::HIR::ExprNode_Closure*>& out): out(out) {}
++                void visit(::HIR::ExprNode_Closure& node) override {
++                    out.insert(&node);
++                    ::HIR::ExprVisitorDef::visit(node);
++                }
++            } v { m_item_closures };
++            root.visit(v);
++
+             root.visit(*this);
+         }
+ 
+@@ -1008,6 +1023,49 @@ namespace {
+                 throw "";
+             }
+         };
++        /// A closure's types can name a closure that would only be extracted after it: addr2line 0.25.1 unit.rs
++        /// `dwarf_and_unit`, where `complete` returns `SimpleLookup<.., F>` with `F` the function's `impl FnOnce`
++        /// return type, defined by a later closure. Extract those first, so that their paths are known when this
++        /// closure's types are rewritten (otherwise they become an empty path).
++        void extract_named_closures(::HIR::ExprNode_Closure& node)
++        {
++            ::std::vector<const ::HIR::ExprNode_Closure*>   found;
++            t_cb_visit_ty   cb = [&](const ::HIR::TypeRef& ty)->bool {
++                if( const auto* nt = ty.data().opt_NodeType() ) {
++                    if( const auto* cp = nt->opt_Closure() ) {
++                        const auto* c = *cp;
++                        if( c->m_code && c->m_obj_path == ::HIR::GenericPath() && m_item_closures.count(c)
++                            && ::std::find(m_closures_in_progress.begin(), m_closures_in_progress.end(), c) == m_closures_in_progress.end()
++                            && ::std::find(found.begin(), found.end(), c) == found.end() )
++                        {
++                            found.push_back(c);
++                        }
++                    }
++                }
++                return false;
++                };
++            struct V: public ::HIR::ExprVisitorDef {
++                const t_cb_visit_ty& cb;
++                V(const t_cb_visit_ty& cb): cb(cb) {}
++                void visit_type(::HIR::TypeRef& ty) override {
++                    visit_ty_with(ty, cb);
++                }
++            } v { cb };
++            v.::HIR::ExprVisitorDef::visit(node);
++            for(const auto idx : node.m_avu_cache.local_vars)
++                visit_ty_with(m_variable_types.at(idx), cb);
++            for(const auto& binding : node.m_avu_cache.captured_vars)
++                visit_ty_with(m_variable_types.at(binding.root_slot), cb);
++
++            for(const auto* c : found)
++            {
++                if( c->m_code ) {
++                    DEBUG("Extracting " << c->m_res_type << " first, as it's named by " << node.m_res_type);
++                    this->visit(const_cast<::HIR::ExprNode_Closure&>(*c));
++                }
++            }
++        }
++
+         Monomorph create_params(const Span& sp, const StaticTraitResolve& resolve, ::HIR::GenericParams& params, ::HIR::PathParams& constructor_path_params) const
+         {
+             // TODO: How to get the bounds?
+@@ -1032,8 +1090,16 @@ namespace {
+ 
+             ASSERT_BUG(sp, node.m_obj_path == ::HIR::GenericPath(), "Closure path already set? " << node.m_obj_path);
+ 
++            struct InProgress {
++                ::std::vector<const ::HIR::ExprNode_Closure*>& list;
++                InProgress(::std::vector<const ::HIR::ExprNode_Closure*>& list, const ::HIR::ExprNode_Closure* n): list(list) { list.push_back(n); }
++                ~InProgress() { list.pop_back(); }
++            } in_progress(m_closures_in_progress, &node);
++
+             ::HIR::ExprVisitorDef::visit(node);
+ 
++            extract_named_closures(node);
++
+             // --- Extract and mutate code into a trait impl on the closure type ---
+ 
+             // TODO: Fix up lifetimes somehow

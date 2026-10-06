@@ -1,0 +1,156 @@
+From b666ed36240ef5736faab8b1b1ca2235bcdca8d2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 00:40:45 +0000
+Subject: [PATCH 79/80] mir: a borrow into the middle of a static is a borrow
+ of the field or element there
+
+rug 1.28.1 src/integer/big.rs `Integer::ONE`:
+
+    pub const ONE: &'static Integer = {
+        const MINI: MiniInteger = MiniInteger::const_from_bool(true);
+        const BORROW: BorrowInteger = MINI.borrow();
+        BorrowInteger::const_deref(&BORROW)
+    };
+
+    MIR ERROR: ::rug::lifted#C_21 BB0/0: src/mir/cleanup.cpp:461 ASSERT ofs == 0 failed
+    - TODO: Support offset pointers in borrows - +0xc
+
+`MiniInteger::borrow` points `mpz_t::d` at `self.limbs`, so the evaluated `BORROW`
+holds a pointer 0xc bytes (0x10 on 64-bit) into the static that holds `MINI`. Constant
+evaluation and static emission already handle that offset (`(uintptr_t)&sym+12`).
+When MIR cleanup turned the constant back into MIR for a body that uses it (here the
+lifted `&BORROW`), `MIR_Cleanup_LiteralToRValue` only accepted pointers to the start of
+a static.
+
+For a thin pointer, walk from the static's type to the struct/tuple field or array
+element starting at that offset (using the same `Target_GetTypeRepr` layout that
+produced the offset) and borrow that place through the static's address, so the
+result is `&(*&STATIC).1[0]` and not integer arithmetic, which constant evaluation
+can't follow. A type mismatch at the end gets the same pointer casts as before.
+An offset that lands inside a primitive, enum or union, or a slice or trait-object
+pointer with an offset, still reports a TODO.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/mir/cleanup.cpp | 85 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/src/mir/cleanup.cpp b/src/mir/cleanup.cpp
+index 0d4d59b8..241e4916 100644
+--- a/src/mir/cleanup.cpp
++++ b/src/mir/cleanup.cpp
+@@ -181,6 +181,57 @@ namespace {
+             : ::HIR::Path(mv$(ty), trait.m_path.clone(), rcstring_vtable);
+         return ::MIR::Constant::make_ItemAddr(box$(vtable_path));
+     }
++
++    /// Descend from `lv` (of type `ty`) to the struct/tuple field or array element that starts `ofs` bytes in.
++    /// Returns false if the offset doesn't land on the start of one.
++    bool place_at_offset(const ::MIR::TypeResolve& state, MirMutator& mutator, ::MIR::LValue& lv, ::HIR::TypeRef& ty, size_t ofs)
++    {
++        while( ofs > 0 )
++        {
++            if( const auto* te = ty.data().opt_Array() )
++            {
++                size_t size = 0;
++                if( !te->size.is_Known() || !Target_GetSizeOf(state.sp, state.m_resolve, te->inner, size) || size == 0 )
++                    return false;
++                size_t idx = ofs / size;
++                if( idx >= te->size.as_Known() )
++                    return false;
++                auto idx_lv = mutator.in_temporary( ::HIR::CoreType::Usize, ::MIR::Constant::make_Uint({ U128(idx), ::HIR::CoreType::Usize }) );
++                lv = ::MIR::LValue::new_Index(mv$(lv), idx_lv.as_Local());
++                ofs -= idx * size;
++                auto inner = te->inner.clone();
++                ty = mv$(inner);
++            }
++            else if( ty.data().is_Tuple() || TU_TEST1(ty.data(), Path, .binding.is_Struct()) )
++            {
++                const auto* repr = Target_GetTypeRepr(state.sp, state.m_resolve, ty);
++                if( !repr )
++                    return false;
++                const TypeRepr::Field* fld = nullptr;
++                unsigned idx = 0;
++                for(const auto& f : repr->fields)
++                {
++                    size_t size = 0;
++                    if( Target_GetSizeOf(state.sp, state.m_resolve, f.ty, size) && f.offset <= ofs && ofs < f.offset + size ) {
++                        fld = &f;
++                        break;
++                    }
++                    idx ++;
++                }
++                if( !fld )
++                    return false;
++                lv = ::MIR::LValue::new_Field(mv$(lv), idx);
++                ofs -= fld->offset;
++                auto inner = fld->ty.clone();
++                ty = mv$(inner);
++            }
++            else
++            {
++                return false;
++            }
++        }
++        return true;
++    }
+ }
+ 
+ ::MIR::RValue MIR_Cleanup_LiteralToRValue(const ::MIR::TypeResolve& state, MirMutator& mutator, EncodedLiteralSlice lit, ::HIR::TypeRef ty, const MonomorphState& params, ::HIR::Path path)
+@@ -458,7 +509,6 @@ namespace {
+ 
+         if(data_reloc->p)
+         {
+-            MIR_ASSERT(state, ofs == 0, "TODO: Support offset pointers in borrows - +0x" << std::hex << ofs);
+             const auto& path = *data_reloc->p;
+             auto ptr_val = ::MIR::Constant::make_ItemAddr(box$(params.monomorph_path(state.sp, path)));
+             DEBUG("ptr_val = " << ptr_val);
+@@ -467,23 +517,40 @@ namespace {
+ 
+             // Get the metadata type (for !Sized wrapper types)
+             auto meta_ty = state.m_resolve.metadata_type(state.sp, te.inner);
++            MIR_ASSERT(state, ofs == 0 || meta_ty == MetadataType::None, "TODO: Support offset pointers in borrows - +0x" << std::hex << ofs);
+             switch(meta_ty)
+             {
+-            case MetadataType::None:
++            case MetadataType::None: {
++                // The borrowed object: the static itself, or (for a pointer into the middle of it) the field/element
++                // starting at that offset - rug 1.28.1 `Integer::ONE`, where `MiniInteger::borrow` in a const points
++                // `mpz_t::d` at the `limbs` field of another const's static.
++                ::HIR::TypeRef  obj_ty = src_ty.clone();
++                ::MIR::RValue   obj_ref_val;
++                if( ofs != 0 ) {
++                    auto obj_lv = ::MIR::LValue::new_Deref( mutator.in_temporary(::HIR::TypeRef::new_borrow(te.type, src_ty.clone()), mv$(ptr_val)) );
++                    MIR_ASSERT(state, place_at_offset(state, mutator, obj_lv, obj_ty, ofs.truncate_u64()),
++                        "TODO: Pointer to +0x" << std::hex << ofs << std::dec << " in " << src_ty << " isn't to a field or array element");
++                    DEBUG("+0x" << std::hex << ofs << std::dec << " = " << obj_lv << " : " << obj_ty);
++                    obj_ref_val = ::MIR::RValue::make_Borrow({ te.type, false, mv$(obj_lv) });
++                }
++                else {
++                    obj_ref_val = ::MIR::RValue( mv$(ptr_val) );
++                }
+                 // TODO: What if the type doesn't match? Emit a `_Cast foo as &Bar`?
+-                if( src_ty != te.inner ) {
+-                    auto src_ty_ref = mutator.in_temporary( ::HIR::TypeRef::new_borrow(te.type, src_ty.clone()), mv$(ptr_val) );
+-                    auto src_ty_ptr = mutator.in_temporary(
+-                        ::HIR::TypeRef::new_pointer(te.type, src_ty.clone()),
+-                        ::MIR::RValue::make_Cast({ mv$(src_ty_ref), ::HIR::TypeRef::new_pointer(te.type, src_ty.clone()) })
++                if( obj_ty != te.inner ) {
++                    auto obj_ty_ref = mutator.in_temporary( ::HIR::TypeRef::new_borrow(te.type, obj_ty.clone()), mv$(obj_ref_val) );
++                    auto obj_ty_ptr = mutator.in_temporary(
++                        ::HIR::TypeRef::new_pointer(te.type, obj_ty.clone()),
++                        ::MIR::RValue::make_Cast({ mv$(obj_ty_ref), ::HIR::TypeRef::new_pointer(te.type, obj_ty.clone()) })
+                     );
+                     auto inner_lval = mutator.in_temporary(
+                         ::HIR::TypeRef::new_pointer(te.type, te.inner.clone()),
+-                        ::MIR::RValue::make_Cast({ mv$(src_ty_ptr), ::HIR::TypeRef::new_pointer(te.type, te.inner.clone()) })
++                        ::MIR::RValue::make_Cast({ mv$(obj_ty_ptr), ::HIR::TypeRef::new_pointer(te.type, te.inner.clone()) })
+                     );
+                     return ::MIR::RValue::make_Borrow({ te.type, false, MIR::LValue::new_Deref(mv$(inner_lval)) });
+                 }
+-                return mv$(ptr_val);
++                return obj_ref_val;
++                }
+             case MetadataType::Slice: {
+                 MIR_ASSERT(state, src_ty.data().is_Array(), "BorrowOf returning slice not of an array, instead " << src_ty);
+                 const auto& te = src_ty.data().as_Array();

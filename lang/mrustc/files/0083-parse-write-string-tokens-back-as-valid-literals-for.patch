@@ -1,0 +1,122 @@
+From b2444dda9f8ae06a26a1f2dd336030f6d24ebe92 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 02:13:13 +0000
+Subject: [PATCH 83/83] parse: write string tokens back as valid literals for
+ proc macro input
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+kalk 3.2.3 src/calculation_result.rs, `#[wasm_bindgen] impl CalculationResult`
+containing `format!("{}{}≈ {}", vars_display, equation_variable, value)`:
+
+    terminate called after throwing an instance of 'std::runtime_error'
+      what():  BUGCHECK: Bad unicode codepoint encountered - ffffffe2
+
+An attribute macro's input sends expression nodes as text (`DumpAST_Node`), and
+re-lexes it. A macro invocation in that text is written token by token with
+`Token::to_str`, whose `EscapedString` escaped every byte outside printable ASCII
+as `\u{..}` of that byte. With a signed `char` the lead byte of `≈` (E2 89 88)
+became `\u{ffffffe2}`, which the lexer can't encode. With an unsigned `char`
+the string would have silently become three different characters. This is
+upstream code and applies on every host.
+
+- `EscapedString`: walk the bytes as `unsigned char` and write bytes of multi-byte
+  UTF-8 characters as they are. Escapes stay for quotes, backslashes and controls.
+- Byte strings were written raw, so a quote, backslash or non-ASCII byte broke the
+  re-lex. Now `\"`, `\\`, `\n` and `\xNN` (new `EscapedByteString`).
+- `TOK_CHAR` lost its closing quote.
+- `operator<<(ostream&, Codepoint)` tested 4-byte characters against `(0x07+1)<<(2*6)`
+  instead of `3*6`, so printing anything above U+FFFF (e.g. in a lexer error)
+  threw the same BUGCHECK.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/parse/lex.cpp   |  2 +-
+ src/parse/token.cpp | 35 +++++++++++++++++++++++++++++++----
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index e68279ea..2099ac34 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -1337,7 +1337,7 @@ bool Codepoint::isxdigit() const {
+         os << (char)(0x80 | ((cp.v >>  6) & 0x3F));
+         os << (char)(0x80 | ((cp.v >>  0) & 0x3F));
+     }
+-    else if( cp.v < (0x07+1)<<(2*6) ) {
++    else if( cp.v < (0x07+1)<<(3*6) ) {
+         os << (char)(0xF0 | ((cp.v >> 18) & 0x07));
+         os << (char)(0x80 | ((cp.v >> 12) & 0x3F));
+         os << (char)(0x80 | ((cp.v >>  6) & 0x3F));
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 13bd05d7..65f3c11b 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -317,7 +317,10 @@ struct EscapedString {
+     EscapedString(const ::std::string& s): s(s) {}
+ 
+     friend ::std::ostream& operator<<(::std::ostream& os, const EscapedString& x) {
+-        for(auto b : x.s) {
++        // NOTE: This text is re-lexed when a macro invocation is handed to a proc macro (via `DumpAST_Node`), so it
++        // has to be a valid literal body. The value is UTF-8: bytes of multi-byte characters are written as-is
++        // (a per-byte `\u{..}` would change the text, and with a signed `char` gave `\u{ffffffe2}` for `≈` - kalk 3.2.3).
++        for(unsigned char b : x.s) {
+             switch(b)
+             {
+             case '"':
+@@ -329,11 +332,35 @@ struct EscapedString {
+             case '\n':
+                 os << "\\n";
+                 break;
++            default:
++                if( (' ' <= b && b < 0x7F) || b >= 0x80 )
++                    os << b;
++                else
++                    os << "\\u{" << ::std::hex << (unsigned int)b << ::std::dec << "}";
++                break;
++            }
++        }
++        return os;
++    }
++};
++/// Body of a byte string literal: arbitrary bytes, non-printable ones as `\xNN`
++struct EscapedByteString {
++    const ::std::string& s;
++    EscapedByteString(const ::std::string& s): s(s) {}
++
++    friend ::std::ostream& operator<<(::std::ostream& os, const EscapedByteString& x) {
++        static const char HEX[] = "0123456789abcdef";
++        for(unsigned char b : x.s) {
++            switch(b)
++            {
++            case '"':   os << "\\\"";   break;
++            case '\\':  os << "\\\\";   break;
++            case '\n':  os << "\\n";    break;
+             default:
+                 if( ' ' <= b && b < 0x7F )
+                     os << b;
+                 else
+-                    os << "\\u{" << ::std::hex << (unsigned int)b << "}";
++                    os << "\\x" << HEX[b >> 4] << HEX[b & 0xF];
+                 break;
+             }
+         }
+@@ -399,7 +426,7 @@ struct EscapedString {
+             return FMT(m_data.as_Integer().m_intval << "_" << coretype_name(m_data.as_Integer().m_datatype));
+         }
+         break; }
+-    case TOK_CHAR:      return FMT("'\\u{"<< ::std::hex << m_data.as_Integer().m_intval << "}");
++    case TOK_CHAR:      return FMT("'\\u{"<< ::std::hex << m_data.as_Integer().m_intval << "}'");
+     case TOK_FLOAT:
+         if( m_data.as_Float().m_datatype == CORETYPE_ANY ) {
+             return FMT(m_data.as_Float().m_floatval);
+@@ -409,7 +436,7 @@ struct EscapedString {
+         }
+     case TOK_STRING:    return FMT("\"" << EscapedString(m_data.as_String()) << "\"" << m_hygiene);
+     case TOK_CSTRING:   return FMT("c\"" << EscapedString(m_data.as_String()) << "\"" << m_hygiene);
+-    case TOK_BYTESTRING:return FMT("b\"" << m_data.as_String() << "\"");
++    case TOK_BYTESTRING:return FMT("b\"" << EscapedByteString(m_data.as_String()) << "\"");
+     case TOK_HASH:  return "#";
+     case TOK_UNDERSCORE:return "_";
+     // Symbols

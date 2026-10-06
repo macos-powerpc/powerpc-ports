@@ -1,0 +1,285 @@
+From 1b91ba2c9d5d0edb89adf26212130df412ba8617 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 17:43:02 +0000
+Subject: [PATCH 88/90] expand/trans: powerpc register operands for `asm!`
+
+`asm!` with register operands failed on powerpc and powerpc64 with "Unknown
+architecture for asm!", because `get_reg_class` only knew x86, x86_64 and
+riscv64. Operand-free `asm!("sync")` already worked.
+
+The register classes are the ones rustc 1.90 defines for PowerPC
+(rustc_target asm/powerpc.rs), with the gcc constraints rustc_codegen_gcc uses:
+`reg` -> "r", `reg_nonzero` -> "b", `freg` -> "f", `vreg` -> "v". `cr` and
+`xer` are clobber-only classes, so using one for a value is an error that asks
+for an explicit register, as in rustc.
+
+GCC's rs6000 backend is stricter than the x86 one about register names and
+about which C types fit in a register, so the C output needs some
+powerpc-only changes:
+- Explicit FPR operands: gcc only knows the FPRs as `frN` (powerpc-linux gcc
+  rejects `fN`), so `fN` is renamed. The register variable is a `double`
+  (gcc rejects a `uintptr_t` in an FPR) and the constraint is "f". Explicit
+  GPRs (`rN` or the bare number) are emitted as before.
+- A value in an explicit vector register is a MIR_TODO, because SIMD values
+  are plain structs in the C output. Vector registers as clobbers
+  (`out("v0") _`) work.
+- The dummy for `out(freg) _` / `out(vreg) _` is a `double` / 16-byte
+  vector, not a `uintptr_t` (gcc: "inconsistent operand constraints").
+- `out("cr") _` (the whole condition register) clobbers cr0-cr7, because gcc
+  only names the fields.
+- Without `options(preserves_flags)` the asm also clobbers "cc" (cr0), as
+  rustc_codegen_gcc does on every target.
+
+Nothing changes for other targets. For an x86_64 asm test crate (class and
+explicit operands, clobbers, intel syntax), the C is byte-identical to the
+previous binary's.
+
+Verified with a no_core powerpc-apple-darwin crate covering every class,
+explicit `r3`, `5`, `f1` and `fr4`, the cr/xer/cr0/v0 clobbers and the dummies.
+The emitted C compiles with powerpc-linux-gnu gcc 14 at -O0 and -O2. In the -O2
+disassembly each operand is in the register it names (`addi r3,r3,1`;
+`mr r5,r3` then `addi r5,r5,1`; `fadd f1,f1,f1`; `fadd f4,f4,f4`). The rules
+for register names and types were checked with the same gcc. Its extra
+register names (`frN`, `crN`, `xer`, `cc`) come from rs6000.h, which Linux and
+Darwin share. `in(cr) x` gives the clobber-only error and `in("v2") x` gives
+the MIR_TODO.
+
+rustc itself still gates `asm!` on powerpc behind `asm_experimental_arch`.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/expand/asm.cpp      |  14 ++++++
+ src/hir/asm.hpp         |  11 +++--
+ src/trans/codegen_c.cpp | 100 +++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 115 insertions(+), 10 deletions(-)
+
+diff --git a/src/expand/asm.cpp b/src/expand/asm.cpp
+index 95255cf4..e2063b95 100644
+--- a/src/expand/asm.cpp
++++ b/src/expand/asm.cpp
+@@ -226,6 +226,18 @@ namespace {
+         ERROR(sp, E0000, "Unknown register for riscv64 - `" << str << "`");
+     }
+ 
++    AsmCommon::RegisterClass get_reg_class_powerpc(const Span &sp, const RcString& str)
++    {
++        if(str == "reg"        )    return AsmCommon::RegisterClass::powerpc_reg;
++        if(str == "reg_nonzero")    return AsmCommon::RegisterClass::powerpc_reg_nonzero;
++        if(str == "freg"       )    return AsmCommon::RegisterClass::powerpc_freg;
++        if(str == "vreg"       )    return AsmCommon::RegisterClass::powerpc_vreg;
++        // `cr` and `xer` are clobber-only: rustc requires an explicit register (e.g. `out("cr0") _`)
++        if(str == "cr" || str == "xer")
++            ERROR(sp, E0000, "Register class `" << str << "` can only be used as a clobber, name an explicit register");
++        ERROR(sp, E0000, "Unknown register for powerpc - `" << str << "`");
++    }
++
+     AsmCommon::RegisterClass get_reg_class(const Span& sp, const RcString& str)
+     {
+         if(Target_GetCurSpec().m_arch.m_name == "x86_64")
+@@ -234,6 +246,8 @@ namespace {
+             return get_reg_class_x8664(sp, str);
+         if (Target_GetCurSpec().m_arch.m_name == "riscv64")
+             return get_reg_class_riscv(sp, str);
++        if (Target_GetCurSpec().m_arch.m_name == "powerpc" || Target_GetCurSpec().m_arch.m_name == "powerpc64")
++            return get_reg_class_powerpc(sp, str);
+         ERROR(sp, E0000, "Unknown architecture for asm!");
+     }
+ }
+diff --git a/src/hir/asm.hpp b/src/hir/asm.hpp
+index c5180220..e4a15b38 100644
+--- a/src/hir/asm.hpp
++++ b/src/hir/asm.hpp
+@@ -59,9 +59,10 @@ namespace AsmCommon {
+         
+         //hexagon_reg,
+         
+-        //powerpc_reg,
+-        //powerpc_reg_nonzero,
+-        //powerpc_freg,
++        powerpc_reg,
++        powerpc_reg_nonzero,
++        powerpc_freg,
++        powerpc_vreg,
+         
+         //wasm32_local,
+         
+@@ -108,6 +109,10 @@ namespace AsmCommon {
+         case RegisterClass::x86_kreg:   return "kreg";
+         case RegisterClass::riscv_reg:  return "reg";
+         case RegisterClass::riscv_freg: return "freg";
++        case RegisterClass::powerpc_reg:    return "reg";
++        case RegisterClass::powerpc_reg_nonzero:    return "reg_nonzero";
++        case RegisterClass::powerpc_freg:   return "freg";
++        case RegisterClass::powerpc_vreg:   return "vreg";
+         }
+         throw "";
+     }
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index c772ba94..f0f236f6 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -5809,6 +5809,52 @@ namespace {
+                 MIR_TODO(mir_res, "Translate to MSVC");
+             }
+         }
++        static bool asm_target_is_powerpc()
++        {
++            const auto& arch = Target_GetCurSpec().m_arch.m_name;
++            return arch == "powerpc" || arch == "powerpc64";
++        }
++        // What an explicit `asm!` register holds - picks both its constraint and a C type that can live in it
++        enum class AsmRegKind { Gpr, Fpr, Vr };
++        static AsmRegKind asm_explicit_reg_kind(const std::string& name)
++        {
++            if( asm_target_is_powerpc() ) {
++                // powerpc: `fN`/`frN` and `vN`
++                size_t ofs = name.compare(0, 2, "fr") == 0 ? 2 : 1;
++                if( name.size() > ofs && name.find_first_not_of("0123456789", ofs) == std::string::npos ) {
++                    if( name[0] == 'f' )    return AsmRegKind::Fpr;
++                    if( name[0] == 'v' )    return AsmRegKind::Vr;
++                }
++            }
++            return AsmRegKind::Gpr;
++        }
++        static std::string asm_explicit_reg_gcc_name(const std::string& name)
++        {
++            // powerpc: gcc only knows the FPRs as `frN` on every target (`fN` isn't one of its names on linux)
++            if( asm_explicit_reg_kind(name) == AsmRegKind::Fpr && name[1] != 'r' )
++                return "fr" + name.substr(1);
++            return name;
++        }
++        static const char* asm_reg_kind_constraint(AsmRegKind kind)
++        {
++            switch(kind)
++            {
++            case AsmRegKind::Gpr:   return "r";
++            case AsmRegKind::Fpr:   return "f";
++            case AsmRegKind::Vr:    return "v";
++            }
++            throw "";
++        }
++        static const char* asm_reg_kind_ctype(AsmRegKind kind)
++        {
++            switch(kind)
++            {
++            case AsmRegKind::Gpr:   return "uintptr_t";
++            case AsmRegKind::Fpr:   return "double";
++            case AsmRegKind::Vr:    return "unsigned int __attribute__((vector_size(16)))";
++            }
++            throw "";
++        }
+         void emit_asm2_gcc(const ::MIR::TypeResolve& mir_res, const ::MIR::Statement& stmt, unsigned indent_level)
+         {
+             auto indent = RepeatLitStr{ "\t", static_cast<int>(indent_level) };
+@@ -5907,9 +5953,15 @@ namespace {
+                                 block_open = true;
+                                 m_of << indent << "{\n";
+                             }
+-                            m_of << indent << "register uintptr_t asm_" << *regname_p << " asm(\"" << *regname_p << "\")";
++                            auto kind = asm_explicit_reg_kind(*regname_p);
++                            if( kind == AsmRegKind::Vr ) {
++                                // SIMD values are plain structs in the C output, no way to put one in a vector register
++                                MIR_TODO(mir_res, "Asm2 GCC: value in explicit vector register `" << *regname_p << "` - " << stmt);
++                            }
++                            const char* ctype = asm_reg_kind_ctype(kind);
++                            m_of << indent << "register " << ctype << " asm_" << *regname_p << " asm(\"" << asm_explicit_reg_gcc_name(*regname_p) << "\")";
+                             if( pe->input ) {
+-                                m_of << " = (uintptr_t)"; emit_param(*pe->input);
++                                m_of << " = (" << ctype << ")"; emit_param(*pe->input);
+                             }
+                             m_of << ";\n";
+                         }
+@@ -5933,7 +5985,19 @@ namespace {
+                                 block_open = true;
+                                 m_of << indent << "{\n";
+                             }
+-                            m_of << indent << "uintptr_t asm_anon_" << outputs.size() << " = 0;\n";
++                            // The dummy must be able to live in the clobbered class
++                            switch(pe->spec.as_Class())
++                            {
++                            case AsmCommon::RegisterClass::powerpc_freg:
++                                m_of << indent << "double asm_anon_" << outputs.size() << " = 0;\n";
++                                break;
++                            case AsmCommon::RegisterClass::powerpc_vreg:
++                                m_of << indent << asm_reg_kind_ctype(AsmRegKind::Vr) << " asm_anon_" << outputs.size() << " = {0};\n";
++                                break;
++                            default:
++                                m_of << indent << "uintptr_t asm_anon_" << outputs.size() << " = 0;\n";
++                                break;
++                            }
+ 
+                             arg_mappings[i] = outputs.size();
+                             outputs.push_back(pe);
+@@ -5965,14 +6029,20 @@ namespace {
+                     }
+                 }
+                 // Clobbers
+-                std::vector<const char*>   clobbers;
++                std::vector<std::string>   clobbers;
+                 for(size_t i = 0; i < se.params.size(); i ++)
+                 {
+                     // An explicit register, not "In" and output parameter
+                     if( const auto* pe = se.params[i].opt_Reg() ) {
+                         if( !pe->input && !pe->output && pe->spec.is_Explicit() ) {
+                             const auto& regname = pe->spec.as_Explicit();
+-                            clobbers.push_back(regname.c_str());
++                            // powerpc: `cr` is the whole condition register, gcc only knows the fields
++                            if( regname == "cr" && asm_target_is_powerpc() ) {
++                                for(const char* f : {"cr0", "cr1", "cr2", "cr3", "cr4", "cr5", "cr6", "cr7"})
++                                    clobbers.push_back(f);
++                                continue;
++                            }
++                            clobbers.push_back(asm_explicit_reg_gcc_name(regname));
+                         }
+                     }
+                 }
+@@ -6044,9 +6114,14 @@ namespace {
+                         // riscv
+                         case AsmCommon::RegisterClass::riscv_reg: m_of << "r"; break;
+                         case AsmCommon::RegisterClass::riscv_freg: m_of << "f"; break;
++                        // powerpc
++                        case AsmCommon::RegisterClass::powerpc_reg: m_of << "r"; break;
++                        case AsmCommon::RegisterClass::powerpc_reg_nonzero: m_of << "b"; break;
++                        case AsmCommon::RegisterClass::powerpc_freg: m_of << "f"; break;
++                        case AsmCommon::RegisterClass::powerpc_vreg: m_of << "v"; break;
+                         }
+                     TU_ARMA(Explicit, name) {
+-                        m_of << "r";
++                        m_of << asm_reg_kind_constraint(asm_explicit_reg_kind(name));
+                         }
+                     }
+                     m_of << "\" (";
+@@ -6085,6 +6160,11 @@ namespace {
+                             // riscv
+                             case AsmCommon::RegisterClass::riscv_reg: m_of << "r"; break;
+                             case AsmCommon::RegisterClass::riscv_freg: m_of << "f"; break;
++                            // powerpc
++                            case AsmCommon::RegisterClass::powerpc_reg: m_of << "r"; break;
++                            case AsmCommon::RegisterClass::powerpc_reg_nonzero: m_of << "b"; break;
++                            case AsmCommon::RegisterClass::powerpc_freg: m_of << "f"; break;
++                            case AsmCommon::RegisterClass::powerpc_vreg: m_of << "v"; break;
+                             }
+                         TU_ARMA(Explicit, name) {
+                             auto it = ::std::find(outputs.begin(), outputs.end(), &r);
+@@ -6092,7 +6172,7 @@ namespace {
+                                 m_of << (it - outputs.begin());
+                             }
+                             else {
+-                                m_of << "r";
++                                m_of << asm_reg_kind_constraint(asm_explicit_reg_kind(name));
+                             }
+                             }
+                         }
+@@ -6117,6 +6197,12 @@ namespace {
+                     m_of << " \"" << clobbers[i] << "\"";
+                     need_clobber_comma = true;
+                 }
++                // powerpc: without `preserves_flags` the asm may change cr0 (`add.` and friends), as rustc_codegen_gcc assumes
++                if( asm_target_is_powerpc() && !se.options.preserves_flags ) {
++                    if( need_clobber_comma ) m_of << ",";
++                    m_of << " \"cc\"";
++                    need_clobber_comma = true;
++                }
+                 // Inverted defaults: rust's `asm!` may touch memory unless `options(nomem)`,
+                 // but gcc assumes it doesn't unless told by a "memory" clobber.
+                 if( !se.options.nomem ) {

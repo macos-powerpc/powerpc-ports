@@ -1,0 +1,175 @@
+From 6cc093ee137ed04c038d84374b6f7b4df175eb48 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 03:14:30 +0000
+Subject: [PATCH 85/86] expand: send float literals to proc macros as floats,
+ with their exact value
+
+kalk 3.2.3 src/kalk_value/mod.rs:134, `#[wasm_bindgen] impl ScientificNotation` with
+`let value = self.value * 10_f64.powi(modulo);`:
+
+    kalk_value/mod.rs:134-135 error:0: compile_error! "expected an expression"
+
+An attribute macro gets the item's expressions printed as text (`DumpAST_Node`) and
+re-lexed. `10_f64` parses as an integer with a float type, and the printer wrote
+nothing for that, so wasm_bindgen's syn saw `self.value * .powi(modulo)`.
+
+Related problems on the same path, fixed too:
+- Float nodes were printed with `<<`, so whole numbers lost their point: `1e3`
+  reached the macro as the integer `1000`.
+- Float tokens in a macro invocation (`Token::to_str`) used the stream's default
+  6 digits: `3.14159265358979` became `3.14159`. A suffixed one printed the type as
+  its enum number (`1.5_f32` -> `1.5_18`). `stringify!` showed all of these too.
+- An integer token with a float type (`10_f64` inside a macro invocation) hit
+  `BUG: Unknown integer type` when sent.
+
+Integer nodes with a float type are now written as `10.0_f64`. Float nodes and
+tokens use the shortest of 15-17 digits that reads back as the same double, with
+`.0` added when there's no point or exponent, and a type-name suffix. Integer tokens
+with f32/f64 type are sent as float tokens.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/ast/dump.cpp          | 38 ++++++++++++++++++++++++++++----------
+ src/expand/proc_macro.cpp |  4 ++++
+ src/parse/token.cpp       | 27 ++++++++++++++++++++++++---
+ 3 files changed, 56 insertions(+), 13 deletions(-)
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index a9cb999e..68af24ab 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -12,6 +12,8 @@
+ #include <hir/hir.hpp>  // ABI_RUST - TODO: Move elsewhere?
+ #include <fstream>
+ #include <limits> // std::numeric_limits
++#include <sstream>
++#include <cstdlib>
+ 
+ #include <cpp_unpack.h>
+ 
+@@ -509,6 +511,9 @@ public:
+         case CORETYPE_F32:
+         case CORETYPE_F64:
+         case CORETYPE_F128:
++            // `10_f64` parses as an integer with a float type: write it as a float literal (this text is re-lexed for proc
++            // macros, where printing nothing turned `self.value * 10_f64.powi(m)` into `self.value * .powi(m)` - kalk 3.2.3)
++            m_os << n.m_value << ".0_" << coretype_name(n.m_datatype);
+             break;
+         case CORETYPE_U8:
+         case CORETYPE_U16:
+@@ -536,29 +541,42 @@ public:
+         switch(n.m_datatype)
+         {
+         case CORETYPE_ANY:
+-            m_os.precision(::std::numeric_limits<double>::max_digits10 + 1);
+-            m_os << n.m_value;
++            print_float_literal(m_os, n.m_value, ::std::numeric_limits<double>::max_digits10);
+             break;
+         case CORETYPE_F16:
+         case CORETYPE_F32:
+-            m_os.precision(::std::numeric_limits<float>::max_digits10 + 1);
+-            m_os << n.m_value;
++            print_float_literal(m_os, n.m_value, ::std::numeric_limits<double>::max_digits10);
+             m_os << "_" << coretype_name(n.m_datatype);
+             break;
+         case CORETYPE_F64:
+-            m_os.precision(::std::numeric_limits<double>::max_digits10 + 1);
+-            m_os << n.m_value;
+-            m_os << "_" << coretype_name(n.m_datatype);
+-            break;
+         case CORETYPE_F128:
+-            m_os.precision(::std::numeric_limits<double>::max_digits10 + 1);
+-            m_os << n.m_value;
++            print_float_literal(m_os, n.m_value, ::std::numeric_limits<double>::max_digits10);
+             m_os << "_" << coretype_name(n.m_datatype);
+             break;
+         default:
+             break;
+         }
+     }
++    /// Enough digits to round-trip, and always a `.` or an exponent so that the text lexes as a float again (`1e3` was
++    /// written as `1000`, an integer)
++    static void print_float_literal(::std::ostream& os, double v, int max_digits)
++    {
++        // Shortest text that reads back as the same value (so `0.1` stays `0.1`)
++        ::std::string s;
++        for(int digits = ::std::min(15, max_digits); digits <= max_digits; digits ++)
++        {
++            ::std::ostringstream    ss;
++            ss.precision(digits);
++            ss << v;
++            s = ss.str();
++            if( ::std::strtod(s.c_str(), nullptr) == v )
++                break;
++        }
++        if( s.find_first_of(".eEni") == ::std::string::npos ) {
++            s += ".0";
++        }
++        os << s;
++    }
+     virtual void visit(AST::ExprNode_Bool& n) override {
+         m_expr_root = false;
+         if( n.m_value )
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index b47ba097..69ffb1a4 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -515,6 +515,10 @@ namespace {
+                 if( tok.datatype() == CORETYPE_CHAR ) {
+                     m_pmi.send_char(tok.intval().truncate_u64());
+                 }
++                else if( tok.datatype() == CORETYPE_F32 || tok.datatype() == CORETYPE_F64 ) {
++                    // `10_f64` lexes as an integer with a float type, but it's a float literal
++                    m_pmi.send_float(tok.datatype(), tok.intval().to_double());
++                }
+                 else {
+                     m_pmi.send_int(tok.datatype(), tok.intval());
+                 }
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 65f3c11b..49f00688 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -9,6 +9,9 @@
+ #include <ast/types.hpp>
+ #include <ast/ast.hpp>
+ #include <ast/expr.hpp> // for reasons
++#include <limits>
++#include <sstream>
++#include <cstdlib>
+ 
+ Token::~Token()
+ {
+@@ -427,12 +430,30 @@ struct EscapedByteString {
+         }
+         break; }
+     case TOK_CHAR:      return FMT("'\\u{"<< ::std::hex << m_data.as_Integer().m_intval << "}'");
+-    case TOK_FLOAT:
++    case TOK_FLOAT: {
++        // Round-trippable digits and always a `.` or exponent (this is re-lexed for proc macro input; the default
++        // precision cut `3.14159265358979` to `3.14159`, and `1000.0` came back as an integer)
++        // - Shortest text that reads back as the same value (so `0.1` stays `0.1` in `stringify!`)
++        const double v = m_data.as_Float().m_floatval;
++        ::std::string s;
++        for(int digits = 15; digits <= ::std::numeric_limits<double>::max_digits10; digits ++)
++        {
++            ::std::ostringstream    ss;
++            ss.precision(digits);
++            ss << v;
++            s = ss.str();
++            if( ::std::strtod(s.c_str(), nullptr) == v )
++                break;
++        }
++        if( s.find_first_of(".eEni") == ::std::string::npos ) {
++            s += ".0";
++        }
+         if( m_data.as_Float().m_datatype == CORETYPE_ANY ) {
+-            return FMT(m_data.as_Float().m_floatval);
++            return s;
+         }
+         else {
+-            return FMT(m_data.as_Float().m_floatval << "_" << m_data.as_Float().m_datatype);
++            return FMT(s << "_" << coretype_name(m_data.as_Float().m_datatype));
++        }
+         }
+     case TOK_STRING:    return FMT("\"" << EscapedString(m_data.as_String()) << "\"" << m_hygiene);
+     case TOK_CSTRING:   return FMT("c\"" << EscapedString(m_data.as_String()) << "\"" << m_hygiene);

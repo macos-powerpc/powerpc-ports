@@ -1,0 +1,250 @@
+From 174b1409ea816f44b02504ec1f9fcd1f22dbfb06 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 6 Oct 2026 17:45:53 +0000
+Subject: [PATCH 90/90] minicargo: infer binaries from src/bin/ as cargo does
+
+tuc 1.3.0 (GitHub source) has `src/lib.rs` and `src/bin/tuc.rs`, and no
+`[[bin]]` in its Cargo.toml. minicargo built the library, reported 100%, and
+produced no executable, so `destroot` failed. Only `src/main.rs` was ever
+inferred as a binary. (The crates.io copy of tuc works, because cargo's
+normalised manifest spells out the `[[bin]]`.)
+
+The inferred binaries are now the ones cargo infers (toml_targets.rs):
+`src/main.rs` named after the package, `src/bin/<name>.rs` and
+`src/bin/<name>/main.rs`. They're combined with explicit `[[bin]]`s as cargo
+does:
+- With no `[[bin]]`, all inferred binaries are built (unless `autobins = false`).
+- With `[[bin]]`s, the inferred ones are added too from edition 2018 on
+  (cargo only warns about them in 2015). One with the name or path of
+  a `[[bin]]` is that same binary.
+- A `[[bin]]` with no `path` takes the path of the inferred binary with its
+  name. `[[bin]] name = "<package>"` next to `src/main.rs` used to point at
+  a nonexistent `src/bin/<package>/main.rs`.
+
+An implicit `src/main.rs` keeps minicargo's existing output name (`foo_bar`
+for package `foo-bar`).
+
+`list_directory` moved from main.cpp (workspace member globs) to
+`os_support`, so manifest.cpp can use it too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ tools/minicargo/main.cpp     | 34 ++-----------------
+ tools/minicargo/manifest.cpp | 63 +++++++++++++++++++++++++++++++++---
+ tools/minicargo/os.cpp       | 27 ++++++++++++++++
+ tools/minicargo/os.hpp       |  4 +++
+ 4 files changed, 91 insertions(+), 37 deletions(-)
+
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index c4a5e291..50e68eb5 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -18,41 +18,11 @@
+ #include <toml.h>   // TomlFile (workspace)
+ #include <fstream>  // for workspace enumeration
+ #include <algorithm>
+-#include <functional>
+-#ifdef _WIN32
+-# include <Windows.h>
+-#else
+-# include <dirent.h>
+-#endif
+ #include "cfg.hpp"
+ #include "resolve.h"
++#include "os.hpp"   // list_directory
+ 
+ namespace {
+-    /// Call `cb` with the name of every entry of the directory `path` (except `.` and `..`)
+-    void list_directory(const ::helpers::path& path, ::std::function<void(const char*)> cb)
+-    {
+-    #ifdef _WIN32
+-        WIN32_FIND_DATA find_data;
+-        HANDLE find_handle = FindFirstFile( (path / "*").str().c_str(), &find_data );
+-        if( find_handle == INVALID_HANDLE_VALUE )
+-            return ;
+-        do {
+-            if( strcmp(find_data.cFileName, ".") != 0 && strcmp(find_data.cFileName, "..") != 0 )
+-                cb(find_data.cFileName);
+-        } while( FindNextFile(find_handle, &find_data) );
+-        FindClose(find_handle);
+-    #else
+-        auto* dp = opendir(path.str().c_str());
+-        if( dp == nullptr )
+-            return ;
+-        while( const auto* dent = readdir(dp) )
+-        {
+-            if( strcmp(dent->d_name, ".") != 0 && strcmp(dent->d_name, "..") != 0 )
+-                cb(dent->d_name);
+-        }
+-        closedir(dp);
+-    #endif
+-    }
+     /// Shell-style pattern match: `*` matches any run of characters, `?` any single character
+     bool glob_match(const char* pat, const char* s)
+     {
+@@ -279,7 +249,7 @@ int main(int argc, const char* argv[])
+                     auto parent = (slash == ::std::string::npos ? ::std::string() : member.substr(0, slash));
+                     auto pattern = member.substr(slash == ::std::string::npos ? 0 : slash + 1);
+                     ::std::vector<::std::string>    matches;
+-                    list_directory(parent.empty() ? dir : dir / parent.c_str(), [&](const char* name) {
++                    os_support::list_directory(parent.empty() ? dir : dir / parent.c_str(), [&](const char* name) {
+                         if( glob_match(pattern.c_str(), name) )
+                             matches.push_back(parent.empty() ? ::std::string(name) : parent + "/" + name);
+                         });
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index 31743117..9ef382a6 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -15,6 +15,7 @@
+ #include <set>
+ #include "repository.h"
+ #include "cfg.hpp"
++#include "os.hpp"   // list_directory
+ 
+ // TODO: Extract this from the target at runtime (by invoking the compiler on the passed target)
+ #ifdef _WIN32
+@@ -399,14 +400,66 @@ PackageManifest PackageManifest::load_from_toml(const ::std::string& path, const
+             rv.m_targets.push_back(PackageTarget { PackageTarget::Type::Lib });
+         }
+     }
+-    // - If there's no binary section, but src/main.rs exists, add as a binary
+-    if( rv.m_create_auto_bins && ! ::std::any_of(rv.m_targets.begin(), rv.m_targets.end(), [](const auto& x){ return x.m_type == PackageTarget::Type::Bin; }) )
++    // - Binaries, as cargo infers them: `src/main.rs` (named after the package), `src/bin/<name>.rs` and
++    //   `src/bin/<name>/main.rs`
+     {
+-        // No library, add one pointing to lib.rs
++        ::std::vector<PackageTarget>   inferred_bins;
+         if( ::std::ifstream(package_dir / "src" / "main.rs").good() )
+         {
+-            DEBUG("- Implicit binary");
+-            rv.m_targets.push_back(PackageTarget { PackageTarget::Type::Bin });
++            // Left unnamed, so it gets the default name below
++            inferred_bins.push_back(PackageTarget { PackageTarget::Type::Bin });
++            inferred_bins.back().m_path = ::helpers::path("src") / "main.rs";
++        }
++        ::std::vector<::std::string>    bin_dir_ents;
++        os_support::list_directory(package_dir / "src" / "bin", [&](const char* name){ bin_dir_ents.push_back(name); });
++        ::std::sort(bin_dir_ents.begin(), bin_dir_ents.end());  // Directory order isn't stable
++        for(const auto& ent : bin_dir_ents)
++        {
++            auto path = ::helpers::path("src") / "bin" / ent.c_str();
++            if( ent.size() > 3 && ent.compare(ent.size() - 3, 3, ".rs") == 0 ) {
++                inferred_bins.push_back(PackageTarget { PackageTarget::Type::Bin });
++                inferred_bins.back().m_name = ent.substr(0, ent.size() - 3);
++                inferred_bins.back().m_path = path;
++            }
++            else if( ::std::ifstream(package_dir / path / "main.rs").good() ) {
++                inferred_bins.push_back(PackageTarget { PackageTarget::Type::Bin });
++                inferred_bins.back().m_name = ent;
++                inferred_bins.back().m_path = path / "main.rs";
++            }
++        }
++        auto bin_name = [&](const PackageTarget& t)->const ::std::string& { return t.m_name == "" ? rv.m_name : t.m_name; };
++
++        // A `[[bin]]` with no path takes the path of the inferred binary with its name (before the fallback below)
++        bool has_explicit_bins = false;
++        for(auto& tgt : rv.m_targets)
++        {
++            if( tgt.m_type != PackageTarget::Type::Bin )
++                continue;
++            has_explicit_bins = true;
++            if( tgt.m_path == "" ) {
++                auto it = ::std::find_if(inferred_bins.begin(), inferred_bins.end(), [&](const PackageTarget& t){ return bin_name(t) == bin_name(tgt); });
++                if( it != inferred_bins.end() )
++                    tgt.m_path = it->m_path;
++            }
++        }
++        // Inferred binaries are added when there's no `[[bin]]`, and also alongside them from edition 2018 on (cargo
++        // only warns about them in 2015). One with the name or path of a `[[bin]]` is that binary, not another.
++        if( rv.m_create_auto_bins && (!has_explicit_bins || (rv.m_edition != Edition::Unspec && rv.m_edition != Edition::Rust2015)) )
++        {
++            for(auto& inf : inferred_bins)
++            {
++                bool is_explicit = ::std::any_of(rv.m_targets.begin(), rv.m_targets.end(), [&](const PackageTarget& t) {
++                    if( t.m_type != PackageTarget::Type::Bin )
++                        return false;
++                    // (`helpers::path` to compare with the separators normalised)
++                    return bin_name(t) == bin_name(inf) || (t.m_path != "" && ::helpers::path(t.m_path) == ::helpers::path(inf.m_path));
++                    });
++                if( !is_explicit )
++                {
++                    DEBUG("- Implicit binary " << bin_name(inf) << " (" << inf.m_path << ")");
++                    rv.m_targets.push_back(::std::move(inf));
++                }
++            }
+         }
+     }
+     if( rv.m_targets.empty() )
+diff --git a/tools/minicargo/os.cpp b/tools/minicargo/os.cpp
+index bf81eb5c..c2829587 100644
+--- a/tools/minicargo/os.cpp
++++ b/tools/minicargo/os.cpp
+@@ -6,6 +6,7 @@
+ #endif
+ 
+ #include <iostream>
++#include <cstring>  // strcmp
+ #include "os.hpp"
+ #include "debug.h"
+ 
+@@ -30,6 +31,7 @@ extern "C" {
+ # include <spawn.h> // posix_spawn
+ # include <sys/wait.h>  // waitpid
+ # include <limits.h>    // PATH_MAX
++# include <dirent.h>    // opendir/readdir
+ extern char **environ;
+ }
+ #endif
+@@ -471,6 +473,31 @@ const helpers::path& get_mrustc_path()
+     return s_compiler_path;
+ }
+ 
++void list_directory(const helpers::path& path, ::std::function<void(const char*)> cb)
++{
++#ifdef _WIN32
++    WIN32_FIND_DATA find_data;
++    HANDLE find_handle = FindFirstFile( (path / "*").str().c_str(), &find_data );
++    if( find_handle == INVALID_HANDLE_VALUE )
++        return ;
++    do {
++        if( strcmp(find_data.cFileName, ".") != 0 && strcmp(find_data.cFileName, "..") != 0 )
++            cb(find_data.cFileName);
++    } while( FindNextFile(find_handle, &find_data) );
++    FindClose(find_handle);
++#else
++    auto* dp = opendir(path.str().c_str());
++    if( dp == nullptr )
++        return ;
++    while( const auto* dent = readdir(dp) )
++    {
++        if( strcmp(dent->d_name, ".") != 0 && strcmp(dent->d_name, "..") != 0 )
++            cb(dent->d_name);
++    }
++    closedir(dp);
++#endif
++}
++
+ }
+ 
+ namespace {
+diff --git a/tools/minicargo/os.hpp b/tools/minicargo/os.hpp
+index 135c54ae..8da52540 100644
+--- a/tools/minicargo/os.hpp
++++ b/tools/minicargo/os.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include "stringlist.h"
+ #include <path.h>
++#include <functional>
+ 
+ #ifdef _WIN32
+ #else
+@@ -46,4 +47,7 @@ void mkdir(const helpers::path& path);
+ 
+ const helpers::path& get_mrustc_path();
+ 
++/// Call `cb` with the name of every entry of the directory `path` (except `.` and `..`)
++void list_directory(const helpers::path& path, ::std::function<void(const char*)> cb);
++
+ }
+\ No newline at end of file
