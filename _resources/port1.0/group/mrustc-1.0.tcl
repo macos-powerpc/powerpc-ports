@@ -61,7 +61,9 @@ options     cargo.bin \
             cargo.crates \
             cargo.offline_cmd \
             cargo.crates_github \
-            cargo.update
+            cargo.crate_patch_dirs \
+            cargo.update \
+            mrustc.incremental
 
 set mrustc_root                 ${prefix}/libexec/mrustc
 
@@ -77,13 +79,23 @@ default     cargo.offline_cmd   {}
 # so offer the option of running cargo-update
 default     cargo.update        {no}
 
+# Resume an interrupted build after the mrustc port itself was rebuilt. minicargo normally rebuilds every
+# crate whose rlib is older than the compiler or than the installed libstd; with this option only changed
+# sources and rebuilt dependencies trigger a rebuild (needs `port -o` as well, for the Portfile mtime):
+#   sudo port -o build <port> mrustc.incremental=yes
+default     mrustc.incremental  {no}
+pre-build {
+    if {[option mrustc.incremental]} {
+        build.env-append        MINICARGO_IGNTOOLS=1
+    }
+}
+
 # Directories of per-crate patches, see rust::apply_crate_patches.
 # The shared ones live next to this PortGroup; [info script] is only this file
 # while it is being sourced, so resolve the path now.
 namespace eval rust {
     variable crate_patches_dir [file normalize [file join [file dirname [info script]] .. crate_patches]]
 }
-options     cargo.crate_patch_dirs
 default     cargo.crate_patch_dirs  {[list ${::rust::crate_patches_dir}]}
 
 # Use `--remap-path-prefix` to prevent build information from being included in installed binaries
