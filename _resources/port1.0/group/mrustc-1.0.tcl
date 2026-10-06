@@ -32,6 +32,13 @@
 # cargo.crates_github \
 #    baz    author/baz  branch  abcdef12345678...commit...abcdef12345678  fedcba654321...
 #
+# Crates that need fixes for powerpc or old macOS are patched from the shared
+# patches in _resources/port1.0/crate_patches (see the README there), so ports
+# don't carry their own copies. A port can add its own directories of crate
+# patches, named the same way:
+#
+# cargo.crate_patch_dirs-append ${filespath}/crate_patches
+#
 
 # This portgroup is modelled upon rust 1.0, with extra overrides to support powerpc.
 # It will evolve, currently some portions below are unneeded or mismatching.
@@ -54,8 +61,7 @@ options     cargo.bin \
             cargo.crates \
             cargo.offline_cmd \
             cargo.crates_github \
-            cargo.update \
-            mrustc.incremental
+            cargo.update
 
 set mrustc_root                 ${prefix}/libexec/mrustc
 
@@ -71,16 +77,14 @@ default     cargo.offline_cmd   {}
 # so offer the option of running cargo-update
 default     cargo.update        {no}
 
-# Resume an interrupted build after the mrustc port itself was rebuilt. minicargo normally rebuilds every
-# crate whose rlib is older than the compiler or than the installed libstd; with this option only changed
-# sources and rebuilt dependencies trigger a rebuild (needs `port -o` as well, for the Portfile mtime):
-#   sudo port -o build <port> mrustc.incremental=yes
-default     mrustc.incremental  {no}
-pre-build {
-    if {[option mrustc.incremental]} {
-        build.env-append        MINICARGO_IGNTOOLS=1
-    }
+# Directories of per-crate patches, see rust::apply_crate_patches.
+# The shared ones live next to this PortGroup; [info script] is only this file
+# while it is being sourced, so resolve the path now.
+namespace eval rust {
+    variable crate_patches_dir [file normalize [file join [file dirname [info script]] .. crate_patches]]
 }
+options     cargo.crate_patch_dirs
+default     cargo.crate_patch_dirs  {[list ${::rust::crate_patches_dir}]}
 
 # Use `--remap-path-prefix` to prevent build information from being included in installed binaries
 options     rust.remap
@@ -466,6 +470,63 @@ proc rust::old_macos_compatibility {cname cversion} {
     }
 }
 
+# Per-crate patches
+#
+# Each directory in cargo.crate_patch_dirs holds patches named
+#     <crate>@<version>.patch         this version only
+#     <crate>@<from>..<to>.patch      from <= version <= to
+#     <crate>@<from>+.patch           from <= version
+# Every patch whose range includes the crate's version is applied right after
+# the crate is unpacked, in directory order and then by name. Paths in the
+# patches are relative to the crate's root (a/src/lib.rs, b/src/lib.rs), so one
+# file serves every version the patch applies to. Versions are compared with
+# vercmp. Crates from GitHub only match <crate>@<commit>.patch.
+
+proc rust::crate_patch_matches {spec cversion exact_only} {
+    if {${spec} eq ${cversion}} {
+        return 1
+    }
+    if {${exact_only}} {
+        return 0
+    }
+    if {[string index ${spec} end] eq "+"} {
+        return [vercmp ${cversion} >= [string range ${spec} 0 end-1]]
+    }
+    set sep [string first .. ${spec}]
+    if {${sep} < 0} {
+        return 0
+    }
+    set from [string range ${spec} 0 ${sep}-1]
+    set to   [string range ${spec} ${sep}+2 end]
+    return [expr {[vercmp ${cversion} >= ${from}] && [vercmp ${cversion} <= ${to}]}]
+}
+
+proc rust::crate_patches {cname cversion exact_only} {
+    set patches [list]
+    foreach dir [option cargo.crate_patch_dirs] {
+        foreach patchfile [lsort [glob -nocomplain -types f -directory ${dir} -- ${cname}@*.patch]] {
+            set spec [string range [file tail ${patchfile}] [string length ${cname}@] end-[string length .patch]]
+            if {[rust::crate_patch_matches ${spec} ${cversion} ${exact_only}]} {
+                lappend patches ${patchfile}
+            }
+        }
+    }
+    return ${patches}
+}
+
+proc rust::apply_crate_patches {cname cversion cdirname exact_only} {
+    set patchbin [findBinary patch ${portutil::autoconf::patch_path}]
+    foreach patchfile [rust::crate_patches ${cname} ${cversion} ${exact_only}] {
+        set pname [file tail ${patchfile}]
+        ui_info "Applying ${pname} to ${cdirname}"
+        if {[catch {system -W "[option cargo.home]/macports/${cdirname}" "${patchbin} -p1 -t -N < [shellescape ${patchfile}]"} result]} {
+            ui_error "${pname} ([file dirname ${patchfile}]) does not apply to ${cname} ${cversion}."
+            ui_error "If ${cname} ${cversion} no longer needs it, rename the patch so its version range ends before ${cversion}; otherwise update the patch or add one for ${cname} ${cversion}."
+            return -code error ${result}
+        }
+    }
+}
+
 proc rust::import_crate {cname cversion chksum cratefile} {
     global cargo.home
 
@@ -473,6 +534,7 @@ proc rust::import_crate {cname cversion chksum cratefile} {
     rust::extract_crate ${cratefile}
     rust::write_cargo_checksum "${cname}-${cversion}" "\"${chksum}\""
     rust::old_macos_compatibility ${cname} ${cversion}
+    rust::apply_crate_patches ${cname} ${cversion} "${cname}-${cversion}" no
 }
 
 proc rust::import_crate_github {cname cgithub crevision chksum cratefile} {
@@ -485,11 +547,18 @@ proc rust::import_crate_github {cname cgithub crevision chksum cratefile} {
     rust::extract_crate ${cratefile}
     rust::write_cargo_checksum ${cdirname} "null"
     rust::old_macos_compatibility ${cname} ${crevision}
+    rust::apply_crate_patches ${cname} ${crevision} ${cdirname} yes
 }
 
 post-extract {
     if {[llength ${cargo.crates}] > 0 || [llength ${cargo.crates_github}]>0} {
         file mkdir "${cargo.home}/macports"
+
+        foreach dir ${cargo.crate_patch_dirs} {
+            if {![file isdirectory ${dir}]} {
+                ui_warn "cargo.crate_patch_dirs: ${dir} is not a directory"
+            }
+        }
 
         # Avoid downloading files from online repository during build phase,
         # use a replacement for crates.io
