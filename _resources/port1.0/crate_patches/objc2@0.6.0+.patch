@@ -1,0 +1,339 @@
+objc2 on powerpc-apple-darwin (Mac OS X 10.4 to 10.6, legacy ObjC runtime).
+
+- Message sending: there was no MsgSendFn impl for powerpc ("Failed to find
+  impl with MSG_SEND_SUPER"). Darwin ppc32 returns every struct and union
+  through a hidden pointer, whatever its size, so those go through
+  objc_msgSend_stret / objc_msgSendSuper_stret and everything else through
+  objc_msgSend (which also returns floating point in f1).
+- libobjc on 10.6 and earlier has none of the ARC entry points (objc_retain,
+  objc_release, objc_autorelease*, objc_autoreleasePoolPush/Pop,
+  objc_storeStrong, objc_retainBlock, the weak functions) and no
+  objc_copyClassList; they arrived in 10.7. On powerpc, ffi/legacy.rs
+  replaces ffi/rc.rs and implements them with -retain/-release/-autorelease,
+  NSAutoreleasePool, _Block_copy and objc_getClassList. There are no zeroing
+  weak references either, so objc2::rc::Weak holds a strong reference on
+  powerpc: no dangling, but a cycle it was meant to break leaks.
+- Like 32-bit Intel macOS, which also uses the legacy runtime: allocate with
+  +alloc (objc_alloc is 10.9+), and drain autorelease pools only on the
+  normal exit, not while unwinding.
+- available!(): without MACOSX_DEPLOYMENT_TARGET, assume 10.4 instead of
+  10.12, so version checks happen at run time.
+
+ProtocolBuilder (objc_allocateProtocol & co., 10.7+) is left alone: it fails
+at link time if a program uses it. powerpc64 isn't covered.
+
+--- a/src/__macro_helpers/os_version/apple.rs
++++ b/src/__macro_helpers/os_version/apple.rs
+@@ -39,7 +39,10 @@ pub(crate) const DEPLOYMENT_TARGET: OSVersion = {
+         // `rustc --print=deployment-target`, as this has to work at `const`
+         // time.
+         #[allow(clippy::if_same_then_else)]
+-        let os_min = if cfg!(target_os = "macos") {
++        let os_min = if cfg!(all(target_os = "macos", target_arch = "powerpc")) {
++            // The oldest PowerPC release a binary may run on.
++            (10, 4, 0)
++        } else if cfg!(target_os = "macos") {
+             (10, 12, 0)
+         } else if cfg!(target_os = "ios") {
+             (10, 0, 0)
+--- a/src/ffi/class.rs
++++ b/src/ffi/class.rs
+@@ -49,6 +49,7 @@ extern_c! {
+     #[cfg(any(doc, not(feature = "unstable-objfw")))]
+     pub fn objc_getMetaClass(name: *const c_char) -> *const AnyClass;
+     /// The returned array is deallocated with [`free`][crate::ffi::free].
++    #[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+     pub fn objc_copyClassList(out_len: *mut c_uint) -> *mut *const AnyClass;
+     pub fn objc_getClassList(buffer: *mut *const AnyClass, buffer_len: c_int) -> c_int;
+ 
+--- /dev/null
++++ b/src/ffi/legacy.rs
+@@ -0,0 +1,187 @@
++//! Runtime functions missing from Mac OS X 10.6 and earlier.
++//!
++//! `libobjc` gained the ARC entry points (`objc_retain`,
++//! `objc_autoreleasePoolPush`, the weak reference functions, ...) and
++//! `objc_copyClassList` in Mac OS X 10.7, so the PowerPC runtimes don't have
++//! them. These implement them with `-retain`, `-release`, `-autorelease`,
++//! `NSAutoreleasePool` and `objc_getClassList`.
++//!
++//! The runtime has no zeroing weak references either (except under garbage
++//! collection), so the weak functions here keep a strong reference: an
++//! object stays alive while a [`Weak`][crate::rc::Weak] to it exists, and
++//! loading the weak reference never returns `nil`. A reference cycle that a
++//! weak reference was meant to break is leaked, but a weak reference never
++//! dangles.
++use core::ffi::{c_uint, c_void};
++use core::mem;
++use core::ptr;
++
++use crate::runtime::{AnyClass, AnyObject, Imp, Sel};
++
++extern "C" {
++    // libSystem
++    fn _Block_copy(block: *const c_void) -> *mut c_void;
++    fn malloc(size: usize) -> *mut c_void;
++}
++
++/// Send a message that takes no arguments and returns an object or nothing.
++#[inline]
++unsafe fn send(obj: *mut AnyObject, sel: Sel) -> *mut AnyObject {
++    let msg_send: Imp = crate::ffi::objc_msgSend;
++    // SAFETY: `objc_msgSend` is called with the signature of the method.
++    let msg_send: unsafe extern "C-unwind" fn(*mut AnyObject, Sel) -> *mut AnyObject =
++        unsafe { mem::transmute(msg_send) };
++    unsafe { msg_send(obj, sel) }
++}
++
++// Autoreleasepool
++
++/// `[[NSAutoreleasePool alloc] init]`
++pub unsafe extern "C-unwind" fn objc_autoreleasePoolPush() -> *mut c_void {
++    let cls: *const AnyClass = crate::class!(NSAutoreleasePool);
++    unsafe {
++        let pool = send(cls as *mut AnyObject, crate::sel!(alloc));
++        send(pool, crate::sel!(init)).cast()
++    }
++}
++
++/// `[pool drain]`, which also drains any pools pushed after `pool`.
++pub unsafe extern "C-unwind" fn objc_autoreleasePoolPop(pool: *mut c_void) {
++    unsafe { send(pool.cast(), crate::sel!(drain)) };
++}
++
++// Autorelease
++
++pub unsafe extern "C-unwind" fn objc_autorelease(value: *mut AnyObject) -> *mut AnyObject {
++    if !value.is_null() {
++        unsafe { send(value, crate::sel!(autorelease)) };
++    }
++    value
++}
++
++pub unsafe extern "C-unwind" fn objc_autoreleaseReturnValue(
++    value: *mut AnyObject,
++) -> *mut AnyObject {
++    unsafe { objc_autorelease(value) }
++}
++
++// Weak pointers (strong references, see the module documentation)
++
++pub unsafe extern "C-unwind" fn objc_copyWeak(to: *mut *mut AnyObject, from: *mut *mut AnyObject) {
++    unsafe { *to = objc_retain(*from) };
++}
++
++pub unsafe extern "C-unwind" fn objc_destroyWeak(addr: *mut *mut AnyObject) {
++    unsafe {
++        objc_release(*addr);
++        *addr = ptr::null_mut();
++    }
++}
++
++pub unsafe extern "C-unwind" fn objc_initWeak(
++    addr: *mut *mut AnyObject,
++    value: *mut AnyObject,
++) -> *mut AnyObject {
++    unsafe { *addr = objc_retain(value) };
++    value
++}
++
++pub unsafe extern "C-unwind" fn objc_loadWeak(addr: *mut *mut AnyObject) -> *mut AnyObject {
++    unsafe { objc_autorelease(objc_loadWeakRetained(addr)) }
++}
++
++pub unsafe extern "C-unwind" fn objc_loadWeakRetained(addr: *mut *mut AnyObject) -> *mut AnyObject {
++    unsafe { objc_retain(*addr) }
++}
++
++pub unsafe extern "C-unwind" fn objc_moveWeak(to: *mut *mut AnyObject, from: *mut *mut AnyObject) {
++    unsafe {
++        *to = *from;
++        *from = ptr::null_mut();
++    }
++}
++
++// Retain / release
++
++pub unsafe extern "C-unwind" fn objc_release(value: *mut AnyObject) {
++    if !value.is_null() {
++        unsafe { send(value, crate::sel!(release)) };
++    }
++}
++
++pub unsafe extern "C-unwind" fn objc_retain(value: *mut AnyObject) -> *mut AnyObject {
++    if !value.is_null() {
++        unsafe { send(value, crate::sel!(retain)) };
++    }
++    value
++}
++
++pub unsafe extern "C-unwind" fn objc_retainAutorelease(value: *mut AnyObject) -> *mut AnyObject {
++    unsafe { objc_autorelease(objc_retain(value)) }
++}
++
++pub unsafe extern "C-unwind" fn objc_retainAutoreleaseReturnValue(
++    value: *mut AnyObject,
++) -> *mut AnyObject {
++    unsafe { objc_retainAutorelease(value) }
++}
++
++pub unsafe extern "C-unwind" fn objc_retainAutoreleasedReturnValue(
++    value: *mut AnyObject,
++) -> *mut AnyObject {
++    unsafe { objc_retain(value) }
++}
++
++/// `_Block_copy`
++pub unsafe extern "C-unwind" fn objc_retainBlock(value: *mut AnyObject) -> *mut AnyObject {
++    unsafe { _Block_copy(value.cast()).cast() }
++}
++
++// Storing values
++
++pub unsafe extern "C-unwind" fn objc_storeStrong(addr: *mut *mut AnyObject, value: *mut AnyObject) {
++    let prev = unsafe { *addr };
++    if prev != value {
++        unsafe {
++            *addr = objc_retain(value);
++            objc_release(prev);
++        }
++    }
++}
++
++pub unsafe extern "C-unwind" fn objc_storeWeak(
++    addr: *mut *mut AnyObject,
++    value: *mut AnyObject,
++) -> *mut AnyObject {
++    unsafe { objc_storeStrong(addr, value) };
++    value
++}
++
++// Classes
++
++/// The returned array is deallocated with [`free`][crate::ffi::free].
++pub unsafe extern "C" fn objc_copyClassList(out_len: *mut c_uint) -> *mut *const AnyClass {
++    let mut len = unsafe { crate::ffi::objc_getClassList(ptr::null_mut(), 0) }.max(0);
++    let buf = loop {
++        let buf: *mut *const AnyClass =
++            unsafe { malloc((len as usize + 1) * mem::size_of::<*const AnyClass>()) }.cast();
++        if buf.is_null() {
++            len = 0;
++            break buf;
++        }
++        // Fills in at most `len` classes, and returns how many are registered
++        // now, which is more if classes were added since the last call.
++        let count = unsafe { crate::ffi::objc_getClassList(buf, len) }.max(0);
++        if count <= len {
++            len = count;
++            unsafe { *buf.add(len as usize) = ptr::null() };
++            break buf;
++        }
++        unsafe { crate::ffi::free(buf.cast()) };
++        len = count;
++    };
++    if !out_len.is_null() {
++        unsafe { *out_len = len as c_uint };
++    }
++    buf
++}
+--- a/src/ffi/mod.rs
++++ b/src/ffi/mod.rs
+@@ -229,7 +229,10 @@ mod method;
+ mod object;
+ mod property;
+ mod protocol;
++#[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+ mod rc;
++#[cfg(all(target_vendor = "apple", target_arch = "powerpc"))]
++mod legacy;
+ mod selector;
+ mod types;
+ mod various;
+@@ -243,7 +246,10 @@ pub use self::method::*;
+ pub use self::object::*;
+ pub use self::property::*;
+ pub use self::protocol::*;
++#[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+ pub use self::rc::*;
++#[cfg(all(target_vendor = "apple", target_arch = "powerpc"))]
++pub use self::legacy::*;
+ pub use self::selector::*;
+ pub use self::types::*;
+ pub use self::various::*;
+--- a/src/rc/allocated_partial_init.rs
++++ b/src/rc/allocated_partial_init.rs
+@@ -96,10 +96,11 @@ impl<T: ?Sized + Message> Allocated<T> {
+     where
+         T: Sized,
+     {
+-        // Available on non-fragile Apple runtimes.
++        // Available on non-fragile Apple runtimes (and not on PowerPC, where
++        // the runtime predates `objc_alloc`).
+         #[cfg(all(
+             target_vendor = "apple",
+-            not(all(target_os = "macos", target_arch = "x86"))
++            not(all(target_os = "macos", any(target_arch = "x86", target_arch = "powerpc")))
+         ))]
+         {
+             // SAFETY: Thread safety checked by the caller.
+@@ -109,7 +110,7 @@ impl<T: ?Sized + Message> Allocated<T> {
+         }
+         #[cfg(not(all(
+             target_vendor = "apple",
+-            not(all(target_os = "macos", target_arch = "x86"))
++            not(all(target_os = "macos", any(target_arch = "x86", target_arch = "powerpc")))
+         )))]
+         {
+             // SAFETY: Thread safety checked by the caller.
+--- a/src/rc/autorelease.rs
++++ b/src/rc/autorelease.rs
+@@ -60,7 +60,7 @@ impl Pool {
+     /// [revision `551.1`]: https://github.com/apple-oss-distributions/objc4/blob/objc4-551.1/runtime/objc-exception.mm#L540
+     #[inline]
+     unsafe fn drain(self) {
+-        #[cfg(all(target_os = "macos", target_arch = "x86"))]
++        #[cfg(all(target_os = "macos", any(target_arch = "x86", target_arch = "powerpc")))]
+         unsafe {
+             ffi::objc_autoreleasePoolPop(self.context);
+         }
+@@ -80,7 +80,7 @@ impl Drop for Pool {
+         });
+ 
+         // See `drain`.
+-        #[cfg(not(all(target_os = "macos", target_arch = "x86")))]
++        #[cfg(not(all(target_os = "macos", any(target_arch = "x86", target_arch = "powerpc"))))]
+         unsafe {
+             ffi::objc_autoreleasePoolPop(self.context);
+         }
+--- a/src/runtime/message_receiver.rs
++++ b/src/runtime/message_receiver.rs
+@@ -123,6 +123,29 @@ mod msg_send_primitive {
+         };
+     }
+ 
++    #[cfg(target_arch = "powerpc")]
++    /// Every struct and union is returned through a hidden pointer, whatever
++    /// its size; everything else, including `long long` and floating-point
++    /// values, is returned in registers by plain `objc_msgSend`.
++    ///
++    /// GCC: `rs6000_return_in_memory`, with `aix_struct_return` set on Darwin.
++    unsafe impl<T: EncodeReturn> MsgSendFn for T {
++        const MSG_SEND: Imp = {
++            if let Encoding::Struct(_, _) | Encoding::Union(_, _) = T::ENCODING_RETURN {
++                ffi::objc_msgSend_stret
++            } else {
++                ffi::objc_msgSend
++            }
++        };
++        const MSG_SEND_SUPER: Imp = {
++            if let Encoding::Struct(_, _) | Encoding::Union(_, _) = T::ENCODING_RETURN {
++                ffi::objc_msgSendSuper_stret
++            } else {
++                ffi::objc_msgSendSuper
++            }
++        };
++    }
++
+     #[cfg(target_arch = "x86_64")]
+     /// If the size of an object is larger than two eightbytes, it has class
+     /// MEMORY. If the type has class MEMORY, then the caller provides space for

@@ -1,0 +1,173 @@
+objc 0.2.4-0.2.7 on 32-bit PowerPC (Mac OS X 10.4-10.6).
+
+1. Message sending: objc 0.2 has message-send modules for x86, x86_64, arm and aarch64
+only, so the crate doesn't build for powerpc. Add one for 32-bit PowerPC: structures of
+every size come back through a hidden pointer (objc_msgSend_stret,
+objc_msgSendSuper_stret), integers, pointers and floating-point values in registers
+(objc_msgSend, objc_msgSendSuper). objc 0.2 has no type encoding for the return type, so
+powerpc.rs tells them apart by size and TypeId; only a structure of 1, 2 or 4 bytes would
+be sent the wrong way. cocoa_image (pngquant) only gets pointers and () back.
+
+2. ARC entry points: the 10.4-10.6 libobjc has no objc_retain, objc_release,
+objc_autorelease or objc_autoreleasePoolPush/Pop (10.7), so StrongPtr (objc_id::Id,
+clipboard 0.5 -> jless) and autoreleasepool failed to link. On powerpc they are Rust
+functions that send retain/release/autorelease, [NSAutoreleasePool new] and drain. They
+are not exported, so another objc crate in the same program can't clash with them. The
+weak-reference functions (objc_initWeak etc.) have no pre-10.7 equivalent and stay
+undefined: a program that really uses WeakPtr fails to link instead of misbehaving.
+
+--- a/src/message/apple/mod.rs
++++ b/src/message/apple/mod.rs
+@@ -15,6 +15,9 @@
+ #[cfg(target_arch = "aarch64")]
+ #[path = "arm64.rs"]
+ mod arch;
++#[cfg(target_arch = "powerpc")]
++#[path = "powerpc.rs"]
++mod arch;
+ 
+ use self::arch::{msg_send_fn, msg_send_super_fn};
+ 
+--- a/src/message/apple/powerpc.rs
++++ b/src/message/apple/powerpc.rs
+@@ -0,0 +1,43 @@
++use std::any::{Any, TypeId};
++use std::mem;
++
++use runtime::Imp;
++
++extern {
++    fn objc_msgSend();
++    fn objc_msgSend_stret();
++
++    fn objc_msgSendSuper();
++    fn objc_msgSendSuper_stret();
++}
++
++// 32-bit PowerPC (Mac OS X 10.4-10.6): structures of every size are returned through
++// a hidden pointer (the _stret variants); integers and pointers come back in r3/r4 and
++// floating-point values in f1, so plain objc_msgSend serves those (no _fpret needed).
++// All that is known about R is its size and TypeId, so anything of at most 4 bytes, and
++// u64/i64/f64, is taken as a scalar and everything else as a structure. That covers
++// pointers, BOOL, NSInteger, CGFloat, NSPoint/NSSize/NSRange (8 bytes) and NSRect; only
++// a structure of 1, 2 or 4 bytes would be sent the wrong way.
++fn returns_in_registers<R: Any>() -> bool {
++    let type_id = TypeId::of::<R>();
++    mem::size_of::<R>() <= 4 ||
++        type_id == TypeId::of::<u64>() ||
++        type_id == TypeId::of::<i64>() ||
++        type_id == TypeId::of::<f64>()
++}
++
++pub fn msg_send_fn<R: Any>() -> Imp {
++    if returns_in_registers::<R>() {
++        objc_msgSend
++    } else {
++        objc_msgSend_stret
++    }
++}
++
++pub fn msg_send_super_fn<R: Any>() -> Imp {
++    if returns_in_registers::<R>() {
++        objc_msgSendSuper
++    } else {
++        objc_msgSendSuper_stret
++    }
++}
+--- a/src/runtime.rs
++++ b/src/runtime.rs
+@@ -109,7 +109,9 @@
+     pub fn objc_allocateProtocol(name: *const c_char) -> *mut Protocol;
+     pub fn objc_registerProtocol(proto: *mut Protocol);
+ 
++    #[cfg(not(target_arch = "powerpc"))]
+     pub fn objc_autoreleasePoolPush() -> *mut c_void;
++    #[cfg(not(target_arch = "powerpc"))]
+     pub fn objc_autoreleasePoolPop(context: *mut c_void);
+ 
+     pub fn protocol_addMethodDescription(proto: *mut Protocol, name: Sel, types: *const c_char, isRequiredMethod: BOOL,
+@@ -132,8 +134,11 @@
+     pub fn method_setImplementation(method: *mut Method, imp: Imp) -> Imp;
+     pub fn method_exchangeImplementations(m1: *mut Method, m2: *mut Method);
+ 
++    #[cfg(not(target_arch = "powerpc"))]
+     pub fn objc_retain(obj: *mut Object) -> *mut Object;
++    #[cfg(not(target_arch = "powerpc"))]
+     pub fn objc_release(obj: *mut Object);
++    #[cfg(not(target_arch = "powerpc"))]
+     pub fn objc_autorelease(obj: *mut Object);
+ 
+     pub fn objc_loadWeakRetained(location: *mut *mut Object) -> *mut Object;
+@@ -142,6 +147,72 @@
+     pub fn objc_copyWeak(to: *mut *mut Object, from: *mut *mut Object);
+ }
+ 
++#[cfg(target_arch = "powerpc")]
++pub use self::arc_fallback::{objc_retain, objc_release, objc_autorelease,
++                             objc_autoreleasePoolPush, objc_autoreleasePoolPop};
++
++// 32-bit PowerPC (Mac OS X 10.4-10.6): libobjc has none of the ARC entry points (10.7), so
++// send the messages they stand for. They are not exported (#[no_mangle]): another objc crate
++// in the same program may define them too. The weak-reference functions have no equivalent
++// and stay undefined, so a program that really uses WeakPtr fails to link instead of
++// misbehaving.
++#[cfg(target_arch = "powerpc")]
++mod arc_fallback {
++    use std::mem;
++    use std::os::raw::{c_char, c_void};
++    use std::sync::atomic::{AtomicPtr, Ordering};
++    use super::{Object, Sel, objc_getClass, sel_registerName};
++
++    extern {
++        fn objc_msgSend();
++    }
++
++    unsafe fn send(obj: *mut Object, cache: &AtomicPtr<c_void>, name: &'static [u8]) -> *mut Object {
++        let mut sel = cache.load(Ordering::Relaxed);
++        if sel.is_null() {
++            sel = sel_registerName(name.as_ptr() as *const c_char).as_ptr() as *mut c_void;
++            cache.store(sel, Ordering::Relaxed);
++        }
++        let imp: unsafe extern fn(*mut Object, Sel) -> *mut Object =
++            mem::transmute(objc_msgSend as unsafe extern fn());
++        imp(obj, Sel::from_ptr(sel))
++    }
++
++    static RETAIN: AtomicPtr<c_void> = AtomicPtr::new(0 as *mut c_void);
++    static RELEASE: AtomicPtr<c_void> = AtomicPtr::new(0 as *mut c_void);
++    static AUTORELEASE: AtomicPtr<c_void> = AtomicPtr::new(0 as *mut c_void);
++    static NEW: AtomicPtr<c_void> = AtomicPtr::new(0 as *mut c_void);
++    static DRAIN: AtomicPtr<c_void> = AtomicPtr::new(0 as *mut c_void);
++
++    /// `[obj retain]`
++    pub unsafe fn objc_retain(obj: *mut Object) -> *mut Object {
++        send(obj, &RETAIN, b"retain\0")
++    }
++    /// `[obj release]`
++    pub unsafe fn objc_release(obj: *mut Object) {
++        send(obj, &RELEASE, b"release\0");
++    }
++    /// `[obj autorelease]`
++    pub unsafe fn objc_autorelease(obj: *mut Object) {
++        send(obj, &AUTORELEASE, b"autorelease\0");
++    }
++    /// `[NSAutoreleasePool new]`, or null if Foundation isn't loaded (then nothing can be
++    /// autoreleased either)
++    pub unsafe fn objc_autoreleasePoolPush() -> *mut c_void {
++        let cls = objc_getClass(b"NSAutoreleasePool\0".as_ptr() as *const c_char);
++        if cls.is_null() {
++            return 0 as *mut c_void;
++        }
++        send(cls as *mut Object, &NEW, b"new\0") as *mut c_void
++    }
++    /// `[pool drain]`
++    pub unsafe fn objc_autoreleasePoolPop(context: *mut c_void) {
++        if !context.is_null() {
++            send(context as *mut Object, &DRAIN, b"drain\0");
++        }
++    }
++}
++
+ impl Sel {
+     /// Registers a method with the Objective-C runtime system,
+     /// maps the method name to a selector, and returns the selector value.

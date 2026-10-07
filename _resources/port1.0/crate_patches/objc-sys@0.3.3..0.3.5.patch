@@ -1,0 +1,273 @@
+objc-sys (the runtime bindings under objc2 0.5) on powerpc-apple-darwin
+(Mac OS X 10.4 to 10.6, legacy ObjC runtime).
+
+libobjc on 10.6 and earlier has none of the ARC entry points (objc_retain,
+objc_release, objc_autorelease*, objc_autoreleasePoolPush/Pop,
+objc_storeStrong, objc_retainBlock, the weak functions) and no
+objc_copyClassList; they arrived in 10.7. On powerpc, src/legacy.rs replaces
+src/rc.rs and implements them with -retain/-release/-autorelease,
+NSAutoreleasePool, _Block_copy and objc_getClassList. There are no zeroing
+weak references either, so weak references are strong ones on powerpc: no
+dangling, but a cycle a weak reference was meant to break leaks.
+
+The `unstable-exception` helper (extern/exception.m) retains the caught
+exception with a -retain message on PowerPC for the same reason.
+
+--- a/extern/exception.m
++++ b/extern/exception.m
+@@ -16,7 +16,12 @@ unsigned char rust_objc_sys_0_3_try_catch_exception(void (*f)(void *), void *con
+     } @catch (id exception) {
+         // The exception is retained while inside the `@catch` block, but is
+         // not guaranteed to be so outside of it; so hence we must do it here!
++#if defined(__ppc__) || defined(__ppc64__)
++        // libobjc has no `objc_retain` before Mac OS X 10.7.
++        *error = [exception retain];
++#else
+         *error = objc_retain(exception);
++#endif
+         return 1;
+     }
+ }
+--- a/src/class.rs
++++ b/src/class.rs
+@@ -54,6 +54,7 @@ extern_c! {
+     #[cfg(any(doc, not(feature = "unstable-objfw")))]
+     pub fn objc_getMetaClass(name: *const c_char) -> *const objc_class;
+     /// The returned array is deallocated with [`free`][crate::free].
++    #[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+     pub fn objc_copyClassList(out_len: *mut c_uint) -> *mut *const objc_class;
+     pub fn objc_getClassList(buffer: *mut *const objc_class, buffer_len: c_int) -> c_int;
+ 
+--- /dev/null
++++ b/src/legacy.rs
+@@ -0,0 +1,206 @@
++//! Runtime functions missing from Mac OS X 10.6 and earlier.
++//!
++//! `libobjc` gained the ARC entry points (`objc_retain`,
++//! `objc_autoreleasePoolPush`, the weak reference functions, ...) and
++//! `objc_copyClassList` in Mac OS X 10.7, so the PowerPC runtimes don't have
++//! them. These implement them with `-retain`, `-release`, `-autorelease`,
++//! `NSAutoreleasePool` and `objc_getClassList`.
++//!
++//! The runtime has no zeroing weak references either (except under garbage
++//! collection), so the weak functions here keep a strong reference: an
++//! object stays alive while a weak reference to it exists, and loading the
++//! weak reference never returns `nil`. A reference cycle that a weak
++//! reference was meant to break is leaked, but a weak reference never
++//! dangles.
++use core::ffi::{c_uint, c_void};
++use core::mem;
++use core::ptr;
++use core::sync::atomic::{AtomicPtr, Ordering};
++
++use crate::{objc_class, objc_object, objc_selector};
++
++extern "C" {
++    // libSystem
++    fn _Block_copy(block: *const c_void) -> *mut c_void;
++    fn malloc(size: usize) -> *mut c_void;
++}
++
++/// A selector, registered on first use.
++macro_rules! sel {
++    ($name:literal) => {{
++        static SEL: AtomicPtr<objc_selector> = AtomicPtr::new(ptr::null_mut());
++        let mut sel = SEL.load(Ordering::Relaxed);
++        if sel.is_null() {
++            sel = unsafe { crate::sel_registerName(concat!($name, "\0").as_ptr().cast()) }
++                as *mut objc_selector;
++            SEL.store(sel, Ordering::Relaxed);
++        }
++        sel as *const objc_selector
++    }};
++}
++
++/// Send a message that takes no arguments and returns an object or nothing.
++#[inline]
++unsafe fn send(obj: *mut objc_object, sel: *const objc_selector) -> *mut objc_object {
++    let msg_send: unsafe extern "C" fn() = crate::objc_msgSend;
++    // SAFETY: `objc_msgSend` is called with the signature of the method.
++    let msg_send: unsafe extern "C" fn(*mut objc_object, *const objc_selector) -> *mut objc_object =
++        unsafe { mem::transmute(msg_send) };
++    unsafe { msg_send(obj, sel) }
++}
++
++// Autoreleasepool
++
++/// `[[NSAutoreleasePool alloc] init]`
++pub unsafe extern "C" fn objc_autoreleasePoolPush() -> *mut c_void {
++    static CLS: AtomicPtr<objc_class> = AtomicPtr::new(ptr::null_mut());
++    let mut cls = CLS.load(Ordering::Relaxed);
++    if cls.is_null() {
++        cls = unsafe { crate::objc_getClass(b"NSAutoreleasePool\0".as_ptr().cast()) }
++            as *mut objc_class;
++        CLS.store(cls, Ordering::Relaxed);
++    }
++    unsafe {
++        let pool = send(cls.cast(), sel!("alloc"));
++        send(pool, sel!("init")).cast()
++    }
++}
++
++/// `[pool drain]`, which also drains any pools pushed after `pool`.
++pub unsafe extern "C" fn objc_autoreleasePoolPop(pool: *mut c_void) {
++    unsafe { send(pool.cast(), sel!("drain")) };
++}
++
++// Autorelease
++
++pub unsafe extern "C" fn objc_autorelease(value: *mut objc_object) -> *mut objc_object {
++    if !value.is_null() {
++        unsafe { send(value, sel!("autorelease")) };
++    }
++    value
++}
++
++pub unsafe extern "C" fn objc_autoreleaseReturnValue(value: *mut objc_object) -> *mut objc_object {
++    unsafe { objc_autorelease(value) }
++}
++
++// Weak pointers (strong references, see the module documentation)
++
++pub unsafe extern "C" fn objc_copyWeak(to: *mut *mut objc_object, from: *mut *mut objc_object) {
++    unsafe { *to = objc_retain(*from) };
++}
++
++pub unsafe extern "C" fn objc_destroyWeak(addr: *mut *mut objc_object) {
++    unsafe {
++        objc_release(*addr);
++        *addr = ptr::null_mut();
++    }
++}
++
++pub unsafe extern "C" fn objc_initWeak(
++    addr: *mut *mut objc_object,
++    value: *mut objc_object,
++) -> *mut objc_object {
++    unsafe { *addr = objc_retain(value) };
++    value
++}
++
++pub unsafe extern "C" fn objc_loadWeak(addr: *mut *mut objc_object) -> *mut objc_object {
++    unsafe { objc_autorelease(objc_loadWeakRetained(addr)) }
++}
++
++pub unsafe extern "C" fn objc_loadWeakRetained(addr: *mut *mut objc_object) -> *mut objc_object {
++    unsafe { objc_retain(*addr) }
++}
++
++pub unsafe extern "C" fn objc_moveWeak(to: *mut *mut objc_object, from: *mut *mut objc_object) {
++    unsafe {
++        *to = *from;
++        *from = ptr::null_mut();
++    }
++}
++
++// Retain / release
++
++pub unsafe extern "C" fn objc_release(value: *mut objc_object) {
++    if !value.is_null() {
++        unsafe { send(value, sel!("release")) };
++    }
++}
++
++pub unsafe extern "C" fn objc_retain(value: *mut objc_object) -> *mut objc_object {
++    if !value.is_null() {
++        unsafe { send(value, sel!("retain")) };
++    }
++    value
++}
++
++pub unsafe extern "C" fn objc_retainAutorelease(value: *mut objc_object) -> *mut objc_object {
++    unsafe { objc_autorelease(objc_retain(value)) }
++}
++
++pub unsafe extern "C" fn objc_retainAutoreleaseReturnValue(
++    value: *mut objc_object,
++) -> *mut objc_object {
++    unsafe { objc_retainAutorelease(value) }
++}
++
++pub unsafe extern "C" fn objc_retainAutoreleasedReturnValue(
++    value: *mut objc_object,
++) -> *mut objc_object {
++    unsafe { objc_retain(value) }
++}
++
++/// `_Block_copy`
++pub unsafe extern "C" fn objc_retainBlock(value: *mut objc_object) -> *mut objc_object {
++    unsafe { _Block_copy(value.cast()).cast() }
++}
++
++// Storing values
++
++pub unsafe extern "C" fn objc_storeStrong(addr: *mut *mut objc_object, value: *mut objc_object) {
++    let prev = unsafe { *addr };
++    if prev != value {
++        unsafe {
++            *addr = objc_retain(value);
++            objc_release(prev);
++        }
++    }
++}
++
++pub unsafe extern "C" fn objc_storeWeak(
++    addr: *mut *mut objc_object,
++    value: *mut objc_object,
++) -> *mut objc_object {
++    unsafe { objc_storeStrong(addr, value) };
++    value
++}
++
++// Classes
++
++/// The returned array is deallocated with [`free`][crate::free].
++pub unsafe extern "C" fn objc_copyClassList(out_len: *mut c_uint) -> *mut *const objc_class {
++    let mut len = unsafe { crate::objc_getClassList(ptr::null_mut(), 0) }.max(0);
++    let buf = loop {
++        let buf: *mut *const objc_class =
++            unsafe { malloc((len as usize + 1) * mem::size_of::<*const objc_class>()) }.cast();
++        if buf.is_null() {
++            len = 0;
++            break buf;
++        }
++        // Fills in at most `len` classes, and returns how many are registered
++        // now, which is more if classes were added since the last call.
++        let count = unsafe { crate::objc_getClassList(buf, len) }.max(0);
++        if count <= len {
++            len = count;
++            unsafe { *buf.add(len as usize) = ptr::null() };
++            break buf;
++        }
++        unsafe { crate::free(buf.cast()) };
++        len = count;
++    };
++    if !out_len.is_null() {
++        unsafe { *out_len = len as c_uint };
++    }
++    buf
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -286,7 +286,10 @@ mod method;
+ mod object;
+ mod property;
+ mod protocol;
++#[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+ mod rc;
++#[cfg(all(target_vendor = "apple", target_arch = "powerpc"))]
++mod legacy;
+ mod selector;
+ mod types;
+ mod various;
+@@ -301,7 +304,10 @@ pub use self::method::*;
+ pub use self::object::*;
+ pub use self::property::*;
+ pub use self::protocol::*;
++#[cfg(not(all(target_vendor = "apple", target_arch = "powerpc")))]
+ pub use self::rc::*;
++#[cfg(all(target_vendor = "apple", target_arch = "powerpc"))]
++pub use self::legacy::*;
+ pub use self::selector::*;
+ pub use self::types::*;
+ pub use self::various::*;
