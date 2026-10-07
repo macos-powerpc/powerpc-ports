@@ -1,0 +1,524 @@
+diff -ruN a/src/unix/apple/macos/component/hwsensor.rs b/src/unix/apple/macos/component/hwsensor.rs
+--- a/src/unix/apple/macos/component/hwsensor.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/unix/apple/macos/component/hwsensor.rs	2026-10-07 21:46:02.184634664 +0000
+@@ -0,0 +1,421 @@
++// Take a look at the license at the top of the repository in the LICENSE file.
++
++// PowerPC Macs (G4/G5, Mac OS X 10.4 - 10.6) have no SMC. Their thermal management lives in
++// the platform plugin (IOPlatformPluginFamily: PowerMac7_2_PlatformPlugin, SMU_Neo2_PlatformPlugin,
++// PBG4_PlatformPlugin, ...), which polls every sensor it manages and publishes the readings in
++// two places of the I/O Registry:
++//
++// 1. Its own entry (a subclass of `IOPlatformPlugin`, e.g. SMU_Neo2_PlatformPlugin on a late G5)
++//    carries an `IOHWSensors` array with one dictionary per sensor: "type" ("temperature" or
++//    "temp", "voltage", "current", "power", ...), "location" (the sensor name, e.g. "CPU A0 DIODE TEMP",
++//    "BACKSIDE", "DRIVE BAY"), "sensor-id" and "current-value". This is the complete list; it also
++//    holds sensors the plugin derives itself (CPU power = voltage x current), which have no nub.
++// 2. Most sensors also exist as an `IOHWSensor` registry object (a nub of AppleHWSensor.kext for
++//    i2c parts, or of the SMU driver), with the same keys; `ioreg -c IOHWSensor -r` lists them and
++//    their "current-value" is updated on each poll.
++//
++// Readings are 16.16 fixed point in both places (degrees Celsius, volts, amperes, watts). Only
++// public IOKit calls are used (no `IOServiceOpen`), so this also works in the sandbox. A refresh
++// re-reads the plugin's table (one property fetch) and then the nubs the table did not cover,
++// matching known components by ("sensor-id", "location"). "high-threshold" is the plugin's
++// notification window, not a limit, so `critical` is `None`.
++
++use crate::sys::utils::CFReleaser;
++use crate::Component;
++
++use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef};
++use core_foundation_sys::base::{
++    kCFAllocatorDefault, kCFAllocatorNull, mach_port_t, Boolean, CFAllocatorRef, CFGetTypeID,
++    CFIndex, CFTypeRef,
++};
++use core_foundation_sys::dictionary::{
++    CFDictionaryGetTypeID, CFDictionaryGetValue, CFDictionaryRef, CFMutableDictionaryRef,
++};
++use core_foundation_sys::number::{
++    kCFNumberSInt64Type, CFNumberGetTypeID, CFNumberGetValue, CFNumberRef,
++};
++use core_foundation_sys::string::{
++    kCFStringEncodingUTF8, CFStringCreateWithBytesNoCopy, CFStringGetCString, CFStringGetTypeID,
++    CFStringRef,
++};
++
++use libc::{c_char, c_int, c_void};
++
++#[allow(non_camel_case_types)]
++type io_object_t = mach_port_t;
++#[allow(non_camel_case_types)]
++type io_iterator_t = io_object_t;
++#[allow(non_camel_case_types)]
++type io_registry_entry_t = io_object_t;
++#[allow(non_camel_case_types)]
++type kern_return_t = c_int;
++#[allow(non_camel_case_types)]
++type IOOptionBits = u32;
++
++const KERN_SUCCESS: kern_return_t = 0;
++// Same value as its replacement `kIOMainPortDefault` (see `ffi.rs`).
++#[allow(non_upper_case_globals)]
++const kIOMasterPortDefault: mach_port_t = 0;
++
++const PLATFORM_PLUGIN_CLASS: &[u8] = b"IOPlatformPlugin\0";
++const SENSOR_NUB_CLASS: &[u8] = b"IOHWSensor\0";
++const SENSOR_TABLE_KEY: &[u8] = b"IOHWSensors";
++const TYPE_KEY: &[u8] = b"type";
++const LOCATION_KEY: &[u8] = b"location";
++const SENSOR_ID_KEY: &[u8] = b"sensor-id";
++const CURRENT_VALUE_KEY: &[u8] = b"current-value";
++
++// Declared here rather than in `ffi.rs`, whose IOKit declarations are only compiled for the
++// `system` / `disk` features or the x86 component backend.
++#[link(name = "IOKit", kind = "framework")]
++extern "C" {
++    fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
++    fn IOServiceGetMatchingServices(
++        main_port: mach_port_t,
++        matching: CFMutableDictionaryRef,
++        existing: *mut io_iterator_t,
++    ) -> kern_return_t;
++    fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
++    fn IOObjectRelease(obj: io_object_t) -> kern_return_t;
++    fn IORegistryEntryCreateCFProperty(
++        entry: io_registry_entry_t,
++        key: CFStringRef,
++        allocator: CFAllocatorRef,
++        options: IOOptionBits,
++    ) -> CFTypeRef;
++}
++
++/// A retained I/O Registry object, released on drop.
++struct IoObject(io_object_t);
++
++impl IoObject {
++    fn new(obj: io_object_t) -> Option<Self> {
++        if obj == 0 {
++            None
++        } else {
++            Some(Self(obj))
++        }
++    }
++
++    fn inner(&self) -> io_object_t {
++        self.0
++    }
++}
++
++impl Drop for IoObject {
++    fn drop(&mut self) {
++        unsafe {
++            IOObjectRelease(self.0);
++        }
++    }
++}
++
++/// An iterator over the registered services of `class` (NUL-terminated) and its subclasses.
++unsafe fn services(class: &[u8]) -> Option<IoObject> {
++    let matching = IOServiceMatching(class.as_ptr() as *const c_char);
++    if matching.is_null() {
++        sysinfo_debug!("IOServiceMatching call failed");
++        return None;
++    }
++    // `IOServiceGetMatchingServices` consumes the matching dictionary.
++    let mut iterator: io_iterator_t = 0;
++    let result = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iterator);
++    if result != KERN_SUCCESS {
++        sysinfo_debug!("Error: IOServiceGetMatchingServices() = {}", result);
++        return None;
++    }
++    IoObject::new(iterator)
++}
++
++unsafe fn cf_key(key: &[u8]) -> Option<CFReleaser<c_void>> {
++    CFReleaser::new(CFStringCreateWithBytesNoCopy(
++        kCFAllocatorDefault,
++        key.as_ptr(),
++        key.len() as CFIndex,
++        kCFStringEncodingUTF8,
++        false as Boolean,
++        kCFAllocatorNull,
++    ) as *const c_void)
++}
++
++/// Copies the registry property `key` (a NUL-free ASCII name) of `entry`.
++unsafe fn property(entry: io_registry_entry_t, key: &[u8]) -> Option<CFReleaser<c_void>> {
++    let key_ref = cf_key(key)?;
++    CFReleaser::new(IORegistryEntryCreateCFProperty(
++        entry,
++        key_ref.inner() as CFStringRef,
++        kCFAllocatorDefault,
++        0,
++    ))
++}
++
++/// The value for `key` in `dict`; owned by the dictionary, so not released.
++unsafe fn dict_value(dict: CFDictionaryRef, key: &[u8]) -> CFTypeRef {
++    match cf_key(key) {
++        Some(key_ref) => CFDictionaryGetValue(dict, key_ref.inner()),
++        None => std::ptr::null(),
++    }
++}
++
++unsafe fn cf_string(value: CFTypeRef) -> Option<String> {
++    if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
++        return None;
++    }
++    let mut buf = [0 as c_char; 128];
++    if CFStringGetCString(
++        value as CFStringRef,
++        buf.as_mut_ptr(),
++        buf.len() as CFIndex,
++        kCFStringEncodingUTF8,
++    ) == 0
++    {
++        return None;
++    }
++    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
++    let bytes: Vec<u8> = buf[..len].iter().map(|&c| c as u8).collect();
++    Some(String::from_utf8_lossy(&bytes).into_owned())
++}
++
++unsafe fn cf_number(value: CFTypeRef) -> Option<i64> {
++    if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
++        return None;
++    }
++    let mut out: i64 = 0;
++    if CFNumberGetValue(
++        value as CFNumberRef,
++        kCFNumberSInt64Type,
++        &mut out as *mut i64 as *mut c_void,
++    ) {
++        Some(out)
++    } else {
++        None
++    }
++}
++
++/// A `current-value`: 16.16 fixed point, in degrees Celsius for temperature sensors.
++fn fixed_16_16(value: i64) -> f32 {
++    value as f32 / 65536.0
++}
++
++/// A CF value that is either ours to release (a copied registry property) or owned by a
++/// dictionary being walked (released with that dictionary).
++enum Value {
++    Owned(CFReleaser<c_void>),
++    Borrowed(CFTypeRef),
++}
++
++impl Value {
++    fn ptr(&self) -> CFTypeRef {
++        match self {
++            Value::Owned(v) => v.inner(),
++            Value::Borrowed(p) => *p,
++        }
++    }
++}
++
++/// One row of a plugin's `IOHWSensors` table, or one `IOHWSensor` nub.
++struct SensorReading {
++    label: String,
++    sensor_id: i64,
++    temperature: Option<f32>,
++}
++
++/// Reads a sensor description (table row or nub properties) through `get`, keeping temperature sensors.
++unsafe fn temperature_sensor(get: impl Fn(&[u8]) -> Option<Value>) -> Option<SensorReading> {
++    // AppleHWSensor (i2c) nubs say "temperature", SMU-published sensors (CPU diodes, inlet
++    // ambient, GPU diode) say "temp": match the stem.
++    let kind = cf_string(get(TYPE_KEY)?.ptr())?;
++    if !kind.contains("temp") {
++        return None;
++    }
++    let label = cf_string(get(LOCATION_KEY)?.ptr())?;
++    let sensor_id = get(SENSOR_ID_KEY).and_then(|v| cf_number(v.ptr())).unwrap_or(-1);
++    let temperature = get(CURRENT_VALUE_KEY).and_then(|v| cf_number(v.ptr())).map(fixed_16_16);
++    Some(SensorReading {
++        label,
++        sensor_id,
++        temperature,
++    })
++}
++
++/// Calls `f` for every temperature row of every platform plugin's `IOHWSensors` table.
++unsafe fn for_each_table_sensor(mut f: impl FnMut(SensorReading)) {
++    let Some(plugins) = services(PLATFORM_PLUGIN_CLASS) else {
++        return;
++    };
++    while let Some(plugin) = IoObject::new(IOIteratorNext(plugins.inner())) {
++        let Some(table) = property(plugin.inner(), SENSOR_TABLE_KEY) else {
++            continue;
++        };
++        if CFGetTypeID(table.inner()) != CFArrayGetTypeID() {
++            continue;
++        }
++        let array = table.inner() as CFArrayRef;
++        for i in 0..CFArrayGetCount(array) {
++            let row = CFArrayGetValueAtIndex(array, i);
++            if row.is_null() || CFGetTypeID(row) != CFDictionaryGetTypeID() {
++                continue;
++            }
++            let row = row as CFDictionaryRef;
++            // Values are owned by the table, which outlives this closure: retain nothing, release nothing.
++            let get = |key: &[u8]| -> Option<Value> {
++                let value = dict_value(row, key);
++                if value.is_null() {
++                    None
++                } else {
++                    Some(Value::Borrowed(value))
++                }
++            };
++            if let Some(reading) = temperature_sensor(get) {
++                f(reading);
++            }
++        }
++    }
++}
++
++/// The reading of one nub.
++unsafe fn nub_sensor(entry: io_registry_entry_t) -> Option<SensorReading> {
++    temperature_sensor(|key: &[u8]| property(entry, key).map(Value::Owned))
++}
++
++/// Where a component's `current-value` is read from on refresh.
++enum Source {
++    /// A row of the plugin's `IOHWSensors` table, found again by ("sensor-id", "location").
++    Table,
++    /// A retained `IOHWSensor` nub.
++    Nub(IoObject),
++}
++
++pub(crate) struct ComponentsInner {
++    pub(crate) components: Vec<Component>,
++}
++
++impl ComponentsInner {
++    pub(crate) fn new() -> Self {
++        Self {
++            components: Vec::with_capacity(8),
++        }
++    }
++
++    pub(crate) fn from_vec(components: Vec<Component>) -> Self {
++        Self { components }
++    }
++
++    pub(crate) fn into_vec(self) -> Vec<Component> {
++        self.components
++    }
++
++    pub(crate) fn list(&self) -> &[Component] {
++        &self.components
++    }
++
++    pub(crate) fn list_mut(&mut self) -> &mut [Component] {
++        &mut self.components
++    }
++
++    fn position(&self, reading: &SensorReading) -> Option<usize> {
++        self.components
++            .iter()
++            .position(|c| c.inner.sensor_id == reading.sensor_id && c.inner.label == reading.label)
++    }
++
++    pub(crate) fn refresh(&mut self) {
++        for c in self.components.iter_mut() {
++            c.inner.updated = false;
++        }
++        unsafe {
++            // 1. The plugin's table: complete, and one property fetch for all readings.
++            for_each_table_sensor(|reading| match self.position(&reading) {
++                Some(i) => self.components[i].inner.set_temperature(reading.temperature),
++                None => self.components.push(Component {
++                    inner: ComponentInner::new(reading, Source::Table),
++                }),
++            });
++            // 2. The nubs, for sensors the table did not list (or a plugin without a table).
++            let Some(nubs) = services(SENSOR_NUB_CLASS) else {
++                return;
++            };
++            while let Some(entry) = IoObject::new(IOIteratorNext(nubs.inner())) {
++                let Some(reading) = nub_sensor(entry.inner()) else {
++                    continue;
++                };
++                match self.position(&reading) {
++                    Some(i) => {
++                        if !self.components[i].inner.updated {
++                            self.components[i].inner.set_temperature(reading.temperature);
++                        }
++                    }
++                    None => self.components.push(Component {
++                        inner: ComponentInner::new(reading, Source::Nub(entry)),
++                    }),
++                }
++            }
++        }
++    }
++}
++
++pub(crate) struct ComponentInner {
++    source: Source,
++    sensor_id: i64,
++    temperature: Option<f32>,
++    max: f32,
++    label: String,
++    pub(crate) updated: bool,
++}
++
++impl ComponentInner {
++    fn new(reading: SensorReading, source: Source) -> Self {
++        Self {
++            source,
++            sensor_id: reading.sensor_id,
++            temperature: reading.temperature,
++            max: reading.temperature.unwrap_or(0.0),
++            label: reading.label,
++            updated: true,
++        }
++    }
++
++    fn set_temperature(&mut self, temperature: Option<f32>) {
++        self.temperature = temperature;
++        if let Some(temperature) = temperature {
++            if temperature > self.max {
++                self.max = temperature;
++            }
++        }
++        self.updated = true;
++    }
++
++    pub(crate) fn temperature(&self) -> Option<f32> {
++        self.temperature
++    }
++
++    pub(crate) fn max(&self) -> Option<f32> {
++        Some(self.max)
++    }
++
++    pub(crate) fn critical(&self) -> Option<f32> {
++        None
++    }
++
++    pub(crate) fn label(&self) -> &str {
++        &self.label
++    }
++
++    pub(crate) fn refresh(&mut self) {
++        let temperature = unsafe {
++            match &self.source {
++                Source::Nub(entry) => nub_sensor(entry.inner()).and_then(|r| r.temperature),
++                Source::Table => {
++                    let mut found = None;
++                    for_each_table_sensor(|reading| {
++                        if reading.sensor_id == self.sensor_id && reading.label == self.label {
++                            found = reading.temperature;
++                        }
++                    });
++                    found
++                }
++            }
++        };
++        self.set_temperature(temperature);
++    }
++}
+diff -ruN a/src/unix/apple/macos/component/mod.rs b/src/unix/apple/macos/component/mod.rs
+--- a/src/unix/apple/macos/component/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/unix/apple/macos/component/mod.rs	2026-10-07 21:10:13.650288122 +0000
+@@ -11,3 +11,29 @@
+ 
+ #[cfg(target_arch = "aarch64")]
+ pub(crate) use self::arm::*;
++
++// PowerPC Macs: the platform plugin's `IOHWSensors` table and the `IOHWSensor` registry objects.
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++pub(crate) mod hwsensor;
++
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++pub(crate) use self::hwsensor::*;
++
++// Anything else: no sensor backend, report no components, like the App Store sandbox build.
++#[cfg(not(any(
++    target_arch = "x86",
++    target_arch = "x86_64",
++    target_arch = "aarch64",
++    target_arch = "powerpc",
++    target_arch = "powerpc64"
++)))]
++pub(crate) mod unsupported;
++
++#[cfg(not(any(
++    target_arch = "x86",
++    target_arch = "x86_64",
++    target_arch = "aarch64",
++    target_arch = "powerpc",
++    target_arch = "powerpc64"
++)))]
++pub(crate) use self::unsupported::*;
+diff -ruN a/src/unix/apple/macos/component/unsupported.rs b/src/unix/apple/macos/component/unsupported.rs
+--- a/src/unix/apple/macos/component/unsupported.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/unix/apple/macos/component/unsupported.rs	2026-10-07 21:10:13.653288202 +0000
+@@ -0,0 +1,62 @@
++// Take a look at the license at the top of the repository in the LICENSE file.
++
++// Architectures without a sensor backend: the same empty implementation as `app_store/component.rs`,
++// which is only compiled for iOS / `apple-sandbox` builds.
++
++use crate::Component;
++
++pub(crate) struct ComponentInner {
++    pub(crate) updated: bool,
++}
++
++impl ComponentInner {
++    pub(crate) fn temperature(&self) -> Option<f32> {
++        None
++    }
++
++    pub(crate) fn max(&self) -> Option<f32> {
++        None
++    }
++
++    pub(crate) fn critical(&self) -> Option<f32> {
++        None
++    }
++
++    pub(crate) fn label(&self) -> &str {
++        ""
++    }
++
++    pub(crate) fn refresh(&mut self) {}
++}
++
++pub(crate) struct ComponentsInner {
++    pub(crate) components: Vec<Component>,
++}
++
++impl ComponentsInner {
++    pub(crate) fn new() -> Self {
++        Self {
++            components: Vec::new(),
++        }
++    }
++
++    pub(crate) fn from_vec(components: Vec<Component>) -> Self {
++        Self { components }
++    }
++
++    pub(crate) fn into_vec(self) -> Vec<Component> {
++        self.components
++    }
++
++    pub(crate) fn list(&self) -> &[Component] {
++        &self.components
++    }
++
++    pub(crate) fn list_mut(&mut self) -> &mut [Component] {
++        &mut self.components
++    }
++
++    pub(crate) fn refresh(&mut self) {
++        // Doesn't do anything.
++    }
++}
