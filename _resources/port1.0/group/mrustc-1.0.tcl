@@ -150,8 +150,15 @@ default     compwrap.compilers_to_wrap          {cc cxx ld}
 default     compwrap.ccache_supported_compilers {}
 
 # possible OpenSSL versions: empty, 3, 1.1, and 1.0
+# Ports with openssl-sys among their crates get MacPorts openssl3 unless they set a
+# branch, so its build script never has to look for an OpenSSL (see rust::set_environment).
 options     openssl.branch
-default     openssl.branch      {}
+default     openssl.branch      {[expr {[rust::uses_crate openssl-sys] ? 3 : {}}]}
+
+# Fail destroot if a binary links the system OpenSSL or libcurl, or uses
+# SecureTransport (see rust::check_system_tls)
+options     mrustc.check_tls
+default     mrustc.check_tls    {yes}
 
 ####################################################################################################################################
 # utility procedures
@@ -201,6 +208,21 @@ proc cargo.rust_platform {{arch ""}} {
 ####################################################################################################################################
 
 namespace eval rust {}
+
+# Is crate `cname` among cargo.crates or cargo.crates_github?
+proc rust::uses_crate {cname} {
+    foreach {name cversion chksum} [option cargo.crates] {
+        if {${name} eq ${cname}} {
+            return 1
+        }
+    }
+    foreach {name cgithub cbranch crevision chksum} [option cargo.crates_github] {
+        if {${name} eq ${cname}} {
+            return 1
+        }
+    }
+    return 0
+}
 
 # for symbol ___emutls_get_address (used when thread-local-storage is emulated)
 #
@@ -323,6 +345,14 @@ proc rust::old_macos_compatibility {cname cversion} {
                     ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
             }
         }
+        "cmake" {
+            if {[vercmp ${cversion} >= 0.1.49]} {
+                # cmake-rs sets CMAKE_OSX_ARCHITECTURES only for x86_64 and aarch64 and panics
+                # ("unsupported darwin target") on every other Darwin target
+                reinplace {s|panic!("unsupported darwin target: {}", target);|if target.contains("powerpc64") { cmd.arg("-DCMAKE_OSX_ARCHITECTURES=ppc64"); } else if target.contains("powerpc") { cmd.arg("-DCMAKE_OSX_ARCHITECTURES=ppc"); } else if target.contains("i686") { cmd.arg("-DCMAKE_OSX_ARCHITECTURES=i386"); } else { panic!("unsupported darwin target: {}", target); }|} \
+                    ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
+            }
+        }
         "curl-sys" {
             if {[vercmp ${cversion} < 0.4.56]} {
                 # On Mac OS X 10.6, clang exists, but `clang --print-search-dirs` returns an empty library directory.
@@ -413,11 +443,13 @@ proc rust::old_macos_compatibility {cname cversion} {
                 ${cargo.home}/macports/${cname}-${cversion}/Cargo.toml
         }
         "curl-sys" {
-            if {[vercmp ${cversion} < 0.4.49]} {
+            if {[vercmp ${cversion} < 0.4.83]} {
                 # curl-sys requires CCDigestGetOutputSizeFromRef which is only available since macOS 10.8
                 # disable USE_SECTRANSP to avoid calling of CCDigestGetOutputSizeFromRef and use OpenSSL instead
+                # (the Cargo.toml change makes openssl-sys a dependency on macOS)
                 # See: https://github.com/alexcrichton/curl-rust/issues/429
-                # curl 8.15.0 dropped SecureTransport:
+                # This is only for the vendored curl (static-curl, or no usable libcurl found).
+                # curl 8.15.0 (curl-sys 0.4.83) dropped SecureTransport and depends on openssl-sys on all unix:
                 # https://github.com/alexcrichton/curl-rust/commit/8b34786fdd93d4c3eca5c66a8374631284dfe576
                 reinplace "s|else if target.contains(\"-apple-\")|else if target.contains(\"-apple_disabled-\")|g" \
                     ${cargo.home}/macports/${cname}-${cversion}/build.rs
@@ -442,8 +474,16 @@ proc rust::old_macos_compatibility {cname cversion} {
         "libgit2-sys" {
             # libgit2-sys requires SSLCreateContext which is only available since macOS 10.8
             # disable GIT_SECURE_TRANSPORT to avoid calling of SSLCreateContext and use OpenSSL instead
+            # (from 0.14 this also switches SHA256 from CommonCrypto to OpenSSL)
             reinplace "s|else if target.contains(\"apple\")|else if target.contains(\"apple_disabled\")|g" \
                 ${cargo.home}/macports/${cname}-${cversion}/build.rs
+            if {[vercmp ${cversion} >= 0.12.2] && [vercmp ${cversion} < 0.13.3]} {
+                # These accept any system libgit2 at least as new as the bundled one (pkg-config
+                # atleast_version), so they would bind to MacPorts libgit2 1.9 with an incompatible
+                # ABI. Make the probe fail so the bundled libgit2 is built.
+                reinplace "s|.probe(\"libgit2\")|.probe(\"libgit2-abi-mismatch\")|" \
+                    ${cargo.home}/macports/${cname}-${cversion}/build.rs
+            }
         }
     }
 
@@ -720,9 +760,18 @@ proc rust::set_environment {} {
     rust::append_envs     CC=[compwrap::wrap_compiler cc]   {build destroot}
     rust::append_envs     CXX=[compwrap::wrap_compiler cxx] {build destroot}
 
+    # cc (and link-cplusplus, which goes through it) links C++ code with -lc++ on every Apple
+    # target, but GCC uses libstdc++, and so does clang unless the C++ library is libc++
+    if {[option os.platform] eq "darwin" && ([string match *gcc* [option configure.compiler]] || [option configure.cxx_stdlib] ne "libc++")} {
+        rust::append_envs CXXSTDLIB=stdc++ {build destroot}
+    }
+
     if { [option openssl.branch] ne "" } {
         set openssl_ver                     [string map {. {}} [option openssl.branch]]
         rust::append_envs                   OPENSSL_DIR=${prefix}/libexec/openssl${openssl_ver}
+        # Also when some crate turns on openssl-sys/vendored: openssl-src has no
+        # powerpc-apple-darwin target, and its OPENSSLDIR would be /usr/local/ssl.
+        rust::append_envs                   OPENSSL_NO_VENDOR=1
         compiler.cpath-prepend              ${prefix}/libexec/openssl${openssl_ver}/include
         compiler.library_path-prepend       ${prefix}/libexec/openssl${openssl_ver}/lib
         configure.pkg_config_path-prepend   ${prefix}/libexec/openssl${openssl_ver}/lib/pkgconfig
@@ -750,6 +799,70 @@ proc rust::set_environment {} {
 }
 port::register_callback rust::set_environment
 
+# Mac OS X 10.4-10.6 ship OpenSSL 0.9.7/0.9.8 and a libcurl built on it in /usr/lib, and
+# SecureTransport only speaks TLS 1.0 and trusts the root certificates of that release.
+# Crates fall back to them quietly (curl-sys `-l curl`, Security.framework backends), and
+# such binaries link but cannot talk to current servers. Executables are linked with
+# -dead_strip, so a SecureTransport import here is actually used.
+proc rust::is_macho {f} {
+    if {[catch {open ${f} r} fd]} {
+        return 0
+    }
+    fconfigure ${fd} -translation binary
+    set magic [read ${fd} 4]
+    close ${fd}
+    if {[binary scan ${magic} H8 hex] != 1} {
+        return 0
+    }
+    return [expr {${hex} in {feedface cefaedfe feedfacf cffaedfe cafebabe}}]
+}
+
+proc rust::check_system_tls {} {
+    set destroot    [option destroot]
+    set bad_libs    {/usr/lib/libssl.* /usr/lib/libcrypto.* /usr/lib/libcurl.*}
+    set bad_syms    {_SSLCreateContext _SSLNewContext _SSLHandshake
+                     _SecTrustSettingsCopyCertificates _SecTrustCopyAnchorCertificates}
+    set problems    [list]
+    # (no `continue` in the body: on a directory, fs-traverse skips its contents)
+    fs-traverse f [list ${destroot}] {
+        if {[file type ${f}] eq "file" && [rust::is_macho ${f}]} {
+            set rel [string range ${f} [string length ${destroot}] end]
+            if {![catch {exec otool -L ${f}} out]} {
+                foreach ln [lrange [split ${out} \n] 1 end] {
+                    set lib [lindex [string trim ${ln}] 0]
+                    foreach pat ${bad_libs} {
+                        if {[string match ${pat} ${lib}]} {
+                            lappend problems "${rel} links ${lib}"
+                        }
+                    }
+                }
+            }
+            if {![catch {exec nm -u ${f}} out]} {
+                foreach sym [split ${out} \n] {
+                    set sym [string trim ${sym}]
+                    if {${sym} in ${bad_syms}} {
+                        lappend problems "${rel} uses ${sym} (Security.framework)"
+                    }
+                }
+            }
+        }
+    }
+    if {[llength ${problems}] > 0} {
+        foreach p [lsort -unique ${problems}] {
+            ui_error "mrustc PG: ${p}"
+        }
+        ui_error "Use MacPorts openssl3/curl and curl-ca-bundle instead (crate patches, Portfile features),"
+        ui_error "or set mrustc.check_tls no if this binary really should use the system TLS stack."
+        return -code error "binaries use the system TLS stack"
+    }
+}
+
+post-destroot {
+    if {[option mrustc.check_tls]} {
+        rust::check_system_tls
+    }
+}
+
 proc rust::rust_pg_callback {} {
     global  subport \
             prefix
@@ -769,6 +882,17 @@ proc rust::rust_pg_callback {} {
         set openssl_ver                 [string map {. {}} [option openssl.branch]]
         depends_lib-delete              port:openssl${openssl_ver}
         depends_lib-append              port:openssl${openssl_ver}
+        # OpenSSL's cert.pem is a link to the curl-ca-bundle file, which openssl does not install
+        depends_run-delete              port:curl-ca-bundle
+        depends_run-append              port:curl-ca-bundle
+    }
+
+    # Without static-curl, curl-sys links `-l curl` with no search path on macOS, which is
+    # ${prefix}/lib/libcurl.dylib (LIBRARY_PATH, and std's ${prefix}/lib) only if curl is
+    # installed - otherwise /usr/lib/libcurl.dylib, built on the system OpenSSL 0.9.x.
+    if {[rust::uses_crate curl-sys]} {
+        depends_lib-delete              port:curl
+        depends_lib-append              port:curl
     }
 
     # rust-bootstrap requires `macosx_deployment_target` instead of `os.major`
@@ -792,6 +916,15 @@ proc rust::rust_pg_callback {} {
         depends_${dep_type}-append      path:lib/${legacyLib}:legacy-support
         configure.ldflags-delete        -Wl,${prefix}/lib/${legacyLib}
         configure.ldflags-append        -Wl,${prefix}/lib/${legacyLib}
+
+        # Its headers too, for the C code that build scripts compile: e.g. TargetConditionals.h
+        # defines TARGET_OS_OSX (missing before the 10.12 SDK; without it aws-lc-sys takes the iOS
+        # CCRandomGenerateBytes path) and sys/random.h declares getentropy. As in the legacysupport
+        # PG, use ${lang}_INCLUDE_PATH, which behaves like -isystem: compiler.cpath behaves like -I,
+        # and legacy-support's GNU extensions warn under -pedantic (aws-lc's jitterentropy).
+        foreach lang {C OBJC CPLUS OBJCPLUS} {
+            rust::append_envs           ${lang}_INCLUDE_PATH=${prefix}/include/LegacySupport
+        }
     }
 
     if {[string match "macports-clang*" [option configure.compiler]] && [option os.major] < 11} {
