@@ -1,0 +1,205 @@
+From 1fa719699f92d2cd8031e5460955401e23d23a88 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 13:13:55 +0000
+Subject: [PATCH] hir: give an async block its own return type, the future's
+ Output
+
+tokio 1.43.0 (sad 0.4.32) sync/watch.rs:
+
+    pub async fn changed(&mut self) -> Result<(), error::RecvError> {
+        cooperative(changed_impl(&self.shared, &mut self.version)).await
+    }
+    async fn changed_impl<T>(..) -> Result<(), error::RecvError> {
+        crate::trace::async_trace_leaf().await;
+        loop { .. if let Some(ret) = maybe_changed(shared, version) { return ret; } notified.await; }
+    }
+
+An async block's `return` target and its Future::Output were both the
+body block's type. A body ending in a `loop` left only by `return` has
+type `!`, so `return ret` was coerced into `!` and the future's Output
+was `!`. `cooperative<F: Future>(..)` then needed Output = Result:
+"Failed to find an impl of Future for async[..] with Output =
+Result<(), RecvError>".
+
+ExprNode_AsyncBlock gets `m_return`, as closures and generators have:
+`return` targets it and the body coerces to it. For an `async fn` it is
+the declared return type, for an `async {}` block it is inferred. The
+magic Future impls (typeck and static), the post-typeck check, the ivar
+apply pass, lifetime inference and the coroutine lowering use it, and the
+HIR visitor/dump include it. (hir/expr.hpp changed.)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir/dump.cpp                  | 2 +-
+ src/hir/expr.cpp                  | 1 +
+ src/hir/expr.hpp                  | 3 +++
+ src/hir/from_ast.cpp              | 6 +++++-
+ src/hir_expand/closures.cpp       | 2 +-
+ src/hir_expand/lifetime_infer.cpp | 2 +-
+ src/hir_typeck/expr_check.cpp     | 3 ++-
+ src/hir_typeck/expr_cs.cpp        | 4 ++++
+ src/hir_typeck/expr_cs__enum.cpp  | 6 +++++-
+ src/hir_typeck/helpers.cpp        | 2 +-
+ src/hir_typeck/static.cpp         | 2 +-
+ 11 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/src/hir/dump.cpp b/src/hir/dump.cpp
+index aa87b772..1c4ccc07 100644
+--- a/src/hir/dump.cpp
++++ b/src/hir/dump.cpp
+@@ -817,7 +817,7 @@ namespace {
+             if( node.m_is_move ) {
+                 m_os << "move ";
+             }
+-            m_os << "async {";
++            m_os << "async -> " << node.m_return << " {";
+             if( !node.m_code ) {
+                 m_os << "/* lowered: " << node.m_obj_path << " */";
+             }
+diff --git a/src/hir/expr.cpp b/src/hir/expr.cpp
+index 9f581788..15bc97a0 100644
+--- a/src/hir/expr.cpp
++++ b/src/hir/expr.cpp
+@@ -323,6 +323,7 @@ DEF_VISIT_H(ExprNode_AsyncBlock, node) {
+     TRACE_FUNCTION_F("_AsyncBlock");
+     if(node.m_code)
+     {
++        visit_type(node.m_return);
+         visit_node_ptr(node.m_code);
+     }
+     else
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index aaf32154..6f30ae9c 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -982,6 +982,9 @@ struct ExprNode_AsyncBlock
+ {
+     ::HIR::ExprNodeP    m_code;
+     bool    m_is_move;
++    /// The future's `Output`: the target of `return` in the block, which the block's value coerces to. Separate from
++    /// `m_code`'s type, which a diverging tail makes `!` (an `async fn`'s body ending in `loop { .. return x; }`).
++    ::HIR::TypeRef  m_return;
+ 
+     ExprNode_Generator::AvuCache m_avu_cache;
+ 
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index c3171ecb..5fe91582 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -1933,7 +1933,11 @@ namespace {
+         //rv.m_markings.is_async = true;
+         // Wrap the code in an async block
+         if( rv.m_code ) {
+-            rv.m_code = HIR::ExprPtr(box$(::HIR::ExprNode_AsyncBlock(sp, std::move(rv.m_code.into_unique()), true) ));
++            auto* node = new ::HIR::ExprNode_AsyncBlock(sp, std::move(rv.m_code.into_unique()), true);
++            // The declared return type is the future's `Output` (`return` targets it, the body coerces to it)
++            // - tokio 1.43.0: `async fn changed_impl(..) -> Result<(), RecvError> { .. loop { .. return ret; .. } }`
++            node->m_return = rv.m_return.clone();
++            rv.m_code = HIR::ExprPtr(::std::unique_ptr<::HIR::ExprNode>(node));
+         }
+         // Make the return type be `impl Future<Output=Ret>`
+         HIR::TraitPath  future_path;
+diff --git a/src/hir_expand/closures.cpp b/src/hir_expand/closures.cpp
+index a710b83a..289aeb99 100644
+--- a/src/hir_expand/closures.cpp
++++ b/src/hir_expand/closures.cpp
+@@ -1926,7 +1926,7 @@ namespace {
+                 ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_Context, ::HIR::PathParams(::HIR::LifetimeRef())), &m_resolve.m_crate.get_struct_by_path(sp, lang_Context) )
+             );
+ 
+-            auto return_ty = node.m_code->m_res_type.clone();
++            auto return_ty = node.m_return.clone();
+             auto body_node = std::move(node.m_code);
+             {
+                 DEBUG("-- Fixing types in body code");
+diff --git a/src/hir_expand/lifetime_infer.cpp b/src/hir_expand/lifetime_infer.cpp
+index b5088707..3545964d 100644
+--- a/src/hir_expand/lifetime_infer.cpp
++++ b/src/hir_expand/lifetime_infer.cpp
+@@ -2067,7 +2067,7 @@ namespace {
+                 }
+             }
+ 
+-            m_returns.push_back(&node.m_code->m_res_type);
++            m_returns.push_back(&node.m_return);
+             HIR::ExprVisitorDef::visit(node);
+             m_returns.pop_back();
+         }
+diff --git a/src/hir_typeck/expr_check.cpp b/src/hir_typeck/expr_check.cpp
+index 65cad7ad..79ed2da3 100644
+--- a/src/hir_typeck/expr_check.cpp
++++ b/src/hir_typeck/expr_check.cpp
+@@ -1184,7 +1184,8 @@ namespace {
+             if( node.m_code )
+             {
+                 auto loops = ::std::move(this->m_loops);
+-                this->closure_ret_types.push_back(RetTarget(node.m_code->m_res_type));
++                check_types_equal(node.m_code->span(), node.m_return, node.m_code->m_res_type);
++                this->closure_ret_types.push_back(RetTarget(node.m_return));
+                 node.m_code->visit( *this );
+                 this->closure_ret_types.pop_back( );
+                 this->m_loops = ::std::move(loops);
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 811c1073..e827a3d5 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1484,6 +1484,10 @@ namespace {
+         void visit(::HIR::ExprNode_GeneratorWrapper& node) override {
+             BUG(node.span(), "");
+         }
++        void visit(::HIR::ExprNode_AsyncBlock& node) override {
++            this->check_type_resolved_top(node.span(), node.m_return);
++            ::HIR::ExprVisitorDef::visit(node);
++        }
+ 
+         void visit_callcache(const Span&sp, ::HIR::ExprCallCache& cache)
+         {
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 14499b35..a705f81f 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -2104,13 +2104,17 @@ namespace typecheck
+         {
+             TRACE_FUNCTION_F(&node << " async { ... }");
+             ASSERT_BUG(node.span(), node.m_code, "empty async?");
++            this->context.add_ivars(node.m_return);
+             this->context.add_ivars(node.m_code->m_res_type);
+ 
+             this->context.equate_types( node.span(), node.m_res_type, ::HIR::TypeRef::new_async(&node) );
+             
++            // The block's value coerces to the output, like a closure body to its return type
++            this->context.equate_types_coerce( node.span(), node.m_return, node.m_code );
++
+             // TODO: Save/clear/restore loop labels
+             auto _ = this->push_inner_coerce_scoped(true);
+-            this->closure_ret_types.push_back(RetTarget(node.m_code->m_res_type));
++            this->closure_ret_types.push_back(RetTarget(node.m_return));
+             node.m_code->visit( *this );
+             this->closure_ret_types.pop_back();
+         }
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index dc52783b..fb9d9186 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -1733,7 +1733,7 @@ bool TraitResolution::find_trait_impls_types(
+             {
+                 static const RcString rcstring_Output = RcString::new_interned("Output");
+                 ::HIR::TraitPath::assoc_list_t   assoc;
+-                assoc.insert(::std::make_pair(rcstring_Output, ::HIR::TraitPath::AtyEqual { trait.clone(), {}, node_p->m_code->m_res_type.clone() }));
++                assoc.insert(::std::make_pair(rcstring_Output, ::HIR::TraitPath::AtyEqual { trait.clone(), {}, node_p->m_return.clone() }));
+                 return callback( ImplRef(type.clone(), {}, mv$(assoc)), ::HIR::Compare::Equal );
+             }
+             }
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index 12119bee..09d1182c 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -426,7 +426,7 @@ bool StaticTraitResolve::find_impl(
+             if( TARGETVER_LEAST_1_90 && trait_path == m_lang_Future )
+             {
+                 ::HIR::TraitPath::assoc_list_t   assoc;
+-                assoc.insert(::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { trait_path.clone(), {}, node_p->m_code->m_res_type.clone() }));
++                assoc.insert(::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { trait_path.clone(), {}, node_p->m_return.clone() }));
+                 ::HIR::PathParams params;
+                 return found_cb( ImplRef(type.clone(), mv$(params), mv$(assoc)), ::HIR::Compare::Equal );
+             }

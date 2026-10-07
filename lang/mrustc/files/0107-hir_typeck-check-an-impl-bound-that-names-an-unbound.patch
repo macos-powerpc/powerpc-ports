@@ -1,0 +1,129 @@
+From 2efa35d85750419c34d321cadad538eb74334a9d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 07:55:24 +0000
+Subject: [PATCH 107/107] hir_typeck: check an impl bound that names an unbound
+ impl parameter after the others
+
+rayon 1.7.0 (fif 0.7.0) files.rs:193, `entries.par_chunks(32)
+.flat_map_iter(..).partition_map(..)`:
+
+    BUG: src/trans/enumerate.cpp:1625: Item not found for
+      <plumbing::#0::Callback<FlatMapIterConsumer<UnzipConsumer<PartitionMap<closure>,
+       ListVecConsumer, ListVecConsumer>, closure>> as ProducerCallback<&[DirEntry]>>
+      ::callback<ChunksProducer<DirEntry>>
+
+    impl<'f, T, U, C, F> Consumer<T> for FlatMapIterConsumer<'f, C, F>
+    where C: UnindexedConsumer<U::Item>, F: Fn(T) -> U + Sync, U: IntoIterator
+
+Only the `Fn` bound's `Output` fixes `U`.
+StaticTraitResolve::find_impl__check_crate_raw makes it a placeholder and
+checks the bounds in source order, so `C: UnindexedConsumer<<?U as
+IntoIterator>::Item>` came first. For a `C` whose own impl needs that
+type (UnzipConsumer: `OP: UnzipOp<T>`, with PartitionMap's L/R taken from
+its closure's output) the nested search failed. The "placeholder =>
+success" fallback only looks at the bounded type, not at the trait
+arguments. So the impl was rejected, bridge()'s local `Callback` impl
+(`C: Consumer<I>`) failed, and enumeration found no item. It passed with
+a `C` that takes any `T`, and with the bounds reordered.
+
+A bound whose (monomorphised) type or trait arguments contain one of this
+impl's unbound placeholders is now checked after the others. Each time,
+the first deferred bound that has become complete is checked next; if
+none has, the first one is checked as before. Impls without placeholders
+are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_typeck/static.cpp | 58 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index 3b438eaf..441f6ee3 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -1350,12 +1350,7 @@ bool StaticTraitResolve::find_impl__check_crate_raw(
+     Matcher matcher { sp, impl_params, params_set, placeholder_name, base_impl_placeholder_idx, placeholders, placeholders_set };
+ 
+     // Bounds
+-    for(const auto& bound : impl_params_def.m_bounds)
+-    {
+-        if( const auto* ep = bound.opt_TraitBound() )
+-        {
+-            const auto& e = *ep;
+-
++    auto check_trait_bound = [&](const ::HIR::GenericBound::Data_TraitBound& e)->bool {
+             DEBUG("Trait bound " << e.type << " : " << e.trait);
+             auto b_ty_mono = matcher.monomorph_type(sp, e.type);
+             this->expand_associated_types(sp, b_ty_mono);
+@@ -1364,7 +1359,7 @@ bool StaticTraitResolve::find_impl__check_crate_raw(
+             DEBUG("- b_ty_mono = " << b_ty_mono << ", b_tp_mono = " << b_tp_mono);
+             // HACK: If the type is '_', assume the bound passes
+             if( b_ty_mono.data().is_Infer() ) {
+-                continue ;
++                return true;
+             }
+ 
+             // TODO: This is extrememly inefficient (looks up the trait impl 1+N times)
+@@ -1430,6 +1425,43 @@ bool StaticTraitResolve::find_impl__check_crate_raw(
+                     return false;
+                 }
+             }
++            return true;
++        };
++    // An impl parameter that the impl type/trait don't fix stays a placeholder until an associated type bound binds it
++    // (`U` in rayon's `impl<T, U, C, F> Consumer<T> for FlatMapIterConsumer<C, F> where C: UnindexedConsumer<U::Item>,
++    // F: Fn(T) -> U`). A bound whose type or trait arguments still contain such a placeholder can't be checked yet: the
++    // nested impl search fails on it, so check it after the other bounds.
++    auto has_unbound_placeholder = [&](const ::HIR::GenericBound::Data_TraitBound& e)->bool {
++        if( placeholders.m_types.empty() )
++            return false;
++        auto is_unbound = [&](const ::HIR::TypeRef& ty)->bool {
++            if( const auto* ge = ty.data().opt_Generic() ) {
++                if( ge->is_placeholder() && ge->name == placeholder_name && ge->idx() >= base_impl_placeholder_idx.ty ) {
++                    auto i = ge->idx() - base_impl_placeholder_idx.ty;
++                    return i < placeholders_set.m_types.size() && !placeholders_set.m_types[i];
++                }
++            }
++            return false;
++        };
++        if( visit_ty_with(matcher.monomorph_type(sp, e.type), is_unbound) )
++            return true;
++        for(const auto& ty : matcher.monomorph_traitpath(sp, e.trait, false).m_path.m_params.m_types)
++            if( visit_ty_with(ty, is_unbound) )
++                return true;
++        return false;
++    };
++    ::std::vector<const ::HIR::GenericBound::Data_TraitBound*>  deferred_bounds;
++    for(const auto& bound : impl_params_def.m_bounds)
++    {
++        if( const auto* ep = bound.opt_TraitBound() )
++        {
++            if( has_unbound_placeholder(*ep) ) {
++                DEBUG("Defer trait bound " << ep->type << " : " << ep->trait);
++                deferred_bounds.push_back(ep);
++            }
++            else if( !check_trait_bound(*ep) ) {
++                return false;
++            }
+         }
+         //else if( const auto* be
+         else  // bound.opt_TraitBound()
+@@ -1437,6 +1469,18 @@ bool StaticTraitResolve::find_impl__check_crate_raw(
+             // Ignore
+         }
+     }
++    // Each check can bind more placeholders: take the first deferred bound that is now complete, or (no progress
++    // possible) the first one, checked as before.
++    while( !deferred_bounds.empty() )
++    {
++        auto it = ::std::find_if(deferred_bounds.begin(), deferred_bounds.end(), [&](const ::HIR::GenericBound::Data_TraitBound* e){ return !has_unbound_placeholder(*e); });
++        if( it == deferred_bounds.end() )
++            it = deferred_bounds.begin();
++        const auto& e = **it;
++        deferred_bounds.erase(it);
++        if( !check_trait_bound(e) )
++            return false;
++    }
+ 
+     for(size_t i = 0; i < impl_params.m_types.size(); i ++)
+     {

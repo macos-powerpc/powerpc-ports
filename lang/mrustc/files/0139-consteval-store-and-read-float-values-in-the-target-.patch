@@ -1,0 +1,112 @@
+From dcc60719b1f758037b0c2f727a85f013be688fa9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 20:42:20 +0000
+Subject: [PATCH 139/141] consteval: store and read float values in the
+ target's byte order
+
+`write_uint`/`read_uint` already honour `m_big_endian`; `write_float`,
+`read_float` and `EncodedLiteralSlice::read_float` used a host-order
+memcpy, so a cross-endian build (powerpc-apple-darwin output from an x86
+host) read back swapped floats from `transmute::<u64, f64>(bits)` or any
+float constant it had just written. A native build on the G5 is
+unaffected (host and target agree); the qemu-ppc mode of fcast-test is
+what showed it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir/hir_ops.cpp                  | 17 +++++++++----
+ src/hir_conv/constant_evaluation.cpp | 36 ++++++++++++++++++++++------
+ 2 files changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/src/hir/hir_ops.cpp b/src/hir/hir_ops.cpp
+index 4d16253a..012c6bbb 100644
+--- a/src/hir/hir_ops.cpp
++++ b/src/hir/hir_ops.cpp
+@@ -1459,12 +1459,21 @@ S128 EncodedLiteralSlice::read_sint(size_t size/*=0*/) const {
+ double EncodedLiteralSlice::read_float(size_t size/*=0*/) const {
+     if(size == 0)   size = m_size;
+     assert(size <= m_size);
++    // The bytes are in the target's order (see `read_uint`): swap when the host differs (cross-endian builds)
++    const uint16_t probe = 1;
++    bool host_big_endian = (*reinterpret_cast<const uint8_t*>(&probe) == 0);
++    uint8_t buf[16];
++    if( size > 16 ) BUG(Span(), "Unexpected float size");
++    memcpy(buf, &m_base.bytes[m_ofs], size);
++    if( host_big_endian != Target_GetCurSpec().m_arch.m_big_endian ) {
++        ::std::reverse(buf, buf + size);
++    }
+     switch(size)
+     {
+-    case 2: { F16 v; memcpy(&v, &m_base.bytes[m_ofs], 2); return v; }
+-    case 4: { float v; memcpy(&v, &m_base.bytes[m_ofs], 4); return v; }
+-    case 8: { double v; memcpy(&v, &m_base.bytes[m_ofs], 8); return v; }
+-    case 16: { F128 v; memcpy(&v,  &m_base.bytes[m_ofs], 16); return v; }
++    case 2: { F16 v; memcpy(&v, buf, 2); return v; }
++    case 4: { float v; memcpy(&v, buf, 4); return v; }
++    case 8: { double v; memcpy(&v, buf, 8); return v; }
++    case 16: { F128 v; memcpy(&v, buf, 16); return v; }
+     default: BUG(Span(), "Unexpected float size");
+     }
+ }
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index 7a32bf89..51d958dd 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -635,16 +635,29 @@ namespace MIR { namespace eval {
+         void write_byte(const MIR::TypeResolve& state, uint8_t v) {
+             write_bytes(state, &v, 1);
+         }
++        /// Floats are stored in the target's byte order (like `write_uint`): swap when the host differs, so a
++        /// cross-endian build (`--target powerpc-apple-darwin` on x86) reads back what it wrote.
++        static bool float_bytes_need_swap() {
++            const uint16_t probe = 1;
++            bool host_big_endian = (*reinterpret_cast<const uint8_t*>(&probe) == 0);
++            return host_big_endian != Target_GetCurSpec().m_arch.m_big_endian;
++        }
+         void write_float(const MIR::TypeResolve& state, unsigned bits, double v) {
++            uint8_t buf[16];
++            size_t len = bits / 8;
+             switch(bits)
+             {
+-            case 16: { F16 v_f = v; write_bytes(state, &v_f, sizeof(v_f)); } break;
+-            case 32: { float  v_f32 = v; write_bytes(state, &v_f32, sizeof(v_f32)); } break;
+-            case 64: { double v_f64 = v; write_bytes(state, &v_f64, sizeof(v_f64)); } break;
+-            case 128: { F128 v_f128 = v; write_bytes(state, &v_f128, 16); } break;
++            case 16: { F16 v_f = v; memcpy(buf, &v_f, 2); } break;
++            case 32: { float  v_f32 = v; memcpy(buf, &v_f32, 4); } break;
++            case 64: { double v_f64 = v; memcpy(buf, &v_f64, 8); } break;
++            case 128: { F128 v_f128 = v; memcpy(buf, &v_f128, 16); } break;
+             default:
+                 MIR_BUG(state, "Unexpected float size (write): " << bits);
+             }
++            if( float_bytes_need_swap() ) {
++                ::std::reverse(buf, buf + len);
++            }
++            write_bytes(state, buf, len);
+         }
+         void write_uint(const MIR::TypeResolve& state, unsigned bits, uint64_t v) {
+             assert(bits <= 64);
+@@ -689,11 +702,20 @@ namespace MIR { namespace eval {
+             memcpy(data, src, len);
+         }
+         double read_float(const ::MIR::TypeResolve& state, unsigned bits) const {
++            uint8_t buf[16];
++            size_t len = bits / 8;
++            if( len == 0 || len > 16 ) {
++                MIR_BUG(state, "Unexpected float size: " << bits);
++            }
++            read_bytes(state, buf, len);
++            if( float_bytes_need_swap() ) {
++                ::std::reverse(buf, buf + len);
++            }
+             switch(bits)
+             {
+-            case 32: { float  v_f32 = 0; read_bytes(state, &v_f32, sizeof(v_f32)); return v_f32; } break;
+-            case 64: { double v_f64 = 0; read_bytes(state, &v_f64, sizeof(v_f64)); return v_f64; } break;
+-            case 128:{ F128 v_f; read_bytes(state, &v_f, sizeof(v_f)); return v_f; } break;
++            case 32: { float  v_f32 = 0; memcpy(&v_f32, buf, 4); return v_f32; } break;
++            case 64: { double v_f64 = 0; memcpy(&v_f64, buf, 8); return v_f64; } break;
++            case 128:{ F128 v_f; memcpy(&v_f, buf, 16); return v_f; } break;
+             default:
+                 MIR_BUG(state, "Unexpected float size: " << bits);
+             }

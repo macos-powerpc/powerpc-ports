@@ -1,0 +1,576 @@
+From d221d7645d354c029c372cbec401d3406724568f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 06:14:35 +0000
+Subject: [PATCH 103/105] hir: associated type bindings with generic arguments
+ (`Tr<Assoc<T> = X>`)
+
+hybrid-array 0.4.14 (just 1.58.0, via digest 0.11) puts
+`U: ArraySize<ArrayType<T> = [T; N]>` on most of its impls (`ArrayType<T>` is
+a GAT):
+
+    BUG: src/hir/from_ast.cpp:853: TODO: get_aty_node - Handle ATYs with args
+
+Upstream 14f262d6 added `aty_params` to `TraitPath::AtyEqual`/`AtyBound`, and
+a few consumers already pass them on (`equate_types_assoc`, trait-impl
+`ImplRef::get_type`, the projection for `Assoc<..>: Bound`). Lowering still
+refused any arguments, though, and most places that copy, index or look up
+a binding ignored them. This finishes the job:
+
+- from_ast: lower the arguments instead of hitting the TODO.
+- Keep them when a binding is monomorphised (`monomorph_tp_aty_equal`, the
+  AtyBound copy), turned into an ImplRef (static `find_impl`, the ATY-bound
+  path of `find_trait_impls_bound`), inherited from a supertrait (bind
+  `fill_type_aliases`) or rebuilt for a trait object.
+- Visit them in HIR::Visitor, ExprVisitorDef and the typeck TyVisitor, so the
+  binding passes and the monomorph-needed checks see types written there.
+- A binding applies only to a projection with the same arguments (types and
+  values; lifetimes are ignored as `PathParams ==` does):
+  - the bound-equality index (`prep_indexes`) is keyed by the projection with
+    its arguments;
+  - `ImplRef::get_type` for bounds compares them, through typeck's ivars when
+    given (new optional argument; it asserted before);
+  - the name lookups in the cached bounds, bounds on associated types, their
+    supertraits and `impl Trait` check them;
+  - `check_associated` passes the rule's arguments to `get_type` (it passed
+    `{}`, which broke a GAT impl whose type uses the GAT's own parameter).
+  Under `U: ArraySize<ArrayType<T> = [T; N]>`, `ArrayType<T>` is `[T; N]` and
+  `ArrayType<u8>` stays opaque.
+- A binding under `for<'a>` that names the HRL in its own arguments
+  (`for<'a> Lend<Item<'a> = &'a u32>`) takes the projection's lifetime.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir/expr.cpp                  |  8 ++++--
+ src/hir/from_ast.cpp              |  4 +--
+ src/hir/visitor.cpp               |  2 ++
+ src/hir_conv/bind.cpp             | 13 ++++++---
+ src/hir_typeck/common.cpp         | 12 +++++++--
+ src/hir_typeck/expr_cs.cpp        | 11 ++++----
+ src/hir_typeck/helpers.cpp        | 38 ++++++++++++++++++--------
+ src/hir_typeck/impl_ref.cpp       | 45 +++++++++++++++++++++++++++----
+ src/hir_typeck/impl_ref.hpp       |  6 ++++-
+ src/hir_typeck/resolve_common.cpp |  7 ++---
+ src/hir_typeck/static.cpp         | 20 +++++++++++---
+ 11 files changed, 126 insertions(+), 40 deletions(-)
+
+diff --git a/src/hir/expr.cpp b/src/hir/expr.cpp
+index 871be611..9f581788 100644
+--- a/src/hir/expr.cpp
++++ b/src/hir/expr.cpp
+@@ -466,11 +466,15 @@ void ::HIR::ExprVisitorDef::visit_path_params(::HIR::PathParams& pp)
+ void ::HIR::ExprVisitorDef::visit_trait_path(::HIR::TraitPath& p)
+ {
+     this->visit_generic_path(::HIR::Visitor::PathContext::TYPE, p.m_path);
+-    for(auto& assoc : p.m_type_bounds)
++    for(auto& assoc : p.m_type_bounds) {
++        this->visit_path_params(assoc.second.aty_params);
+         this->visit_type(assoc.second.type);
+-    for(auto& assoc : p.m_trait_bounds)
++    }
++    for(auto& assoc : p.m_trait_bounds) {
++        this->visit_path_params(assoc.second.aty_params);
+         for(auto& t : assoc.second.traits)
+             this->visit_trait_path(t);
++    }
+ }
+ void ::HIR::ExprVisitorDef::visit_path(::HIR::Visitor::PathContext pc, ::HIR::Path& path)
+ {
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index d295a80d..c3171ecb 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -846,12 +846,10 @@ namespace {
+                 BUG(sp, "Not a trait: " << path << " : " << pb.tag_str());
+             }
+         }
++        // The associated type's name, and the arguments for a GAT (`Tr<Assoc<T> = X>`, hybrid-array 0.4.14)
+         static std::pair<RcString,HIR::PathParams> get_aty_node(const Span& sp, const ::AST::PathNode& pn)
+         {
+             auto args = LowerHIR_PathParams(sp, pn.args(), false);
+-            if( args.has_params() ) {
+-                TODO(sp, "Handle ATYs with args");
+-            }
+             return std::make_pair(pn.name(), std::move(args));
+         }
+     };
+diff --git a/src/hir/visitor.cpp b/src/hir/visitor.cpp
+index 8f7d17af..06d211d7 100644
+--- a/src/hir/visitor.cpp
++++ b/src/hir/visitor.cpp
+@@ -576,11 +576,13 @@ void ::HIR::Visitor::visit_trait_path(::HIR::TraitPath& p)
+     for(auto& assoc : p.m_type_bounds)
+     {
+         this->visit_generic_path(assoc.second.source_trait, ::HIR::Visitor::PathContext::TYPE);
++        this->visit_path_params(assoc.second.aty_params);
+         this->visit_type(assoc.second.type);
+     }
+     for(auto& assoc : p.m_trait_bounds)
+     {
+         this->visit_generic_path(assoc.second.source_trait, ::HIR::Visitor::PathContext::TYPE);
++        this->visit_path_params(assoc.second.aty_params);
+         for(auto& trait : assoc.second.traits)
+             this->visit_trait_path(trait);
+     }
+diff --git a/src/hir_conv/bind.cpp b/src/hir_conv/bind.cpp
+index 0dff1c7c..72f7a451 100644
+--- a/src/hir_conv/bind.cpp
++++ b/src/hir_conv/bind.cpp
+@@ -991,6 +991,7 @@ namespace {
+                         if( out_path.m_type_bounds.count(ty.first) == 0 )
+                         {
+                             HIR::TypeRef    v;
++                            HIR::PathParams v_params;
+ 
+                             for(auto oit = tp_stack.rbegin(); oit != tp_stack.rend(); ++oit)
+                             {
+@@ -998,35 +999,39 @@ namespace {
+                                 if( it != (*oit)->m_type_bounds.end() ) {
+                                     // TODO: Check the source trait
+                                     v = it->second.type.clone();
++                                    v_params = it->second.aty_params.clone();
+                                     break;
+                                 }
+                             }
+                             // TODO: What if there's multiple?
+-                            DEBUG(ty.first << " = " << v);
++                            DEBUG(ty.first << v_params << " = " << v);
+ 
+                             if( v != ::HIR::TypeRef() )
+                             {
+-                                out_path.m_type_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyEqual { out_path.m_path.clone(), {}, mv$(v) }) );
++                                out_path.m_type_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyEqual { out_path.m_path.clone(), mv$(v_params), mv$(v) }) );
+                             }
+                         }
+ 
+                         if( out_path.m_trait_bounds.count(ty.first) == 0 )
+                         {
+                             std::vector<HIR::TraitPath> traits;
++                            HIR::PathParams traits_params;
+                             for(auto oit = tp_stack.rbegin(); oit != tp_stack.rend(); ++oit)
+                             {
+                                 auto it = (*oit)->m_trait_bounds.find(ty.first);
+                                 if( it != (*oit)->m_trait_bounds.end() )
+                                 {
+                                     // TODO: Check the source trait
++                                    if( traits.empty() )
++                                        traits_params = it->second.aty_params.clone();
+                                     for(const auto& t : it->second.traits)
+                                         traits.push_back(t.clone());
+                                 }
+                             }
+-                            DEBUG(ty.first << ": " << traits);
++                            DEBUG(ty.first << traits_params << ": " << traits);
+                             if( !traits.empty() )
+                             {
+-                                out_path.m_trait_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyBound { out_path.m_path.clone(), {}, mv$(traits) }) );
++                                out_path.m_trait_bounds.insert( ::std::make_pair(ty.first, ::HIR::TraitPath::AtyBound { out_path.m_path.clone(), mv$(traits_params), mv$(traits) }) );
+                             }
+                         }
+                     }
+diff --git a/src/hir_typeck/common.cpp b/src/hir_typeck/common.cpp
+index 04102573..26129670 100644
+--- a/src/hir_typeck/common.cpp
++++ b/src/hir_typeck/common.cpp
+@@ -40,12 +40,16 @@ struct TyVisitor
+         for(auto& assoc : tpl.m_type_bounds)
+         {
+             visit_path_params(assoc.second.source_trait.m_params);
++            if( visit_path_params(assoc.second.aty_params) )
++                return true;
+             if( visit_type(assoc.second.type) )
+                 return true;
+         }
+         for(auto& assoc : tpl.m_trait_bounds)
+         {
+             visit_path_params(assoc.second.source_trait.m_params);
++            if( visit_path_params(assoc.second.aty_params) )
++                return true;
+             for(auto& t : assoc.second.traits)
+                 visit_trait_path(t);
+         }
+@@ -509,7 +513,11 @@ bool monomorphise_type_needed(const ::HIR::TypeRef& tpl, bool ignore_lifetimes/*
+             ));
+     }
+     for(const auto& assoc : tpl.m_trait_bounds) {
+-        auto v = HIR::TraitPath::AtyBound { this->monomorph_genericpath(sp, assoc.second.source_trait, allow_infer, false), {} };
++        auto v = HIR::TraitPath::AtyBound {
++            this->monomorph_genericpath(sp, assoc.second.source_trait, allow_infer, false),
++            this->monomorph_path_params(sp, assoc.second.aty_params, allow_infer),
++            {}
++            };
+         for(const auto& trait : assoc.second.traits)
+             v.traits.push_back( monomorph_traitpath(sp, trait, allow_infer, false) );
+         rv.m_trait_bounds.insert(::std::make_pair( assoc.first, std::move(v) ));
+@@ -521,7 +529,7 @@ bool monomorphise_type_needed(const ::HIR::TypeRef& tpl, bool ignore_lifetimes/*
+ {
+     return HIR::TraitPath::AtyEqual {
+         this->monomorph_genericpath(sp, tpl.source_trait, allow_infer, false),
+-        {},
++        this->monomorph_path_params(sp, tpl.aty_params, allow_infer),
+         this->monomorph_type(sp, tpl.type, allow_infer)
+         };
+ }
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 7a857940..2d598c45 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -5610,8 +5610,7 @@ namespace {
+             [&](ImplRef impl, HIR::Compare cmp) {
+                 DEBUG("[check_associated] Found cmp=" << cmp << " " << impl);
+                 if( v.name != "" ) {
+-                    // TODO: Are params needed for these ATY bounds?
+-                    auto out_ty_o = impl.get_type(v.name.c_str(), {});
++                    auto out_ty_o = impl.get_type(v.name.c_str(), v.aty_pp, &context.m_ivars);
+                     if( out_ty_o == ::HIR::TypeRef() )
+                     {
+                         out_ty_o = ::HIR::TypeRef::new_path(::HIR::Path( v.impl_ty.clone(), ::HIR::GenericPath(v.trait, v.params.clone()), v.name, v.aty_pp.clone() ), {});
+@@ -5709,8 +5708,8 @@ namespace {
+                             // Edge case: Might be just outright identical
+                             if( possible_impl.impl_ty == impl_ty && possible_impl.params == impl_params )
+                             {
+-                                auto t1 = v.name == "" ? HIR::TypeRef() : possible_impl.impl_ref.get_type(v.name.c_str(), {});
+-                                auto t2 = v.name == "" ? HIR::TypeRef() : impl.get_type(v.name.c_str(), {});
++                                auto t1 = v.name == "" ? HIR::TypeRef() : possible_impl.impl_ref.get_type(v.name.c_str(), v.aty_pp, &context.m_ivars);
++                                auto t2 = v.name == "" ? HIR::TypeRef() : impl.get_type(v.name.c_str(), v.aty_pp, &context.m_ivars);
+                                 if(v.name == "" || t1 == t2 || t2 == HIR::TypeRef())
+                                 {
+                                     DEBUG("[check_associated] HACK: Same type and params, and ATY matches or this impl doesn't have it");
+@@ -5732,7 +5731,7 @@ namespace {
+                                 else
+                                 {
+                                     DEBUG("[check_associated] HACK: Same type and params, but ATY mismatch - "
+-                                        << possible_impl.impl_ref.get_type(v.name.c_str(), {}) << " != " << impl.get_type(v.name.c_str(), {}));
++                                        << possible_impl.impl_ref.get_type(v.name.c_str(), v.aty_pp, &context.m_ivars) << " != " << impl.get_type(v.name.c_str(), v.aty_pp, &context.m_ivars));
+                                 }
+                             }
+                         }
+@@ -6216,7 +6215,7 @@ namespace
+                 // If this bound specifies an associated type, then check that that type could match
+                 if( bound.name != "" )
+                 {
+-                    auto aty = impl.get_type(bound.name.c_str(), {});
++                    auto aty = impl.get_type(bound.name.c_str(), clone_path_params_with(sp, bound.aty_pp, cb), &context.m_ivars);
+                     // The associated type is not present, what does that mean?
+                     if( aty == ::HIR::TypeRef() ) {
+                         DEBUG("[check_ivar_poss__fails_bounds] No ATY for " << bound.name << " in impl");
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 4c8103a8..0dba161e 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -2037,7 +2037,11 @@ bool TraitResolution::find_trait_impls(const Span& sp,
+                 // TODO: Monormophise and EAT associated types
+                 ::HIR::TraitPath::assoc_list_t  b_atys;
+                 for(const auto& aty : bound.m_type_bounds)
+-                    b_atys.insert(::std::make_pair( aty.first, ::HIR::TraitPath::AtyEqual { monomorph_cb.monomorph_genericpath(sp, aty.second.source_trait, false), {}, monomorph_cb.monomorph_type(sp, aty.second.type) } ));
++                    b_atys.insert(::std::make_pair( aty.first, ::HIR::TraitPath::AtyEqual {
++                        monomorph_cb.monomorph_genericpath(sp, aty.second.source_trait, false),
++                        monomorph_cb.monomorph_path_params(sp, aty.second.aty_params, false),
++                        monomorph_cb.monomorph_type(sp, aty.second.type)
++                        } ));
+ 
+                 if( bound.m_path.m_path == trait )
+                 {
+@@ -2630,7 +2634,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+                     auto hrls = get_hrls(sp, trait.m_hrtbs, trait_gp.m_params, trait_path.m_params);
+                     {
+                         auto it = trait.m_type_bounds.find( pe.item );
+-                        if( it != trait.m_type_bounds.end() ) {
++                        if( it != trait.m_type_bounds.end() && m_ivars.pathparams_equal(it->second.aty_params, pe.params) ) {
+                             input = MonomorphHrlsOnly(hrls).monomorph_type(sp, it->second.type);
+                             return ;
+                         }
+@@ -2721,6 +2725,13 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+             //if( cmp != HIR::Compare::Unequal ) {
+             if( cmp == HIR::Compare::Equal ) {
+                 auto it = bound_info.assoc.find(pe.item);
++                // A GAT's binding only applies to the same arguments (unknown arguments might still match)
++                bool args_unknown = false;
++                if( it != bound_info.assoc.end() && !m_ivars.pathparams_equal(it->second.aty_params, pe.params) ) {
++                    DEBUG("[expand_associated_types_inplace__UfcsKnown] Bound " << pe.item << it->second.aty_params << " doesn't apply to " << pe.params);
++                    args_unknown = m_ivars.pathparams_contain_ivars(pe.params, /*only_unbound=*/true);
++                    it = bound_info.assoc.end();
++                }
+                 // 1. Check if the bounds include the desired item
+                 if( it == bound_info.assoc.end() ) {
+                     // If not, assume it's opaque and return as such
+@@ -2729,7 +2740,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+ 
+                     // Flag so if no impl was found by the lower checks, it gets correctly set to Opaque (or left unbound)
+                     found_bound_with_no_type = true;
+-                    if( cmp == HIR::Compare::Fuzzy ) {
++                    if( cmp == HIR::Compare::Fuzzy || args_unknown ) {
+                         result_type = ResultType::LeaveUnbound;
+                     }
+                     else {
+@@ -2790,6 +2801,11 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+                 DEBUG("-> " << bound_tp);
+                 if( bound_tp == pe.trait ) {
+                     auto it = bound.m_type_bounds.find( pe.item );
++                    // A GAT's binding only applies to the same arguments
++                    if( it != bound.m_type_bounds.end() && !m_ivars.pathparams_equal(cb_placeholders_trait.monomorph_path_params(sp, it->second.aty_params, false), pe.params) ) {
++                        DEBUG("Inner bound " << pe.item << it->second.aty_params << " doesn't apply to " << pe.params);
++                        it = bound.m_type_bounds.end();
++                    }
+                     if( it != bound.m_type_bounds.end() ) {
+                         if( monomorphise_type_needed(it->second.type) ) {
+                             input = cb_placeholders_trait.monomorph_type(sp, it->second.type);
+@@ -2810,7 +2826,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+                         bound_trait, bound_tp.m_path,bound_tp.m_params, pe.type,
+                         [&](const HIR::TraitPath& tp){
+                             auto it = tp.m_type_bounds.find(pe.item);
+-                            if( it != tp.m_type_bounds.end() ) {
++                            if( it != tp.m_type_bounds.end() && m_ivars.pathparams_equal(it->second.aty_params, pe.params) ) {
+                                 input = it->second.type.clone();
+                                 return true;
+                             }
+@@ -2831,7 +2847,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+         if( qual == ::HIR::Compare::Fuzzy ) {
+         }
+         else {
+-            auto ty = impl.get_type( pe.item.c_str(), pe.params );
++            auto ty = impl.get_type( pe.item.c_str(), pe.params, &m_ivars );
+             if( ty == ::HIR::TypeRef() )
+             {
+                 DEBUG("Assuming that " << input << " is an opaque name");
+@@ -2854,7 +2870,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+         if( qual == ::HIR::Compare::Fuzzy ) {
+         }
+         else {
+-            auto ty = impl.get_type( pe.item.c_str(), pe.params );
++            auto ty = impl.get_type( pe.item.c_str(), pe.params, &m_ivars );
+             if( ty == ::HIR::TypeRef() )
+             {
+                 DEBUG("Assuming that " << input << " is an opaque name");
+@@ -2908,7 +2924,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+                 return false;
+             }
+             else {
+-                auto ty = impl.get_type( pe.item.c_str(), pe.params );
++                auto ty = impl.get_type( pe.item.c_str(), pe.params, &m_ivars );
+                 if( ty == ::HIR::TypeRef() ) {
+                     if( is_bound ) {
+                         return false;
+@@ -2956,7 +2972,7 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+             return ;
+         }
+         else {
+-            auto ty = best_impl.get_type( pe.item.c_str(), pe.params );
++            auto ty = best_impl.get_type( pe.item.c_str(), pe.params, &m_ivars );
+             if( ty == ::HIR::TypeRef() ) {
+                 if( !this->m_ivars.type_contains_ivars(input, false) ) {
+                     DEBUG("Assuming opaque - best impl didn't have ATY");
+@@ -3907,7 +3923,7 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+                         ::HIR::TypeRef  tmp;
+                         const ::HIR::TypeRef*   ty_p;
+ 
+-                        tmp = impl.get_type(assoc_bound.first.c_str(), assoc_bound.second.aty_params);
++                        tmp = impl.get_type(assoc_bound.first.c_str(), assoc_bound.second.aty_params, &m_ivars);
+                         if( tmp == ::HIR::TypeRef() ) {
+                             // This bound isn't from this particular trait, go the slow way of using expand_associated_types
+                             tmp = this->expand_associated_types(sp, ::HIR::TypeRef::new_path(
+@@ -4599,7 +4615,7 @@ bool TraitResolution::trait_contains_type(const Span& sp, const ::HIR::GenericPa
+                     total_cmp &= cmp;
+                     tmp_e.m_trait.m_path.m_params = impl.get_trait_params();
+                     for(const auto& aty : de->m_trait.m_type_bounds) {
+-                        auto atyv = impl.get_type(aty.first.c_str(), aty.second.aty_params);
++                        auto atyv = impl.get_type(aty.first.c_str(), aty.second.aty_params, &m_ivars);
+                         if( atyv == ::HIR::TypeRef() )
+                         {
+                             // Get the trait from which this associated type comes.
+@@ -4628,7 +4644,7 @@ bool TraitResolution::trait_contains_type(const Span& sp, const ::HIR::GenericPa
+                         }
+                         tmp_e.m_trait.m_type_bounds[aty.first] = ::HIR::TraitPath::AtyEqual {
+                             mv$(source_trait),
+-                            {},
++                            aty.second.aty_params.clone(),
+                             mv$(atyv)
+                         };
+                     }
+diff --git a/src/hir_typeck/impl_ref.cpp b/src/hir_typeck/impl_ref.cpp
+index b4cdf4c8..8f03b4a7 100644
+--- a/src/hir_typeck/impl_ref.cpp
++++ b/src/hir_typeck/impl_ref.cpp
+@@ -8,6 +8,7 @@
+ #include "impl_ref.hpp"
+ #include <hir/hir.hpp>
+ #include "static.hpp"   // for monomorphise_type_with
++#include "helpers.hpp"  // HMTypeInferrence
+ 
+ bool ImplRef::more_specific_than(const ImplRef& other) const
+ {
+@@ -223,7 +224,34 @@ ImplRef::Monomorph ImplRef::get_cb_monomorph_traitimpl(const Span& sp, const ::H
+     throw "";
+ }
+ 
+-::HIR::TypeRef ImplRef::get_type(const char* name, const HIR::PathParams& params) const
++namespace {
++    // Does a binding for `Assoc<aty_params>` apply to `Assoc<params>`? (types and values; lifetimes are erased later)
++    bool aty_params_match(const HIR::PathParams& aty_params, const HIR::PathParams& params, const HMTypeInferrence* ivars)
++    {
++        return ivars ? ivars->pathparams_equal(aty_params, params) : aty_params == params;
++    }
++    // A binding under a `for<'a>` can name the HRL in its own arguments (`for<'a> Tr<Item<'a> = &'a T>`): that lifetime is
++    // the projection's argument.
++    HIR::PathParams aty_hrls(const HIR::PathParams& hrls, const HIR::PathParams& aty_params, const HIR::PathParams& params)
++    {
++        auto rv = hrls.clone();
++        for(size_t i = 0; i < aty_params.m_lifetimes.size() && i < params.m_lifetimes.size(); i ++)
++        {
++            const auto& l = aty_params.m_lifetimes[i];
++            if( l.is_hrl() )
++            {
++                auto idx = l.as_param().idx();
++                // Untouched slots map the HRL to itself (what MonomorphHrlsOnly does for an index past the end)
++                while( rv.m_lifetimes.size() <= idx )
++                    rv.m_lifetimes.push_back(HIR::LifetimeRef( (3 << 8) | rv.m_lifetimes.size() ));
++                rv.m_lifetimes[idx] = params.m_lifetimes[i];
++            }
++        }
++        return rv;
++    }
++}
++
++::HIR::TypeRef ImplRef::get_type(const char* name, const HIR::PathParams& params, const HMTypeInferrence* ivars) const
+ {
+     if( !name[0] )
+         return ::HIR::TypeRef();
+@@ -249,15 +277,22 @@ ImplRef::Monomorph ImplRef::get_cb_monomorph_traitimpl(const Span& sp, const ::H
+         auto it = e.assoc->find(name);
+         if(it == e.assoc->end())
+             return ::HIR::TypeRef();
+-        ASSERT_BUG(Span(), !params.has_params(), "TODO: BoundedPtr ATY with params?");
+-        return MonomorphHrlsOnly(e.hrls).monomorph_type(sp, it->second.type, true);
++        // A GAT's binding (`Tr<Assoc<T> = X>`) only says what `Assoc<T>` is
++        if( !aty_params_match(it->second.aty_params, params, ivars) ) {
++            DEBUG("ATY " << name << it->second.aty_params << " doesn't apply to " << name << params);
++            return ::HIR::TypeRef();
++        }
++        return MonomorphHrlsOnly(aty_hrls(e.hrls, it->second.aty_params, params)).monomorph_type(sp, it->second.type, true);
+         }
+     TU_ARMA(Bounded, e) {
+         auto it = e.assoc.find(name);
+         if(it == e.assoc.end())
+             return ::HIR::TypeRef();
+-        ASSERT_BUG(Span(), !params.has_params(), "TODO: Bounded ATY with params?");
+-        return MonomorphHrlsOnly(e.hrls).monomorph_type(sp, it->second.type, true);
++        if( !aty_params_match(it->second.aty_params, params, ivars) ) {
++            DEBUG("ATY " << name << it->second.aty_params << " doesn't apply to " << name << params);
++            return ::HIR::TypeRef();
++        }
++        return MonomorphHrlsOnly(aty_hrls(e.hrls, it->second.aty_params, params)).monomorph_type(sp, it->second.type, true);
+         }
+     }
+     return ::HIR::TypeRef();
+diff --git a/src/hir_typeck/impl_ref.hpp b/src/hir_typeck/impl_ref.hpp
+index 97b9f941..e9f4e2c3 100644
+--- a/src/hir_typeck/impl_ref.hpp
++++ b/src/hir_typeck/impl_ref.hpp
+@@ -17,6 +17,8 @@ namespace HIR {
+ }
+ 
+ 
++class HMTypeInferrence;
++
+ struct ImplRef
+ {
+     TAGGED_UNION(Data, TraitImpl,
+@@ -98,7 +100,9 @@ struct ImplRef
+     ::HIR::TypeRef get_trait_ty_param(unsigned int) const;
+ 
+     bool type_is_specialisable(const char* name) const;
+-    ::HIR::TypeRef get_type(const char* name, const HIR::PathParams& params) const;
++    /// `params` are the associated type's own arguments (GATs). A binding from a bound (`Tr<Assoc<T> = X>`) only applies
++    /// when they match; `ivars` is typecheck's inference state, used to compare them
++    ::HIR::TypeRef get_type(const char* name, const HIR::PathParams& params, const HMTypeInferrence* ivars=nullptr) const;
+ 
+     friend ::std::ostream& operator<<(::std::ostream& os, const ImplRef& x);
+ };
+diff --git a/src/hir_typeck/resolve_common.cpp b/src/hir_typeck/resolve_common.cpp
+index 2cc82836..2eef7156 100644
+--- a/src/hir_typeck/resolve_common.cpp
++++ b/src/hir_typeck/resolve_common.cpp
+@@ -94,7 +94,8 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+         DEBUG("Equality (TB) - <" << type << " as " << tb.second.source_trait << ">::" << tb.first << " = " << tb.second);
+         push_type(tb.first, trait_path.m_hrtbs.get(), tb.second);
+ 
+-        auto ty_l = ::HIR::TypeRef::new_path( ::HIR::Path( type.clone(), tb.second.source_trait.clone(), tb.first ), ::HIR::TypePathBinding::make_Opaque({}) );
++        // A GAT's binding is for the projection with its arguments (`Tr<Assoc<T> = X>` says nothing about `Assoc<u8>`)
++        auto ty_l = ::HIR::TypeRef::new_path( ::HIR::Path( type.clone(), tb.second.source_trait.clone(), tb.first, tb.second.aty_params.clone() ), ::HIR::TypePathBinding::make_Opaque({}) );
+         prep_indexes__add_equality( sp, trait_path.m_hrtbs.get(), mv$(ty_l), tb.second.type.clone() );
+     }
+ 
+@@ -112,10 +113,10 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+     {
+         for(const auto& trait : tb.second.traits) {
+             auto ty_l = ::HIR::TypeRef::new_path(
+-                ::HIR::Path( type.clone(), tb.second.source_trait.clone(), tb.first ),
++                ::HIR::Path( type.clone(), tb.second.source_trait.clone(), tb.first, tb.second.aty_params.clone() ),
+                 ::HIR::TypePathBinding::make_Opaque({})
+             );
+-            DEBUG("Bound (TB) - <" << type << " as " << tb.second.source_trait << ">::" << tb.first << " : " << trait);
++            DEBUG("Bound (TB) - <" << type << " as " << tb.second.source_trait << ">::" << tb.first << tb.second.aty_params << " : " << trait);
+             prep_indexes__add_trait_bound(sp, outer_hrtbs, std::move(ty_l), trait.clone());
+         }
+     }
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index d31737a5..fe754ce0 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -549,7 +549,9 @@ bool StaticTraitResolve::find_impl(
+                     {
+                         auto hrls = get_hrls(sp, bound.m_hrtbs, b_params_mono, trait_params);
+                         // Optimisation: If this was a monomorphised path, then move ownership into the ImplRef
+-                        if( &b_params_mono == &params_mono_o || ::std::any_of(bound.m_type_bounds.begin(), bound.m_type_bounds.end(), [&](const auto& x){ return monomorphise_type_needed(x.second.type); }) )
++                        if( &b_params_mono == &params_mono_o || ::std::any_of(bound.m_type_bounds.begin(), bound.m_type_bounds.end(), [&](const auto& x){
++                                return monomorphise_type_needed(x.second.type) || monomorphise_pathparams_needed(x.second.aty_params);
++                                }) )
+                         {
+                             ::HIR::TraitPath::assoc_list_t  atys;
+                             if( ! bound.m_type_bounds.empty() )
+@@ -557,10 +559,12 @@ bool StaticTraitResolve::find_impl(
+                                 for(const auto& tb : bound.m_type_bounds)
+                                 {
+                                     auto src = monomorph_cb.monomorph_genericpath(sp, tb.second.source_trait, false);
++                                    auto aty_params = monomorph_cb.monomorph_path_params(sp, tb.second.aty_params, false);
+                                     auto aty = monomorph_cb.monomorph_type(sp, tb.second.type, false);
+                                     expand_associated_types(sp, aty);
+                                     expand_associated_types_params(sp, src.m_params);
+-                                    atys.insert(::std::make_pair( tb.first, ::HIR::TraitPath::AtyEqual { mv$(src), {}, mv$(aty) } ));
++                                    expand_associated_types_params(sp, aty_params);
++                                    atys.insert(::std::make_pair( tb.first, ::HIR::TraitPath::AtyEqual { mv$(src), mv$(aty_params), mv$(aty) } ));
+                                 }
+                             }
+                             if( found_cb( ImplRef(std::move(hrls), type.clone(), mv$(params_mono_o), mv$(atys)), false ) )
+@@ -1972,6 +1976,11 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+             // 2. Check if the trait (or any supertrait) includes e2.trait
+             if( be_trait == e2.trait ) {
+                 auto it = bound.second.assoc.find(e2.item);
++                // A GAT's binding only applies to the same arguments
++                if( it != bound.second.assoc.end() && it->second.aty_params != e2.params ) {
++                    DEBUG("Bound " << e2.item << it->second.aty_params << " doesn't apply to " << e2.params);
++                    it = bound.second.assoc.end();
++                }
+                 // 1. Check if the bounds include the desired item
+                 if( it == bound.second.assoc.end() ) {
+                     // If not, assume it's opaque and return as such
+@@ -2019,6 +2028,11 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+                 // - TODO: Parameters?
+                 if( bound.m_path == e2.trait ) {
+                     auto it = bound.m_type_bounds.find( e2.item );
++                    // A GAT's binding only applies to the same arguments
++                    if( it != bound.m_type_bounds.end() && cb_placeholders_trait.monomorph_path_params(sp, it->second.aty_params, false) != e2.params ) {
++                        DEBUG("Inner bound " << e2.item << it->second.aty_params << " doesn't apply to " << e2.params);
++                        it = bound.m_type_bounds.end();
++                    }
+                     if( it != bound.m_type_bounds.end() ) {
+                         DEBUG("Found inner bound: " << it->second.type);
+                         if( monomorphise_type_needed(it->second.type) ) {
+@@ -2041,7 +2055,7 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+                         bound_trait, bound.m_path.m_path, bound_params, e2.type,
+                         [&](const auto& params, const auto& assoc){
+                             auto it = assoc.find(e2.item);
+-                            if( it != assoc.end() ) {
++                            if( it != assoc.end() && it->second.aty_params == e2.params ) {
+                                 input = it->second.type.clone();
+                                 return true;
+                             }

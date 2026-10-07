@@ -1,0 +1,164 @@
+From a8144b34fb8a71388268989caed757916eaec0dc Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 02:29:34 +0000
+Subject: [PATCH 099/100] codegen_c: lay out emulated i128/u128 halves in
+ target byte order
+
+Targets without a native 128-bit integer (32-bit ones, MSVC) emulate
+i128/u128 with `struct { uint64_t lo, hi; }`. That is the little-endian
+memory image of the value, but mrustc's own byte-level views assume the
+rustc layout: statics are emitted as raw words in target byte order, so on
+a big-endian target such as powerpc-apple-darwin `static ONE: u128 = 1`
+comes out as `.raw = {0,0,0,1}` and reads back as lo=0, hi=1 = 2^64. Every
+other byte-level view is off the same way: `u64 as u128` lands in the high
+word of the memory image, transmutes to/from `[u8; 16]` (and with them
+`from_be_bytes`/`to_ne_bytes`/`from_le_bytes`), unions, pointer casts and
+u128 fields of raw-emitted statics (std's `Ipv6Addr::from(u128)` and
+`to_bits`, uuid, ulid). Arithmetic on values that never leave registers
+was fine, which is why most code worked.
+
+Declare the struct as `{ hi, lo }` on big-endian targets, and make every
+initialiser in the prelude designated so it doesn't depend on the field
+order (the generated C already relies on C99 designated initialisers for
+`{ .raw = ... }`). Little-endian output only changes in the initialiser
+spelling.
+
+Checked with a 24-case no_core harness driven from C (statics, a u128
+field of a static struct, transmutes both ways, integer casts,
+ctlz/cttz/ctpop, casts to float, bswap): the ppc32 build run under
+qemu-ppc fails 12 cases with the old compiler and, together with the
+following helper fix, passes all 24; an x86_64 build with
+`emulate-i128 = true` in the target spec passes 24/24 too. cabi-test
+still passes 12/12.
+
+Note: this changes the in-memory layout of i128/u128 on big-endian
+targets, so libstd and every crate built with an earlier compiler have to
+be rebuilt together.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/trans/codegen_c.cpp | 46 +++++++++++++++++++++++------------------
+ src/trans/target.cpp    |  5 +++--
+ 2 files changed, 29 insertions(+), 22 deletions(-)
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 27100546..d13fe037 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -622,16 +622,22 @@ namespace {
+ 
+             if( m_options.emulated_i128 )
+             {
++                // The two halves are laid out in the target's byte order, so the in-memory
++                // representation of a 128-bit value (statics emitted as raw words, transmutes
++                // to/from byte arrays, unions, pointer casts) is the one rustc defines: `lo, hi`
++                // on little-endian targets, `hi, lo` on big-endian ones (e.g. ppc32). Every
++                // initialiser below is designated so it doesn't depend on the field order.
++                const char* halves = Target_GetCurSpec().m_arch.m_big_endian ? "uint64_t hi, lo;" : "uint64_t lo, hi;";
+                 m_of
+-                    << "typedef struct { uint64_t lo, hi; } uint128_t;\n"
+-                    << "typedef struct { uint64_t lo, hi; } int128_t;\n"
++                    << "typedef struct { " << halves << " } uint128_t;\n"
++                    << "typedef struct { " << halves << " } int128_t;\n"
+                     << "static inline uint128_t intrinsic_ctlz_u128(uint128_t v);\n"
+                     << "static inline uint128_t shl128(uint128_t a, uint32_t b);\n"
+                     << "static inline uint128_t shr128(uint128_t a, uint32_t b);\n"
+                     << "static inline float make_float(int is_neg, int exp, uint32_t mantissa_bits) { float rv; uint32_t vi=(mantissa_bits&((1<<23)-1))|((exp+127)<<23);if(is_neg)vi|=1<<31; memcpy(&rv, &vi, 4); return rv; }\n"
+                     << "static inline double make_double(int is_neg, int exp, uint32_t mantissa_bits) { double rv; uint64_t vi=(mantissa_bits&((1ull<<52)-1))|((uint64_t)(exp+1023)<<52);if(is_neg)vi|=1ull<<63; memcpy(&rv, &vi, 4); return rv; }\n"
+-                    << "static inline uint128_t make128_raw(uint64_t hi, uint64_t lo) { uint128_t rv = { lo, hi }; return rv; }\n"
+-                    << "static inline uint128_t make128(uint64_t v) { uint128_t rv = { v, 0 }; return rv; }\n"
++                    << "static inline uint128_t make128_raw(uint64_t hi, uint64_t lo) { uint128_t rv = { .lo = lo, .hi = hi }; return rv; }\n"
++                    << "static inline uint128_t make128(uint64_t v) { uint128_t rv = { .lo = v, .hi = 0 }; return rv; }\n"
+                     // https://blog.m-ou.se/floats/
+                     << "static inline float cast128_float(uint128_t v) {"
+                     << " int n = intrinsic_ctlz_u128(v).lo;"
+@@ -681,14 +687,14 @@ namespace {
+                     << "static inline bool div128_o(uint128_t a, uint128_t b, uint128_t* q, uint128_t* r) {"
+                     << " if(a.hi == 0 && b.hi == 0) { if(q) { q->hi=0; q->lo = a.lo / b.lo; } if(r) { r->hi=0; r->lo = a.lo % b.lo; } return false; }"
+                     << " if(cmp128(a, b) < 0) { if(q) { q->hi=0; q->lo=0; } if(r) *r = a; return false; }"
+-                    << " uint128_t a_div_2 = {(a.lo>>1)|(a.hi << 63), a.hi>>1};"
++                    << " uint128_t a_div_2 = { .lo = (a.lo>>1)|(a.hi << 63), .hi = a.hi>>1 };"
+                     << " int shift = 0;"
+                     << " while( cmp128(a_div_2, b) >= 0 && shift < 128 ) {"
+                     <<  " shift += 1;"
+                     <<  " b.hi = (b.hi<<1)|(b.lo>>63); b.lo <<= 1;"
+                     <<  " }"
+                     << " if(shift == 128) return true;" // true = overflowed
+-                    << " uint128_t mask = { /*lo=*/(shift >= 64 ? 0 : (1ull << shift)), /*hi=*/(shift < 64 ? 0 : 1ull << (shift-64)) };"
++                    << " uint128_t mask = { .lo = (shift >= 64 ? 0 : (1ull << shift)), .hi = (shift < 64 ? 0 : 1ull << (shift-64)) };"
+                     << " shift ++;"
+                     << " if(q) { q->hi = 0; q->lo = 0; }"
+                     << " while(shift--) {"
+@@ -704,24 +710,24 @@ namespace {
+                     << "static inline uint128_t mul128(uint128_t a, uint128_t b) { uint128_t v; mul128_o(a, b, &v); return v; }\n"
+                     << "static inline uint128_t div128(uint128_t a, uint128_t b) { uint128_t v; div128_o(a, b, &v, NULL); return v; }\n"
+                     << "static inline uint128_t mod128(uint128_t a, uint128_t b) { uint128_t v; div128_o(a, b, NULL, &v); return v;}\n"
+-                    << "static inline uint128_t and128(uint128_t a, uint128_t b) { uint128_t v = { a.lo & b.lo, a.hi & b.hi }; return v; }\n"
+-                    << "static inline uint128_t or128 (uint128_t a, uint128_t b) { uint128_t v = { a.lo | b.lo, a.hi | b.hi }; return v; }\n"
+-                    << "static inline uint128_t xor128(uint128_t a, uint128_t b) { uint128_t v = { a.lo ^ b.lo, a.hi ^ b.hi }; return v; }\n"
++                    << "static inline uint128_t and128(uint128_t a, uint128_t b) { uint128_t v = { .lo = a.lo & b.lo, .hi = a.hi & b.hi }; return v; }\n"
++                    << "static inline uint128_t or128 (uint128_t a, uint128_t b) { uint128_t v = { .lo = a.lo | b.lo, .hi = a.hi | b.hi }; return v; }\n"
++                    << "static inline uint128_t xor128(uint128_t a, uint128_t b) { uint128_t v = { .lo = a.lo ^ b.lo, .hi = a.hi ^ b.hi }; return v; }\n"
+                     << "static inline uint128_t shl128(uint128_t a, uint32_t b) { uint128_t v; if(b == 0) { return a; } else if(b < 64) { v.lo = a.lo << b; v.hi = (a.hi << b) | (a.lo >> (64 - b)); } else { v.hi = a.lo << (b - 64); v.lo = 0; } return v; }\n"
+                     << "static inline uint128_t shr128(uint128_t a, uint32_t b) { uint128_t v; if(b == 0) { return a; } else if(b < 64) { v.lo = (a.lo >> b)|(a.hi << (64 - b)); v.hi = a.hi >> b; } else { v.lo = a.hi >> (b - 64); v.hi = 0; } return v; }\n"
+-                    << "static inline uint128_t popcount128(uint128_t a) { uint128_t v = { __builtin_popcountll(a.lo) + __builtin_popcountll(a.hi), 0 }; return v; }\n"
+-                    << "static inline uint128_t __builtin_bswap128(uint128_t v) { uint128_t rv = { __builtin_bswap64(v.hi), __builtin_bswap64(v.lo) }; return rv; }\n"
++                    << "static inline uint128_t popcount128(uint128_t a) { uint128_t v = { .lo = __builtin_popcountll(a.lo) + __builtin_popcountll(a.hi), .hi = 0 }; return v; }\n"
++                    << "static inline uint128_t __builtin_bswap128(uint128_t v) { uint128_t rv = { .lo = __builtin_bswap64(v.hi), .hi = __builtin_bswap64(v.lo) }; return rv; }\n"
+                     << "static inline uint128_t intrinsic_ctlz_u128(uint128_t v) {\n"
+-                    << "\tuint128_t rv = { (v.hi != 0 ? __builtin_clz64(v.hi) : (v.lo != 0 ? 64 + __builtin_clz64(v.lo) : 128)), 0 };\n"
++                    << "\tuint128_t rv = { .lo = (v.hi != 0 ? __builtin_clz64(v.hi) : (v.lo != 0 ? 64 + __builtin_clz64(v.lo) : 128)), .hi = 0 };\n"
+                     << "\treturn rv;\n"
+                     << "}\n"
+                     << "static inline uint128_t intrinsic_cttz_u128(uint128_t v) {\n"
+-                    << "\tuint128_t rv = { (v.lo == 0 ? (v.hi == 0 ? 128 : __builtin_ctz64(v.hi) + 64) : __builtin_ctz64(v.lo)), 0 };\n"
++                    << "\tuint128_t rv = { .lo = (v.lo == 0 ? (v.hi == 0 ? 128 : __builtin_ctz64(v.hi) + 64) : __builtin_ctz64(v.lo)), .hi = 0 };\n"
+                     << "\treturn rv;\n"
+                     << "}\n"
+-                    << "static inline int128_t make128s_raw(uint64_t hi, uint64_t lo) { int128_t rv = { lo, hi }; return rv; }\n"
+-                    << "static inline int128_t make128s(int64_t v) { int128_t rv = { v, (v < 0 ? -1 : 0) }; return rv; }\n"
+-                    << "static inline int128_t neg128s(int128_t v) { int128_t rv = { ~v.lo+1, ~v.hi + (v.lo == 0) }; return rv; }\n"
++                    << "static inline int128_t make128s_raw(uint64_t hi, uint64_t lo) { int128_t rv = { .lo = lo, .hi = hi }; return rv; }\n"
++                    << "static inline int128_t make128s(int64_t v) { int128_t rv = { .lo = v, .hi = (v < 0 ? -1 : 0) }; return rv; }\n"
++                    << "static inline int128_t neg128s(int128_t v) { int128_t rv = { .lo = ~v.lo+1, .hi = ~v.hi + (v.lo == 0) }; return rv; }\n"
+                     << "static inline float cast128s_float(int128_t v) {"
+                     << " int sgn = (v.hi >> 63);"
+                     << " int128_t abs = sgn ? neg128s(v) : v;"
+@@ -761,9 +767,9 @@ namespace {
+                     << "static inline int128_t mul128s(int128_t a, int128_t b) { int128_t v; mul128s_o(a, b, &v); return v; }\n"
+                     << "static inline int128_t div128s(int128_t a, int128_t b) { int128_t v; div128s_o(a, b, &v, NULL); return v; }\n"
+                     << "static inline int128_t mod128s(int128_t a, int128_t b) { int128_t v; div128s_o(a, b, NULL, &v); return v; }\n"
+-                    << "static inline int128_t and128s(int128_t a, int128_t b) { int128_t v = { a.lo & b.lo, a.hi & b.hi }; return v; }\n"
+-                    << "static inline int128_t or128s (int128_t a, int128_t b) { int128_t v = { a.lo | b.lo, a.hi | b.hi }; return v; }\n"
+-                    << "static inline int128_t xor128s(int128_t a, int128_t b) { int128_t v = { a.lo ^ b.lo, a.hi ^ b.hi }; return v; }\n"
++                    << "static inline int128_t and128s(int128_t a, int128_t b) { int128_t v = { .lo = a.lo & b.lo, .hi = a.hi & b.hi }; return v; }\n"
++                    << "static inline int128_t or128s (int128_t a, int128_t b) { int128_t v = { .lo = a.lo | b.lo, .hi = a.hi | b.hi }; return v; }\n"
++                    << "static inline int128_t xor128s(int128_t a, int128_t b) { int128_t v = { .lo = a.lo ^ b.lo, .hi = a.hi ^ b.hi }; return v; }\n"
+                     << "static inline int128_t shl128s(int128_t a, uint32_t b) { int128_t v; if(b == 0) { return a; } else if(b < 64) { v.lo = a.lo << b; v.hi = (a.hi << b) | (a.lo >> (64 - b)); } else { v.hi = a.lo << (b - 64); v.lo = 0; } return v; }\n"
+                     << "static inline int128_t shr128s(int128_t a, uint32_t b) { int128_t v; if(b == 0) { return a; } else if(b < 64) { v.lo = (a.lo >> b)|(a.hi << (64 - b)); v.hi = (int64_t)a.hi >> b; } else { v.lo = (int64_t)a.hi >> (b - 64); v.hi = (int64_t)a.hi < 0 ? -1 : 0; } return v; }\n"
+                     << "static inline uint128_t int128_to_uint128(int128_t a) { return make128_raw(a.lo, a.hi); }\n"
+@@ -830,7 +836,7 @@ namespace {
+                 ;
+             if( m_options.emulated_i128 )
+             {
+-                m_of << "static inline uint128_t __mrustc_bitrev128(uint128_t v) { uint128_t rv = { __mrustc_bitrev64(v.hi), __mrustc_bitrev64(v.lo) }; return rv; }\n";
++                m_of << "static inline uint128_t __mrustc_bitrev128(uint128_t v) { uint128_t rv = { .lo = __mrustc_bitrev64(v.hi), .hi = __mrustc_bitrev64(v.lo) }; return rv; }\n";
+             }
+             else
+             {
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index 18b55374..4fad78b5 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -1243,8 +1243,9 @@ namespace {
+             if( !is_composite )
+             {
+                 // A scalar (or pointer/...): return its natural alignment.
+-                // NOTE: u128 is emitted as `struct { uint64_t lo, hi; }`, for which the C
+-                // compiler would derive 8 via `lo` - matching the spec alignment returned here.
++                // NOTE: u128 is emitted as `struct { uint64_t hi, lo; }` on big-endian targets
++                // (`lo, hi` on little-endian), for which the C compiler would derive 8 via its
++                // first `uint64_t` field - matching the spec alignment returned here.
+                 size_t sz = 0, al = 0;
+                 if( !Target_GetSizeAndAlignOf(sp, resolve, t, sz, al) )
+                     return 1;

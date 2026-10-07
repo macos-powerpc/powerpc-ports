@@ -1,0 +1,118 @@
+From 17f45c2d58f761c19557b2886228d5b4b1956d55 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 06:30:39 +0000
+Subject: [PATCH 105/105] hir_typeck: keep the associated type bindings of a
+ supertrait found through a bound
+
+lexical-core 0.6.8 (dmux 0.6.2) src/atof/algorithm/math.rs:2342:
+
+    trait SharedOps { type StorageType: CloneableVecLike<Limb>; fn data(&self) -> &Self::StorageType; .. }
+    fn trailing_zeros(&self) -> usize { small::trailing_zeros(self.data()) }   // takes &[Limb]
+
+    error:0: Type mismatch between [u32] and <Self as SharedOps>::StorageType
+
+with `CloneableVecLike<T>: VecLike<T>` and `VecLike<T>: DerefMut<Target = [T]>`.
+The deref coercion `&Self::StorageType -> &[u32]` asks for a `Deref` impl on
+the opaque `StorageType`. find_trait_impls finds `Deref` as a supertrait of
+the bound, but built the ImplRef with an empty binding list. So `Target` came
+back unknown and the coercion compared `[u32]` with the opaque
+`<StorageType as Deref>::Target`. `&**self.data()` worked, because projection
+expansion goes through a different path. Even
+`type StorageType: DerefMut<Target = [u32]>` failed this way, where the
+binding is written on the bound but belongs to its supertrait.
+
+The ImplRef for a supertrait found through a bound now gets that trait's
+bindings: its own (from the bound trait's supertrait list, e.g. `Deref` with
+`Target = [T]` under `VecLike<T>`) and the bound's own bindings for the
+trait's items (`DerefMut<Target = X>`). Same in typeck (find_trait_impls on
+opaque projection) and in StaticTraitResolve::find_impl (the
+an `find_named_trait_in_trait` and `m_all_parent_traits` paths).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_typeck/helpers.cpp | 15 ++++++++++++++-
+ src/hir_typeck/static.cpp  | 24 ++++++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 0dba161e..6e09cfe3 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -2042,6 +2042,11 @@ bool TraitResolution::find_trait_impls(const Span& sp,
+                         monomorph_cb.monomorph_path_params(sp, aty.second.aty_params, false),
+                         monomorph_cb.monomorph_type(sp, aty.second.type)
+                         } ));
++                // Bindings for a supertrait's items (`DerefMut<Target = X>` binds Deref's `Target`), for the supertrait search below
++                ::HIR::TraitPath::assoc_list_t  b_atys_super;
++                for(const auto& aty : b_atys)
++                    if( aty.second.source_trait.m_path != bound.m_path.m_path )
++                        b_atys_super.insert(::std::make_pair( aty.first, aty.second.clone() ));
+ 
+                 if( bound.m_path.m_path == trait )
+                 {
+@@ -2079,7 +2084,15 @@ bool TraitResolution::find_trait_impls(const Span& sp,
+                         ASSERT_BUG(sp, !bound.m_hrtbs || !i_tp.m_hrtbs, "TODO: Handle two layers of HRTBs - " << bound.m_path << " and " << i_tp);
+                         const HIR::GenericParams* hrtbs = bound.m_hrtbs ? bound.m_hrtbs.get() : i_tp.m_hrtbs.get();
+                         auto hrls = get_hrls(sp, hrtbs, i_tp.m_path.m_params, params);
+-                        auto ir = ImplRef(std::move(hrls), type.clone(), i_tp.m_path.m_params.clone(), {});
++                        // The supertrait's bindings: from the bound trait's supertrait list (`VecLike<T>: DerefMut<Target = [T]>`)
++                        // and from the bound itself (`T: DerefMut<Target = X>`)
++                        ::HIR::TraitPath::assoc_list_t  atys;
++                        for(const auto& aty : i_tp.m_type_bounds)
++                            atys.insert(::std::make_pair( aty.first, aty.second.clone() ));
++                        for(const auto& aty : b_atys_super)
++                            if( aty.second.source_trait.m_path == i_tp.m_path.m_path )
++                                atys.insert(::std::make_pair( aty.first, aty.second.clone() ));
++                        auto ir = ImplRef(std::move(hrls), type.clone(), i_tp.m_path.m_params.clone(), std::move(atys));
+                         rv |= (cmp != ::HIR::Compare::Unequal && callback( std::move(ir), cmp ));
+                         ret = true;
+                         return false;   // Continue
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index fe754ce0..3b438eaf 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -579,6 +579,26 @@ bool StaticTraitResolve::find_impl(
+                     }
+                 }
+ 
++                // The supertrait's bindings: its own (from the bound trait's supertrait list) and the bound's for its items
++                // (`T: DerefMut<Target = X>` binds Deref's `Target`)
++                auto supertrait_atys = [&](const ::HIR::TraitPath::assoc_list_t& own) {
++                    ::HIR::TraitPath::assoc_list_t  rv;
++                    for(const auto& aty : own)
++                        rv.insert(::std::make_pair( aty.first, aty.second.clone() ));
++                    for(const auto& tb : bound.m_type_bounds)
++                    {
++                        if( tb.second.source_trait.m_path != trait_path )
++                            continue ;
++                        auto aty = monomorph_cb.monomorph_type(sp, tb.second.type, false);
++                        expand_associated_types(sp, aty);
++                        rv.insert(::std::make_pair( tb.first, ::HIR::TraitPath::AtyEqual {
++                            monomorph_cb.monomorph_genericpath(sp, tb.second.source_trait, false),
++                            monomorph_cb.monomorph_path_params(sp, tb.second.aty_params, false),
++                            mv$(aty)
++                            } ));
++                    }
++                    return rv;
++                    };
+                 if(trait_params)
+                 {
+                     return this->find_named_trait_in_trait(sp,  trait_path, *trait_params,  *bound.m_trait_ptr,  bound.m_path.m_path, b_params_mono, type,
+@@ -586,7 +606,7 @@ bool StaticTraitResolve::find_impl(
+                             if( i_params != *trait_params )
+                                 return false;
+                             DEBUG("impl " << trait_path << i_params << " for " << type << " -- desired " << trait_path << *trait_params);
+-                            return found_cb( ImplRef(type.clone(), i_params.clone(), {}), false );
++                            return found_cb( ImplRef(type.clone(), i_params.clone(), supertrait_atys(i_assoc)), false );
+                         });
+                 }
+                 else
+@@ -604,7 +624,7 @@ bool StaticTraitResolve::find_impl(
+                         {
+                             // TODO: Monomorphse trait params
+                             //DEBUG("impl " << trait_path << i_params << " for " << type << " -- desired " << trait_path << *trait_params);
+-                            return found_cb( ImplRef(type.clone(), mv$(pt_mono.m_path.m_params), {}), false );
++                            return found_cb( ImplRef(type.clone(), mv$(pt_mono.m_path.m_params), supertrait_atys(pt_mono.m_type_bounds)), false );
+                         }
+                     }
+                     return false;

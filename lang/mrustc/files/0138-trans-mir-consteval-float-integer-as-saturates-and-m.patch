@@ -1,0 +1,171 @@
+From efe9abde5f9290664dcccceeb0bb5852f8d1b247 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 20:42:19 +0000
+Subject: [PATCH 138/141] trans/mir/consteval: float -> integer `as` saturates
+ and maps NaN to 0
+
+pngquant 3.0.3 wrote a 1280x720 PNG whose palette was 256 copies of
+libimagequant's "fully transparent" sentinel (71,112,76,a=0) with every
+pixel index 0, while `--verbose` reported 306 colours, a 256-colour
+palette and MSE 0.028. `f_pixel::to_rgb` (imagequant 4.2.2 pal.rs:125)
+computes the output alpha as `(256.0 / LIQ_WEIGHT_A) * self.a`, exactly
+256.0 for an opaque colour, and relies on `as u8` saturating to 255.
+
+Three places turned that into 0 (and did the wrong thing for every
+out-of-range or NaN source):
+- codegen_c emitted a plain C cast, undefined out of range; GCC gives
+  `(uint8_t)256.0f == 0` on ppc and x86. Casts to integers from f32/f64
+  now go through MRUSTC_FCAST: NaN -> 0, below the range -> MIN, at or
+  above -> MAX, else truncation.
+- the MIR optimiser folded a constant float cast with `truncate_u`.
+- the constant evaluator used a C++ `static_cast`.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_conv/constant_evaluation.cpp | 25 +++++++++++----
+ src/mir/optimise.cpp                 | 21 +++++++++----
+ src/trans/codegen_c.cpp              | 46 ++++++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index da8b06ef..7a32bf89 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -10,6 +10,7 @@
+ #include <hir/expr.hpp>
+ #include <hir/visitor.hpp>
+ #include <algorithm>
++#include <cmath>
+ #include <mir/mir.hpp>
+ #include <hir_typeck/common.hpp>    // Monomorph
+ #include <mir/helpers.hpp>
+@@ -2096,12 +2097,24 @@ namespace HIR {
+                         MIR_ASSERT(state, !src_ty.data().is_NamedFunction(), "");
+                         dst.write_uint( state, ti.bits, inval.read_uint(state, src_ti.bits) );
+                         break;
+-                    case TypeInfo::Float:
+-                        if( ti.ty == TypeInfo::Signed )
+-                            dst.write_uint( state, ti.bits, static_cast<int64_t>(inval.read_float(state, src_ti.bits)) );
+-                        else
+-                            dst.write_uint( state, ti.bits, static_cast<uint64_t>(inval.read_float(state, src_ti.bits)) );
+-                        break;
++                    case TypeInfo::Float: {
++                        // `as` saturates and maps NaN to 0 (a C++ cast is undefined out of range; codegen_c emits
++                        // the same rule as MRUSTC_FCAST)
++                        double v = inval.read_float(state, src_ti.bits);
++                        if( ti.ty == TypeInfo::Signed ) {
++                            double hi = std::ldexp(1.0, ti.bits - 1);
++                            int64_t imax = (ti.bits >= 64) ? INT64_MAX : (int64_t(1) << (ti.bits - 1)) - 1;
++                            int64_t imin = (ti.bits >= 64) ? INT64_MIN : -(int64_t(1) << (ti.bits - 1));
++                            int64_t r = (v != v) ? 0 : (v >= hi) ? imax : (v <= -hi) ? imin : static_cast<int64_t>(v);
++                            dst.write_uint( state, ti.bits, r );
++                        }
++                        else {
++                            double hi = std::ldexp(1.0, ti.bits);
++                            uint64_t umax = (ti.bits >= 64) ? UINT64_MAX : (uint64_t(1) << ti.bits) - 1;
++                            uint64_t r = (v != v) ? 0 : (v >= hi) ? umax : (v <= 0.0) ? 0 : static_cast<uint64_t>(v);
++                            dst.write_uint( state, ti.bits, r );
++                        }
++                        } break;
+                     case TypeInfo::Other: {
+                         MIR_ASSERT(state, TU_TEST1(src_ty.data(), Path, .binding.is_Enum()), "Constant cast Variant to integer with invalid type - " << src_ty);
+                         MIR_ASSERT(state, src_ty.data().as_Path().binding.as_Enum(), "Enum binding pointer not set! - " << src_ty);
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index a75e8ec2..20c4638f 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -3602,15 +3602,24 @@ bool MIR_Optimise_ConstPropagate(::MIR::TypeResolve& state, ::MIR::Function& fcn
+                                 }
+                                 else if( const auto* vp = nv.opt_Float() )
+                                 {
+-                                    if( 0.0 <= vp->v && vp->v <= UINT64_MAX )
++                                    // `as` saturates: a value at or above the type's range is its maximum (`256.0 as u8`
++                                    // is 255, not the truncated 0: libimagequant's opaque palette alpha). Negative and
++                                    // NaN sources are left to codegen, which saturates too.
++                                    if( 0.0 <= vp->v && vp->v < 18446744073709551616.0 )
+                                     {
+-                                        new_value = ::MIR::Constant::make_Uint({
+-                                            H::truncate_u(*te, U128(static_cast<uint64_t>(vp->v))),
+-                                            *te
+-                                            });
++                                        auto v = U128(static_cast<uint64_t>(vp->v));
++                                        auto t = H::truncate_u(*te, v);
++                                        if( !(t == v) ) {
++                                            t = H::truncate_u(*te, U128(UINT64_MAX));
++                                        }
++                                        new_value = ::MIR::Constant::make_Uint({ t, *te });
++                                    }
++                                    else if( vp->v >= 18446744073709551616.0 && *te != ::HIR::CoreType::U128 )
++                                    {
++                                        new_value = ::MIR::Constant::make_Uint({ H::truncate_u(*te, U128(UINT64_MAX)), *te });
+                                     }
+                                     else {
+-                                        // UB: Casting float out of range?
++                                        // Negative or NaN: codegen's saturating cast handles it
+                                     }
+                                 }
+                                 else
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index f09eff35..252d1b2d 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -846,6 +846,9 @@ namespace {
+                 << "static inline uint32_t __mrustc_bitrev32(uint32_t v) { if(v==0) return 0; return ((uint32_t)__mrustc_bitrev16(v>>16))|((uint32_t)__mrustc_bitrev16(v)<<16); }\n"
+                 << "static inline uint64_t __mrustc_bitrev64(uint64_t v) { if(v==0) return 0; return ((uint64_t)__mrustc_bitrev32(v>>32))|((uint64_t)__mrustc_bitrev32(v)<<32); }\n"
+                 // TODO: 128
++                // Rust's float -> integer `as` saturates and maps NaN to 0; a C cast is undefined out of range (and
++                // truncates: `(uint8_t)256.0f` is 0). LO/HI are the saturating bounds in the float domain.
++                << "#define MRUSTC_FCAST(T, MINV, LO, HI, MAXV, v) ( ((v) != (v)) ? (T)0 : ((v) <= (LO)) ? (T)(MINV) : ((v) >= (HI)) ? (T)(MAXV) : (T)(v) )\n"
+                 ;
+             if( m_options.emulated_i128 )
+             {
+@@ -4726,6 +4729,49 @@ namespace {
+                 return ;
+             }
+ 
++            // Float -> integer: saturating, NaN -> 0 (`as` semantics since Rust 1.45). A plain C cast is undefined out
++            // of range: GCC gave 0 for `(uint8_t)256.0f`, which made every opaque palette entry of libimagequant
++            // (`to_rgb`: `a: (256.0 * a) as u8`) fully transparent on ppc (pngquant wrote an empty image).
++            if( ty.data().is_Primitive() && ve.type.data().is_Primitive() )
++            {
++                auto st = ty.data().as_Primitive();
++                auto dt = ve.type.data().as_Primitive();
++                if( st == ::HIR::CoreType::F32 || st == ::HIR::CoreType::F64 )
++                {
++                    const char* minv = nullptr; const char* lo = nullptr; const char* hi = nullptr; const char* maxv = nullptr;
++                    unsigned ptr_bits = Target_GetPointerBits();
++                    switch(dt)
++                    {
++                    case ::HIR::CoreType::I8:  minv = "INT8_MIN";  lo = "-128.0";  hi = "128.0";  maxv = "INT8_MAX";  break;
++                    case ::HIR::CoreType::I16: minv = "INT16_MIN"; lo = "-32768.0"; hi = "32768.0"; maxv = "INT16_MAX"; break;
++                    case ::HIR::CoreType::I32: minv = "INT32_MIN"; lo = "-2147483648.0"; hi = "2147483648.0"; maxv = "INT32_MAX"; break;
++                    case ::HIR::CoreType::I64: minv = "INT64_MIN"; lo = "-9223372036854775808.0"; hi = "9223372036854775808.0"; maxv = "INT64_MAX"; break;
++                    case ::HIR::CoreType::U8:  minv = "0"; lo = "0.0"; hi = "256.0";   maxv = "UINT8_MAX";  break;
++                    case ::HIR::CoreType::U16: minv = "0"; lo = "0.0"; hi = "65536.0"; maxv = "UINT16_MAX"; break;
++                    case ::HIR::CoreType::U32: minv = "0"; lo = "0.0"; hi = "4294967296.0"; maxv = "UINT32_MAX"; break;
++                    case ::HIR::CoreType::U64: minv = "0"; lo = "0.0"; hi = "18446744073709551616.0"; maxv = "UINT64_MAX"; break;
++                    case ::HIR::CoreType::Isize:
++                        if( ptr_bits == 64 ) { minv = "INTPTR_MIN"; lo = "-9223372036854775808.0"; hi = "9223372036854775808.0"; maxv = "INTPTR_MAX"; }
++                        else                 { minv = "INTPTR_MIN"; lo = "-2147483648.0"; hi = "2147483648.0"; maxv = "INTPTR_MAX"; }
++                        break;
++                    case ::HIR::CoreType::Usize:
++                        if( ptr_bits == 64 ) { minv = "0"; lo = "0.0"; hi = "18446744073709551616.0"; maxv = "UINTPTR_MAX"; }
++                        else                 { minv = "0"; lo = "0.0"; hi = "4294967296.0"; maxv = "UINTPTR_MAX"; }
++                        break;
++                    default:
++                        break;
++                    }
++                    if( minv )
++                    {
++                        emit_lvalue(dst);
++                        m_of << " = MRUSTC_FCAST("; emit_ctype(ve.type); m_of << ", " << minv << ", " << lo << ", " << hi << ", " << maxv << ", ";
++                        emit_lvalue(ve.val);
++                        m_of << ")";
++                        return;
++                    }
++                }
++            }
++
+             // Standard cast
+             emit_lvalue(dst);
+             m_of << " = ";

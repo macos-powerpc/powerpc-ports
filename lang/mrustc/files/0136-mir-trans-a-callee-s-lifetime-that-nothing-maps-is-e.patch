@@ -1,0 +1,95 @@
+From c358a43331f020171ab08604a4fcb5337a65796f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 18:23:30 +0000
+Subject: [PATCH] mir/trans: a callee's lifetime that nothing maps is erased,
+ not passed through
+
+tokio 1.43.0 (sad 0.4.32) net/unix/stream.rs:71 `UnixStream::connect<P>`:
+`poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?`
+failed at trans with "BUG: trans/enumerate.cpp:1614: Path
+<closure#I_connect_376<'#omitted> as Fn<(&'M1 mut Context<'M1>,)>>::call
+<'#omitted> is generic".
+
+The inliner clones `PollFn::poll` into the async fn's generated poll. Its
+body calls `<F as FnMut<(&'M1 mut Context<'M1>,)>>::call_mut` with poll's
+own elided method lifetime, and the call path records no lifetime
+arguments, so MonomorphiserPP::get_lifetime's passthrough kept `'M1` in
+the cloned MIR. Usually the closure's shims are inlined next and the
+leak disappears; tokio's closure body is too big, so the path survived
+to trans, where the instance's params don't cover `'M1` either.
+
+- The inliner's ParamsSet maps a callee impl/method lifetime to the
+  call's argument when recorded and erases it otherwise.
+- Trans_Params does the same: codegen erases lifetimes anyway, so the
+  "is generic" check only has to see types and values.
+
+Kit async-return-test: connect_generic.rs / connect_big.rs (built with
+-O), the tokio shape with a small and a non-inlinable closure body; the
+inline trace shows `FnMut<(&'#omitted mut Context<'#omitted>,)>` now.
+The real tokio crate couldn't be built here; this is the mechanism the
+assert describes. Battery 24/24, C byte-identical.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/mir/optimise.cpp     | 19 +++++++++++++++++++
+ src/trans/trans_list.hpp | 17 +++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index 3a4fe4a5..a75e8ec2 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -716,6 +716,25 @@ namespace
+         const ::HIR::PathParams* get_hrb_params() const override {
+             return nullptr;
+         }
++        /// The callee's own lifetime parameters mean nothing in the function its body is cloned into: use the call's
++        /// arguments when they were recorded, otherwise erase. (The base passthrough left e.g. `PollFn::poll`'s `'M1`
++        /// in `<closure as FnMut<(&'M1 mut Context<'M1>,)>>::call_mut`, which trans then rejected as generic when the
++        /// closure body was too big to inline in turn - tokio 1.43.0 UnixStream::connect.)
++        ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
++            const ::HIR::PathParams* p = nullptr;
++            switch(g.group())
++            {
++            case 0: p = &impl_params;   break;
++            case 1: p = fcn_params; break;
++            default:
++                return MonomorphiserPP::get_lifetime(sp, g);
++            }
++            if( p && g.idx() < p->m_lifetimes.size() ) {
++                return p->m_lifetimes[g.idx()];
++            }
++            DEBUG("Erasing callee lifetime " << g);
++            return ::HIR::LifetimeRef();
++        }
+     };
+     const ::MIR::Function* get_called_mir(const ::MIR::TypeResolve& state, const TransList* list, const ::HIR::Path& path, ParamsSet& params)
+     {
+diff --git a/src/trans/trans_list.hpp b/src/trans/trans_list.hpp
+index 7a327652..78e2718b 100644
+--- a/src/trans/trans_list.hpp
++++ b/src/trans/trans_list.hpp
+@@ -71,6 +71,23 @@ struct Trans_Params:
+     const ::HIR::PathParams* get_hrb_params() const override {
+         return nullptr;
+     }
++    /// Codegen erases lifetimes: a generic lifetime the instance's params don't cover (e.g. a callee's method lifetime
++    /// left in an inlined MIR path) is erased rather than passed through, so `Trans_Enumerate_FillFrom_PathMono`'s
++    /// "is generic" check only ever sees types and values.
++    ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
++        const ::HIR::PathParams* p = nullptr;
++        switch(g.group())
++        {
++        case 0: p = &pp_impl;   break;
++        case 1: p = &pp_method; break;
++        default:
++            return MonomorphiserPP::get_lifetime(sp, g);
++        }
++        if( g.idx() < p->m_lifetimes.size() ) {
++            return p->m_lifetimes[g.idx()];
++        }
++        return ::HIR::LifetimeRef();
++    }
+ };
+ 
+ struct CachedFunction {

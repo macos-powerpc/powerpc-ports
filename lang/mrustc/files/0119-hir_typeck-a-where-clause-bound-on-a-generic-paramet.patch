@@ -1,0 +1,103 @@
+From bf19e073598b015c89a46e83b9a5fafcc18e9ab3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 13:01:55 +0000
+Subject: [PATCH] hir_typeck: a where-clause bound on a generic parameter wins
+ over blanket impls when expanding a projection
+
+digest 0.11.3 (rars 0.9.4) block_api.rs:
+
+    pub trait SmallBlockSizeUser: BlockSizeUser<BlockSize = <Self as SmallBlockSizeUser>::_BlockSize> { type _BlockSize: BlockSizes; }
+    impl<T: BlockSizeUser> SmallBlockSizeUser for T where T::BlockSize: BlockSizes { type _BlockSize = T::BlockSize; }
+
+For `T: VariableOutputCore` (which has SmallBlockSizeUser as a supertrait),
+`<T as BlockSizeUser>::BlockSize` expands through the supertrait binding to
+`<T as SmallBlockSizeUser>::_BlockSize`. That one has a bound for `T` but
+no binding, so the expansion went on to the blanket impl and back to
+`<T as BlockSizeUser>::BlockSize`, and the loop guard stopped at different
+points depending on where it started. CtOutWrapper::finalize_fixed_core
+passes its `&mut Buffer<Self>` to `T::finalize_variable_core` and the two
+spellings didn't match: "MIR_Validate: Argument (1) type mismatch: input
+is &mut BlockBuffer<<T as SmallBlockSizeUser>::_BlockSize, ..>, but
+expected is &mut BlockBuffer<<T as BlockSizeUser>::BlockSize, ..>"
+(a no_core model stops earlier: lifetime_infer.cpp:695 "Mismatched types:
+T != CtOutWrapper<T>", `<CtOutWrapper<T> as BlockSizeUser>::BlockSize`
+left unexpanded).
+
+As rustc prefers param-env candidates, a projection on a generic parameter
+that has a bound for exactly that trait, without a binding for the item,
+now stays opaque instead of being expanded through an impl. Same in
+TraitResolution (typeck) and StaticTraitResolve, so both use the
+`_BlockSize` form. Without such a bound, blanket impls are used as before.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_typeck/helpers.cpp | 19 +++++++++++++++----
+ src/hir_typeck/static.cpp  | 11 ++++++++++-
+ 2 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 5bc71028..dc52783b 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -2965,10 +2965,21 @@ void TraitResolution::expand_associated_types_inplace__UfcsKnown(const Span& sp,
+         }
+         };
+ 
+-    rv = this->find_trait_impls_crate(sp, trait_path.m_path, trait_path.m_params, pe.type, cb_find_impl);
+-    if( !rv ) {
+-        is_bound = true;
+-        rv = find_trait_impls_bound(sp, trait_path.m_path, trait_path.m_params, pe.type, cb_find_impl);
++    // A where-clause bound on a generic parameter wins over impls (as rustc prefers param-env candidates): with no
++    // binding for the item the projection stays opaque, instead of going through a blanket impl. (StaticTraitResolve
++    // does the same, so both sides agree on the form.)
++    // - digest 0.11.3: `SmallBlockSizeUser: BlockSizeUser<BlockSize = <Self as SmallBlockSizeUser>::_BlockSize>` and
++    //   `impl<T: BlockSizeUser> SmallBlockSizeUser for T { type _BlockSize = T::BlockSize; }` expand into each other
++    const bool bound_on_generic = found_bound_with_no_type && result_type == ResultType::Opaque && pe.type.data().is_Generic();
++    if( bound_on_generic ) {
++        DEBUG("Bound on a generic without the item - not searching impls");
++    }
++    else {
++        rv = this->find_trait_impls_crate(sp, trait_path.m_path, trait_path.m_params, pe.type, cb_find_impl);
++        if( !rv ) {
++            is_bound = true;
++            rv = find_trait_impls_bound(sp, trait_path.m_path, trait_path.m_params, pe.type, cb_find_impl);
++        }
+     }
+     if( !rv && best_impl.is_valid() ) {
+         if( can_fuzz && count > 1 ) {
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index f811ee2b..12119bee 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -2017,6 +2017,8 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+     // 1. Bounds
+     bool rv = false;
+     bool assume_opaque = true;
++    // A bound for exactly this type and trait, without a binding for the item
++    bool bound_without_item = false;
+     if(!rv)
+     {
+         if( replace_equalities(input) )
+@@ -2050,6 +2052,7 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+                     // If not, assume it's opaque and return as such
+                     // TODO: What happens if there's two bounds that overlap? 'F: FnMut<()>, F: FnOnce<(), Output=Bar>'
+                     DEBUG("Found impl for " << input << " but no bound on item, assuming opaque");
++                    bound_without_item = true;
+                 }
+                 else {
+                     assume_opaque = false;
+@@ -2146,7 +2149,13 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+ 
+     bool replacement_happened = true;
+     ::ImplRef  best_impl;
+-    rv = this->find_impl(sp, trait_path.m_path, trait_path.m_params, e2.type, [&](ImplRef impl, bool fuzzy) {
++    // A where-clause bound on a generic parameter wins over impls (as in TraitResolution, see there): leave it opaque
++    // - digest 0.11.3: `SmallBlockSizeUser`'s `_BlockSize` and its blanket impl
++    const bool bound_on_generic = bound_without_item && e2.type.data().is_Generic();
++    if( bound_on_generic ) {
++        DEBUG("Bound on a generic without the item - not searching impls");
++    }
++    rv = !bound_on_generic && this->find_impl(sp, trait_path.m_path, trait_path.m_params, e2.type, [&](ImplRef impl, bool fuzzy) {
+         DEBUG("[expand_associated_types] Found " << impl);
+         // If a fuzzy match was found, monomorphise and EAT the checked types and try again
+         // - A fuzzy can be caused by an opaque match.

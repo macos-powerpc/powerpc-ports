@@ -1,0 +1,240 @@
+From 700f088c201976a04810da464d93d1dca45b8952 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 20:42:20 +0000
+Subject: [PATCH 141/141] parse/mir: `super let` bindings, owned by the enclosing block
+
+core 1.90's `pin!` expands to
+
+    { super let mut pinned = $value; unsafe { Pin::new_unchecked(&mut pinned) } }
+
+(the unstable `super_let` feature). sad 0.4.32 main.rs:74 `let mut out =
+pin!(out);` failed to parse: `super` started a path, "Unexpected token
+TOK_RWORD_LET, expected TOK_DOUBLE_COLON". tokio and futures use their
+own pin macros, so this is the first user of core's.
+
+A statement beginning `super let` is parsed as a let binding flagged
+`m_is_super` (AST) / `m_super` (HIR). In MIR lowering the bindings are
+owned by the enclosing variable scope instead of the block's own, so
+they are dropped with the enclosing block: the `Pin<&mut T>` returned
+from the macro's block stays valid, matching the temporary lifetime
+extension rustc applies.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/ast/expr.cpp          |  2 +-
+ src/ast/expr.hpp          |  6 +++++-
+ src/hir/expr.hpp          |  2 ++
+ src/hir/from_ast_expr.cpp |  1 +
+ src/mir/from_hir.cpp      |  9 +++++++--
+ src/mir/from_hir.hpp      |  5 +++--
+ src/mir/mir_builder.cpp   | 10 ++++++++--
+ src/parse/expr.cpp        | 23 ++++++++++++++++++++---
+ 8 files changed, 47 insertions(+), 11 deletions(-)
+
+diff --git a/src/ast/expr.cpp b/src/ast/expr.cpp
+index 362b4f93..79731fd8 100644
+--- a/src/ast/expr.cpp
++++ b/src/ast/expr.cpp
+@@ -271,7 +271,7 @@ NODE(ExprNode_LetBinding, {
+         }
+     }
+ },{
+-    return NEWNODE(ExprNode_LetBinding, m_pat.clone(), m_type.clone(), OPT_CLONE(m_value), OPT_CLONE(m_else));
++    return NEWNODE(ExprNode_LetBinding, m_pat.clone(), m_type.clone(), OPT_CLONE(m_value), OPT_CLONE(m_else), m_is_super);
+ })
+ 
+ NODE(ExprNode_Assign, {
+diff --git a/src/ast/expr.hpp b/src/ast/expr.hpp
+index 8786ca27..3c31f73d 100644
+--- a/src/ast/expr.hpp
++++ b/src/ast/expr.hpp
+@@ -256,11 +256,15 @@ struct ExprNode_LetBinding:
+     /// Allocated binding slots/indexes for the pattern in `let-else`
+     ::std::pair<unsigned,unsigned>  m_letelse_slots;
+ 
+-    ExprNode_LetBinding(Pattern pat, TypeRef type, ExprNodeP value, ExprNodeP else_arm={})
++    /// `super let`: the binding is dropped with the enclosing block, not the block it appears in (core's `pin!`)
++    bool    m_is_super = false;
++
++    ExprNode_LetBinding(Pattern pat, TypeRef type, ExprNodeP value, ExprNodeP else_arm={}, bool is_super=false)
+         : m_pat( ::std::move(pat) )
+         , m_type( ::std::move(type) )
+         , m_value( ::std::move(value) )
+         , m_else( ::std::move(else_arm) )
++        , m_is_super( is_super )
+     {
+     }
+ 
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index 6f30ae9c..3178b743 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -249,6 +249,8 @@ struct ExprNode_Let:
+     /// The type was written in the source (`let x: T = v;`), making `v` a coercion site - so a `&mut` is reborrowed
+     /// instead of moved. (`m_type` itself is replaced by the inferred type during typecheck)
+     bool    m_type_annotated = false;
++    /// `super let`: the bindings live (and drop) with the enclosing block, not the block they appear in
++    bool    m_super = false;
+ 
+     ExprNode_Let(Span sp, ::HIR::Pattern pat, ::HIR::TypeRef ty, ::HIR::ExprNodeP val):
+         ExprNode(mv$(sp)),
+diff --git a/src/hir/from_ast_expr.cpp b/src/hir/from_ast_expr.cpp
+index 2a602b9f..936fff43 100644
+--- a/src/hir/from_ast_expr.cpp
++++ b/src/hir/from_ast_expr.cpp
+@@ -279,6 +279,7 @@ struct LowerHIR_ExprNode_Visitor:
+                 lower_opt( v.m_value )
+                 );
+             node->m_type_annotated = type_annotated;
++            node->m_super = v.m_is_super;
+             m_rv.reset( node );
+         }
+     }
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index 8c2b31a0..a0570c8a 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -47,6 +47,8 @@ namespace {
+         const ScopeHandle*  m_borrow_raise_target = nullptr;
+         const ScopeHandle*  m_stmt_scope = nullptr;
+         bool m_in_borrow = false;
++        /// Set while defining the bindings of a `super let` (owned by the enclosing block's scope)
++        bool m_super_let = false;
+ 
+         struct GeneratorState {
+             struct State {
+@@ -237,7 +239,7 @@ namespace {
+         void define_vars_from(const Span& sp, const ::HIR::Pattern& pat) override
+         {
+             for(const auto& pb : pat.m_bindings) {
+-                m_builder.define_variable( pb.m_slot );
++                m_builder.define_variable( pb.m_slot, m_super_let );
+             }
+ 
+             TU_MATCHA( (pat.m_data), (e),
+@@ -874,7 +876,10 @@ namespace {
+         void visit(::HIR::ExprNode_Let& node) override
+         {
+             TRACE_FUNCTION_F("_Let " << node.m_pattern);
+-            this->define_vars_from(node.span(), node.m_pattern);
++            {
++                auto _ = save_and_edit(m_super_let, node.m_super);
++                this->define_vars_from(node.span(), node.m_pattern);
++            }
+             if( node.m_value )
+             {
+                 auto _ = save_and_edit(m_borrow_raise_target, m_block_tmp_scope);
+diff --git a/src/mir/from_hir.hpp b/src/mir/from_hir.hpp
+index a841b6ef..94a4ca69 100644
+--- a/src/mir/from_hir.hpp
++++ b/src/mir/from_hir.hpp
+@@ -429,8 +429,9 @@ public:
+         return m_fcn_scope;
+     }
+ 
+-    /// Introduce a new variable within the current scope
+-    void define_variable(unsigned int idx);
++    /// Introduce a new variable within the current scope. `in_parent_scope`: skip the current variable scope and
++    /// own it in the enclosing one (`super let`), so it is dropped with the enclosing block.
++    void define_variable(unsigned int idx, bool in_parent_scope = false);
+     // Helper - Marks a variable/... as moved (and checks if the move is valid)
+     void moved_lvalue(const Span& sp, const ::MIR::LValue& lv);
+ private:
+diff --git a/src/mir/mir_builder.cpp b/src/mir/mir_builder.cpp
+index 1724fe6f..b6f346bd 100644
+--- a/src/mir/mir_builder.cpp
++++ b/src/mir/mir_builder.cpp
+@@ -164,9 +164,10 @@ const ::HIR::TypeRef* MirBuilder::is_type_owned_box(const ::HIR::TypeRef& ty) co
+     }
+ }
+ 
+-void MirBuilder::define_variable(unsigned int idx)
++void MirBuilder::define_variable(unsigned int idx, bool in_parent_scope)
+ {
+-    DEBUG("DEFINE (var) _" << idx  << ": " << m_output.locals.at(idx));
++    DEBUG("DEFINE (var) _" << idx  << ": " << m_output.locals.at(idx) << (in_parent_scope ? " (super)" : ""));
++    bool skip_one = in_parent_scope;
+     for( auto scope_idx : ::reverse(m_scope_stack) )
+     {
+         auto& scope_def = m_scopes.at(scope_idx);
+@@ -176,6 +177,11 @@ void MirBuilder::define_variable(unsigned int idx)
+         (Owning,
+             if( !e.is_temporary )
+             {
++                if( skip_one ) {
++                    // `super let`: the block's own variable scope is skipped, the enclosing one owns the variable
++                    skip_one = false;
++                    continue;
++                }
+                 auto it = ::std::find(e.slots.begin(), e.slots.end(), idx);
+                 assert(it == e.slots.end());
+                 e.slots.push_back( idx );
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 709d2e36..da093b57 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -29,7 +29,7 @@ ExprNodeP Parse_ExprBlockNode(TokenStream& lex, AST::ExprNode_Block::Type ty, Id
+ //ExprNodeP Parse_ExprBlockLine(TokenStream& lex, bool *add_silence);
+ ExprNodeP Parse_ExprBlockLine_Stmt(TokenStream& lex, bool& has_semicolon);
+ //ExprNodeP Parse_Stmt(TokenStream& lex);   // common.hpp
+-ExprNodeP Parse_Stmt_Let(TokenStream& lex);
++ExprNodeP Parse_Stmt_Let(TokenStream& lex, bool is_super = false);
+ ExprNodeP Parse_Expr0(TokenStream& lex);
+ ExprNodeP Parse_Expr1_5(TokenStream& lex);  // Boolean OR
+ ExprNodeP Parse_Expr3(TokenStream& lex);
+@@ -289,6 +289,10 @@ ExprNodeP Parse_ExprBlockLine(TokenStream& lex, bool *add_silence)
+         case TOK_RWORD_SUPER:
+         case TOK_DOUBLE_COLON:
+         case TOK_RWORD_SELF:
++            // `super let x = ..;` (unstable `super_let`, used by core's `pin!` since 1.90) is a statement, not a path
++            if( tok.type() == TOK_RWORD_SUPER && lex.lookahead(0) == TOK_RWORD_LET ) {
++                break;
++            }
+             if(tok.type() != TOK_RWORD_SELF || lex.lookahead(0) == TOK_DOUBLE_COLON) {
+                 PUTBACK(tok, lex);
+                 auto p = Parse_Path(lex, PATH_GENERIC_EXPR);
+@@ -337,6 +341,12 @@ ExprNodeP Parse_ExprBlockLine(TokenStream& lex, bool *add_silence)
+             ret = Parse_Stmt_Let(lex);
+             GET_CHECK_TOK(tok, lex, TOK_SEMICOLON);
+             return ret;
++        // `super let`: the binding belongs to the enclosing block (see ExprNode_LetBinding::m_is_super)
++        case TOK_RWORD_SUPER:
++            GET_CHECK_TOK(tok, lex, TOK_RWORD_LET);
++            ret = Parse_Stmt_Let(lex, /*is_super=*/true);
++            GET_CHECK_TOK(tok, lex, TOK_SEMICOLON);
++            return ret;
+ 
+         // Blocks that don't need semicolons
+         // NOTE: If these are followed by a small set of tokens (`.` and `?`) then they are actually the start of an expression
+@@ -704,6 +714,13 @@ ExprNodeP Parse_Stmt(TokenStream& lex)
+     // Duplicated here for the :stmt pattern fragment.
+     case TOK_RWORD_LET:
+         return Parse_Stmt_Let(lex);
++    case TOK_RWORD_SUPER:
++        if( lex.lookahead(0) == TOK_RWORD_LET ) {
++            GET_TOK(tok, lex);
++            return Parse_Stmt_Let(lex, /*is_super=*/true);
++        }
++        PUTBACK(tok, lex);
++        return Parse_Expr0(lex);
+     case TOK_RWORD_YIELD:
+         return Parse_FlowControl(lex, AST::ExprNode_Flow::YIELD);
+     case TOK_RWORD_CONTINUE:
+@@ -734,7 +751,7 @@ ExprNodeP Parse_Stmt(TokenStream& lex)
+     }
+ }
+ 
+-ExprNodeP Parse_Stmt_Let(TokenStream& lex)
++ExprNodeP Parse_Stmt_Let(TokenStream& lex, bool is_super)
+ {
+     Token   tok;
+     AST::Pattern pat = Parse_Pattern(lex, AllowOrPattern::Yes);   // irrefutable
+@@ -750,7 +767,7 @@ ExprNodeP Parse_Stmt_Let(TokenStream& lex)
+             else_arm = Parse_ExprBlockNode(lex);
+         }
+     }
+-    return NEWNODE( AST::ExprNode_LetBinding, ::std::move(pat), mv$(type), ::std::move(val), ::std::move(else_arm) );
++    return NEWNODE( AST::ExprNode_LetBinding, ::std::move(pat), mv$(type), ::std::move(val), ::std::move(else_arm), is_super );
+ }
+ 
+ ::std::vector<ExprNodeP> Parse_ParenList(TokenStream& lex)

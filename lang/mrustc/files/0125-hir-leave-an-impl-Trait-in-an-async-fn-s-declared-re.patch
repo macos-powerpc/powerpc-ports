@@ -1,0 +1,68 @@
+From aeb400ad3a6c98a779dde831d1557326c90df8f0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 7 Oct 2026 14:36:44 +0000
+Subject: [PATCH 125/126] hir: leave an `impl Trait` in an async fn's declared
+ return type to inference in the body
+
+tokio 1.43.0 (sad 0.4.32) net/lookup_host.rs:
+
+    pub async fn lookup_host<T>(host: T) -> io::Result<impl Iterator<Item = SocketAddr>>
+    where T: ToSocketAddrs
+    { host.to_socket_addrs(sealed::Internal).await }
+
+0120 made the declared return type the async block's `m_return`. Inside
+the body the `impl Iterator` is an opaque erased type, so the awaited
+`io::Result<<T as ToSocketAddrsPriv>::Iter>` didn't match it: "Type
+mismatch between impl Iterator+use<..> /*fn lookup_host<T>#1*/ and
+<T as ToSocketAddrsPriv>::Iter". The erased types in `m_return` are now
+`_` (the rest of the declared type stays, for coercions); the function's
+own `impl Future<Output = ..>` keeps them. TypeRef::clone shares nodes,
+so the copy is unshared (get_unique) along the way before editing.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir/from_ast.cpp | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 5fe91582..a6c75d01 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -1936,7 +1936,37 @@ namespace {
+             auto* node = new ::HIR::ExprNode_AsyncBlock(sp, std::move(rv.m_code.into_unique()), true);
+             // The declared return type is the future's `Output` (`return` targets it, the body coerces to it)
+             // - tokio 1.43.0: `async fn changed_impl(..) -> Result<(), RecvError> { .. loop { .. return ret; .. } }`
++            // An `impl Trait` in it is opaque inside the body, so those parts are left to inference
++            // - tokio 1.43.0: `async fn lookup_host<T>(host: T) -> io::Result<impl Iterator<Item = SocketAddr>>`
++            // NOTE: `clone` shares nodes, so each node on the way to an erased type is unshared (`get_unique`) first
++            struct H {
++                static void strip_erased(::HIR::TypeRef& t) {
++                    if( t.data().is_ErasedType() ) {
++                        t = ::HIR::TypeRef();
++                        return ;
++                    }
++                    if( !visit_ty_with(t, [](const ::HIR::TypeRef& x){ return x.data().is_ErasedType(); }) )
++                        return ;
++                    auto& d = t.get_unique();
++                    if( auto* e = d.opt_Path() ) {
++                        if( auto* gp = e->path.m_data.opt_Generic() ) {
++                            for(auto& ity : gp->m_params.m_types)
++                                strip_erased(ity);
++                        }
++                    }
++                    else if( auto* e = d.opt_Tuple() ) {
++                        for(auto& ity : *e)
++                            strip_erased(ity);
++                    }
++                    else if( auto* e = d.opt_Borrow() )     strip_erased(e->inner);
++                    else if( auto* e = d.opt_Pointer() )    strip_erased(e->inner);
++                    else if( auto* e = d.opt_Array() )      strip_erased(e->inner);
++                    else if( auto* e = d.opt_Slice() )      strip_erased(e->inner);
++                    // Others (e.g. a projection's arguments) stay as written
++                }
++            };
+             node->m_return = rv.m_return.clone();
++            H::strip_erased(node->m_return);
+             rv.m_code = HIR::ExprPtr(::std::unique_ptr<::HIR::ExprNode>(node));
+         }
+         // Make the return type be `impl Future<Output=Ret>`
