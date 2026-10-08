@@ -1,0 +1,217 @@
+From f493248086dcb90c575a5d73b5f86ee963f076bb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 17:11:38 +0000
+Subject: [PATCH 144/144] hir_typeck: a trait impl that only matches by binding
+ receiver ivars waits for them
+
+http-body 1.0.1 lib.rs:83, inside `impl<T: Body + Unpin + ?Sized> Body for
+&mut T`: `Pin::new(&**self).is_end_stream()` failed with "Failed to find
+an impl of DerefMut for &T" (drill 0.9.1). The argument coercion `&T -> _` into
+`Pin::new`'s `Ptr` is deferred, so the method was looked up on `Pin<_>`;
+`impl<P> Body for Pin<P> where P: Unpin + DerefMut, P::Target: Body` matched
+with every where-clause "fuzzy" on the unresolved `_`, and `find_method`
+committed to it. One pass later `_ = &T`, `&T: DerefMut` fails, and typeck
+errors. rustc probes with `Pin<&T>`, rejects that impl on its where-clauses
+and auto-derefs to `T: Body`.
+
+`find_method` (the current-trait and in-scope-trait steps) now treats an impl
+whose match is only Fuzzy because of non-literal ivars inside the receiver
+type as "not a match yet": it keeps looking for an exact match among the
+other impls and, finding none, pauses the lookup (new
+`TraitResolution::DeferredOnFuzzyImpl`, turned into the usual `~0u` by
+`autoderef_find_method`) so the ivar-possibility stages can pin the receiver
+first. Only when nothing else was found at that autoderef/autoref level, only
+when the caller asks (`defer_fuzzy_impls`, the revisit visitor outside
+fallback mode - the same split `visit_call_populate_cache` already uses for
+inherent impls), and never for integer/float literal ivars, which default
+late. Fallback mode commits to the fuzzy impl as before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 21e4ac82..b4a752b2 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -4824,9 +4824,26 @@ const ::HIR::TypeRef* TraitResolution::autoderef(const Span& sp, const ::HIR::Ty
+     }
+ }
+ 
++namespace {
++    /// Does the type still contain a (non-literal) inference variable, following ivars that are already bound?
++    bool type_contains_unbounded_ivars(const HMTypeInferrence& ivars, const ::HIR::TypeRef& ty)
++    {
++        return visit_ty_with(ty, [&](const ::HIR::TypeRef& t)->bool {
++            const auto& r = ivars.get_type(t);
++            if( type_is_unbounded_infer(r) )
++                return true;
++            // A bound ivar: the walker doesn't see its value, look inside it
++            if( t.data().is_Infer() && !r.data().is_Infer() )
++                return type_contains_unbounded_ivars(ivars, r);
++            return false;
++            });
++    }
++}
++
+ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+         const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
+-        /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
++        /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++        bool defer_fuzzy_impls
+         ) const
+ {
+     try {
+@@ -4868,24 +4885,24 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+         DEBUG(deref_count << ": " << ty);
+ 
+         // Non-referenced
+-        if( this->find_method(sp, traits, ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities) )
++        if( this->find_method(sp, traits, ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+ 
+         // Auto-ref
+         auto borrow_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ty.clone());
+-        if( this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities) )
++        if( this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND & *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Unique;
+-        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities) )
++        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND &mut *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Owned;
+-        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities) )
++        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND &move *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+@@ -4915,6 +4932,9 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+     } catch(const TraitResolution::RecursionDetected& ) {
+         DEBUG("Recursion detected, deferring");
+         return ~0u;
++    } catch(const TraitResolution::DeferredOnFuzzyImpl& ) {
++        DEBUG("Trait impl match depends on receiver ivars, deferring");
++        return ~0u;
+     }
+ }
+ 
+@@ -5048,13 +5068,28 @@ const ::HIR::TypeRef* TraitResolution::check_method_receiver(const Span& sp, con
+ 
+ bool TraitResolution::find_method(const Span& sp,
+     const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+-    AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
++    AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++    bool defer_fuzzy_impls
+     ) const
+ {
+     bool rv = false;
+-    TRACE_FUNCTION_FR("ty=" << ty << ", name=" << method_name << ", access=" << access, rv << " " << possibilities);
++    TRACE_FUNCTION_FR("ty=" << ty << ", name=" << method_name << ", access=" << access << ", defer_fuzzy_impls=" << defer_fuzzy_impls, rv << " " << possibilities);
+     auto cb_infer = m_ivars.callback_resolve_infer();
+ 
++    // A trait impl whose where-clauses can only be checked once ivars inside the receiver resolve (`Pin<_>: Body`
++    // through `impl<P: DerefMut> Body for Pin<P>`, `_` still waiting on an argument coercion) is not a match yet.
++    // Committing to it binds the call to that impl, and when the ivar later resolves to a type that fails the bound
++    // (`&T: DerefMut`) typeck errors ("Failed to find an impl") where rustc, probing with the resolved type, rejects
++    // the impl and auto-derefs to the one that applies (`T: Body`; http-body 1.0.1 `Pin::new(&**self).is_end_stream()`).
++    // When asked (outside fallback mode), wait for the receiver instead; fallback mode commits as before. Only when
++    // nothing else was found at this level: an inherent method or an exact match beats the fuzzy impl as it always did.
++    auto defer_if_only_fuzzy = [&](::HIR::Compare cmp, const ::HIR::TypeRef& self_ty) {
++        if( defer_fuzzy_impls && cmp == ::HIR::Compare::Fuzzy && possibilities.empty() && type_contains_unbounded_ivars(m_ivars, self_ty) ) {
++            DEBUG("Impl only matches if the ivars in " << m_ivars.fmt_type(self_ty) << " resolve a particular way, deferring");
++            throw DeferredOnFuzzyImpl();
++        }
++        };
++
+     auto get_ivared_params = [&](const ::HIR::GenericParams& tpl)->::HIR::PathParams {
+         unsigned int n_params = tpl.m_types.size();
+         ASSERT_BUG(sp, n_params <= ivars.size(), "Not enough type ivars allocated for method: " << n_params << " needed but " << ivars.size() << " allocated by caller\ntpl = " << tpl.fmt_args());
+@@ -5213,13 +5248,17 @@ bool TraitResolution::find_method(const Span& sp,
+ 
+                 try {
+                     bool crate_impl_found = false;
++                    auto impl_cmp = ::HIR::Compare::Unequal;
+                     find_trait_impls_crate(sp, final_trait_path.m_path, &trait_params, *self_ty,  [&](auto impl, auto cmp) {
+                         DEBUG("[find_method] " << impl << ", cmp = " << cmp);
+                         //magic_found = true;
+                         crate_impl_found = true;
+-                        return true;
++                        impl_cmp = cmp;
++                        // Keep looking for an exact match past an impl that only matched fuzzily
++                        return !(defer_fuzzy_impls && cmp == ::HIR::Compare::Fuzzy);
+                         });
+                     if( crate_impl_found ) {
++                        defer_if_only_fuzzy(impl_cmp, *self_ty);
+                         DEBUG("Found trait impl " << m_current_trait_path->m_path << trait_params << " for " << *self_ty << " ("<<m_ivars.fmt_type(*self_ty)<<")");
+                         possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty->clone(), ::HIR::GenericPath( final_trait_path.m_path, mv$(trait_params) ), method_name, {}) ));
+                         DEBUG("++ " << possibilities.back());
+@@ -5473,8 +5512,10 @@ bool TraitResolution::find_method(const Span& sp,
+ 
+             bool magic_found = false;
+             bool crate_impl_found = false;
++            auto impl_cmp = ::HIR::Compare::Unequal;
+ 
+             crate_impl_found = find_trait_impls_magic(sp, *trait_ref.first, trait_params, self_ty,  [&](auto impl, auto cmp) {
++                impl_cmp = ::HIR::Compare::Equal;
+                 return true;
+                 });
+ 
+@@ -5484,14 +5525,19 @@ bool TraitResolution::find_method(const Span& sp,
+                     DEBUG("[find_method] " << impl << ", cmp = " << cmp);
+                     magic_found = true;
+                     crate_impl_found = true;
+-                    return true;
++                    if( impl_cmp != ::HIR::Compare::Equal )
++                        impl_cmp = cmp;
++                    // Keep looking for an exact match past an impl that only matched fuzzily
++                    return !(defer_fuzzy_impls && impl_cmp == ::HIR::Compare::Fuzzy);
+                     });
+             } catch(const TraitResolution::RecursionDetected& ) {
+                 DEBUG("Recursion detected, assuming good");
+                 magic_found = true;
+                 crate_impl_found = true;
++                impl_cmp = ::HIR::Compare::Equal;
+             }
+             if( crate_impl_found ) {
++                defer_if_only_fuzzy(impl_cmp, self_ty);
+                 DEBUG("Found trait impl " << *trait_ref.first << trait_params << " for " << self_ty << " ("<<m_ivars.fmt_type(self_ty)<<")");
+                 possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty.clone(), ::HIR::GenericPath( *trait_ref.first, mv$(trait_params) ), method_name, {}) ));
+                 DEBUG("++ " << possibilities.back());
+diff --git a/src/hir_typeck/helpers.hpp b/src/hir_typeck/helpers.hpp
+index 9f268e87..41f7f3a6 100644
+--- a/src/hir_typeck/helpers.hpp
++++ b/src/hir_typeck/helpers.hpp
+@@ -267,6 +267,9 @@ public:
+     bool find_trait_impls_types(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams& params, const ::HIR::TypeRef& type,  t_cb_trait_impl_r callback) const;
+ 
+     struct RecursionDetected {};
++    /// Thrown by `find_method` when the only trait impl matching the receiver does so fuzzily because of ivars inside the
++    /// receiver type (and the caller asked to wait for those). `autoderef_find_method` turns it into a "pause" (~0u).
++    struct DeferredOnFuzzyImpl {};
+ 
+ private:
+     ::HIR::Compare check_auto_trait_impl_destructure(const Span& sp, const ::HIR::SimplePath& trait, const ::HIR::PathParams* params_ptr, const ::HIR::TypeRef& type) const;
+@@ -288,7 +291,8 @@ public:
+     /// \return Number of times deref was applied (or ~0 if _ was hit)
+     unsigned int autoderef_find_method(const Span& sp,
+             const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
+-            /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
++            /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++            bool defer_fuzzy_impls = false
+             ) const;
+     /// Locate the named field by applying auto-dereferencing.
+     /// \return Number of times deref was applied (or ~0 if _ was hit)
+@@ -317,7 +321,8 @@ public:
+     friend ::std::ostream& operator<<(::std::ostream& os, const AllowedReceivers& x);
+     bool find_method(const Span& sp,
+             const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+-            AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities
++            AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++            bool defer_fuzzy_impls = false
+             ) const;
+ 
+     /// Locates a named method in a trait, and returns the path of the trait that contains it (with fixed parameters)
