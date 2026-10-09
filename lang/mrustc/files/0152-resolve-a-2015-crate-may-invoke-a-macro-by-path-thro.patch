@@ -1,0 +1,118 @@
+From 877e39ab3b72473216d8bed7d661164c1295ac09 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 21:45:21 +0000
+Subject: [PATCH] resolve: a 2015 crate may invoke a macro by path through the
+ extern prelude
+
+bitreader 0.3.11 (fselect 0.10.3) is a 2015-edition crate with no
+`extern crate cfg_if;` that writes, at its root,
+
+    cfg_if::cfg_if! { if #[cfg(feature = "std")] { .. } else { .. } }
+
+    src/lib.rs:50-64 error:0: Unknown macro cfg_if::cfg_if
+
+Since Rust 1.30 the extern prelude (every `--extern` crate) is in scope in
+all editions; only `use` paths can't name it in 2015 (reference, "Extern
+prelude").  Resolve Absolute already applies that rule to ordinary paths
+(`TARGETVER_LEAST_1_29`), but the shared module lookup behind
+`Resolve_Lookup_Macro` consulted the implicit crates from 2018 only.
+
+`ResolveState` gets an `extern_prelude` flag: set from 2018, and in 2015
+for a non-`use` path.  `Resolve_Lookup_Macro` passes it unless its caller
+is importing a macro with `use`, so `use cfg_if::cfg_if;` in a 2015 crate
+stays unresolved, as rustc has it.  The single-segment crate-name hack
+stays 2018-only; a bare `lazy_static!` finds its `#[macro_use]` import
+before this lookup runs anyway.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/expand/mod.cpp     |  2 +-
+ src/resolve/common.cpp | 21 +++++++++++++++------
+ src/resolve/common.hpp |  2 +-
+ 3 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 19771190..5814490f 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -2196,7 +2196,7 @@ void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Modul
+                     DEBUG("Use " << ue.path);
+ 
+                     AST::AbsolutePath   ref_path;
+-                    auto m = Resolve_Lookup_Macro(ue.sp, es.crate, mod.path(), ue.path, /*out_path=*/&ref_path);
++                    auto m = Resolve_Lookup_Macro(ue.sp, es.crate, mod.path(), ue.path, /*out_path=*/&ref_path, /*in_use=*/true);
+                     MacroRef   ref;
+                     TU_MATCH_HDRA( (m), { )
+                     TU_ARMA(None, e) {
+diff --git a/src/resolve/common.cpp b/src/resolve/common.cpp
+index f0df3398..be417f7c 100644
+--- a/src/resolve/common.cpp
++++ b/src/resolve/common.cpp
+@@ -7,6 +7,7 @@
+  */
+ #include "main_bindings.hpp"
+ #include "common.hpp"
++#include <target_version.hpp>
+ #include <ast/crate.hpp>
+ #include <ast/ast.hpp>
+ #include <ast/expr.hpp>
+@@ -40,13 +41,21 @@ namespace {
+     {
+         const Span& sp;
+         const AST::Crate& crate;
++        /// May a path's first segment name a `--extern` crate with no `extern crate` item (the extern prelude)?
++        /// Always from 2018. In 2015 for every path but a `use` path (reference, "Extern prelude": "In the 2015
++        /// edition, crates in the extern prelude cannot be referenced via `use` declarations"), which is the
++        /// `TARGETVER_LEAST_1_29` rule Resolve Absolute applies to non-`use` paths.
++        /// - bitreader 0.3.11 (fselect 0.10.3), 2015: `cfg_if::cfg_if! { .. }` with no `extern crate cfg_if;`
++        ///   -> "Unknown macro cfg_if::cfg_if"
++        bool extern_prelude;
+ 
+         typedef std::pair<const AST::Module*,RcString>  antirecurse_stack_ent_t;
+         std::vector< antirecurse_stack_ent_t > antirecurse_stack;
+ 
+-        ResolveState(const Span& span, const AST::Crate& crate):
++        ResolveState(const Span& span, const AST::Crate& crate, bool non_use_path=false):
+             sp(span),
+-            crate(crate)
++            crate(crate),
++            extern_prelude( crate.m_edition >= AST::Edition::Rust2018 || (non_use_path && TARGETVER_LEAST_1_29) )
+         {
+         }
+ 
+@@ -203,8 +212,8 @@ namespace {
+                     i += 1;
+                 } while( i < base_nodes.size() && base_nodes[base_nodes.size() - i].name().c_str()[0] == '#' );
+ 
+-                // If not found, and 2018 - look for a crate
+-                if( crate.m_edition >= AST::Edition::Rust2018 )
++                // If not found, and the extern prelude applies (2018, or a non-`use` path) - look for a crate
++                if( extern_prelude )
+                 {
+                     DEBUG("Trying implicit externs for " << name);
+                     DEBUG(FmtLambda([&](std::ostream& os) { for(const auto& v : AST::g_implicit_crates) os << " " << v.first;}));
+@@ -948,10 +957,10 @@ ResolveModuleRef Resolve_Lookup_GetModule(const Span& sp, const AST::Crate& crat
+     return rs.get_module(base_path, path, ignore_last, out_path);
+ }
+ 
+-ResolveItemRef_Macro Resolve_Lookup_Macro(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path, ::AST::AbsolutePath* out_path)
++ResolveItemRef_Macro Resolve_Lookup_Macro(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path, ::AST::AbsolutePath* out_path, bool in_use)
+ {
+     TRACE_FUNCTION_F("path=" << path << " in " << base_path);
+-    ResolveState    rs(span, crate);
++    ResolveState    rs(span, crate, /*non_use_path=*/!in_use);
+ 
+     const auto& item_name = path.nodes().back().name();
+     auto mod = rs.get_module(base_path, path, true, out_path);
+diff --git a/src/resolve/common.hpp b/src/resolve/common.hpp
+index a3f7c348..1d276748 100644
+--- a/src/resolve/common.hpp
++++ b/src/resolve/common.hpp
+@@ -80,6 +80,6 @@ extern ::std::ostream& operator<<(::std::ostream& os, ResolveNamespace ns);
+ /// <param name="out_path"></param>
+ /// <returns></returns>
+ extern ResolveModuleRef Resolve_Lookup_GetModule(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path, bool ignore_last, ::AST::AbsolutePath* out_path);
+-extern ResolveItemRef_Macro Resolve_Lookup_Macro(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path, ::AST::AbsolutePath* out_path);
++extern ResolveItemRef_Macro Resolve_Lookup_Macro(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path, ::AST::AbsolutePath* out_path, bool in_use=false);
+ // Returns the module that contains the provided name
+ extern ResolveModuleRef Resolve_Lookup_GetModuleForName(const Span& sp, const AST::Crate& crate, const ::AST::Path& base_path, const ::AST::Path& path, ResolveNamespace ns, ::AST::AbsolutePath* out_path);

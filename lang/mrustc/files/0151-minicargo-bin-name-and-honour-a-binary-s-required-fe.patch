@@ -1,0 +1,142 @@
+From 75f56c056c09b93fce6418523256c853276e9f0c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 21:37:21 +0000
+Subject: [PATCH] minicargo: `--bin <name>`, and honour a binary's
+ `required-features`
+
+qsv 24.0.0 has `autobins = false` and four `[[bin]]` targets (qsv, qsvmcp,
+qsvlite, qsvdp), each with `required-features` naming its own feature. Its
+port builds with `--bin qsv`, as cargo would be told:
+
+    Unknown flag --bin
+
+Add `--bin <name>` (repeatable, `--bin=name` too) selecting those binaries of
+the root package; a name no `[[bin]]` has, or one whose required features
+aren't active, is an error as in cargo. `--bins` (cargo's "every binary") is
+accepted and changes nothing, since that is what minicargo builds anyway.
+
+Without `--bin`, every `[[bin]]` was built whatever its `required-features`
+said (the manifest reader kept the list, nothing looked at it), so qsv would
+have gone on to compile qsvlite and qsvdp without their features. Now
+a binary whose required features aren't all active is skipped with a note,
+cargo's behaviour. Features activated through another feature count
+(`active_features()` holds the closure).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tools/minicargo/build.cpp | 34 ++++++++++++++++++++++++++++++++--
+ tools/minicargo/build.h   |  3 +++
+ tools/minicargo/main.cpp  | 16 ++++++++++++++++
+ 3 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/tools/minicargo/build.cpp b/tools/minicargo/build.cpp
+index 135f9a8e..cc9167cb 100644
+--- a/tools/minicargo/build.cpp
++++ b/tools/minicargo/build.cpp
+@@ -659,12 +659,42 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+     // Now that all libraries are done, build the binaries (if present)
+     switch(opts.mode)
+     {
+-    case BuildOptions::Mode::Normal:
++    case BuildOptions::Mode::Normal: {
++        // As cargo: `--bin <name>` builds just those binaries (an unknown name, or one whose `required-features`
++        // aren't active, is an error); without it, every binary whose `required-features` are active, the others
++        // skipped. `required-features` had been read from the manifest but never consulted.
++        // - qsv 24.0.0: [[bin]] qsv/qsvmcp/qsvlite/qsvdp, each behind its own feature; the port passes `--bin qsv`
++        const auto& active = m_root_manifest.active_features();
++        auto missing_required_feature = [&](const PackageTarget& t) -> const ::std::string* {
++            for(const auto& f : t.m_required_features) {
++                if( ::std::find(active.begin(), active.end(), f) == active.end() )
++                    return &f;
++            }
++            return nullptr;
++        };
++        ::std::vector<::std::string>    bins_found;
+         this->m_root_manifest.foreach_binaries([&](const PackageTarget& bin_target)->bool {
++            if( !opts.bins.empty() ) {
++                if( ::std::find(opts.bins.begin(), opts.bins.end(), bin_target.m_name) == opts.bins.end() )
++                    return true;
++                bins_found.push_back(bin_target.m_name);
++                if( const auto* f = missing_required_feature(bin_target) ) {
++                    throw ::std::runtime_error(::format("target `", bin_target.m_name, "` in package `", m_root_manifest.name(),
++                        "` requires the feature `", *f, "` (not active; see `--features`)"));
++                }
++            }
++            else if( const auto* f = missing_required_feature(bin_target) ) {
++                ::std::cout << "Skipping binary `" << bin_target.m_name << "`: requires the feature `" << *f << "`" << ::std::endl;
++                return true;
++            }
+             push_root_target(bin_target);
+             return true;
+             });
+-        break;
++        for(const auto& b : opts.bins) {
++            if( ::std::find(bins_found.begin(), bins_found.end(), b) == bins_found.end() )
++                throw ::std::runtime_error(::format("no bin target named `", b, "` in package `", m_root_manifest.name(), "`"));
++        }
++        break; }
+     case BuildOptions::Mode::Test:
+         this->m_root_manifest.foreach_ty(PackageTarget::Type::Test, [&](const PackageTarget& test_target)->bool {
+             push_root_target(test_target);
+diff --git a/tools/minicargo/build.h b/tools/minicargo/build.h
+index e27d824b..89e23d81 100644
+--- a/tools/minicargo/build.h
++++ b/tools/minicargo/build.h
+@@ -23,6 +23,9 @@ struct BuildOptions
+     bool enable_debug = false;
+     const char* target_name = nullptr;  // if null, host is used
+     const char* panic_strategy = nullptr;  // if non-null, passed to the compiler as -C panic=<strategy>
++    /// `--bin <name>`: build only these binaries of the root package (empty = every binary whose
++    /// `required-features` are active)
++    ::std::vector<::std::string>    bins;
+     enum class Mode {
+         /// Build the binary/library
+         Normal,
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index 5c0a4c10..415f22b6 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -94,6 +94,9 @@ struct ProgramOptions
+     /// nullptr means "let the compiler pick its default" (mrustc: `panic_abort`).
+     const char* panic_strategy = nullptr;
+ 
++    /// `--bin <name>` (repeatable): binaries of the root package to build; empty = all that the active features allow
++    ::std::vector<::std::string>    bins;
++
+     /// Workspace member (package name) to build when the manifest is a virtual
+     /// workspace root ([workspace] with no [package])
+     const char* package_name = nullptr;
+@@ -493,6 +496,7 @@ int main(int argc, const char* argv[])
+         build_opts.enable_debug = opts.enable_debug;
+         build_opts.target_name = opts.target;
+         build_opts.panic_strategy = opts.panic_strategy;
++        build_opts.bins = opts.bins;
+         for(const auto* d : opts.lib_search_dirs)
+             build_opts.lib_search_dirs.push_back( ::helpers::path(d) );
+         // Indicate desire to build tests (or examples) instead of the primary target
+@@ -690,6 +694,16 @@ int ProgramOptions::parse(int argc, const char* argv[])
+                 if( !v )    return 1;
+                 this->package_name = v;
+             }
++            // `--bin <name>`, as cargo: only that binary target (repeatable). `--bins` is cargo's "all binaries", which is
++            // what minicargo builds anyway, so it just has to be accepted.
++            // - qsv 24.0.0: four [[bin]]s each behind its own feature; the port passes `--bin qsv`
++            else if( ::std::strcmp(flag, "--bin") == 0 ) {
++                const char* v = get_value();
++                if( !v )    return 1;
++                this->bins.push_back(v);
++            }
++            else if( ::std::strcmp(arg, "--bins") == 0 ) {
++            }
+             else if( ::std::strcmp(arg, "--pause") == 0 ) {
+                 this->pause_before_quit = true;
+             }
+@@ -735,6 +749,8 @@ void ProgramOptions::help() const
+         << "-n                       : Don't build any packages, just list the packages that would be built\n"
+         << "-g                       : Pass `-g` to compiler\n"
+         << "--package,-p <name>      : Workspace member to build (for virtual workspace roots)\n"
++        << "--bin <name>             : Build only this binary of the package (repeatable; default is every binary\n"
++        << "                           whose `required-features` are active)\n"
+         << "--no-default-features    : \n"
+         << "--features <list>        : \n"
+         << "--panic <strategy>       : Pass `-C panic=<strategy>` to the compiler (e.g. `unwind`)\n"

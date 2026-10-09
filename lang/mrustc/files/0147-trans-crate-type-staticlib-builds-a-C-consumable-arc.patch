@@ -1,0 +1,500 @@
+From 24841e2bec91c702b3eae32c27fb189f74947cdb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 20:37:13 +0000
+Subject: [PATCH 147/149] trans: `--crate-type staticlib` builds a C-consumable
+ archive
+
+A `staticlib` crate (new `AST::Crate::Type::StaticLib`, from `--crate-type
+staticlib` or `#![crate_type = "staticlib"]`) is a whole program minus
+`main`, meant for a non-Rust linker: gccrs links two of them
+(libformat_parser, ffi-polonius) into crab1 with g++.  Until now the type
+was rejected, and minicargo built such crates as rlibs.
+
+The new `CodegenOutput::StaticArchive` enumerates like an rlib (public
+items) plus the `#[no_mangle]`/`#[export_name]` functions an executable
+would root, loads the allocator and panic runtime like an executable, and
+produces `lib<name>.a` = this crate's object + a glue object + every
+dependency's `.rlib.o` (the list the executable link already computes,
+including the panic-crate selection).  The glue (allocator shims,
+`__rust_alloc_error_handler`, `panic_impl`, the `mrustc_panic_*` TLS) goes
+in its own member on purpose: when two mrustc archives are linked into one
+program both crate objects are pulled in, but an archive member is only
+loaded for a still-undefined symbol, so only one copy of the glue is.
+
+The archiver is `AR_<triple>`, `AR`, `<triple>-ar`, then `ar`; the archive
+is removed first so `ar r` can't keep stale members.  Native libraries and
+dylib crates the consumer has to add are written to `lib<name>.a.libs` as
+a shell-ready fragment and printed as a note (what `rustc --print
+native-static-libs` gives).  Deferred codegen writes the compile, glue
+compile and `ar` as one `&&` line, since the runner executes one line.
+MSVC output is a TODO.
+
+The rlib path (`CodegenOutput::StaticLibrary`, still the empty `.rlib`
+plus `.rlib.o`) and the executable path are unchanged: the emitted command
+and C for an executable are byte-identical to before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/ast/crate.hpp           |   1 +
+ src/expand/crate_tags.cpp   |   3 +
+ src/main.cpp                |  26 ++++-
+ src/trans/codegen_c.cpp     | 215 ++++++++++++++++++++++++++++--------
+ src/trans/enumerate.cpp     |   8 +-
+ src/trans/main_bindings.hpp |   3 +-
+ 6 files changed, 206 insertions(+), 50 deletions(-)
+
+diff --git a/src/ast/crate.hpp b/src/ast/crate.hpp
+index e8997db6..5100b338 100644
+--- a/src/ast/crate.hpp
++++ b/src/ast/crate.hpp
+@@ -85,6 +85,7 @@ public:
+         RustLib,
+         RustDylib,
+         CDylib,
++        StaticLib,   // C-consumable archive: this crate's code, every dependency's, and the runtime glue
+         Executable,
+         ProcMacro,   // Procedural macro
+     } m_crate_type = Type::Unknown;
+diff --git a/src/expand/crate_tags.cpp b/src/expand/crate_tags.cpp
+index 738d442c..dcd941e7 100644
+--- a/src/expand/crate_tags.cpp
++++ b/src/expand/crate_tags.cpp
+@@ -25,6 +25,9 @@ public:
+         else if( name == "cdylib" ) {
+             crate.m_crate_type = AST::Crate::Type::CDylib;
+         }
++        else if( name == "staticlib" ) {
++            crate.m_crate_type = AST::Crate::Type::StaticLib;
++        }
+         else if( name == "proc-macro" ) {
+             crate.m_crate_type = AST::Crate::Type::ProcMacro;
+         }
+diff --git a/src/main.cpp b/src/main.cpp
+index 56b80df1..37d162d3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -367,6 +367,9 @@ int main(int argc, char *argv[])
+             case ::AST::Crate::Type::RustLib:
+                 params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << ".rlib");
+                 break;
++            case ::AST::Crate::Type::StaticLib:
++                params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << ".a");
++                break;
+             case ::AST::Crate::Type::Executable:
+                 params.outfile = FMT(params.output_dir << crate.m_crate_name_set << EXESUF);
+                 break;
+@@ -394,7 +397,9 @@ int main(int argc, char *argv[])
+ 
+         // Allocator and panic strategies
+         CompilePhaseV("Implicit Crates", [&]() {
+-            if( crate.m_crate_type == ::AST::Crate::Type::Executable || params.test_harness || crate.m_crate_type == ::AST::Crate::Type::ProcMacro )
++            // A static archive is a whole program minus `main`, so it needs the allocator and panic runtime too
++            if( crate.m_crate_type == ::AST::Crate::Type::Executable || params.test_harness || crate.m_crate_type == ::AST::Crate::Type::ProcMacro
++                || crate.m_crate_type == ::AST::Crate::Type::StaticLib )
+             {
+                 bool allocator_crate_loaded = false;
+                 RcString    alloc_crate_name;
+@@ -449,8 +454,11 @@ int main(int argc, char *argv[])
+                     crate.load_extern_crate(Span(), panic_crate.c_str());
+                 }
+ 
+-                // - `mrustc-main` lang item default
+-                crate.m_lang_items.insert(::std::make_pair( ::std::string("mrustc-main"), ::AST::AbsolutePath("", {"main"}) ));
++                // - `mrustc-main` lang item default (a static archive has no entry point)
++                if( crate.m_crate_type != ::AST::Crate::Type::StaticLib )
++                {
++                    crate.m_lang_items.insert(::std::make_pair( ::std::string("mrustc-main"), ::AST::AbsolutePath("", {"main"}) ));
++                }
+             }
+             });
+ 
+@@ -794,6 +802,9 @@ int main(int argc, char *argv[])
+             case ::AST::Crate::Type::RustDylib:
+             case ::AST::Crate::Type::CDylib:
+                 return Trans_Enumerate_Public(*hir_crate);
++            case ::AST::Crate::Type::StaticLib:
++                // Public items, plus `#[no_mangle]`/`#[export_name]` functions: the archive is consumed by C code
++                return Trans_Enumerate_Public(*hir_crate, /*link_named_roots=*/true);
+             case ::AST::Crate::Type::ProcMacro:
+             case ::AST::Crate::Type::Executable:
+                 return Trans_Enumerate_Main(*hir_crate);
+@@ -857,6 +868,10 @@ int main(int argc, char *argv[])
+             // Generate a .so/.dll
+             CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::DynamicLibrary, trans_opt, std::move(hir_crate), std::move(items), hir_file); });
+             break;
++        case ::AST::Crate::Type::StaticLib:
++            // Generate a C-consumable archive: this crate's object, every dependency's object, and the runtime glue
++            CompilePhaseV("Trans Codegen", [&]() { Trans_Codegen(params.outfile, CodegenOutput::StaticArchive, trans_opt, std::move(hir_crate), std::move(items), ""); });
++            break;
+         case ::AST::Crate::Type::ProcMacro: {
+             // Needs: An executable (the actual macro handler), metadata (for `extern crate foo;`)
+             // - Metadata was done before enumerate
+@@ -1251,6 +1266,9 @@ ProgramParams::ProgramParams(int argc, char *argv[])
+                 else if( strcmp(type_str, "dylib") == 0 ) {
+                     this->crate_type = ::AST::Crate::Type::RustDylib;
+                 }
++                else if( strcmp(type_str, "staticlib") == 0 ) {
++                    this->crate_type = ::AST::Crate::Type::StaticLib;
++                }
+                 else if( strcmp(type_str, "bin") == 0 ) {
+                     this->crate_type = ::AST::Crate::Type::Executable;
+                 }
+@@ -1389,7 +1407,7 @@ void ProgramParams::show_help() const
+         "                   : Specify the path for a given crate (instead of searching for it)\n"
+         "--crate-tag <str>  : Specify a suffix for symbols and output files\n"
+         "--crate-name <str> : Override/set the crate name\n"
+-        "--crate-type <ty>  : Override/set the crate type (rlib, bin, proc-macro)\n"
++        "--crate-type <ty>  : Override/set the crate type (rlib, dylib, staticlib, bin, proc-macro)\n"
+         "--cfg flag         : Set a boolean #[cfg]/cfg! flag\n"
+         "--cfg flag=\"val\"   : Set a string #[cfg]/cfg! flag\n"
+         "--target <name>    : Compile code for the given target\n"
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 252d1b2d..cfc0cde7 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -889,7 +889,7 @@ namespace {
+ 
+         void finalise(const TransOptions& opt, CodegenOutput out_ty, const ::std::string& hir_file) override
+         {
+-            const bool create_shims = (out_ty == CodegenOutput::Executable);
++            const bool create_shims = (out_ty == CodegenOutput::Executable || out_ty == CodegenOutput::StaticArchive);
+ 
+             // TODO: Support dynamic libraries too
+             // - No main, but has the rest.
+@@ -925,6 +925,22 @@ namespace {
+                 m_of << "}\n";
+             }
+ 
++            // A static archive gets the glue in its own object: when two mrustc archives are linked into one program,
++            // each crate object is pulled in (it defines the symbols the program asked for), but an archive member is
++            // only loaded for a still-undefined symbol, so only one copy of the glue is.
++            ::std::string   glue_path_c;
++            if( out_ty == CodegenOutput::StaticArchive )
++            {
++                m_of.flush();
++                m_of.close();
++                ASSERT_BUG(Span(), !m_of.bad(), "Error set on output stream for: " << m_outfile_path_c);
++                glue_path_c = m_outfile_path + ".glue.c";
++                m_of.open(glue_path_c);
++                ASSERT_BUG(Span(), m_of.is_open(), "Failed to open `" << glue_path_c << "` for writing");
++                m_of << "#include <stdint.h>\n";
++                m_of << "#include <setjmp.h>\n";
++            }
++
+             // Auto-generated code/items for the "root" rust binary (cdylib or executable)
+             if( create_shims )
+             {
+@@ -1166,6 +1182,7 @@ namespace {
+             {
+             case CodegenOutput::Executable:
+             case CodegenOutput::DynamicLibrary:
++            case CodegenOutput::StaticArchive:
+                 for( const auto& crate_name : m_crate.m_ext_crates_ordered )
+                 {
+                     const auto& crate = m_crate.m_ext_crates.at(crate_name);
+@@ -1326,6 +1343,7 @@ namespace {
+             bool is_windows = false;
+ #endif
+             size_t  arg_file_start = 0;
++            size_t  cc_prefix_len = 0;  // The arguments up to here (compiler and its options) are shared by every compile
+             switch( m_compiler )
+             {
+             case Compiler::Gcc:
+@@ -1390,6 +1408,7 @@ namespace {
+                 }
+                 // TODO: Why?
+                 args.push_back("-fPIC");
++                cc_prefix_len = args.get_vec().size();
+                 args.push_back("-o");
+                 switch(out_ty)
+                 {
+@@ -1399,6 +1418,7 @@ namespace {
+                     args.push_back(m_outfile_path  .c_str());
+                     break;
+                 case CodegenOutput::StaticLibrary:
++                case CodegenOutput::StaticArchive:
+                     args.push_back(m_outfile_path+".o");
+                     break;
+                 }
+@@ -1451,11 +1471,15 @@ namespace {
+                     break;
+                 case CodegenOutput::StaticLibrary:
+                 case CodegenOutput::Object:
++                case CodegenOutput::StaticArchive:
+                     args.push_back("-c");
+                     break;
+                 }
+                 break;
+             case Compiler::Msvc:
++                if( out_ty == CodegenOutput::StaticArchive ) {
++                    TODO(Span(), "StaticArchive output with MSVC");
++                }
+                 // TODO: Look up these paths in the registry and use CreateProcess instead of system
+                 // - OR, run `vcvarsall` and get the required environment variables and PATH from it?
+                 args.push_back(detect_msvc().path_vcvarsall);
+@@ -1489,6 +1513,7 @@ namespace {
+                         args.push_back(FMT("/Fd" << m_outfile_path << ".pdb")); // Set the PDB path
+                         break;
+                     case CodegenOutput::StaticLibrary:
++                    case CodegenOutput::StaticArchive:
+                     case CodegenOutput::Object:
+                         args.push_back("/Z7");  // Store the debug data in the .obj
+                         break;
+@@ -1535,6 +1560,7 @@ namespace {
+                     }
+                     break;
+                 case CodegenOutput::StaticLibrary:
++                case CodegenOutput::StaticArchive:
+                     args.push_back("/c");
+                     args.push_back(FMT("/Fo" << m_outfile_path << ".obj"));
+                     break;
+@@ -1546,63 +1572,164 @@ namespace {
+                 break;
+             }
+ 
+-            ::std::stringstream cmd_ss;
+-            if (is_windows)
+-            {
+-                cmd_ss << "echo \"\" & ";
+-            }
+-            std::string command_file = m_outfile_path + "_cmd.txt";
+-            std::ofstream   command_file_stream;
+-            if( getenv("MRUSTC_CCACHE") ) {
+-                cmd_ss << "ccache ";
+-            }
+-            bool use_arg_file = arg_file_start > 0;
+-            if(use_arg_file) {
+-                command_file_stream.open(command_file);
+-                ASSERT_BUG(Span(), command_file_stream.is_open(), "Failed to open command file `" << command_file << "` for writing");
+-            }
+-            size_t i = -1;
+-            for(const auto& arg : args.get_vec())
++            // Turn an argument list into a shell command (a response file takes everything from `arg_file_start` on)
++            auto make_command = [&](const StringList& args, size_t arg_file_start, const ::std::string& command_file)->::std::string {
++                ::std::stringstream cmd_ss;
++                if (is_windows)
++                {
++                    cmd_ss << "echo \"\" & ";
++                }
++                std::ofstream   command_file_stream;
++                if( getenv("MRUSTC_CCACHE") ) {
++                    cmd_ss << "ccache ";
++                }
++                bool use_arg_file = arg_file_start > 0;
++                if(use_arg_file) {
++                    command_file_stream.open(command_file);
++                    ASSERT_BUG(Span(), command_file_stream.is_open(), "Failed to open command file `" << command_file << "` for writing");
++                }
++                size_t i = -1;
++                for(const auto& arg : args.get_vec())
++                {
++                    i ++;
++                    auto& out_ss = (use_arg_file && i >= arg_file_start ? static_cast<::std::ostream&>(command_file_stream) : cmd_ss);
++                    if(strcmp(arg, "&") == 0 && is_windows) {
++                        out_ss << "&";
++                    }
++                    else {
++                        if( is_windows && strchr(arg, ' ') == nullptr ) {
++                            out_ss << arg << " ";
++                        }
++                        else {
++                            out_ss << "\"" << FmtShell(arg, is_windows) << "\" ";
++                        }
++                    }
++                }
++                if(use_arg_file) {
++                    cmd_ss << "@\"" << FmtShell(command_file, is_windows) << "\"";
++                    command_file_stream.close();
++                    ASSERT_BUG(Span(), !command_file_stream.bad(), "Error set on output stream for: " << command_file);
++                }
++                return cmd_ss.str();
++                };
++            ::std::vector<::std::string>    commands;
++            commands.push_back( make_command(args, arg_file_start, m_outfile_path + "_cmd.txt") );
++
++            if( out_ty == CodegenOutput::StaticArchive )
+             {
+-                i ++;
+-                auto& out_ss = (use_arg_file && i >= arg_file_start ? static_cast<::std::ostream&>(command_file_stream) : cmd_ss);
+-                if(strcmp(arg, "&") == 0 && is_windows) {
+-                    out_ss << "&";
++                // Compile the glue with the same compiler and options
++                auto glue_path_o = m_outfile_path + ".glue.o";
++                StringList  glue_args;
++                for(size_t i = 0; i < cc_prefix_len; i ++)
++                {
++                    glue_args.push_back( ::std::string(args.get_vec()[i]) );
+                 }
+-                else {
+-                    if( is_windows && strchr(arg, ' ') == nullptr ) {
+-                        out_ss << arg << " ";
++                glue_args.push_back("-o");
++                glue_args.push_back(glue_path_o);
++                glue_args.push_back(glue_path_c);
++                glue_args.push_back("-c");
++                commands.push_back( make_command(glue_args, arg_file_start, m_outfile_path + ".glue_cmd.txt") );
++
++                // Archive this crate's object, the glue, and every dependency's object
++                // - `ar r` only adds/replaces members, so a stale archive could keep the objects of dependencies that
++                //   are gone: start from scratch
++                {
++                    ::std::stringstream rm_ss;
++                    rm_ss << (is_windows ? "del /f /q " : "rm -f ") << "\"" << FmtShell(m_outfile_path, is_windows) << "\"";
++                    commands.push_back( rm_ss.str() );
++                }
++                // - The archiver is picked like the compiler: `AR_<triple>`, `AR`, `<triple>-ar`, then `ar`
++                StringList  ar_args;
++                {
++                    std::string varname = "AR_" + Target_GetCurSpec().m_backend_c.m_c_compiler;
++                    std::replace(varname.begin(), varname.end(), '-', '_');
++                    if( getenv(varname.c_str()) ) {
++                        ar_args.push_back( getenv(varname.c_str()) );
++                    }
++                    else if( getenv("AR") ) {
++                        ar_args.push_back( getenv("AR") );
++                    }
++                    else if (system(("command -v " + Target_GetCurSpec().m_backend_c.m_c_compiler + "-ar" + " >/dev/null 2>&1").c_str()) == 0) {
++                        ar_args.push_back( Target_GetCurSpec().m_backend_c.m_c_compiler + "-ar" );
+                     }
+                     else {
+-                        out_ss << "\"" << FmtShell(arg, is_windows) << "\" ";
++                        ar_args.push_back("ar");
+                     }
+                 }
++                ar_args.push_back("rcs");
++                ar_args.push_back(m_outfile_path);
++                ar_args.push_back(m_outfile_path + ".o");
++                ar_args.push_back(glue_path_o);
++                for(const auto& c : ext_crates)
++                {
++                    ar_args.push_back(std::string(c) + ".o");
++                }
++                commands.push_back( make_command(ar_args, 0, "") );
++
++                // An archive can't carry link flags: record the native libraries (and dylib crates) a consumer has to
++                // add to its link, the way `rustc --print native-static-libs` does
++                ::std::stringstream libs_ss;
++                for(const auto& c : ext_crates_dylib)
++                {
++                    libs_ss << " \"" << FmtShell(c, is_windows) << "\"";
++                }
++                for(auto l_d : libraries_and_dirs)
++                {
++                    switch(l_d.first)
++                    {
++                    case LinkList::Ty::Directory:
++                        libs_ss << " -L \"" << FmtShell(l_d.second, is_windows) << "\"";
++                        break;
++                    case LinkList::Ty::Implicit:
++                        if (!strncmp(l_d.second, "framework=", strlen("framework="))) {
++                            libs_ss << " -framework \"" << FmtShell(l_d.second + strlen("framework="), is_windows) << "\"";
++                        }
++                        else {
++                            libs_ss << " -l \"" << FmtShell(l_d.second, is_windows) << "\"";
++                        }
++                        break;
++                    case LinkList::Ty::Explicit:
++                        libs_ss << " \"" << FmtShell(l_d.second, is_windows) << "\"";
++                        break;
++                    }
++                }
++                ::std::ofstream(m_outfile_path + ".libs") << libs_ss.str() << ::std::endl;
++                ::std::cerr << "note: link " << m_outfile_path << " with:" << libs_ss.str() << ::std::endl;
+             }
+-            if(use_arg_file) {
+-                cmd_ss << "@\"" << FmtShell(command_file, is_windows) << "\"";
+-                command_file_stream.close();
+-                ASSERT_BUG(Span(), !command_file_stream.bad(), "Error set on output stream for: " << m_outfile_path_c);
++
++            for(const auto& cmd : commands)
++            {
++                ::std::cout << "Running command - " << cmd << ::std::endl;
+             }
+-            //DEBUG("- " << cmd_ss.str());
+-            ::std::cout << "Running command - " << cmd_ss.str() << ::std::endl;
+             if( opt.build_command_file != "" )
+             {
+-                ::std::cerr << "INVOKE CC: " << cmd_ss.str() << ::std::endl;
+-                ::std::ofstream(opt.build_command_file) << cmd_ss.str() << ::std::endl;
++                // A single line: the deferred codegen runner (minicargo) executes the first line of this file
++                ::std::string   joined;
++                for(const auto& cmd : commands)
++                {
++                    if( !joined.empty() )
++                        joined += " && ";
++                    joined += cmd;
++                }
++                ::std::cerr << "INVOKE CC: " << joined << ::std::endl;
++                ::std::ofstream(opt.build_command_file) << joined << ::std::endl;
+             }
+             else
+             {
+-                int ec = system(cmd_ss.str().c_str());
+-                if( ec == -1 )
+-                {
+-                    ::std::cerr << "C Compiler failed to execute (system returned -1)" << ::std::endl;
+-                    perror("system");
+-                    exit(1);
+-                }
+-                else if( ec != 0 )
++                for(const auto& cmd : commands)
+                 {
+-                    ::std::cerr << "C Compiler failed to execute - error code " << ec << ::std::endl;
+-                    exit(1);
++                    int ec = system(cmd.c_str());
++                    if( ec == -1 )
++                    {
++                        ::std::cerr << "C Compiler failed to execute (system returned -1)" << ::std::endl;
++                        perror("system");
++                        exit(1);
++                    }
++                    else if( ec != 0 )
++                    {
++                        ::std::cerr << "C Compiler failed to execute - error code " << ec << ::std::endl;
++                        exit(1);
++                    }
+                 }
+             }
+ 
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index e5c10a3a..1d365a4b 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -542,12 +542,18 @@ namespace {
+ }
+ 
+ /// Enumerate trans items for all public non-generic items (library crate)
+-TransList Trans_Enumerate_Public(::HIR::Crate& crate)
++TransList Trans_Enumerate_Public(::HIR::Crate& crate, bool link_named_roots)
+ {
+     static Span sp;
+     EnumState   state { crate };
+ 
+     Trans_Enumerate_Public_Mod(state, crate.m_root_module,  ::HIR::SimplePath(crate.m_crate_name,{}), true);
++    // A static archive is consumed by C code: like in an executable, its `#[no_mangle]`/`#[export_name]` functions
++    // are roots even when they aren't public
++    if( link_named_roots )
++    {
++        Trans_Enumerate_LinkNamed_Mod(state, crate.m_root_module, ::HIR::SimplePath(crate.m_crate_name, {}));
++    }
+ 
+     // Impl blocks
+     StaticTraitResolve resolve { crate };
+diff --git a/src/trans/main_bindings.hpp b/src/trans/main_bindings.hpp
+index b3149e48..089f7120 100644
+--- a/src/trans/main_bindings.hpp
++++ b/src/trans/main_bindings.hpp
+@@ -31,11 +31,12 @@ enum class CodegenOutput {
+     StaticLibrary,  // .a
+     DynamicLibrary, // .so
+     Executable, // no suffix, includes main stub (TODO: Can't that just be added earlier?)
++    StaticArchive,  // .a for C consumers: this crate's object, every dependency's object, and the runtime glue (no main)
+ };
+ 
+ extern TransList Trans_Enumerate_Main(const ::HIR::Crate& crate);
+ // NOTE: This also sets the saveout flags
+-extern TransList Trans_Enumerate_Public(::HIR::Crate& crate);
++extern TransList Trans_Enumerate_Public(::HIR::Crate& crate, bool link_named_roots=false);
+ 
+ /// Re-run enumeration on monomorphised functions, removing now-unused items
+ extern void Trans_Enumerate_Cleanup(const ::HIR::Crate& crate, TransList& list);

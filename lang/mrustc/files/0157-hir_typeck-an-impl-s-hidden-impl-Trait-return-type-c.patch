@@ -1,0 +1,156 @@
+From 0b5c0117d92e89b126e5cb2aa3e69be4b12deedc Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 01:45:44 +0000
+Subject: [PATCH] hir_typeck: an impl's hidden `impl Trait` return type comes
+ from its method
+
+vivid 0.11.1 `#[derive(RustEmbed)] struct ThemeAssets;` with rust-embed
+8.11.0, whose trait says `fn iter() -> impl Iterator<Item = Cow<'static,
+str>> + 'static` and whose derive writes `fn iter() -> Filenames { .. }`:
+
+    BUG: src/hir_typeck/static.cpp:2218: valid_for_opaque(input):
+    Set opaque on a non-generic type: <ThemeAssets as RustEmbed>::erased#iter_0
+
+A trait method returning `impl Trait` gets a hidden associated type,
+`erased#iter_0`, standing for the return type. Impls receive their entry
+for it in hir_expand/vtable.cpp, after typeck, and only when their own
+method returns `impl Trait`. So while the impl is type-checked the
+projection on a concrete self type finds no entry, is marked opaque, and
+the assertion that opaque projections involve generics fires. With the
+trait in another crate this hits every such impl, a concrete return type
+or not; with the trait in the same crate the concrete return fails the
+signature comparison instead.
+
+`ImplRef::get_type` now derives a missing `erased#<method>_<n>` entry from
+the impl method's return type, using the trait method's return type as
+the template: the term standing where the trait has that projection (or,
+before the trait's crate ran the hidden-type pass, the `ErasedType` with
+that index). The result is monomorphised as an associated type is, so
+every expansion site, during and after typeck, sees `Filenames`, or the
+impl's own `impl Trait` which the erased-type pass resolves as before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_typeck/impl_ref.cpp | 95 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/src/hir_typeck/impl_ref.cpp b/src/hir_typeck/impl_ref.cpp
+index 8f03b4a7..80fc3fca 100644
+--- a/src/hir_typeck/impl_ref.cpp
++++ b/src/hir_typeck/impl_ref.cpp
+@@ -9,6 +9,8 @@
+ #include <hir/hir.hpp>
+ #include "static.hpp"   // for monomorphise_type_with
+ #include "helpers.hpp"  // HMTypeInferrence
++#include <cstring>
++#include <cstdlib>
+ 
+ bool ImplRef::more_specific_than(const ImplRef& other) const
+ {
+@@ -251,6 +253,76 @@ namespace {
+     }
+ }
+ 
++namespace {
++    /// RPITIT: a trait method returning `impl Trait` gets a hidden `erased#<method>_<n>` associated type, which an impl
++    /// only receives after typeck (hir_expand/vtable.cpp), and never when its method names a concrete type instead.
++    /// Find, in the impl method's return type `ty`, the term standing where the trait method's return type `tpl` has
++    /// that hidden type (an `erased#` projection once the trait crate is built, the `ErasedType` itself before).
++    /// - rust-embed 8.11.0 `fn iter() -> impl Iterator<..>` / derive `fn iter() -> Filenames` (vivid 0.11.1):
++    ///   "Set opaque on a non-generic type: <ThemeAssets as RustEmbed>::erased#iter_0" in Typecheck Outer
++    const ::HIR::TypeRef* find_erased_slot(const ::HIR::TypeRef& tpl, const ::HIR::TypeRef& ty, const char* name, unsigned idx)
++    {
++        if( const auto* p = tpl.data().opt_Path() ) {
++            if( const auto* pe = p->path.m_data.opt_UfcsKnown() ) {
++                if( ::std::strcmp(pe->item.c_str(), name) == 0 )
++                    return &ty;
++            }
++        }
++        if( const auto* te = tpl.data().opt_ErasedType() ) {
++            if( const auto* f = te->m_inner.opt_Fcn() ) {
++                if( f->m_index == idx )
++                    return &ty;
++            }
++            return nullptr;
++        }
++        TU_MATCH_HDRA( (tpl.data()), {)
++        default:
++            return nullptr;
++        TU_ARMA(Path, e) {
++            const auto* e2 = ty.data().opt_Path();
++            if( !e2 )
++                return nullptr;
++            const auto* g = e.path.m_data.opt_Generic();
++            const auto* g2 = e2->path.m_data.opt_Generic();
++            if( !g || !g2 || g->m_path != g2->m_path || g->m_params.m_types.size() != g2->m_params.m_types.size() )
++                return nullptr;
++            for(size_t i = 0; i < g->m_params.m_types.size(); i ++) {
++                if( const auto* r = find_erased_slot(g->m_params.m_types[i], g2->m_params.m_types[i], name, idx) )
++                    return r;
++            }
++            return nullptr;
++            }
++        TU_ARMA(Tuple, e) {
++            const auto* e2 = ty.data().opt_Tuple();
++            if( !e2 || e2->size() != e.size() )
++                return nullptr;
++            for(size_t i = 0; i < e.size(); i ++) {
++                if( const auto* r = find_erased_slot(e[i], (*e2)[i], name, idx) )
++                    return r;
++            }
++            return nullptr;
++            }
++        TU_ARMA(Borrow, e) {
++            const auto* e2 = ty.data().opt_Borrow();
++            return e2 ? find_erased_slot(e.inner, e2->inner, name, idx) : nullptr;
++            }
++        TU_ARMA(Pointer, e) {
++            const auto* e2 = ty.data().opt_Pointer();
++            return e2 ? find_erased_slot(e.inner, e2->inner, name, idx) : nullptr;
++            }
++        TU_ARMA(Array, e) {
++            const auto* e2 = ty.data().opt_Array();
++            return e2 ? find_erased_slot(e.inner, e2->inner, name, idx) : nullptr;
++            }
++        TU_ARMA(Slice, e) {
++            const auto* e2 = ty.data().opt_Slice();
++            return e2 ? find_erased_slot(e.inner, e2->inner, name, idx) : nullptr;
++            }
++        }
++        return nullptr;
++    }
++}
++
+ ::HIR::TypeRef ImplRef::get_type(const char* name, const HIR::PathParams& params, const HMTypeInferrence* ivars) const
+ {
+     if( !name[0] )
+@@ -267,6 +339,29 @@ namespace {
+                 auto def = MonomorphStatePtr(&ty_self, &e.impl->m_trait_args, nullptr).monomorph_type(sp, e.trait_ptr->m_types.at(name).m_default);
+                 return this->get_cb_monomorph_traitimpl(sp, params).monomorph_type(sp, def);
+             }
++            // A hidden `erased#<method>_<n>` type (see `find_erased_slot`): take it from the impl method's return type
++            if( ::std::strncmp(name, ATY_PREFIX_ERASED, ::std::strlen(ATY_PREFIX_ERASED)) == 0 )
++            {
++                ::std::string   n(name + ::std::strlen(ATY_PREFIX_ERASED));
++                auto us = n.rfind('_');
++                if( us != ::std::string::npos && us + 1 < n.size() )
++                {
++                    auto method = RcString::new_interned(n.substr(0, us));
++                    unsigned idx = static_cast<unsigned>(::std::strtoul(n.c_str() + us + 1, nullptr, 10));
++                    auto it_m = e.impl->m_methods.find(method);
++                    auto it_t = e.trait_ptr->m_values.find(method);
++                    if( it_m != e.impl->m_methods.end() && it_t != e.trait_ptr->m_values.end() && it_t->second.is_Function() )
++                    {
++                        const auto& tpl = it_t->second.as_Function().m_return;
++                        const auto& impl_ret = it_m->second.data.m_return;
++                        if( const auto* slot = find_erased_slot(tpl, impl_ret, name, idx) )
++                        {
++                            DEBUG("name=" << name << " from impl method `" << method << "` return " << impl_ret << " -> " << *slot);
++                            return this->get_cb_monomorph_traitimpl(sp, params).monomorph_type(sp, *slot);
++                        }
++                    }
++                }
++            }
+             return ::HIR::TypeRef();
+         }
+         const ::HIR::TypeRef& tpl_ty = it->second.data;

@@ -1,0 +1,88 @@
+From e08b5a3daf3c2ef54eb8e257ccbb2a91cd36e2c8 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 00:07:17 +0000
+Subject: [PATCH] hir_expand: a coroutine's output type is fixed up like its body
+
+sad 0.4.32 src/input.rs:194, in `async fn stream_in(..) -> impl Stream`:
+
+    Mode::Preview(path) | Mode::Patch(path) => Either::Right(stream_patch(path).await),
+
+    Typecheck Expressions (validate): Type mismatch
+     - Either<Once<..>, TryFilterMap<TryUnfold<.., closure#stream_patch_5, future#stream_patch_4>, .., closure#stream_patch_6>>
+    != Either<Once<..>, TryFilterMap<TryUnfold<.., closure[0x..], async[0x..]>, .., closure[0x..]>>
+
+`stream_patch` is an `async fn .. -> impl Stream` whose concrete output
+holds a closure and an async block of its own body.  Extracting the async
+fn's coroutine runs the type fixup over the body, so the nested closure
+and block become their items there, but the block's return type was
+cloned beforehand and only monomorphised: the coroutine's `Output` and
+its `poll`'s `Poll<..>` kept naming the nested items by their node
+identity.  The validate pass, comparing that against the body's type,
+reported the two spellings as different types.  A plain closure already
+runs the fixup over its signature.
+
+Visit the cloned return type with the same fixup before it is used, in
+the async-block branch and, for the same reason, the yield and return
+types of the generator branch.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_expand/closures.cpp | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/hir_expand/closures.cpp b/src/hir_expand/closures.cpp
+index 0710e4dc..23fbdbfa 100644
+--- a/src/hir_expand/closures.cpp
++++ b/src/hir_expand/closures.cpp
+@@ -1831,15 +1831,23 @@ namespace {
+             }
+             // - `-> GeneratorState<{Yield},{Return}>`
+             ::HIR::PathParams   ret_params;
+-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, node.m_yield_ty) );
+-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, node.m_return) );
++            // As for an async block: nested closures in the yield/return types are already extracted items
++            auto yield_ty = node.m_yield_ty.clone();
++            auto return_ty = node.m_return.clone();
++            {
++                ExprVisitor_Fixup   fixup { m_resolve.m_crate, &params, monomorph_cb, &m_out };
++                fixup.visit_type( yield_ty );
++                fixup.visit_type( return_ty );
++            }
++            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, yield_ty) );
++            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, return_ty) );
+             fcn_resume.m_return = ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_GeneratorState, std::move(ret_params)), &m_resolve.m_crate.get_enum_by_path(sp, lang_GeneratorState) );
+             // - ` { ... }`
+             // Emit as a top-level generator
+             // - It has a populated body, non-zero `m_obj_ptr`, and unset `m_obj_path`
+             auto v = ::std::make_unique<::HIR::ExprNode_GeneratorWrapper>(sp, HIR::TypeRef(), mv$(body_node), /*move*/false, /*pinned*/false, /*future*/false);
+-            v->m_yield_ty = monomorph_cb.monomorph_type(sp, node.m_yield_ty);
+-            v->m_return   = monomorph_cb.monomorph_type(sp, node.m_return);
++            v->m_yield_ty = monomorph_cb.monomorph_type(sp, yield_ty);
++            v->m_return   = monomorph_cb.monomorph_type(sp, return_ty);
+             v->m_capture_usages = std::move(cr_vars.capture_usages);
+             v->m_res_type = fcn_resume.m_return.clone();
+             v->m_obj_ptr = node.m_obj_ptr;
+@@ -1860,7 +1868,7 @@ namespace {
+             }
+             impl.m_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(gen_struct_path, params.make_nop_params(0)), &gen_struct_ref );
+             impl.m_types.insert(std::make_pair( RcString::new_interned("Yield" ), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, node.m_yield_ty) } ));
+-            impl.m_types.insert(std::make_pair( RcString::new_interned("Return"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, node.m_return) } ));
++            impl.m_types.insert(std::make_pair( RcString::new_interned("Return"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, return_ty) } ));
+             impl.m_methods.insert(std::make_pair( RcString::new_interned("resume"), ::HIR::TraitImpl::ImplEnt<HIR::Function> { false, std::move(fcn_resume) } ));
+             impl.m_params = std::move(params);
+             m_out.trait_impls.push_back(std::make_pair(TARGETVER_LEAST_1_90 ? "coroutine" : "generator", std::move(impl)));
+@@ -1960,6 +1968,14 @@ namespace {
+                 DEBUG("-- Fixing types in body code");
+                 ExprVisitor_Fixup   fixup { m_resolve.m_crate, &params, monomorph_cb, &m_out };
+                 fixup.visit_node_ptr( body_node );
++                // The output type too: a closure or async block nested in it was extracted already and must be named
++                // by its item, as the body is (the closure case does this for its signature).
++                // - sad 0.4.32 input.rs: `async fn stream_patch(..) -> impl Stream` returning
++                //   `Either<Once<..>, TryFilterMap<TryUnfold<.., closure, async>, .., closure>>`; awaited in
++                //   `stream_in` -> validate "Type mismatch" between the `async[..]`/`closure[..]` Output of the
++                //   coroutine's `poll` and the extracted `future#stream_patch_4`/`closure#stream_patch_5` names
++                DEBUG("-- Fixing types in the output type");
++                fixup.visit_type( return_ty );
+             }
+ 
+             // -- Prepare drop impl for later filling

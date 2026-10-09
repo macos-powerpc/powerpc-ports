@@ -1,0 +1,143 @@
+From 86a7aa226cb7f2bffdb51da04cea2617404dcbfa Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 20:37:13 +0000
+Subject: [PATCH 148/149] minicargo: build the `staticlib` archive of the root
+ package
+
+A root package whose `[lib] crate-type` lists `staticlib` gets a second
+job, `<pkg> [staticlib]`, running mrustc with `--crate-type staticlib -o
+lib<name>.a` (cargo's name, no version suffix: it is a final product for
+a non-Rust consumer, e.g. GCC's makefiles for gccrs).  The rlib job stays as
+it is, so dependants, including the package's own `[[bin]]` targets, keep
+linking the rlib; dependency crates are not affected (built as rlibs).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ tools/minicargo/build.cpp | 61 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/tools/minicargo/build.cpp b/tools/minicargo/build.cpp
+index 6d981950..135f9a8e 100644
+--- a/tools/minicargo/build.cpp
++++ b/tools/minicargo/build.cpp
+@@ -37,6 +37,10 @@
+ bool deferred_codegen_enabled() {
+     return getenv("MINICARGO_DEFER_CODEGEN") != 0;
+ }
++/// `crate-type` of a library target lists `staticlib`
++static bool target_wants_staticlib(const PackageTarget& target) {
++    return ::std::find(target.m_crate_types.begin(), target.m_crate_types.end(), PackageTarget::CrateType::staticlib) != target.m_crate_types.end();
++}
+ 
+ static bool has_suffix(const ::std::string& s, const char* suffix) {
+     const size_t n = ::std::strlen(suffix);
+@@ -116,7 +120,8 @@ struct RunState
+         return get_output_dir(true) / get_build_script_out(manifest);
+     }
+     /// Get the output file for a crate (e.g. libfoo.rlib, or foo.exe)
+-    ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const;
++    /// - `staticlib`: the C-consumable archive of a `crate-type = ["staticlib", ..]` library (its rlib is what Rust dependants use)
++    ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, bool staticlib=false) const;
+     
+     // If `is_for_host` and cross compiling, use a different directory
+     // - TODO: Include the target arch in the output dir too?
+@@ -169,12 +174,15 @@ class Job_BuildTarget: public Job_Build
+ {
+     const PackageTarget&    m_target;
+     const bool  m_is_for_host;
++    /// Build the `staticlib` archive of this library (a second mrustc run beside the rlib one)
++    const bool  m_staticlib;
+ 
+ public:
+-    Job_BuildTarget(RunState& parent, const PackageManifest& manifest, const PackageTarget& target, bool is_host)
+-        : Job_Build(parent, manifest, parent.get_key(manifest, false, is_host, &target))
++    Job_BuildTarget(RunState& parent, const PackageManifest& manifest, const PackageTarget& target, bool is_host, bool staticlib=false)
++        : Job_Build(parent, manifest, parent.get_key(manifest, false, is_host, &target) + (staticlib ? " [staticlib]" : ""))
+         , m_target(target)
+         , m_is_for_host(is_host)
++        , m_staticlib(staticlib)
+     {
+     }
+     helpers::path   m_build_script;
+@@ -562,6 +570,39 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+                 make_dep_codegen(d);
+             }
+         }
++
++        // `crate-type = ["staticlib", ..]` on the root package: also produce the C-consumable archive, with a second
++        // mrustc run (dependants, e.g. the package's own binaries, keep using the rlib built above)
++        if( &p == &m_root_manifest && opts.mode == BuildOptions::Mode::Normal && target_wants_staticlib(p.get_library()) )
++        {
++            auto job_sl = ::std::make_unique<Job_BuildTarget>(run_state, p, p.get_library(), e.is_host, /*staticlib=*/true);
++            auto sl_ts = Timestamp::for_file(job_sl->get_outfile());
++            bool sl_dirty = run_state.outfile_needs_rebuild(job_sl->get_outfile());
++            if( bs_job_name != "" ) {
++                job_sl->m_dependencies.push_back(bs_job_name);
++                sl_dirty = true;
++            }
++            job_sl->m_build_script = job_p->m_build_script;
++            p.iter_main_dependencies([&](const PackageRef& dep) {
++                if( !dep.is_disabled() )
++                {
++                    auto k = run_state.get_key(dep.get_package(), false, e.is_host);
++                    sl_dirty |= convert_state.handle_dep(job_sl->m_dependencies, sl_ts, k);
++                }
++            });
++            job_sl->m_is_dirty = sl_dirty;
++            auto job_sl_p = job_sl.get();
++            convert_state.add_job(std::move(job_sl), sl_ts, sl_dirty);
++            if( job_sl_p->get_codegen() != helpers::path() )
++            {
++                auto job_codegen = ::std::make_unique<Job_Codegen>(run_state, job_sl_p->name(), job_sl_p->get_outfile(), job_sl_p->get_codegen());
++                job_codegen->m_is_dirty = sl_dirty || run_state.outfile_needs_rebuild(job_codegen->get_outfile());
++                convert_state.add_job(std::move(job_codegen), sl_ts, sl_dirty);
++                for(auto& d : job_sl_p->m_dependencies) {
++                    make_dep_codegen(d);
++                }
++            }
++        }
+     }
+ 
+     std::string bs_job_name;
+@@ -888,7 +929,7 @@ bool RunState::outfile_needs_rebuild(const helpers::path& outfile) const
+ {
+     return std::string("build_") + manifest.name().c_str() + (manifest.version() == PackageVersion() ? "" : get_crate_suffix(manifest).c_str());
+ }
+-::helpers::path RunState::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix) const
++::helpers::path RunState::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, bool staticlib) const
+ {
+     auto outfile = this->get_output_dir(is_for_host);
+ 
+@@ -905,6 +946,14 @@ bool RunState::outfile_needs_rebuild(const helpers::path& outfile) const
+     switch(target.m_type)
+     {
+     case PackageTarget::Type::Lib:
++        if( staticlib )
++        {
++            // Named like cargo's (`lib<name>.a`, no version suffix): it is a final product for a non-Rust consumer, which
++            // looks for that name (e.g. GCC's makefiles for gccrs's libformat_parser/ffi-polonius)
++            if(crate_type)  *crate_type = "staticlib";
++            outfile /= ::format("lib", target.m_name, ".a");
++            break;
++        }
+         switch( target.m_crate_types.size() > 0
+                 ? target.m_crate_types.front()
+                 : (target.m_is_proc_macro
+@@ -1035,7 +1084,7 @@ void Job_Build::push_args_common(StringList& args, const helpers::path& outfile,
+ //
+ helpers::path Job_BuildTarget::get_outfile() const
+ {
+-    return parent.get_crate_path(m_manifest, m_target, m_is_for_host, nullptr, nullptr);
++    return parent.get_crate_path(m_manifest, m_target, m_is_for_host, nullptr, nullptr, m_staticlib);
+ }
+ helpers::path Job_BuildTarget::get_codegen() const
+ {
+@@ -1049,7 +1098,7 @@ RunnableJob Job_BuildTarget::start()
+ {
+     const char* crate_type;
+     ::std::string   crate_suffix;
+-    auto outfile = parent.get_crate_path(m_manifest, m_target, m_is_for_host,  &crate_type, &crate_suffix);
++    auto outfile = parent.get_crate_path(m_manifest, m_target, m_is_for_host,  &crate_type, &crate_suffix, m_staticlib);
+     auto depfile = outfile + ".d";
+ 
+     StringList  args;

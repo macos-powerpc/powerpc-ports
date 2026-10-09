@@ -1,0 +1,98 @@
+From ee4fbb21060907ed056d3b3fd3eebf5c213e0ba1 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 8 Oct 2026 23:49:09 +0000
+Subject: [PATCH] hir_conv: resolve the shorthand left inside a bound's copied
+ trait path
+
+tower-layer 0.3.3 (ast-grep 0.45.3) tuple.rs, from the five-layer impl on:
+
+    impl<S, L1, L2, L3, L4, L5> Layer<S> for (L1, L2, L3, L4, L5)
+    where L1: Layer<L2::Service>, L2: Layer<L3::Service>,
+          L3: Layer<L4::Service>, L4: Layer<L5::Service>, L5: Layer<S>,
+
+    BUG: src/hir_typeck/static.cpp:1834: Encountered UfcsUnknown in EAT
+         - <L5 as _>::Service
+
+Resolve UFCS turns `L2::Service` into `<L2 as Layer<..>>::Service` by
+copying the `L2: Layer<L3::Service>` bound's trait path as it stands.
+Bounds are resolved in order, so that copy still holds the bound's own
+shorthand, `<L3 as _>::Service`, and the copy's copy one level deeper.
+The Outer pass leaves one such level in every bound; the paths pass, when
+it meets the stale `<L3 as _>::Service` in bound 1, copies from bound 3
+(two levels down, itself not visited yet) and then expands the result,
+which with five layers still contains `<L5 as _>::Service`. Four layers
+happened to run out of nesting first, which is why the two-, three- and
+four-tuple impls went through.
+
+After a path is resolved through a generic bound, visit the copied trait
+params so any shorthand inside is resolved before anything expands the
+path. Blanked (null) params of a value path are skipped. A depth guard
+turns a self-referential `where T: Tr<T::A>` into an error instead of
+unbounded recursion; that program still dies earlier on a pre-existing
+null-type assertion, as it did before (rustc rejects it as a cycle).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/hir_conv/resolve_ufcs.cpp | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/src/hir_conv/resolve_ufcs.cpp b/src/hir_conv/resolve_ufcs.cpp
+index 92fa417d..c22ddad0 100644
+--- a/src/hir_conv/resolve_ufcs.cpp
++++ b/src/hir_conv/resolve_ufcs.cpp
+@@ -757,6 +757,33 @@ namespace resolve_ufcs {
+             }
+         }
+ 
++        /// Depth of nested bound-copy resolution (`visit_bound_copy_params`), to turn a cyclic `where T: Tr<T::A>` into an error
++        unsigned m_bound_copy_depth = 0;
++        /// A path just resolved through a generic bound carries a copy of that bound's trait params; resolve any
++        /// shorthand still inside the copy (see the caller)
++        void visit_bound_copy_params(::HIR::Path& p)
++        {
++            auto& trait_params = p.m_data.as_UfcsKnown().trait.m_params;
++            bool has_unknown = false;
++            for(const auto& t : trait_params.m_types) {
++                if( t == HIR::TypeRef() )   // blanked for a value path in an expression
++                    continue ;
++                visit_ty_with(t, [&](const HIR::TypeRef& ty)->bool {
++                    if( ty.data().is_Path() && ty.data().as_Path().path.m_data.is_UfcsUnknown() )
++                        has_unknown = true;
++                    return has_unknown;
++                    });
++            }
++            if( !has_unknown )
++                return ;
++            if( m_bound_copy_depth > 64 ) {
++                ERROR(Span(), E0000, "Shorthand associated type bounds nest too deeply (cyclic?) at " << p);
++            }
++            m_bound_copy_depth ++;
++            DEBUG("Resolving the bound copy's params: " << p);
++            this->visit_path_params(trait_params);
++            m_bound_copy_depth --;
++        }
+         void visit_path(::HIR::Path& p, ::HIR::Visitor::PathContext pc) override
+         {
+             static Span sp;
+@@ -826,14 +853,21 @@ namespace resolve_ufcs {
+                 }
+ 
+                 // Search for matching impls in current generic blocks
++                // - The bound's trait path is copied as it stands, and bounds are resolved in order, so a copy taken
++                //   from a bound not visited yet still holds that bound's own shorthand (`<L5 as _>::Service`).
++                //   Resolve the copy's params now, before anything expands the path.
++                //   tower-layer 0.3.3 tuple.rs: `L1: Layer<L2::Service>, L2: Layer<L3::Service>, .. L5: Layer<S>` -
++                //   from five layers on, "BUG: Encountered UfcsUnknown in EAT - <L5 as _>::Service"
+                 if( m_resolve.m_item_generics != nullptr && locate_trait_item_in_bounds(pc, e.type, *m_resolve.m_item_generics,  p.m_data) ) {
+                     DEBUG("Found in item params, p = " << p);
+                     assert(!p.m_data.is_UfcsUnknown());
++                    this->visit_bound_copy_params(p);
+                     return ;
+                 }
+                 if( m_resolve.m_impl_generics != nullptr && locate_trait_item_in_bounds(pc, e.type, *m_resolve.m_impl_generics,  p.m_data) ) {
+                     DEBUG("Found in impl params, p = " << p);
+                     assert(!p.m_data.is_UfcsUnknown());
++                    this->visit_bound_copy_params(p);
+                     return ;
+                 }
+ 
