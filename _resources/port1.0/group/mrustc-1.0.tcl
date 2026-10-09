@@ -895,6 +895,13 @@ proc rust::rust_pg_callback {} {
         depends_lib-append              port:curl
     }
 
+    # Use PEM from ports:
+    if {[rust::uses_crate rustls-native-certs]} {
+        rust::append_envs               MACPORTS_CA_BUNDLE=${prefix}/share/curl/curl-ca-bundle.crt {build destroot}
+        depends_run-delete              port:curl-ca-bundle
+        depends_run-append              port:curl-ca-bundle
+    }
+
     # rust-bootstrap requires `macosx_deployment_target` instead of `os.major`
     if {[option os.platform] eq "darwin" && [vercmp [option macosx_deployment_target] < 10.12]} {
         if { [join [lrange [split ${subport} -] 0 1] -] eq "rust-bootstrap" } {
