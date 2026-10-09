@@ -1,0 +1,324 @@
+From 0df6e1696d7a09cbb9aefb2e2cac8c0aec376ac0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 05:59:58 +0000
+Subject: [PATCH] expand: `:pat` fragments reach proc macros; macro_rules
+ matches literal and range patterns
+
+tokio 1.53.1 `select!` (interprocess 2.4.4 uds_local_socket/tokio/
+stream.rs:52, skim 5.7.3), after 0163:
+
+    MACRO<tokio::select> BUG: proc_macro.cpp:525: TODO: visit_token - TOK_INTERPOLATED_PATTERN
+
+`select!` hands each branch's `$bind:pat` to tokio-macros:
+`$crate::select_priv_clean_pattern!($bind) => {}`. The proc-macro
+input serialiser had TODOs for interpolated patterns and paths, and its
+`visit_pattern` only covered `_`, bindings, tuples and struct patterns.
+Struct patterns also emitted `...` for a `..` rest.
+
+- visit_token sends TOK_INTERPOLATED_PATTERN through visit_pattern
+  and TOK_INTERPOLATED_PATH through visit_path.
+- visit_pattern covers the rest of the AST: tuple-struct, literals and
+  ranges (new visit_pattern_value: negative numbers, chars, bools,
+  floats, strings, paths), `&`/`&mut`, `box`, slices with or without
+  `..`, or-patterns and macro invocations. A plain binding is no longer
+  sent as `x @ _`, and struct patterns use expression-style paths and
+  `..`.
+
+Writing the kit turned up a second, older gap: `$p:pat` did not match
+patterns starting with `-`, `true`/`false` or `..=`, nor `a..b`/`a..`
+ranges ("Macro_InvokeRules_MatchPattern - No arm matched" for
+`m!(n; -5..=-1 => ..)`). macro_rules' consume_pat now takes them
+(consume_pat_range_value for range ends).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 9d615eda..a1a76f4d 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -520,9 +520,13 @@ namespace {
+                 visit_type(const_cast<::Token&>(tok).frag_type());
+                 break;
+             case TOK_INTERPOLATED_PATH:
+-                TODO(sp, "TOK_INTERPOLATED_PATH");
++                visit_path(const_cast<::Token&>(tok).frag_path());
++                break;
++            // A `:pat` fragment forwarded to a proc macro
++            // - tokio 1.53.1 `select!`: `$crate::select_priv_clean_pattern!($bind)` (interprocess 2.4.4, skim)
+             case TOK_INTERPOLATED_PATTERN:
+-                TODO(sp, "TOK_INTERPOLATED_PATTERN");
++                visit_pattern(const_cast<::Token&>(tok).frag_pattern());
++                break;
+             case TOK_INTERPOLATED_STMT:
+             case TOK_INTERPOLATED_BLOCK:
+             case TOK_INTERPOLATED_EXPR:
+@@ -725,11 +729,92 @@ namespace {
+                 else {
+                     m_pmi.send_ident(b.m_name);
+                 }
++                // A plain binding (`x`, `ref mut x`) is `binding @ _` here: no need to spell out the `@ _`
++                if( pat.data().is_Any() && &b == &pat.bindings().back() ) {
++                    return;
++                }
+                 m_pmi.send_symbol("@");
+             }
+             TU_MATCH_HDRA( (pat.data()), { )
+-            default:
+-                TODO(sp, "visit_pattern " << pat.data().tag_str() << " - " << pat);
++            TU_ARMA(Macro, e) {
++                this->visit_path(e.inv->path(), /*is_expr=*/true);
++                m_pmi.send_symbol("!");
++                this->visit_tokentree(e.inv->input_tt());
++                }
++            TU_ARMA(Box, e) {
++                m_pmi.send_rword("box");
++                this->visit_pattern(*e.sub);
++                }
++            TU_ARMA(Ref, e) {
++                m_pmi.send_symbol("&");
++                if( e.mut ) {
++                    m_pmi.send_rword("mut");
++                }
++                this->visit_pattern(*e.sub);
++                }
++            // `a`, `a ..= b`, `..= b`
++            TU_ARMA(Value, e) {
++                this->visit_pattern_value(e.start);
++                if( !e.end.is_Invalid() ) {
++                    m_pmi.send_symbol("..=");
++                    this->visit_pattern_value(e.end);
++                }
++                }
++            // `a .. b`, `a ..`, `.. b`
++            TU_ARMA(ValueLeftInc, e) {
++                this->visit_pattern_value(e.start);
++                m_pmi.send_symbol("..");
++                this->visit_pattern_value(e.end);
++                }
++            TU_ARMA(StructTuple, e) {
++                this->visit_path(e.path, /*is_expr=*/true);
++                m_pmi.send_symbol("(");
++                visit_tuple_pattern(e.tup_pat);
++                m_pmi.send_symbol(")");
++                }
++            TU_ARMA(Slice, e) {
++                m_pmi.send_symbol("[");
++                for(const auto& p : e.sub_pats) {
++                    visit_pattern(p);
++                    m_pmi.send_symbol(",");
++                }
++                m_pmi.send_symbol("]");
++                }
++            TU_ARMA(SplitSlice, e) {
++                m_pmi.send_symbol("[");
++                for(const auto& p : e.leading) {
++                    visit_pattern(p);
++                    m_pmi.send_symbol(",");
++                }
++                if( e.extra_bind.is_valid() ) {
++                    if( e.extra_bind.m_mutable ) {
++                        m_pmi.send_rword("mut");
++                    }
++                    if( e.extra_bind.m_type != ::AST::PatternBinding::Type::MOVE ) {
++                        m_pmi.send_rword("ref");
++                        if( e.extra_bind.m_type == ::AST::PatternBinding::Type::MUTREF ) {
++                            m_pmi.send_rword("mut");
++                        }
++                    }
++                    m_pmi.send_ident(e.extra_bind.m_name);
++                    m_pmi.send_symbol("@");
++                }
++                m_pmi.send_symbol("..");
++                m_pmi.send_symbol(",");
++                for(const auto& p : e.trailing) {
++                    visit_pattern(p);
++                    m_pmi.send_symbol(",");
++                }
++                m_pmi.send_symbol("]");
++                }
++            TU_ARMA(Or, e) {
++                for(size_t i = 0; i < e.size(); i ++) {
++                    if( i > 0 ) {
++                        m_pmi.send_symbol("|");
++                    }
++                    visit_pattern(e[i]);
++                }
++                }
+             TU_ARMA(Any, e) {
+                 m_pmi.send_rword("_");
+                 }
+@@ -747,7 +832,7 @@ namespace {
+                 m_pmi.send_symbol(")");
+                 }
+             TU_ARMA(Struct, e) {
+-                this->visit_path(e.path);
++                this->visit_path(e.path, /*is_expr=*/true);
+                 m_pmi.send_symbol("{");
+                 for(const auto& spe : e.sub_patterns) {
+                     this->visit_attrs(spe.attrs);
+@@ -757,12 +842,66 @@ namespace {
+                     m_pmi.send_symbol(",");
+                 }
+                 if( !e.is_exhaustive ) {
+-                    m_pmi.send_symbol("...");
++                    m_pmi.send_symbol("..");
+                 }
+                 m_pmi.send_symbol("}");
+                 }
+             }
+         }
++        void visit_pattern_value(const ::AST::Pattern::Value& v)
++        {
++            TU_MATCH_HDRA( (v), { )
++            TU_ARMA(Invalid, e) {
++                // The open end of a range
++                }
++            TU_ARMA(Integer, e) {
++                switch(e.type)
++                {
++                case CORETYPE_BOOL:
++                    m_pmi.send_rword(e.value != U128(0) ? "true" : "false");
++                    break;
++                case CORETYPE_CHAR:
++                    m_pmi.send_char(static_cast<uint32_t>(e.value.truncate_u64()));
++                    break;
++                case CORETYPE_ANY:
++                case CORETYPE_INT:
++                case CORETYPE_I8:
++                case CORETYPE_I16:
++                case CORETYPE_I32:
++                case CORETYPE_I64:
++                case CORETYPE_I128:
++                    // `Parse_PatternValue` stores `-n` as two's complement
++                    if( (e.value >> 127u) != U128(0) ) {
++                        m_pmi.send_symbol("-");
++                        m_pmi.send_int(e.type, ~e.value + U128(1));
++                        break;
++                    }
++                    // fall through
++                default:
++                    m_pmi.send_int(e.type, e.value);
++                    break;
++                }
++                }
++            TU_ARMA(Float, e) {
++                if( e.value < 0 ) {
++                    m_pmi.send_symbol("-");
++                    m_pmi.send_float(e.type, -e.value);
++                }
++                else {
++                    m_pmi.send_float(e.type, e.value);
++                }
++                }
++            TU_ARMA(String, e) {
++                m_pmi.send_string(e);
++                }
++            TU_ARMA(ByteString, e) {
++                m_pmi.send_bytestring(e.v);
++                }
++            TU_ARMA(Named, e) {
++                this->visit_path(e, /*is_expr=*/true);
++                }
++            }
++        }
+         void visit_tuple_pattern(const AST::Pattern::TuplePat& v)
+         {
+             for(const auto& p : v.start) {
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 4a89507b..58d5639a 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -1164,6 +1164,33 @@ namespace
+             return false;
+         }
+     }
++    /// A literal or path that can be a pattern value or a range end (`-` allowed before a number)
++    bool consume_pat_range_value(TokenStreamRO& lex)
++    {
++        switch(lex.next())
++        {
++        case TOK_IDENT:
++        case TOK_RWORD_SUPER:
++        case TOK_RWORD_SELF:
++        case TOK_RWORD_CRATE:
++        case TOK_DOUBLE_COLON:
++        case TOK_INTERPOLATED_PATH:
++            return consume_path(lex);
++        case TOK_DASH:
++            lex.consume();
++            return lex.consume_if(TOK_INTEGER) || lex.consume_if(TOK_FLOAT);
++        case TOK_STRING:
++        case TOK_BYTESTRING:
++        case TOK_INTEGER:
++        case TOK_FLOAT:
++        case TOK_RWORD_TRUE:
++        case TOK_RWORD_FALSE:
++            lex.consume();
++            return true;
++        default:
++            return false;
++        }
++    }
+     bool consume_pat(TokenStreamRO& lex, bool allow_or=true)
+     {
+         TRACE_FUNCTION;
+@@ -1247,8 +1274,21 @@ namespace
+             case TOK_STRING:
+             case TOK_INTEGER:
+             case TOK_FLOAT:
+-                lex.consume();
++            // `-1`, `true`: the rest of a pattern's literals (`-5..=-1 => ..` didn't match a `$p:pat => ..` arm)
++            case TOK_DASH:
++            case TOK_RWORD_TRUE:
++            case TOK_RWORD_FALSE:
++                if( !consume_pat_range_value(lex) )
++                    return false;
+                 break;
++            // `..=X`, a range with only an end
++            case TOK_DOUBLE_DOT_EQUAL:
++                lex.consume();
++                if( !consume_pat_range_value(lex) )
++                    return false;
++                if( allow_or && lex.consume_if(TOK_PIPE) )
++                    continue;
++                return true;
+             default:
+                 return false;
+             }
+@@ -1256,23 +1296,31 @@ namespace
+                 continue;
+             // ... or ..=
+             if( lex.consume_if(TOK_TRIPLE_DOT) || lex.consume_if(TOK_DOUBLE_DOT_EQUAL) )
++            {
++                if( !consume_pat_range_value(lex) )
++                    return false;
++            }
++            // `a .. b`, or `a ..` with no end
++            else if( lex.consume_if(TOK_DOUBLE_DOT) )
+             {
+                 switch(lex.next())
+                 {
+                 case TOK_IDENT:
+                 case TOK_RWORD_SUPER:
+                 case TOK_RWORD_SELF:
++                case TOK_RWORD_CRATE:
+                 case TOK_DOUBLE_COLON:
+                 case TOK_INTERPOLATED_PATH:
+-                    consume_path(lex);
+-                    break;
++                case TOK_DASH:
+                 case TOK_STRING:
++                case TOK_BYTESTRING:
+                 case TOK_INTEGER:
+                 case TOK_FLOAT:
+-                    lex.consume();
++                    if( !consume_pat_range_value(lex) )
++                        return false;
+                     break;
+                 default:
+-                    return false;
++                    break;
+                 }
+             }
+             if(allow_or && lex.consume_if(TOK_PIPE))

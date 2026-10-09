@@ -1,0 +1,198 @@
+From 39e1437d52dd1c0f65e1b34ed23847caa13c248a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 17:01:12 +0000
+Subject: [PATCH 198/199] hir_typeck: a method call allocates value ivars for
+ in-scope traits with const params
+
+The method-call node keeps a pool of type ivars for the in-scope traits
+that provide the method, so each find_method pass searches with the same
+`Trait<_, ..>` params. Traits with const params had no such pool and the
+lookup asserted: "TODO: Handle value params" (helpers.cpp
+get_ivared_params) for `self.hist.volume(cube)` in quantette 0.6.0
+quantize/wu/shared.rs with `InclusionExclusion<T, const N: usize>` in
+scope - the next failure after 0197 in that crate.
+
+The node now also allocates value ivars (the largest const-param count
+over the candidate traits), find_method and autoderef_find_method take
+them beside the type ivars, and the duplicate-trait collapse in
+expr_cs.cpp fills them in the same way instead of its TODO.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index 00ffd9ac..6c318c18 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -654,6 +654,8 @@ struct ExprNode_CallMethod:
+     t_trait_list    m_traits;
+     // - A pool of ivars to use for searching for trait impls
+     ::std::vector<unsigned int> m_trait_param_ivars;
++    // - The same for the traits' const params (value ivars)
++    ::std::vector<unsigned int> m_trait_param_val_ivars;
+ 
+     ExprNode_CallMethod(Span sp, ::HIR::ExprNodeP val, RcString method_name, ::HIR::PathParams params, ::std::vector< ::HIR::ExprNodeP> args):
+         ExprNode( mv$(sp) ),
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 5930a48d..c96a7236 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -982,7 +982,7 @@ namespace {
+             //   back to trait if the inherent is still ambigious.
+             ::std::vector<::std::pair<TraitResolution::AutoderefBorrow, ::HIR::Path>> possible_methods;
+             // NOTE: Outside fallback mode, a trait impl that only matches by binding receiver ivars pauses the lookup (see `find_method`)
+-            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, ty, node.m_method,  possible_methods,
++            unsigned int deref_count = this->context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, node.m_trait_param_val_ivars, ty, node.m_method,  possible_methods,
+                 this->m_defer_fuzzy_impls, &this->context.m_has_fuzzy_deferred_method);
+         try_again:
+             if( deref_count != ~0u )
+@@ -1083,7 +1083,15 @@ namespace {
+                                     //ASSERT_BUG(sp, m_ivars.get_type( trait_params.m_types.back() ).m_data.as_Infer().index == ivars[i], "A method selection ivar was bound");
+                                 }
+                                 if(e1.trait.m_params.m_values.size() > 0) {
+-                                    TODO(sp, "Populate infer for value generics");
++                                    auto& val_ivars = node.m_trait_param_val_ivars;
++                                    unsigned int n_values = e1.trait.m_params.m_values.size();
++                                    while(val_ivars.size() < n_values) {
++                                        val_ivars.push_back(context.m_ivars.new_ivar_val());
++                                    }
++                                    trait_params.m_values.reserve( n_values );
++                                    for(unsigned int i = 0; i < n_values; i++) {
++                                        trait_params.m_values.push_back( ::HIR::ConstGeneric::make_Infer( ::HIR::ConstGeneric::Data_Infer { val_ivars[i] }) );
++                                    }
+                                 }
+                                 // If one of these was already using the placeholder ivars, then maintain the one with the palceholders
+                                 if( e1.trait.m_params != trait_params )
+@@ -6381,7 +6389,7 @@ namespace
+ 
+                 DEBUG("Check <" << t << ">::" << node.m_method);
+                 ::std::vector<::std::pair<TraitResolution::AutoderefBorrow, ::HIR::Path>> possible_methods;
+-                unsigned int deref_count = context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, t, node.m_method,  possible_methods);
++                unsigned int deref_count = context.m_resolve.autoderef_find_method(node.span(), node.m_traits, node.m_trait_param_ivars, node.m_trait_param_val_ivars, t, node.m_method,  possible_methods);
+                 DEBUG("> deref_count = " << deref_count << ", possible_methods={" << possible_methods << "}");
+                 // TODO: Detect the above hitting an ivar, and use that instead of this hacky check of if it's `_` or `&_`
+                 if( !(t.data().is_Infer() || TU_TEST1(t.data(), Borrow, .inner.data().is_Infer())) && possible_methods.empty() )
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 4245c8ef..4a2c4f3a 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -1628,7 +1628,8 @@ namespace typecheck
+             const RcString& method_name = node.m_method;
+             ::HIR::t_trait_list    possible_traits;
+             unsigned int max_num_params = 0;
+-            auto visit_trait_inner = [&method_name, &max_num_params, &possible_traits](const HIR::SimplePath& p, const HIR::Trait& tr, bool push) {
++            unsigned int max_num_values = 0;
++            auto visit_trait_inner = [&method_name, &max_num_params, &max_num_values, &possible_traits](const HIR::SimplePath& p, const HIR::Trait& tr, bool push) {
+ 
+                 auto it = tr.m_values.find(method_name);
+                 if( it == tr.m_values.end() )
+@@ -1637,6 +1638,8 @@ namespace typecheck
+                     return ;
+                 if( tr.m_params.m_types.size() > max_num_params )
+                     max_num_params = tr.m_params.m_types.size();
++                if( tr.m_params.m_values.size() > max_num_values )
++                    max_num_values = tr.m_params.m_values.size();
+ 
+                 if( push ) {
+                     DEBUG("Found method in " << p << " (push)");
+@@ -1672,6 +1675,11 @@ namespace typecheck
+             {
+                 node.m_trait_param_ivars.push_back( this->context.m_ivars.new_ivar() );
+             }
++            // A trait with const params (`InclusionExclusion<T, const N: usize>`, quantette) needs value ivars too
++            for(unsigned int i = 0; i < max_num_values; i ++)
++            {
++                node.m_trait_param_val_ivars.push_back( this->context.m_ivars.new_ivar_val() );
++            }
+ 
+             {
+                 auto _ = this->push_inner_coerce_scoped(false);
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index af6a9ef0..3e41fa9f 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -4916,7 +4916,7 @@ namespace {
+ }
+ 
+ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+-        const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
++        const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
+         /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+         bool defer_fuzzy_impls,
+         /* Out -> */bool* out_deferred_on_fuzzy
+@@ -4961,24 +4961,24 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+         DEBUG(deref_count << ": " << ty);
+ 
+         // Non-referenced
+-        if( this->find_method(sp, traits, ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, defer_fuzzy_impls) )
++        if( this->find_method(sp, traits, ivars, val_ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+ 
+         // Auto-ref
+         auto borrow_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ty.clone());
+-        if( this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, defer_fuzzy_impls) )
++        if( this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND & *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Unique;
+-        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, defer_fuzzy_impls) )
++        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND &mut *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Owned;
+-        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, defer_fuzzy_impls) )
++        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, defer_fuzzy_impls) )
+         {
+             DEBUG("FOUND &move *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+@@ -5146,7 +5146,7 @@ const ::HIR::TypeRef* TraitResolution::check_method_receiver(const Span& sp, con
+ }
+ 
+ bool TraitResolution::find_method(const Span& sp,
+-    const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
++    const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+     AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+     bool defer_fuzzy_impls
+     ) const
+@@ -5178,7 +5178,14 @@ bool TraitResolution::find_method(const Span& sp,
+             trait_params.m_types.push_back( ::HIR::TypeRef::new_infer(ivars[i], ::HIR::InferClass::None) );
+             ASSERT_BUG(sp, m_ivars.get_type( trait_params.m_types.back() ).data().as_Infer().index == ivars[i], "A method selection ivar was bound");
+         }
+-        ASSERT_BUG(sp, tpl.m_values.empty(), "TODO: Handle value params");
++        // The traits' const params get the value ivars allocated beside the type ones (`InclusionExclusion<T, const N:
++        // usize>` in scope for `self.hist.volume(cube)`, quantette 0.6.0 wu/shared.rs)
++        unsigned int n_values = tpl.m_values.size();
++        ASSERT_BUG(sp, n_values <= val_ivars.size(), "Not enough value ivars allocated for method: " << n_values << " needed but " << val_ivars.size() << " allocated by caller\ntpl = " << tpl.fmt_args());
++        trait_params.m_values.reserve( n_values );
++        for(unsigned int i = 0; i < n_values; i++) {
++            trait_params.m_values.push_back( ::HIR::ConstGeneric::make_Infer( ::HIR::ConstGeneric::Data_Infer { val_ivars[i] }) );
++        }
+         return trait_params;
+         };
+ 
+diff --git a/src/hir_typeck/helpers.hpp b/src/hir_typeck/helpers.hpp
+index b2224a99..9ff11e50 100644
+--- a/src/hir_typeck/helpers.hpp
++++ b/src/hir_typeck/helpers.hpp
+@@ -290,7 +290,7 @@ public:
+     /// Locate the named method by applying auto-dereferencing.
+     /// \return Number of times deref was applied (or ~0 if _ was hit)
+     unsigned int autoderef_find_method(const Span& sp,
+-            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
++            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
+             /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+             bool defer_fuzzy_impls = false,
+             /* Out -> */bool* out_deferred_on_fuzzy = nullptr
+@@ -321,7 +321,7 @@ public:
+     };
+     friend ::std::ostream& operator<<(::std::ostream& os, const AllowedReceivers& x);
+     bool find_method(const Span& sp,
+-            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
++            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+             AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+             bool defer_fuzzy_impls = false
+             ) const;

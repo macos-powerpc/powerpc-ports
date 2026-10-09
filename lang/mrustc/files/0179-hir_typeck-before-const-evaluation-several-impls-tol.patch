@@ -1,0 +1,80 @@
+From e2d613394ab206e40469956a0eaecaa88bc15639 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 09:46:46 +0000
+Subject: [PATCH] hir_typeck: before const evaluation, several impls told apart
+ only by a const argument leave the projection
+
+StaticTraitResolve::expand_associated_types__UfcsKnown runs in Resolve UFCS,
+before constant evaluation, when `{ STRUCT_VARIANT_ID }`/`{ 0 }`/`{ 1 }`
+impl arguments are still Unevaluated and compare Fuzzy.  The first such impl
+was taken as "actually matches", so in zerocopy 0.8.59 (impls.rs:1082) the
+`HasField<Client, (), {V}, {1}> for (A, B)` impl's `Self::Type` became the
+`{0}` impl's `A`: "Method project doesn't match trait: Expected *mut B Found
+*mut A".
+
+Count the impls that match only fuzzily on unevaluated const arguments; take
+a single one as before, but with several leave the projection for typeck,
+which sees evaluated values.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index a582f525..430c37ef 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -2167,7 +2167,16 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+     if( bound_on_generic ) {
+         DEBUG("Bound on a generic without the item - not searching impls");
+     }
+-    rv = !bound_on_generic && this->find_impl(sp, trait_path.m_path, trait_path.m_params, e2.type, [&](ImplRef impl, bool fuzzy) {
++    // Impls that match only fuzzily because of const arguments not evaluated yet (Resolve UFCS runs before constant
++    // evaluation): with more than one such candidate, taking the first is a guess, so leave the projection for later
++    // - zerocopy 0.8.59 impls.rs:1082: `HasField<Client, (), {STRUCT_VARIANT_ID}, {0}>`, `{1}`, .. for the same tuple;
++    //   `Self::Type` in the `{1}` impl became the `{0}` impl's `A` -> "Method project doesn't match trait"
++    auto has_unevaluated = [](const ::HIR::PathParams& pp) {
++        return ::std::any_of(pp.m_values.begin(), pp.m_values.end(), [](const ::HIR::ConstGeneric& v){ return v.is_Unevaluated(); });
++        };
++    unsigned n_fuzzy_const = 0;
++    bool accept_fuzzy_const = false;
++    auto cb_impl = [&](ImplRef impl, bool fuzzy)->bool {
+         DEBUG("[expand_associated_types] Found " << impl);
+         // If a fuzzy match was found, monomorphise and EAT the checked types and try again
+         // - A fuzzy can be caused by an opaque match.
+@@ -2187,10 +2196,16 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+             for(auto& ty : pp.m_types)
+                 this->expand_associated_types(sp, ty);
+             DEBUG("pp -> " << pp);
+-            if( pp.compare_with_placeholders(sp, trait_path.m_params, cb_ident) == HIR::Compare::Unequal ) {
++            auto cmp = pp.compare_with_placeholders(sp, trait_path.m_params, cb_ident);
++            if( cmp == HIR::Compare::Unequal ) {
+                 DEBUG("[expand_associated_types] - Fuzzy - params don't match: " << pp << " != " << trait_path.m_params);
+                 return false;
+             }
++            if( cmp == HIR::Compare::Fuzzy && !accept_fuzzy_const && (has_unevaluated(pp) || has_unevaluated(trait_path.m_params)) ) {
++                DEBUG("[expand_associated_types] - Fuzzy on unevaluated const arguments, counted");
++                n_fuzzy_const += 1;
++                return false;
++            }
+             DEBUG("[expand_associated_types] - Fuzzy - Actually matches");
+         }
+ 
+@@ -2220,7 +2235,17 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+             }
+             return true;
+         }
+-        });
++        };
++    rv = !bound_on_generic && this->find_impl(sp, trait_path.m_path, trait_path.m_params, e2.type, cb_impl);
++    if( !rv && n_fuzzy_const == 1 ) {
++        // The only candidate: take it, as before
++        accept_fuzzy_const = true;
++        rv = this->find_impl(sp, trait_path.m_path, trait_path.m_params, e2.type, cb_impl);
++    }
++    else if( !rv && n_fuzzy_const > 1 ) {
++        DEBUG("- " << n_fuzzy_const << " impls match only on unevaluated const arguments - leaving " << input << " for later");
++        return false;
++    }
+     if( rv ) {
+         if( recurse )
+             this->expand_associated_types(sp, input);

@@ -1,0 +1,107 @@
+From 816cc4108fab142fcc03dfa9d4c32892e043ce97 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 06:32:18 +0000
+Subject: [PATCH] hir_typeck: `Pin<&mut Self>` methods on an associated type or
+ `impl Trait` under a wrapper
+
+tower 0.5.3 util/oneshot.rs:96 (ast-grep 0.45.3):
+
+    StateProj::Called { fut } => { let res = ready!(fut.poll(cx))?; .. }
+
+    error: No applicable methods for {Pin<&mut <S as Service<Req>>::Future>}.poll
+
+`fut` is pin-project-lite's projection of `#[pin] fut: S::Future`, and
+`Service::Future: Future`. find_method's "mutually exclusive searches"
+find methods from an associated type's trait bounds (or an `impl
+Trait`'s traits) only when that type is the receiver or sits under `&`
+or `Box` (get_inner_type). `Future::poll` takes `self: Pin<&mut Self>`,
+and inside `Pin<..>` nothing was found. A plain generic `F: Future`
+works through its bounds, and trait objects already had the deeper
+search (FindDynInner, from patch 0028).
+
+FindDynInner now takes a predicate. The `impl Trait` and associated
+type branches fall back to it when the shallow search finds no target
+(and no generic or other target is there either). For a type found
+under a wrapper, the method's receiver check must give that type as
+`Self`, as for trait objects. `Pin<&mut Wrapper<S::F>>` therefore
+still has no `Tr::go`.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 40af0b5e..28b52496 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -5322,19 +5322,22 @@ bool TraitResolution::find_method(const Span& sp,
+     // Custom receivers (`self: Pin<&mut Self>`, `self: Arc<Self>`) mean the trait object can sit
+     // under wrapper structs the plain Borrow/Box peel can't see - search deeper for one. A false
+     // positive here is harmless: the extracted `Self` must be the found trait object itself.
++    // (Also used for `impl Trait` and associated types below, with the same `Self` check.)
+     struct FindDynInner {
+-        static const ::HIR::TypeRef* find(const HMTypeInferrence& ivars, const ::HIR::TypeRef& t) {
++        typedef bool (*t_is_target)(const ::HIR::TypeRef& ty);
++        static bool is_trait_object(const ::HIR::TypeRef& ty) { return ty.data().is_TraitObject(); }
++        static const ::HIR::TypeRef* find(const HMTypeInferrence& ivars, const ::HIR::TypeRef& t, t_is_target is_target = is_trait_object) {
+             const auto& ty = ivars.get_type(t);
+-            if( ty.data().is_TraitObject() )
++            if( is_target(ty) )
+                 return &ty;
+             if( ty.data().is_Borrow() )
+-                return find(ivars, ty.data().as_Borrow().inner);
++                return find(ivars, ty.data().as_Borrow().inner, is_target);
+             if( ty.data().is_Path() && ty.data().as_Path().binding.is_Struct() )
+             {
+                 if( const auto* pe = ty.data().as_Path().path.m_data.opt_Generic() )
+                 {
+                     if( !pe->m_params.m_types.empty() )
+-                        return find(ivars, pe->m_params.m_types.front());
++                        return find(ivars, pe->m_params.m_types.front(), is_target);
+                 }
+             }
+             return nullptr;
+@@ -5379,8 +5382,23 @@ bool TraitResolution::find_method(const Span& sp,
+     }
+ 
+     // 5. Mutually exclusive searches
+-    // - Erased type - `impl Trait`
+-    if( const auto* ityp = get_inner_type(ty, [](const auto& t){ return t.data().is_ErasedType(); }) )
++    // An `impl Trait` or associated type can also sit under a custom receiver's wrapper, as for trait objects above
++    // (`self: Pin<&mut Self>` methods on `Pin<&mut S::Future>`); found that way, the receiver's `Self` must be it.
++    // - tower 0.5.3 util/oneshot.rs:96: `fut.poll(cx)` on pin-project-lite's `fut: Pin<&mut S::Future>` with
++    //   `Service::Future: Future` -> "No applicable methods for {Pin<&mut <S as Service<Req>>::Future>}.poll"
++    static const auto is_erased = [](const ::HIR::TypeRef& t){ return t.data().is_ErasedType(); };
++    static const auto is_ufcs_known = [](const ::HIR::TypeRef& t){ return t.data().is_Path() && t.data().as_Path().path.m_data.is_UfcsKnown(); };
++    bool inner_under_wrapper = false;
++    auto get_inner_type_or_wrapped = [&](FindDynInner::t_is_target is_target)->const ::HIR::TypeRef* {
++        if( const auto* rv = get_inner_type(ty, is_target) )
++            return rv;
++        if( get_inner_type(ty, [](const auto& t){ return t.data().is_Generic() || t.data().is_ErasedType() || (t.data().is_Path() && t.data().as_Path().path.m_data.is_UfcsKnown()); }) )
++            return nullptr;
++        const auto* rv = FindDynInner::find(this->m_ivars, ty, is_target);
++        inner_under_wrapper = (rv != nullptr);
++        return rv;
++        };
++    if( const auto* ityp = get_inner_type_or_wrapped(is_erased) )
+     {
+         const auto& e = ityp->data().as_ErasedType();
+         for(const auto& trait_path : e.m_traits)
+@@ -5392,7 +5410,8 @@ bool TraitResolution::find_method(const Span& sp,
+             {
+                 DEBUG("- Found trait " << final_trait_path << " (erased type)");
+ 
+-                if(const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access))
++                const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access);
++                if( self_ty_p && (!inner_under_wrapper || *self_ty_p == *ityp) )
+                 {
+                     possibilities.push_back(::std::make_pair(borrow_type, ::HIR::Path(self_ty_p->clone(), mv$(final_trait_path), method_name, {}) ));
+                     DEBUG("++ " << possibilities.back());
+@@ -5406,7 +5425,7 @@ bool TraitResolution::find_method(const Span& sp,
+     {
+     }
+     // UfcsKnown paths: Can have trait bounds added by the definer
+-    else if( const auto* ityp = get_inner_type(ty, [](const auto& t){ return t.data().is_Path() && t.data().as_Path().path.m_data.is_UfcsKnown(); }) )
++    else if( const auto* ityp = get_inner_type_or_wrapped(is_ufcs_known) )
+     {
+         const auto& e = ityp->data().as_Path().path.m_data.as_UfcsKnown();
+         DEBUG("UfcsKnown - Search associated type bounds in trait - " << e.trait);

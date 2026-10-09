@@ -1,0 +1,321 @@
+From 18c890ae3fb27b39d781672d8afce1e942503371 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 03:35:45 +0000
+Subject: [PATCH 159/159] hir_expand: nested coroutines follow the enclosing
+ item's generics
+
+Two failures in closures.cpp's coroutine (async block / generator)
+extraction, both about which generics a coroutine's types name.
+
+1. sad 0.4.32 subprocess.rs, `stream_into(.., writer: impl AsyncWrite,
+   stream: impl Stream)` with `try_unfold(.., |mut s| async { .. })`:
+
+       Lower MIR: common.cpp:688 Type param erased$1/*M:1*/ out of range
+       for (max 0)
+
+   An extracted coroutine nested in a closure or in another coroutine
+   kept its `m_obj_path` and `m_state_data_type` in the generics of the
+   item that defined it. MIR lowering of the enclosing closure or
+   coroutine body, whose own generics are impl-level, then met the
+   method generics. Nested closures already handle this: the enclosing
+   rewrite (ExprVisitor_Mutate / ExprVisitor_GeneratorRewrite) remaps
+   their path, and the type fixup reads the untouched
+   `m_obj_path_base`. Coroutines had neither, so even
+   `async fn f<T>(x: T) -> T { async move { x }.await }` failed.
+   Impl-level generics only worked while the enclosing coroutine
+   happened to number them the same.
+
+   ExprNode_Generator and ExprNode_AsyncBlock get `m_obj_path_base`,
+   set at extraction. The fixup builds their node types from it, and
+   both rewrite visitors remap the path and state type of an extracted
+   nested coroutine.
+
+2. tokio-util 0.7.19 sync/mpsc.rs:78 (ast-grep 0.45.3), in `impl<T>`:
+
+       Self(ReusableBoxFuture::new(async { unreachable!() }))
+
+       closures.cpp:768 get_type would add a new param after freeze - T
+
+   The block's Output (`Result<OwnedPermit<T>, ..>`) names `T` and the
+   body doesn't. The coroutine's generics were frozen, and copied into
+   its structs, before the Output was monomorphised. The async block's
+   Output, and a generator's resume/yield/return types, are now
+   computed before `add_bounds` and the freeze, and reused. They use
+   the closure signature's order, monomorphise and then fix up. 0155
+   fixed up first and then monomorphised, which mapped the paths of
+   nested items twice. The generator's `Yield` associated type now also
+   uses the fixed-up type.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir/expr.hpp            |   6 ++
+ src/hir_expand/closures.cpp | 129 ++++++++++++++++++++++++++----------
+ 2 files changed, 101 insertions(+), 34 deletions(-)
+
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index 3178b743..00ffd9ac 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -925,6 +925,9 @@ struct ExprNode_Generator:
+ 
+     // Generated type information
+     const ::HIR::Struct*    m_obj_ptr = nullptr;
++    // - Path to the generated type in the defining item's generics (as `ExprNode_Closure::m_obj_path_base`):
++    //   an enclosing closure/coroutine rewrites `m_obj_path` (and `m_state_data_type`) into its own generics
++    ::HIR::GenericPath  m_obj_path_base;
+     ::HIR::GenericPath  m_obj_path;
+     // Lifetime for captured borrows, filled by lifetime infer pass
+     ::HIR::LifetimeRef  m_capture_lifetime;
+@@ -992,6 +995,9 @@ struct ExprNode_AsyncBlock
+ 
+     // Generated type information
+     const ::HIR::Struct*    m_obj_ptr = nullptr;
++    // - Path to the generated type in the defining item's generics (as `ExprNode_Closure::m_obj_path_base`):
++    //   an enclosing closure/coroutine rewrites `m_obj_path` (and `m_state_data_type`) into its own generics
++    ::HIR::GenericPath  m_obj_path_base;
+     ::HIR::GenericPath  m_obj_path;
+     // Lifetime for captured borrows, filled by lifetime infer pass
+     ::HIR::LifetimeRef  m_capture_lifetime;
+diff --git a/src/hir_expand/closures.cpp b/src/hir_expand/closures.cpp
+index 23fbdbfa..e8452b5e 100644
+--- a/src/hir_expand/closures.cpp
++++ b/src/hir_expand/closures.cpp
+@@ -238,6 +238,33 @@ namespace {
+                 visit_node_ptr(subnode);
+             }
+         }
++        // A coroutine in the closure body was extracted already: its path and state type name the enclosing item's
++        // generics, which MIR lowering of this closure's body must see as the closure's own
++        // - sad 0.4.32 subprocess.rs `stream_into(.., writer: impl AsyncWrite, stream: impl Stream)`:
++        //   `try_unfold(.., |mut s| async { .. })` -> "Type param erased$1/*M:1*/ out of range" in Lower MIR
++        void visit(::HIR::ExprNode_Generator& node) override
++        {
++            assert( ! node.m_code );
++            visit_type( node.m_return );
++            visit_type( node.m_yield_ty );
++            visit_type( node.m_resume_ty );
++            visit_generic_path( ::HIR::Visitor::PathContext::TYPE, node.m_obj_path );
++            visit_type( node.m_state_data_type );
++            for(auto& subnode : node.m_captures)
++            {
++                visit_node_ptr(subnode);
++            }
++        }
++        void visit(::HIR::ExprNode_AsyncBlock& node) override
++        {
++            assert( ! node.m_code );
++            visit_generic_path( ::HIR::Visitor::PathContext::TYPE, node.m_obj_path );
++            visit_type( node.m_state_data_type );
++            for(auto& subnode : node.m_captures)
++            {
++                visit_node_ptr(subnode);
++            }
++        }
+         void visit(::HIR::ExprNode_Variable& node) override
+         {
+             // 1. Is it a closure-local?
+@@ -498,15 +525,15 @@ namespace {
+                             return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&str) );
+                             }
+                         TU_ARMA(Generator, node_p) {
+-                            DEBUG("Generator: " << node_p->m_obj_path);
+-                            auto path = monomorphiser.monomorph_genericpath(sp, node_p->m_obj_path, false);
++                            DEBUG("Generator: " << node_p->m_obj_path_base);
++                            auto path = monomorphiser.monomorph_genericpath(sp, node_p->m_obj_path_base, false);
+                             const auto& str = *node_p->m_obj_ptr;
+                             DEBUG(ty << " -> " << path);
+                             return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&str) );
+                             }
+                         TU_ARMA(Async, node_p) {
+-                            DEBUG("Async: " << node_p->m_obj_path);
+-                            auto path = monomorphiser.monomorph_genericpath(sp, node_p->m_obj_path, false);
++                            DEBUG("Async: " << node_p->m_obj_path_base);
++                            auto path = monomorphiser.monomorph_genericpath(sp, node_p->m_obj_path_base, false);
+                             const auto& str = *node_p->m_obj_ptr;
+                             DEBUG(ty << " -> " << path);
+                             return ::HIR::TypeRef::new_path( mv$(path), ::HIR::TypePathBinding::make_Struct(&str) );
+@@ -1573,6 +1600,29 @@ namespace {
+                 for(auto& cap : node.m_captures)
+                     visit_node_ptr(cap);
+             }
++            // As for closures: a nested coroutine's path and state type go into this coroutine's generics
++            // - `async fn f<T>(x: T) -> T { async move { x }.await }` -> "Type param T/*M:0*/ out of range" in Lower MIR
++            void visit(::HIR::ExprNode_Generator& node) override
++            {
++                assert(!node.m_code);
++                visit_type(node.m_return);
++                visit_type(node.m_yield_ty);
++                visit_type(node.m_resume_ty);
++                visit_generic_path(::HIR::Visitor::PathContext::TYPE, node.m_obj_path);
++                visit_type(node.m_state_data_type);
++
++                for(auto& cap : node.m_captures)
++                    visit_node_ptr(cap);
++            }
++            void visit(::HIR::ExprNode_AsyncBlock& node) override
++            {
++                assert(!node.m_code);
++                visit_generic_path(::HIR::Visitor::PathContext::TYPE, node.m_obj_path);
++                visit_type(node.m_state_data_type);
++
++                for(auto& cap : node.m_captures)
++                    visit_node_ptr(cap);
++            }
+ 
+             /// Update variable definitions
+             void visit_pattern(const Span& sp, ::HIR::Pattern& pat) override
+@@ -1737,6 +1787,19 @@ namespace {
+                 visitor_rewrite.visit_node_ptr(node.m_code);
+             }
+ 
++            // The coroutine's own types: in its generics, nested closures/coroutines named by their items (as for a closure's
++            // signature: monomorphise, then fix up), and before `params` are copied into the structs and frozen, as they
++            // can name generics the body doesn't (see the async block case)
++            auto resume_ty = monomorph_cb.monomorph_type(sp, node.m_resume_ty);
++            auto yield_ty = monomorph_cb.monomorph_type(sp, node.m_yield_ty);
++            auto return_ty = monomorph_cb.monomorph_type(sp, node.m_return);
++            {
++                ExprVisitor_Fixup   fixup { m_resolve.m_crate, nullptr, monomorph_cb, &m_out };
++                fixup.visit_type( resume_ty );
++                fixup.visit_type( yield_ty );
++                fixup.visit_type( return_ty );
++            }
++
+             monomorph_cb.add_bounds(sp, m_resolve);
+ 
+             // Create state index enum
+@@ -1778,6 +1841,7 @@ namespace {
+             // Mark the object pathname in the closure.
+             node.m_obj_ptr = &gen_struct_ref;
+             node.m_obj_path = ::HIR::GenericPath( gen_struct_path, monomorph_cb.freeze() );
++            node.m_obj_path_base = node.m_obj_path.clone();
+             node.m_captures = std::move(cr_vars.capture_nodes);
+             node.m_state_data_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(state_struct_path, node.m_obj_path.m_params.clone()), &state_struct_ptr->as_Struct() );
+ 
+@@ -1827,27 +1891,19 @@ namespace {
+             // - `self: Pin<&mut {Self}>`
+             fcn_resume.m_args.push_back(std::make_pair( HIR::Pattern(), self_arg_ty.clone() ));
+             if( TARGETVER_LEAST_1_74 ) {
+-                fcn_resume.m_args.push_back(std::make_pair( HIR::Pattern(), monomorph_cb.monomorph_type(sp, node.m_resume_ty) ));
++                fcn_resume.m_args.push_back(std::make_pair( HIR::Pattern(), resume_ty.clone() ));
+             }
+             // - `-> GeneratorState<{Yield},{Return}>`
+             ::HIR::PathParams   ret_params;
+-            // As for an async block: nested closures in the yield/return types are already extracted items
+-            auto yield_ty = node.m_yield_ty.clone();
+-            auto return_ty = node.m_return.clone();
+-            {
+-                ExprVisitor_Fixup   fixup { m_resolve.m_crate, &params, monomorph_cb, &m_out };
+-                fixup.visit_type( yield_ty );
+-                fixup.visit_type( return_ty );
+-            }
+-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, yield_ty) );
+-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, return_ty) );
++            ret_params.m_types.push_back( yield_ty.clone() );
++            ret_params.m_types.push_back( return_ty.clone() );
+             fcn_resume.m_return = ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_GeneratorState, std::move(ret_params)), &m_resolve.m_crate.get_enum_by_path(sp, lang_GeneratorState) );
+             // - ` { ... }`
+             // Emit as a top-level generator
+             // - It has a populated body, non-zero `m_obj_ptr`, and unset `m_obj_path`
+             auto v = ::std::make_unique<::HIR::ExprNode_GeneratorWrapper>(sp, HIR::TypeRef(), mv$(body_node), /*move*/false, /*pinned*/false, /*future*/false);
+-            v->m_yield_ty = monomorph_cb.monomorph_type(sp, yield_ty);
+-            v->m_return   = monomorph_cb.monomorph_type(sp, return_ty);
++            v->m_yield_ty = yield_ty.clone();
++            v->m_return   = return_ty.clone();
+             v->m_capture_usages = std::move(cr_vars.capture_usages);
+             v->m_res_type = fcn_resume.m_return.clone();
+             v->m_obj_ptr = node.m_obj_ptr;
+@@ -1864,11 +1920,11 @@ namespace {
+             ::HIR::TraitImpl    impl;
+             if( TARGETVER_LEAST_1_74 )
+             {
+-                impl.m_trait_args.m_types.push_back( monomorph_cb.monomorph_type(sp, node.m_resume_ty) );
++                impl.m_trait_args.m_types.push_back( std::move(resume_ty) );
+             }
+             impl.m_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(gen_struct_path, params.make_nop_params(0)), &gen_struct_ref );
+-            impl.m_types.insert(std::make_pair( RcString::new_interned("Yield" ), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, node.m_yield_ty) } ));
+-            impl.m_types.insert(std::make_pair( RcString::new_interned("Return"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, monomorph_cb.monomorph_type(sp, return_ty) } ));
++            impl.m_types.insert(std::make_pair( RcString::new_interned("Yield" ), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, std::move(yield_ty) } ));
++            impl.m_types.insert(std::make_pair( RcString::new_interned("Return"), ::HIR::TraitImpl::ImplEnt<HIR::TypeRef> { false, std::move(return_ty) } ));
+             impl.m_methods.insert(std::make_pair( RcString::new_interned("resume"), ::HIR::TraitImpl::ImplEnt<HIR::Function> { false, std::move(fcn_resume) } ));
+             impl.m_params = std::move(params);
+             m_out.trait_impls.push_back(std::make_pair(TARGETVER_LEAST_1_90 ? "coroutine" : "generator", std::move(impl)));
+@@ -1896,6 +1952,20 @@ namespace {
+                 visitor_rewrite.visit_node_ptr(node.m_code);
+             }
+ 
++            // The output type: in the coroutine's generics, with closures/blocks nested in it named by their items (as the
++            // body is below, and as for a closure's signature: monomorphise, then fix up). Before `params` are copied into
++            // the structs and frozen, as it can name generics the body doesn't.
++            // - sad 0.4.32 input.rs: `async fn stream_patch(..) -> impl Stream` returning
++            //   `Either<Once<..>, TryFilterMap<TryUnfold<.., closure, async>, .., closure>>`; awaited in `stream_in` ->
++            //   validate "Type mismatch" between `async[..]`/`closure[..]` in the `poll` Output and the extracted items
++            // - tokio-util 0.7.19 sync/mpsc.rs:78 `Self(ReusableBoxFuture::new(async { unreachable!() }))` in `impl<T>`:
++            //   `Output = Result<OwnedPermit<T>, ..>` -> "get_type would add a new param after freeze - T/*I:0*/"
++            auto output_ty = monomorph_cb.monomorph_type(sp, node.m_return);
++            {
++                ExprVisitor_Fixup   fixup { m_resolve.m_crate, nullptr, monomorph_cb, &m_out };
++                fixup.visit_type( output_ty );
++            }
++
+             monomorph_cb.add_bounds(sp, m_resolve);
+ 
+             // Create state index enum
+@@ -1943,6 +2013,7 @@ namespace {
+             // Mark the object pathname
+             node.m_obj_ptr = &gen_struct_ref;
+             node.m_obj_path = ::HIR::GenericPath( gen_struct_path, monomorph_cb.freeze() );
++            node.m_obj_path_base = node.m_obj_path.clone();
+             node.m_captures = std::move(cr_vars.capture_nodes);
+             node.m_state_data_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(state_struct_path, node.m_obj_path.m_params.clone()), &state_struct_ptr->as_Struct() );
+ 
+@@ -1962,20 +2033,11 @@ namespace {
+                 ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_Context, ::HIR::PathParams(::HIR::LifetimeRef())), &m_resolve.m_crate.get_struct_by_path(sp, lang_Context) )
+             );
+ 
+-            auto return_ty = node.m_return.clone();
+             auto body_node = std::move(node.m_code);
+             {
+                 DEBUG("-- Fixing types in body code");
+                 ExprVisitor_Fixup   fixup { m_resolve.m_crate, &params, monomorph_cb, &m_out };
+                 fixup.visit_node_ptr( body_node );
+-                // The output type too: a closure or async block nested in it was extracted already and must be named
+-                // by its item, as the body is (the closure case does this for its signature).
+-                // - sad 0.4.32 input.rs: `async fn stream_patch(..) -> impl Stream` returning
+-                //   `Either<Once<..>, TryFilterMap<TryUnfold<.., closure, async>, .., closure>>`; awaited in
+-                //   `stream_in` -> validate "Type mismatch" between the `async[..]`/`closure[..]` Output of the
+-                //   coroutine's `poll` and the extracted `future#stream_patch_4`/`closure#stream_patch_5` names
+-                DEBUG("-- Fixing types in the output type");
+-                fixup.visit_type( return_ty );
+             }
+ 
+             // -- Prepare drop impl for later filling
+@@ -2005,14 +2067,14 @@ namespace {
+             fcn_resume.m_args.push_back(std::make_pair( HIR::Pattern(), cr_vars.new_locals[1].clone() ));
+             // - `-> Poll<{Return}>`
+             ::HIR::PathParams   ret_params;
+-            ret_params.m_types.push_back( monomorph_cb.monomorph_type(sp, return_ty) );
++            ret_params.m_types.push_back( output_ty.clone() );
+             auto lang_Poll = m_resolve.m_crate.get_lang_item_path(sp, "Poll");
+             fcn_resume.m_return = ::HIR::TypeRef::new_path( ::HIR::GenericPath(lang_Poll, std::move(ret_params)), &m_resolve.m_crate.get_enum_by_path(sp, lang_Poll) );
+             // - ` { ... }`
+             // Emit as a top-level generator
+             // - It has a populated body, non-zero `m_obj_ptr`, and unset `m_obj_path`
+             auto v = ::std::make_unique<::HIR::ExprNode_GeneratorWrapper>(sp, HIR::TypeRef(), std::move(body_node), false, false, /*future*/true);
+-            v->m_return   = monomorph_cb.monomorph_type(sp, return_ty);
++            v->m_return   = output_ty.clone();
+             v->m_capture_usages = std::move(cr_vars.capture_usages);
+             v->m_res_type = fcn_resume.m_return.clone();
+             v->m_obj_ptr = node.m_obj_ptr;
+@@ -2025,9 +2087,8 @@ namespace {
+ 
+ 
+             // -- Create impl
+-            // The output type goes through `monomorph_cb`, which refers to `params`: before they move into the impl
+-            // - tokio 1.43.0: `async fn lookup_host<T>(host: T) -> io::Result<impl Iterator<..>>` (Output names `T`)
+-            auto output_ty = monomorph_cb.monomorph_type(sp, return_ty);
++            // (`output_ty` was monomorphised above, before the generics moved into the impl: tokio 1.43.0
++            //  `async fn lookup_host<T>(host: T) -> io::Result<impl Iterator<..>>` has an Output naming `T`)
+             ::HIR::TraitImpl    impl;
+             impl.m_params = std::move(params);
+             impl.m_type = ::HIR::TypeRef::new_path( ::HIR::GenericPath(gen_struct_path, impl.m_params.make_nop_params(0)), &gen_struct_ref );

@@ -1,0 +1,162 @@
+From 319bc534789963ab6848211bea5186afda6c2941 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 12:31:33 +0000
+Subject: [PATCH 186/188] resolve: a local item named like a primitive type
+ wins in a `use` path
+
+Resolving a single-segment `use` path checked the builtin type names
+before the module's own items, so `mod f32; pub use f32::*;` imported
+the builtin `f32` and died on the glob: quantette 0.6.0
+quantize/wu/mod.rs:17 (skim 5.7.3) "Wildcard import expanded to
+an invalid item class - TypeAlias".
+
+The walk that already lets a local type-namespace item shadow the
+extern prelude is now a helper and also guards the builtin-type
+fallback, in every edition.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index fc6a0750..9bccf815 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -48,6 +48,60 @@ void Resolve_Use(::AST::Crate& crate)
+     Resolve_Use_Mod(crate, crate.m_root_module, ::AST::Path("", {}));
+ }
+ 
++// Does the module containing this `use` (found by walking `base_path` from the crate root) have a local
++// type-namespace item with this name? Such an item shadows the extern prelude (2018+) and the builtin types.
++// Conservative: if the walk fails for any reason, say no.
++static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name)
++{
++    bool has_local_shadow = false;
++    const AST::Module* cur_mod = &crate.m_root_module;
++    bool walk_ok = true;
++    for( unsigned int i = 0; walk_ok && i < base_path.nodes().size(); i ++ )
++    {
++        const auto& seg_name = base_path.nodes()[i].name();
++        if( seg_name.size() > 0 && seg_name.c_str()[0] == '#' ) {
++            // Anon modules aren't indexed by name - can't safely continue the walk.
++            walk_ok = false;
++            break;
++        }
++        const AST::Module* next_mod = nullptr;
++        for(const auto& item : cur_mod->m_items) {
++            if( item->name == seg_name && item->data.is_Module() ) {
++                next_mod = &item->data.as_Module();
++                break;
++            }
++        }
++        if( !next_mod ) {
++            walk_ok = false;
++            break;
++        }
++        cur_mod = next_mod;
++    }
++    if( walk_ok )
++    {
++        for(const auto& item : cur_mod->m_items) {
++            if( item->name != name )
++                continue;
++            TU_MATCH_HDRA( (item->data), {)
++            default:
++                break;
++            TU_ARMA(Module, i)     { has_local_shadow = true; }
++            TU_ARMA(Crate, i)      { has_local_shadow = true; }
++            TU_ARMA(Struct, i)     { has_local_shadow = true; }
++            TU_ARMA(Enum, i)       { has_local_shadow = true; }
++            TU_ARMA(Union, i)      { has_local_shadow = true; }
++            TU_ARMA(Trait, i)      { has_local_shadow = true; }
++            TU_ARMA(Type, i)       { has_local_shadow = true; }
++            }
++            // Keep scanning on a name match in the value namespace only
++            // (e.g. a `fn core` shouldn't stop a later `mod core` from shadowing)
++            if( has_local_shadow )
++                break;
++        }
++    }
++    return has_local_shadow;
++}
++
+ // - Convert self::/super:: paths into non-canonical absolute forms
+ ::AST::Path Resolve_Use_AbsolutisePath(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path)
+ {
+@@ -70,63 +124,10 @@ void Resolve_Use(::AST::Crate& crate)
+ 
+         // 2018 edition and later: all extern crates are implicitly in the namespace.
+         // - Fun fact: The equivalent logic for non-use is gated on TARGETVER_LEAST_1_29 (but use is still special until 2018)
++        // Local items shadow the extern prelude and the builtin types
++        const auto& name = e.nodes.at(0).name();
++        bool has_local_shadow = Resolve_Use_LocalTypeItemShadows(crate, base_path, name);
+         if( crate.m_edition >= AST::Edition::Rust2018 ) {
+-            const auto& name = e.nodes.at(0).name();
+-
+-            // Local items shadow the extern prelude: if the module containing this `use`
+-            // statement (found by walking `base_path` from the crate root) has a local
+-            // type-namespace item with this name, don't consult the implicit-crate list.
+-            // Be conservative - if the walk fails for any reason, fall through to the
+-            // previous (extern-crate-wins) behaviour.
+-            bool has_local_shadow = false;
+-            {
+-                const AST::Module* cur_mod = &crate.m_root_module;
+-                bool walk_ok = true;
+-                for( unsigned int i = 0; walk_ok && i < base_path.nodes().size(); i ++ )
+-                {
+-                    const auto& seg_name = base_path.nodes()[i].name();
+-                    if( seg_name.size() > 0 && seg_name.c_str()[0] == '#' ) {
+-                        // Anon modules aren't indexed by name - can't safely continue the walk.
+-                        walk_ok = false;
+-                        break;
+-                    }
+-                    const AST::Module* next_mod = nullptr;
+-                    for(const auto& item : cur_mod->m_items) {
+-                        if( item->name == seg_name && item->data.is_Module() ) {
+-                            next_mod = &item->data.as_Module();
+-                            break;
+-                        }
+-                    }
+-                    if( !next_mod ) {
+-                        walk_ok = false;
+-                        break;
+-                    }
+-                    cur_mod = next_mod;
+-                }
+-                if( walk_ok )
+-                {
+-                    for(const auto& item : cur_mod->m_items) {
+-                        if( item->name != name )
+-                            continue;
+-                        TU_MATCH_HDRA( (item->data), {)
+-                        default:
+-                            break;
+-                        TU_ARMA(Module, i)     { has_local_shadow = true; }
+-                        TU_ARMA(Crate, i)      { has_local_shadow = true; }
+-                        TU_ARMA(Struct, i)     { has_local_shadow = true; }
+-                        TU_ARMA(Enum, i)       { has_local_shadow = true; }
+-                        TU_ARMA(Union, i)      { has_local_shadow = true; }
+-                        TU_ARMA(Trait, i)      { has_local_shadow = true; }
+-                        TU_ARMA(Type, i)       { has_local_shadow = true; }
+-                        }
+-                        // Keep scanning on a name match in the value namespace only (e.g. a
+-                        // `fn core` shouldn't stop a later `mod core` from shadowing)
+-                        if( has_local_shadow )
+-                            break;
+-                    }
+-                }
+-            }
+-
+             if( !has_local_shadow )
+             {
+                 auto ec_it = AST::g_implicit_crates.find(name);
+@@ -148,7 +149,9 @@ void Resolve_Use(::AST::Crate& crate)
+         }
+ 
+         // If there's only one node, then check for primitives.
+-        if(path.nodes().size() == 1) {
++        // - A local item of that name is what the path means: quantette 0.6.0 quantize/wu/mod.rs `mod f32; mod u8;
++        //   pub use f32::*; pub use u8::*;` -> "Wildcard import of invalid item type - ::\"#builtins\"::f32"
++        if(path.nodes().size() == 1 && !has_local_shadow) {
+             auto ct = coretype_fromstring(path.nodes()[0].name().c_str());
+             if( ct != CORETYPE_INVAL ) {
+                 DEBUG("Found builtin type for `use` - " << path);

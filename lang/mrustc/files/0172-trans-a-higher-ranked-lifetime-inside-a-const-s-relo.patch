@@ -1,0 +1,71 @@
+From d260317b459d5311aeefcd24f184e23dd756d2fc Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 07:52:04 +0000
+Subject: [PATCH] trans: a higher-ranked lifetime inside a const's relocation
+ passes through enumeration
+
+inquire 0.9.4 src/prompts/select/mod.rs:186 (ast-grep 0.45.3):
+
+    impl<'a, T> Select<'a, T> where T: fmt::Display {
+        pub const DEFAULT_SORTER: Sorter<'a> = &|options: &mut [(usize, i64)]| { .. };
+    }
+    // Sorter<'a> = &'a dyn Fn(&mut [(usize, i64)])
+
+    BUG: hir_typeck/common.cpp:806: Higher-ranked lifetime parameters were not expected (got /*H:0*/)
+
+The const's value points at the hoisted closure and at its vtable
+`<closure as Fn<(&'H0 mut [..],)>>::vtable#`, whose `'H0` is the
+`for<'a>` of `dyn Fn(&mut ..)`. Trans Enumerate walks those relocations
+with the impl's parameters. With any parameter on the impl, even a lone
+lifetime, the paths are monomorphised, and the monomorphiser had no
+binder context for `'H0` (a parameter-less impl skips the monomorph).
+Two places did this:
+
+- Trans_Params::get_lifetime, used through
+  Trans_Enumerate_FillFrom_Literal, now keeps a higher-ranked lifetime
+  as it is (codegen erases lifetimes anyway).
+- enumerate_type_impl's root list for public consts of lifetime-only
+  impls uses a MonomorphStatePtr with an empty higher-ranked parameter
+  list, so `'H0` takes the existing "out of range - passthrough" path.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index 1d365a4b..e50ec204 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -628,10 +628,15 @@ TransList Trans_Enumerate_Public(::HIR::Crate& crate, bool link_named_roots)
+                 if( e.second.publicity.is_global() && !impl.m_params.is_generic() && !e.second.data.m_params.is_generic() )
+                 {
+                     auto pp_method = e.second.data.m_params.make_empty_params(/*allow_lifetimes_only=*/true);
++                    // No higher-ranked params: a `for<'a>` lifetime bound inside a relocation's path (a closure's
++                    // `<closure as Fn<(&'a u8,)>>::vtable#`) passes through (inquire 0.9.4 `const DEFAULT_SORTER`)
++                    static const ::HIR::PathParams  no_hrb_params;
+                     for(const auto& r : e.second.data.m_value_res.relocations) {
+                         if(r.p) {
+                             // Still need to monomorph, as lifetimes aren't counted in `is_generic`
+-                            state.rv.m_roots.push_back( MonomorphStatePtr(nullptr, &impl_params, &pp_method).monomorph_path(Span(), *r.p) );
++                            auto ms = MonomorphStatePtr(nullptr, &impl_params, &pp_method);
++                            ms.pp_hrb = &no_hrb_params;
++                            state.rv.m_roots.push_back( ms.monomorph_path(Span(), *r.p) );
+                         }
+                     }
+                 }
+diff --git a/src/trans/trans_list.hpp b/src/trans/trans_list.hpp
+index 78e2718b..3089ea48 100644
+--- a/src/trans/trans_list.hpp
++++ b/src/trans/trans_list.hpp
+@@ -80,6 +80,12 @@ struct Trans_Params:
+         {
+         case 0: p = &pp_impl;   break;
+         case 1: p = &pp_method; break;
++        // A higher-ranked lifetime is bound inside the path being monomorphised (the `for<'a>` of
++        // `<closure as Fn<(&'a u8,)>>::vtable#`): keep it, as for a path that needs no monomorphising
++        // - inquire 0.9.4 prompts/select/mod.rs: `impl<'a, T> Select<'a, T> { const DEFAULT_SORTER: Sorter<'a> = &|..| ..; }`,
++        //   the const's value enumerated with the impl's (lifetime) params -> "Higher-ranked lifetime parameters were not expected"
++        case ::HIR::GENERIC_Hrtb:
++            return ::HIR::LifetimeRef(g.binding);
+         default:
+             return MonomorphiserPP::get_lifetime(sp, g);
+         }

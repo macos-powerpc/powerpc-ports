@@ -1,0 +1,79 @@
+From 621937d9b4b3e3e5e653780a719a89511f2fd69e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 14:06:24 +0000
+Subject: [PATCH] hir_typeck: an unresolved const argument leaves the impl's
+ param to its bounds
+
+Matching an impl against a request whose const argument is still
+an inference variable recorded that variable as the impl parameter's
+value. A where-clause of the impl that would have fixed it then only
+compared fuzzily, the impl was reported as an exact match, and the
+caller's argument was never inferred:
+
+  trait ColorComponents<Component, const N: usize> { .. }
+  impl<Color, Component, const N: usize> ColorComponents<Component, N>
+      for Color where Color: ArrayCast<Array = [Component; N]> {}
+  fn dither<Color, const N: usize>(..) where Color: ColorComponents<f32, N>
+
+quantette 0.6.0 (skim 5.7.3) api/pipeline.rs:946
+`ditherer.dither_image_to_image(image, color_map)` with `Oklab:
+ArrayCast<Array = [f32; 3]>`: "BUG: expr_cs.cpp:1715: Failure to infer
+Infer(0)".
+
+Such a param is now left to the impl's bounds as a placeholder, which
+bind it (and the copy-back keeps the inference variable when nothing
+binds it); the match is fuzzy, so check_associated's single-impl path
+equates the caller's argument with the resolved value.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 37848cab..ed1f7a42 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -3642,6 +3642,9 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+         Span    sp;
+         HIR::PathParams& out_impl_params;
+     public:
++        /// Value params the request gave as an unresolved ivar: left unset (a placeholder the impl's bounds can
++        /// bind), and used as the fallback when nothing binds them.
++        ::std::vector<::HIR::ConstGeneric>  deferred_values;
+         GetParams(Span sp, HIR::PathParams& out_impl_params):
+             sp(sp),
+             out_impl_params(out_impl_params)
+@@ -3674,6 +3677,17 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+                 ASSERT_BUG(sp, sz.as_Infer().index != ~0u, "");
+             if( out_impl_params.m_values[g.binding] == HIR::ConstGeneric() )
+             {
++                // An unresolved ivar is no value for the param yet. Recording it made a where-clause that would fix
++                // the param only compare fuzzily: `impl<Color, Component, const N: usize> ColorComponents<Component, N>
++                // for Color where Color: ArrayCast<Array = [Component; N]>` asked for `Oklab: ColorComponents<f32, _>`
++                // compared `[f32; _]` with `[f32; 3]` and the method's N stayed uninferred - quantette 0.6.0
++                // api/pipeline.rs:946 `ditherer.dither_image_to_image(image, color_map)`, "Failure to infer Infer(0)".
++                if( sz.is_Infer() ) {
++                    deferred_values.resize(out_impl_params.m_values.size());
++                    deferred_values[g.binding] = sz.clone();
++                    DEBUG("[ftic_check_params] Value param " << g.binding << " = " << sz << " (ivar, left to the bounds)");
++                    return ::HIR::Compare::Equal;
++                }
+                 DEBUG("[ftic_check_params] Value param " << g.binding << " = " << sz);
+                 out_impl_params.m_values[g.binding] = sz.clone();
+                 return ::HIR::Compare::Equal;
+@@ -4131,7 +4145,15 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+     }
+     for(size_t i = 0; i < out_impl_params.m_values.size(); i ++) {
+         if( out_impl_params.m_values[i] == HIR::ConstGeneric() ) {
+-            out_impl_params.m_values[i] = std::move(placeholders.m_values[i]);
++            // A placeholder nothing bound falls back to the ivar the request gave (see GetParams::match_val)
++            bool still_placeholder = placeholders.m_values[i].is_Generic() && placeholders.m_values[i].as_Generic().name == placeholder_name;
++            if( still_placeholder && i < get_params.deferred_values.size() && get_params.deferred_values[i] != HIR::ConstGeneric() ) {
++                DEBUG("Value param " << i << " unbound, keep the request's " << get_params.deferred_values[i]);
++                out_impl_params.m_values[i] = std::move(get_params.deferred_values[i]);
++            }
++            else {
++                out_impl_params.m_values[i] = std::move(placeholders.m_values[i]);
++            }
+         }
+         ASSERT_BUG(sp, out_impl_params.m_values[i] != HIR::ConstGeneric(), "");
+     }

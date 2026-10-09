@@ -1,0 +1,118 @@
+From e53f1159d4715e8e5d8197718df355ea25da9233 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 05:23:21 +0000
+Subject: [PATCH] hir_typeck: an impl whose extra params are only in
+ where-clauses still gives its associated types
+
+tower 0.5.3 util/boxed/sync.rs:68 (ast-grep 0.45.3):
+
+    let inner: Box<dyn Service<T, Response = U, Error = E, Future = BoxFuture<U, E>> + Send> =
+        Box::new(inner.map_future(|f: S::Future| Box::pin(f) as _));
+
+    Spare rule - _Cast {Pin<Box<<S as Service<T>>::Future>>} -> _
+    BUG: expr_cs.cpp: Spare rules left after typecheck stabilised
+
+The closure's return type `_` (the `as _` target) comes from the
+unsizing: `<MapFuture<S, closure> as Service<T>>::Future` must be
+`BoxFuture<U, E>`, and `MapFuture`'s impl
+
+    impl<R, S, F, T, E, Fut> Service<R> for MapFuture<S, F>
+    where S: Service<R>, F: FnMut(S::Future) -> Fut, E: From<S::Error>,
+          Fut: Future<Output = Result<T, E>>
+    { type Future = Fut; .. }
+
+says that is `Fut`, the closure's return type. check_associated found
+this one impl and its answer, but `T` and `E` appear only in the
+where-clauses and stay placeholders until `Fut` is known. With
+placeholders present it only matches them against the impl type, then
+waits ("Magic params present, wait"). None occur there, so it waited
+forever.
+
+When the placeholders appear in none of the output type, the impl type
+and the trait params, the impl is now used like any single impl. Its
+where-clauses are added as bounds as usual, with one fresh ivar per
+placeholder, shared by all bounds (`Fut: Future<Output = Result<_1,
+_2>>`), so they are still checked and pin `T`/`E` later.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index a2cd5009..49e52dc9 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -5886,7 +5886,24 @@ namespace {
+             // - If there are any magic params in the impl, don't use it yet.
+             //  > Ideally, there should be a match_test_generics to resolve the magic impls.
+             DEBUG("> best_impl=" << best_impl);
+-            if( best_impl.has_magic_params() ) {
++            // Magic params that appear only in the impl's where-clauses (not in the output, the impl type or the trait
++            // params) can't be bound by matching the impl, so waiting never ends; the impl still gives the answer, so
++            // use it, with fresh ivars for the placeholders in its bounds (below).
++            // - tower 0.5.3 util/boxed/sync.rs:68 `Box::new(inner.map_future(|f| Box::pin(f) as _))` coerced to
++            //   `Box<dyn Service<.., Future = BoxFuture<U, E>>>`: `impl<R, S, F, T, E, Fut> Service<R> for MapFuture<S, F>
++            //   where F: FnMut(S::Future) -> Fut, Fut: Future<Output = Result<T, E>>` has `type Future = Fut`, with
++            //   `T`/`E` only known once `Fut` is -> "Spare rule - _Cast {..} -> _"
++            bool magic_in_bounds_only = best_impl.has_magic_params()
++                && !type_contains_impl_placeholder(output_type)
++                && !type_contains_impl_placeholder(possible_impl_ty)
++                && ::std::none_of(possible_params.m_types.begin(), possible_params.m_types.end(), type_contains_impl_placeholder)
++                && ::std::none_of(possible_params.m_values.begin(), possible_params.m_values.end(),
++                    [](const HIR::ConstGeneric& v){ return v.is_Generic() && v.as_Generic().is_placeholder(); })
++                ;
++            if( magic_in_bounds_only ) {
++                DEBUG("> Magic params only in the impl's bounds, using it");
++            }
++            if( best_impl.has_magic_params() && !magic_in_bounds_only ) {
+                 // Pick this impl, and evaluate it (expanding the magic params out)
+                 // - Equate `v.impl_ty` and `best_impl`'s type...
+                 //   - We expect an ivar from `v.impl_ty` to be matched against some sort of known type (struct, tuple, array, ...)
+@@ -6020,6 +6037,37 @@ namespace {
+             {
+                 const auto& e = *ep;
+                 assert(e.impl);
++                // The where-clause-only magic params (`magic_in_bounds_only`): one fresh ivar each, shared by all bounds
++                struct PlaceholderIvars: public Monomorphiser
++                {
++                    Context& m_context;
++                    mutable ::std::map<HIR::GenericRef, HIR::TypeRef>    m_types;
++                    mutable ::std::map<HIR::GenericRef, HIR::ConstGeneric>   m_values;
++                    PlaceholderIvars(Context& context): m_context(context) {}
++                    ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& g) const override {
++                        if( !g.is_placeholder() )
++                            return HIR::TypeRef(g);
++                        auto it = m_types.find(g);
++                        if( it == m_types.end() ) {
++                            it = m_types.insert(std::make_pair( g, m_context.m_ivars.new_ivar_tr() )).first;
++                            DEBUG("New type ivar for placeholder " << g << " = " << it->second);
++                        }
++                        return it->second.clone();
++                    }
++                    ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
++                        if( !g.is_placeholder() )
++                            return g;
++                        auto it = m_values.find(g);
++                        if( it == m_values.end() ) {
++                            auto v = ::HIR::ConstGeneric::make_Infer( ::HIR::ConstGeneric::Data_Infer { m_context.m_ivars.new_ivar_val() });
++                            it = m_values.insert(std::make_pair( g, std::move(v) )).first;
++                        }
++                        return it->second.clone();
++                    }
++                    ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
++                        return HIR::LifetimeRef(g.binding);
++                    }
++                } placeholder_ivars { context };
+                 for(const auto& bound : e.impl->m_params.m_bounds )
+                 {
+                     TU_MATCH_HDRA((bound), {)
+@@ -6033,6 +6081,10 @@ namespace {
+                         auto _ = ms.push_hrb(outer_present ? *be.hrtbs : empty_params);
+                         auto b_ty_mono = ms.monomorph_type(sp, be.type);
+                         auto b_tp_mono = ms.monomorph_traitpath(sp, be.trait, true);
++                        if( magic_in_bounds_only ) {
++                            b_ty_mono = placeholder_ivars.monomorph_type(sp, b_ty_mono, true);
++                            b_tp_mono = placeholder_ivars.monomorph_traitpath(sp, b_tp_mono, true);
++                        }
+                         DEBUG("- " << b_ty_mono << " : " << b_tp_mono);
+                         ASSERT_BUG(sp, !outer_present || !static_cast<bool>(b_tp_mono.m_hrtbs), "Two layers of HRTBs not allowed (should have been disallowed in HIR lower)");
+                         auto pp_hrl = outer_present ? be.hrtbs->make_empty_params(true)

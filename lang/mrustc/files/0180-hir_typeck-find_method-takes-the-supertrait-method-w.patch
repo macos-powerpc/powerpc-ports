@@ -1,0 +1,164 @@
+From 7e9da64b8518dd4e3dcec143c7964d31b04c26db Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 09:53:57 +0000
+Subject: [PATCH] hir_typeck: find_method takes the supertrait method whose
+ receiver fits, not the first by name
+
+trait_contains_method returned the first method of that name in the trait or
+its parent traits (sorted by path), and find_method checked the receiver
+only afterwards.  With supertraits sharing a name - `Ord::cmp(&self)` and
+`Iterator::cmp(self)` both under typed-path's `Components<'a>` - it was
+`Ord::cmp` at every autoref level, so the by-value `Iterator::cmp` was never
+seen and the autoref `Ord::cmp` won: typed-path 0.12.3 non_utf8/path.rs:1163
+`self.components().cmp(other.components())` -> "Type mismatch between
+&<T as Encoding>::Components<'_> and <T as Encoding>::Components<'_>".
+
+trait_contains_method takes an optional filter; find_method passes
+a receiver check, so each autoref level finds the method that fits it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 6f399500..49f762a2 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -4142,13 +4142,17 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+ }
+ 
+ namespace {
+-    bool trait_contains_method_inner(const ::HIR::Trait& trait_ptr, const RcString& name,  const ::HIR::Function*& out_fcn_ptr)
++    bool trait_contains_method_inner(const ::HIR::Trait& trait_ptr, const RcString& name,  const ::HIR::Function*& out_fcn_ptr, const TraitResolution::t_cb_method_filter& filter)
+     {
+         auto it = trait_ptr.m_values.find(name);
+         if( it != trait_ptr.m_values.end() )
+         {
+             if( it->second.is_Function() ) {
+                 const auto& v = it->second.as_Function();
++                if( filter && !filter(v) ) {
++                    DEBUG("- Skipping " << name << ": receiver doesn't fit");
++                    return false;
++                }
+                 out_fcn_ptr = &v;
+                 return true;
+             }
+@@ -4157,12 +4161,12 @@ namespace {
+     }
+ }
+ 
+-const ::HIR::Function* TraitResolution::trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const RcString& name,  ::HIR::GenericPath& out_path) const
++const ::HIR::Function* TraitResolution::trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const RcString& name,  ::HIR::GenericPath& out_path, const t_cb_method_filter& filter) const
+ {
+     TRACE_FUNCTION_FR("trait_path=" << trait_path << ",name=" << name, out_path);
+     const ::HIR::Function* rv = nullptr;
+ 
+-    if( trait_contains_method_inner(trait_ptr, name, rv) )
++    if( trait_contains_method_inner(trait_ptr, name, rv, filter) )
+     {
+         assert(rv);
+         out_path = trait_path.clone();
+@@ -4172,7 +4176,7 @@ const ::HIR::Function* TraitResolution::trait_contains_method(const Span& sp, co
+     auto monomorph_cb = MonomorphStatePtr(&self, &trait_path.m_params, nullptr);
+     for(const auto& st : trait_ptr.m_all_parent_traits)
+     {
+-        if( trait_contains_method_inner(*st.m_trait_ptr, name, rv) )
++        if( trait_contains_method_inner(*st.m_trait_ptr, name, rv, filter) )
+         {
+             assert(rv);
+             // TODO: HRLs
+@@ -5122,6 +5126,16 @@ bool TraitResolution::find_method(const Span& sp,
+         return trait_params;
+         };
+ 
++    // Supertraits can share a method name with different receivers (`Ord::cmp(&self)`, `Iterator::cmp(self)`, both
++    // supertraits of typed-path's `Components<'a>`): take the first one whose receiver fits this autoref level, not the
++    // first by name - which (sorted by path, `core::cmp` < `core::iter`) was `Ord::cmp` at every level, so the by-value
++    // `Iterator::cmp` was never seen and the autoref `Ord::cmp` won.
++    // - typed-path 0.12.3 non_utf8/path.rs:1163: `self.components().cmp(other.components())` on
++    //   `<T as Encoding>::Components<'_>` -> "Type mismatch between &<T as Encoding>::Components and ..."
++    t_cb_method_filter receiver_fits = [&](const ::HIR::Function& fcn) {
++        return check_method_receiver(sp, fcn, ty, access) != nullptr;
++        };
++
+     // 1. Search for inherent methods
+     // - Inherent methods are searched first.
+     // TODO: Have a cache of name+receiver_type to a list of types and impls
+@@ -5159,7 +5173,7 @@ bool TraitResolution::find_method(const Span& sp,
+         // 1. Find the named method in the trait.
+         ::HIR::GenericPath final_trait_path;
+         const ::HIR::Function* fcn_ptr;
+-        if( !(fcn_ptr = this->trait_contains_method(sp, e_trait_gp, *e_trait_info.trait_ptr, e_type, method_name,  final_trait_path)) ) {
++        if( !(fcn_ptr = this->trait_contains_method(sp, e_trait_gp, *e_trait_info.trait_ptr, e_type, method_name,  final_trait_path, receiver_fits)) ) {
+             DEBUG("- Method '" << method_name << "' missing");
+             continue ;
+         }
+@@ -5251,7 +5265,7 @@ bool TraitResolution::find_method(const Span& sp,
+     {
+         ::HIR::GenericPath final_trait_path;
+         const ::HIR::Function* fcn_ptr;
+-        if( (fcn_ptr = this->trait_contains_method(sp, *m_current_trait_path, *m_current_trait_ptr, ty, method_name, final_trait_path)) )
++        if( (fcn_ptr = this->trait_contains_method(sp, *m_current_trait_path, *m_current_trait_ptr, ty, method_name, final_trait_path, receiver_fits)) )
+         {
+             DEBUG("- Found trait " << final_trait_path << " (current)");
+             if(const auto* self_ty = check_method_receiver(sp, *fcn_ptr, ty, access))
+@@ -5363,7 +5377,7 @@ bool TraitResolution::find_method(const Span& sp,
+ 
+         bool found_trait_object = false;
+         ::HIR::GenericPath final_trait_path;
+-        if( const auto* fcn_ptr = this->trait_contains_method(sp, e.m_trait.m_path, trait, ::HIR::TypeRef::new_self(), method_name,  final_trait_path) )
++        if( const auto* fcn_ptr = this->trait_contains_method(sp, e.m_trait.m_path, trait, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits) )
+         {
+             DEBUG("- Found trait " << final_trait_path << " (trait object)");
+             // - If the receiver is valid, then it's correct (no need to check the type again)
+@@ -5415,7 +5429,7 @@ bool TraitResolution::find_method(const Span& sp,
+             const auto& trait = this->m_crate.get_trait_by_path(sp, trait_path.m_path.m_path);
+ 
+             ::HIR::GenericPath final_trait_path;
+-            if( const auto* fcn_ptr = this->trait_contains_method(sp, trait_path.m_path, trait, ::HIR::TypeRef::new_self(), method_name,  final_trait_path) )
++            if( const auto* fcn_ptr = this->trait_contains_method(sp, trait_path.m_path, trait, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits) )
+             {
+                 DEBUG("- Found trait " << final_trait_path << " (erased type)");
+ 
+@@ -5457,7 +5471,7 @@ bool TraitResolution::find_method(const Span& sp,
+                 ::HIR::Path( ::HIR::TypeRef::new_self(), bound.m_path.clone(), e.item ),
+                 HIR::TypePathBinding::make_Opaque({})
+                 );
+-            if( const auto* fcn_ptr = this->trait_contains_method(sp, bound.m_path, *bound.m_trait_ptr, ty_self, method_name,  final_trait_path) )
++            if( const auto* fcn_ptr = this->trait_contains_method(sp, bound.m_path, *bound.m_trait_ptr, ty_self, method_name,  final_trait_path, receiver_fits) )
+             {
+                 DEBUG("- Found trait " << final_trait_path << " (UFCS Known, aty bounds)");
+ 
+@@ -5499,7 +5513,7 @@ bool TraitResolution::find_method(const Span& sp,
+             // Found such a bound, now to test if it is useful
+ 
+             ::HIR::GenericPath final_trait_path;
+-            if( const auto* fcn_ptr = this->trait_contains_method(sp, be.trait.m_path, *be.trait.m_trait_ptr, ::HIR::TypeRef::new_self(), method_name,  final_trait_path) )
++            if( const auto* fcn_ptr = this->trait_contains_method(sp, be.trait.m_path, *be.trait.m_trait_ptr, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits) )
+             {
+                 DEBUG("- Found trait " << final_trait_path << " (UFCS Known, trait bounds)");
+ 
+@@ -5534,7 +5548,7 @@ bool TraitResolution::find_method(const Span& sp,
+ 
+         ::HIR::GenericPath final_trait_path;
+         const ::HIR::Function* fcn_ptr;
+-        if( !(fcn_ptr = this->trait_contains_method(sp, *trait_ref.first, *trait_ref.second, ::HIR::TypeRef::new_self(), method_name,  final_trait_path)) )
++        if( !(fcn_ptr = this->trait_contains_method(sp, *trait_ref.first, *trait_ref.second, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits)) )
+             continue ;
+         DEBUG("- Found trait " << final_trait_path << " (in scope)");
+ 
+diff --git a/src/hir_typeck/helpers.hpp b/src/hir_typeck/helpers.hpp
+index 6d9fa468..b2224a99 100644
+--- a/src/hir_typeck/helpers.hpp
++++ b/src/hir_typeck/helpers.hpp
+@@ -326,8 +326,10 @@ public:
+             bool defer_fuzzy_impls = false
+             ) const;
+ 
++    typedef ::std::function<bool(const ::HIR::Function&)>  t_cb_method_filter;
+     /// Locates a named method in a trait, and returns the path of the trait that contains it (with fixed parameters)
+-    const ::HIR::Function* trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const RcString& name,  ::HIR::GenericPath& out_path) const;
++    /// - `filter` (if set) skips methods it rejects, so a later supertrait's method of the same name can be found
++    const ::HIR::Function* trait_contains_method(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const ::HIR::TypeRef& self, const RcString& name,  ::HIR::GenericPath& out_path, const t_cb_method_filter& filter = nullptr) const;
+     bool trait_contains_type(const Span& sp, const ::HIR::GenericPath& trait_path, const ::HIR::Trait& trait_ptr, const char* name,  ::HIR::GenericPath& out_path) const;
+ 
+     ::HIR::Compare type_is_sized(const Span& sp, const ::HIR::TypeRef& ty) const;

@@ -1,0 +1,107 @@
+From 4b65fb09589d1f1a00a19c6777dc84fe0b0ec483 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 09:04:26 +0000
+Subject: [PATCH] mir: a `ref mut` binding keeps its `&mut` type inside a match guard
+
+schemars 1.2.2 src/_private/mod.rs:476-483 (ast-grep 0.45.3):
+
+    if let Some(instance_type) = obj.get_mut("type") {
+        match instance_type {
+            Value::String(string) if string != "null" => { .. }
+
+    MIR ERROR: _private::allow_null: Type mismatch:
+     dst : &&'static mut String
+     src : &&'static String
+
+`string` is a `ref mut` binding (match ergonomics on `&mut Value`), and
+typeck types its uses in the guard as `&mut String`, here
+`PartialEq::ne(&string, ..)`. The guard aliases downgraded every
+`ref`/`ref mut` binding to a shared `&T` borrow. rustc keeps the
+binding's type in a guard and leaves stopping mutation to borrowck.
+
+The alias temporary now borrows with the binding's own kind, in the
+first rule's setup and in the per-rule copies of the guard. Unlike
+a `&T`, the `&mut T` temporary isn't Copy. It lives in a temporary scope
+outside the arm's split (the builder has no drop flags there, see the
+TODOs in new_temporary), so it was dropped where the arms join, also on
+paths that never set it ("Use of non-valid lvalue"). It is only used
+through the guard's `&` to it and has nothing to drop, so it is marked
+moved once that reference is taken. Shared-borrow aliases are
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/mir/from_hir_match.cpp b/src/mir/from_hir_match.cpp
+index 741349a3..4d3046f6 100644
+--- a/src/mir/from_hir_match.cpp
++++ b/src/mir/from_hir_match.cpp
+@@ -431,20 +431,31 @@ void MIR_LowerHIR_Match( MirBuilder& builder, MirConverter& conv, ::HIR::ExprNod
+                 auto val = conv.get_value_for_binding_path(sp, match_ty, match_val, b);
+                 DEBUG("Set alias for: " << *b.binding << " := " << val);
+                 if( b.binding->m_type != ::HIR::PatternBinding::Type::Move ) {
+-                    final_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Shared;
+                     // Not a move binding, still need to borrow but no deref
+                     // - Or, make another temporary for the borrow (no scope needed)
++                    // The borrow keeps the binding's own kind: typeck gave the guard's uses of a `ref mut` binding
++                    // the type `&mut T` (as rustc does; borrowck, not the type, stops mutation in a guard)
++                    // - schemars 1.2.2 _private/mod.rs:483: `Value::String(string) if string != "null"` on a `&mut Value`
++                    //   -> MIR "Type mismatch: &&'static mut String vs &&'static String"
++                    auto bt = final_ty.data().as_Borrow().type;
+                     auto tmp2 = builder.new_temporary(final_ty);
+                     binding_temps_alt[binding_temps.size()] = tmp2.as_Local();
+-                    builder.push_stmt_assign(sp, tmp2.clone(), ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, false, std::move(val) }));
++                    builder.push_stmt_assign(sp, tmp2.clone(), ::MIR::RValue::make_Borrow({ bt, false, std::move(val) }));
+                     val = std::move(tmp2);
+                 }
++                const bool val_is_alt_temp = (b.binding->m_type != ::HIR::PatternBinding::Type::Move);
++                auto alt_temp = val_is_alt_temp ? val.clone() : ::MIR::LValue();
+                 // Allocate a temporary to hold a borrow of that type
+                 auto tmp = builder.new_temporary(::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, std::move(final_ty)));
+                 // - Store the temporary index so later copies can write to it
+                 binding_temps.push_back(tmp.as_Local());
+                 // Assign the temporary with a borrow of the other slot
+                 builder.push_stmt_assign(sp, tmp.clone(), ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, false, std::move(val) }));
++                // A `&mut` temporary (`ref mut` binding) is only used through `tmp`, and isn't `Copy`: nothing to drop, and
++                // its scope (outside this arm's split) would drop it on paths that never set it (other arms)
++                if( val_is_alt_temp ) {
++                    builder.moved_lvalue(sp, alt_temp);
++                }
+                 // And set an alias to point to `*temp`
+                 builder.add_variable_alias(sp, b.binding->m_slot, ::HIR::PatternBinding::Type::Move, ::MIR::LValue::new_Deref(std::move(tmp)));
+             }
+@@ -679,25 +690,32 @@ void MIR_LowerHIR_Match( MirBuilder& builder, MirConverter& conv, ::HIR::ExprNod
+                     DEBUG("Set alias for: " << *b.binding << " := " << val);
+                     if( b.binding->m_type != ::HIR::PatternBinding::Type::Move ) {
+                         MIR::LValue tmp2;
++                        // (the binding's own borrow kind, as for the first rule above)
++                        auto bt = conv.get_binding_type(sp, b.binding->m_slot).data().as_Borrow().type;
+                         if( binding_temps_alt[j] == ~0u ) {
+                             // Not a move binding, still need to borrow but no deref
+                             // - Or, make another temporary for the borrow (no scope needed)
+                             auto final_ty = conv.get_binding_type(sp, b.binding->m_slot).clone();
+-                            final_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Shared;
+                             tmp2 = builder.new_temporary(final_ty);
+                             binding_temps_alt[j] = tmp2.as_Local();
+                         }
+                         else {
+                             tmp2 = ::MIR::LValue::new_Local(binding_temps_alt[j]);
+                         }
+-                        builder.push_stmt_assign(sp, tmp2.clone(), ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, false, std::move(val) }));
++                        builder.push_stmt_assign(sp, tmp2.clone(), ::MIR::RValue::make_Borrow({ bt, false, std::move(val) }));
+                         val = std::move(tmp2);
+                     }
++                    const bool val_is_alt_temp = (b.binding->m_type != ::HIR::PatternBinding::Type::Move);
++                    auto alt_temp = val_is_alt_temp ? val.clone() : ::MIR::LValue();
+                     builder.push_stmt_assign(
+                         sp,
+                         ::MIR::LValue::new_Local(binding_temps[j]),
+                         ::MIR::RValue::make_Borrow({ ::HIR::BorrowType::Shared, false, std::move(val) })
+                     );
++                    // (as for the first rule: the `&mut` temporary needs no drop)
++                    if( val_is_alt_temp ) {
++                        builder.moved_lvalue(sp, alt_temp);
++                    }
+                 }
+                 // Clone the guard contents with updated block references
+                 builder.insert_cloned(sp, guard_code, mapper);

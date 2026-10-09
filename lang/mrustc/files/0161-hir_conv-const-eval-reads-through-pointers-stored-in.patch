@@ -1,0 +1,101 @@
+From ba5dc91cf2157ff5b42746cfc532e25f70a3acc4 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 04:47:06 +0000
+Subject: [PATCH] hir_conv: const eval reads through pointers stored in another
+ static's value
+
+schemars_derive 1.2.2 attr/schemars_to_serde.rs (ast-grep 0.45.3):
+
+    pub(crate) static SERDE_KEYWORDS: &[&str] = &["rename", .., "with"];
+    pub(crate) static SCHEMARS_KEYWORDS_PARSED_BY_SERDE: &[&str] =
+        SERDE_KEYWORDS.split_at(SERDE_KEYWORDS.len() - 2).0;
+
+    Assertion failed: (ofs <= alloc.as_value().size()), function ValueRef,
+    file src/hir_conv/constant_evaluation.cpp, line 568.
+
+Evaluating the second static evaluates `SERDE_KEYWORDS` on demand. Its
+value is `{&lifted#C_0, 21}`, with the array literal hoisted into the
+static `lifted#C_0`. Reading that stored value back, `get_reloc`
+turns each relocation that names a static into a `StaticRef` with no
+data, since it has no evaluator to fetch the value; a dead `TODO`
+after the `return` marks it unfinished. `split_at`'s
+`from_raw_parts(ptr.add(mid), ..)` then derefed a pointer at offset
+19 elements into an allocation of size 0.
+
+The evaluator frame now looks up the value of such a target
+(`reloc_for_read`, through `get_staticref`, which also evaluates
+a static that isn't evaluated yet). It does so wherever it reads through
+a pointer: deref, and the source of `copy_nonoverlapping`,
+`read_via_copy` and `discriminant_value`. Only reads that previously
+saw an empty value change.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index 611c7dfc..ce098f36 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -472,6 +472,7 @@ namespace MIR { namespace eval {
+         }
+ 
+         size_t size() const { return m_encoded ? m_encoded->bytes.size() : 0; }
++        bool has_value() const { return m_encoded != nullptr; }
+         const uint8_t* get_bytes(size_t ofs, size_t len, bool check_mask) const override {
+             if(m_encoded) {
+                 assert(ofs <= m_encoded->bytes.size());
+@@ -1082,6 +1083,19 @@ namespace MIR { namespace eval {
+             return this->resolve.monomorph_expand(this->state.sp, ty, this->ms);
+         }
+ 
++        /// Target of a pointer that is about to be read through. A pointer read out of a static's stored value names
++        /// its target static by path only (`get_reloc` has no evaluator), so look that static's value up here.
++        /// - schemars_derive 1.2.2: `static B: &[&str] = A.split_at(A.len() - 2).0;` with `static A: &[&str] = &[..]`
++        ///   read `A`'s array (`lifted#C_0`) as empty -> "ofs <= alloc.as_value().size()" assert in ValueRef
++        RelocPtr reloc_for_read(const RelocPtr& r) const
++        {
++            if( const auto* sr = r.as_staticref() ) {
++                if( !sr->has_value() ) {
++                    return RelocPtr(get_staticref(sr->path().clone()));
++                }
++            }
++            return r;
++        }
+         StaticRefPtr get_staticref_mono(const ::HIR::Path& p, HIR::TypeRef* out_ty=nullptr) const
+         {
+             // NOTE: Value won't need to be monomorphed, as it shouldn't be generic
+@@ -1269,6 +1283,7 @@ namespace MIR { namespace eval {
+                         metadata = val.slice(Target_GetPointerBits()/8);
+                     }
+                     auto p = val.read_ptr(state);
++                    p.second = reloc_for_read(p.second);
+                     MIR_ASSERT(state, p.first >= EncodedLiteral::PTR_BASE, "Null (<PTR_BASE) pointer deref");
+                     MIR_ASSERT(state, p.first % al == 0, "Unaligned pointer deref");
+                     DEBUG("> " << ValueRef(p.second) << " - o=" << (p.first - EncodedLiteral::PTR_BASE) << " sz=" << sz << " " << *typ);
+@@ -2930,7 +2945,7 @@ namespace HIR {
+                     size_t nbytes = element_size * count.truncate_u64();
+                     MIR_ASSERT(state, ptr_src.first >= EncodedLiteral::PTR_BASE, "");
+                     MIR_ASSERT(state, ptr_dst.first >= EncodedLiteral::PTR_BASE, "");
+-                    auto vr_src = ValueRef(ptr_src.second, ptr_src.first - EncodedLiteral::PTR_BASE).slice(0, nbytes);
++                    auto vr_src = ValueRef(local_state.reloc_for_read(ptr_src.second), ptr_src.first - EncodedLiteral::PTR_BASE).slice(0, nbytes);
+                     auto vr_dst = ValueRef(ptr_dst.second, ptr_dst.first - EncodedLiteral::PTR_BASE).slice(0, nbytes);
+                     vr_dst.copy_from(state, vr_src);
+                 }
+@@ -3014,7 +3029,7 @@ namespace HIR {
+                 // Innards of `core::ptr::read` (on 1.90+)
+                 else if( te->name == "read_via_copy" ) {
+                     auto ptr_src = local_state.read_param_ptr(e.args.at(0));
+-                    auto vr_src = ValueRef(ptr_src.second, ptr_src.first - EncodedLiteral::PTR_BASE);
++                    auto vr_src = ValueRef(local_state.reloc_for_read(ptr_src.second), ptr_src.first - EncodedLiteral::PTR_BASE);
+                     dst.copy_from(state, vr_src);
+                 }
+                 else if( te->name == "variant_count" ) {
+@@ -3104,7 +3119,7 @@ namespace HIR {
+                     auto ty = local_state.monomorph_expand(te->params.m_types.at(0));
+                     auto ptr_src = local_state.read_param_ptr(e.args.at(0));
+                     MIR_ASSERT(state, ptr_src.second && ptr_src.first >= EncodedLiteral::PTR_BASE, "`discriminant_value` of an invalid pointer");
+-                    auto lit = ValueRef(ptr_src.second, ptr_src.first - EncodedLiteral::PTR_BASE);
++                    auto lit = ValueRef(local_state.reloc_for_read(ptr_src.second), ptr_src.first - EncodedLiteral::PTR_BASE);
+                     // Result type is `<T as DiscriminantKind>::Discriminant` (`isize`, or the enum's `repr` type)
+                     HIR::TypeRef    tmp;
+                     const auto& ret_ty = state.get_lvalue_type(tmp, e.ret_val);

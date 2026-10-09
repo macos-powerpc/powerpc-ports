@@ -1,0 +1,175 @@
+From 95c091da7ac40cc811b76bb5fde46d14a1376dd3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 9 Oct 2026 20:28:03 +0000
+Subject: [PATCH] hir_expand: a closure that moves a captured `&mut` without a reborrow
+ captures it by value
+
+The closure capture analysis assumes that moving a `&mut` is turned into
+a reborrow by the later reborrow pass, so such a capture only needs a
+unique borrow and the closure is FnMut. The reborrow pass only covers
+coercion sites (call arguments, an annotated `let`, returns, struct and
+tuple fields, match arm values); a `let` without a type, a block tail in
+one, or a match scrutinee keeps moving the value. The move then came out
+of `*self.N` and MIR lowering failed:
+
+  security-framework 3.7.0 secure_transport.rs:821 (tombi):
+    let ret = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut data = data;
+        while !data.is_empty() { .. data = rest; read += len; .. }
+        ..
+    }))
+
+  secure_transport.rs:821:1 error:0: Attempting to move out of invalid slot - a0*.2*
+
+Such a use now keeps its Move usage for the capture: the variable is
+captured by value and the closure (or async block) is FnOnce, as in
+rustc. Uses at reborrow sites are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+diff --git a/src/hir_expand/annotate_value_usage.cpp b/src/hir_expand/annotate_value_usage.cpp
+index 11613a3e..456111bb 100644
+--- a/src/hir_expand/annotate_value_usage.cpp
++++ b/src/hir_expand/annotate_value_usage.cpp
+@@ -81,6 +81,8 @@ namespace {
+         ::std::vector< Scope> m_closure_stack;
+         /// Disable the capture logic in `ExprNode_Variable` (as the variable was captured using a field access)
+         bool    m_ignore_variable_capture;
++        /// Values moved where the reborrow pass inserts no `&mut *` (see `add_unreborrowed_values`)
++        ::std::vector<const ::HIR::ExprNode*>   m_unreborrowed_values;
+ 
+ 
+         struct UsageGuard
+@@ -260,12 +262,36 @@ namespace {
+                 DEBUG("await stack=[" << scope->yield_stack << "]");
+             }
+         }
++        /// A captured `&mut` that is moved is normally reborrowed by the reborrow pass, so the capture only needs a unique
++        /// borrow (`get_real_usage`). That pass leaves `let x = v;` (no type written) and a match scrutinee alone, so
++        /// there the variable really moves and must be captured by value (making the closure `FnOnce`, as in rustc).
++        /// Record the nodes such a site takes by value, through block tails (`if`/`match` arm values are reborrowed).
++        /// - security-framework 3.7.0 secure_transport.rs:821 `catch_unwind(AssertUnwindSafe(|| { let mut data = data;
++        ///   .. }))` (tombi): "Attempting to move out of invalid slot - a0*.2*"
++        void add_unreborrowed_values(const ::HIR::ExprNode* node)
++        {
++            if( const auto* b = dynamic_cast<const ::HIR::ExprNode_Block*>(node) ) {
++                if( b->m_value_node )
++                    add_unreborrowed_values(b->m_value_node.get());
++            }
++            else {
++                m_unreborrowed_values.push_back(node);
++            }
++        }
++        bool is_unreborrowed_value(const ::HIR::ExprNode& node) const {
++            return ::std::find(m_unreborrowed_values.begin(), m_unreborrowed_values.end(), &node) != m_unreborrowed_values.end();
++        }
++
+         void visit(::HIR::ExprNode_Let& node) override
+         {
+             add_defs_from_pattern(node.span(), node.m_pattern);
+             if( node.m_value )
+             {
+-                auto _ = this->push_usage( this->get_usage_for_pattern(node.span(), node.m_pattern, node.m_type) );
++                auto vu = this->get_usage_for_pattern(node.span(), node.m_pattern, node.m_type);
++                if( vu == ::HIR::ValueUsage::Move && !node.m_type_annotated && !m_closure_stack.empty() ) {
++                    add_unreborrowed_values(node.m_value.get());
++                }
++                auto _ = this->push_usage( vu );
+                 this->visit_node_ptr( node.m_value );
+             }
+         }
+@@ -343,6 +369,9 @@ namespace {
+                     DEBUG("No value usage for pattern arms (no arms?), default to borrow");
+                     vu = ::HIR::ValueUsage::Borrow;
+                 }
++                if( vu == ::HIR::ValueUsage::Move && !m_closure_stack.empty() ) {
++                    add_unreborrowed_values(node.m_value.get());
++                }
+                 auto _ = this->push_usage( vu );
+                 this->visit_node_ptr( node.m_value );
+             }
+@@ -526,7 +555,7 @@ namespace {
+                     if( auto* inner_var = dynamic_cast<::HIR::ExprNode_Variable*>(inner) ) {
+                         std::reverse(fields.begin(), fields.end());
+ 
+-                        mark_used_variable(node.span(), inner_var->m_slot, fields, this->get_usage());
++                        mark_used_variable(node.span(), inner_var->m_slot, fields, this->get_usage(), !is_unreborrowed_value(node));
+ 
+                         m_ignore_variable_capture = true;
+                     }
+@@ -658,7 +687,7 @@ namespace {
+             DEBUG("_Variable: #" << node.m_slot << " '" << node.m_name << "' " << node.m_usage);
+             if( !m_closure_stack.empty() && !m_ignore_variable_capture )
+             {
+-                mark_used_variable(node.span(), node.m_slot, {}, node.m_usage);
++                mark_used_variable(node.span(), node.m_slot, {}, node.m_usage, !is_unreborrowed_value(node));
+             }
+         }
+         void visit(::HIR::ExprNode_ConstParam& node) override
+@@ -1149,7 +1178,8 @@ namespace {
+ 
+         // --- Closure/generator usage tracking ---
+         /// Update usage depending on the type
+-        ::HIR::ValueUsage get_real_usage(const Span& sp, unsigned slot, const std::vector<RcString>& fields, ::HIR::ValueUsage usage)
++        /// `reborrowed`: false when the reborrow pass will leave this use as a move (`add_unreborrowed_values`)
++        ::HIR::ValueUsage get_real_usage(const Span& sp, unsigned slot, const std::vector<RcString>& fields, ::HIR::ValueUsage usage, bool reborrowed)
+         {
+             // If the usage is move, update it depending on the type
+             if( usage == ::HIR::ValueUsage::Move )
+@@ -1167,7 +1197,7 @@ namespace {
+                 }
+                 // `&mut` types get re-borrowed
+                 // - The reborrow pass is AFTER this pass
+-                else if( ty->data().is_Borrow() && ty->data().as_Borrow().type == ::HIR::BorrowType::Unique ) {
++                else if( reborrowed && ty->data().is_Borrow() && ty->data().as_Borrow().type == ::HIR::BorrowType::Unique ) {
+                     usage = ::HIR::ValueUsage::Mutate;
+                 }
+                 else {
+@@ -1175,7 +1205,7 @@ namespace {
+             }
+             return usage;
+         }
+-        void mark_used_variable_closure(const Span& sp, ClosureScope& closure_rec, unsigned slot, std::vector<RcString> fields, ::HIR::ValueUsage usage)
++        void mark_used_variable_closure(const Span& sp, ClosureScope& closure_rec, unsigned slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed)
+         {
+             DEBUG("(" << slot << ", [" << fields << "], usage=" << usage << ")");
+             const auto& closure_defs = closure_rec.local_vars;
+@@ -1185,7 +1215,7 @@ namespace {
+                 // Ignore, this is local to the current closure
+                 return ;
+             }
+-            usage = get_real_usage(sp, slot, fields, usage);
++            usage = get_real_usage(sp, slot, fields, usage, reborrowed);
+ 
+             HIR::ExprNode_Closure::AvuCache::Capture    new_ent;
+             new_ent.root_slot = slot;
+@@ -1282,24 +1312,24 @@ namespace {
+             }
+             DEBUG("Captured " << slot << " - " << m_variable_types.at(slot) << " :: " << cap_type_name);
+         }
+-        void mark_used_variable_generator(const Span& sp, CoroutineScope& scope, unsigned int slot, std::vector<RcString> fields, ::HIR::ValueUsage usage)
++        void mark_used_variable_generator(const Span& sp, CoroutineScope& scope, unsigned int slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed)
+         {
+             auto& e = scope.used_variables[slot];
+             e.last_used_stack = scope.yield_stack;
+-            e.usage = std::max(e.usage, get_real_usage(sp, slot, fields, usage));
++            e.usage = std::max(e.usage, get_real_usage(sp, slot, fields, usage, reborrowed));
+             DEBUG("Used #" << slot << " :: stack=[" << e.last_used_stack << "]");
+         }
+-        void mark_used_variable(const Span& sp, unsigned int slot, std::vector<RcString> fields, ::HIR::ValueUsage usage)
++        void mark_used_variable(const Span& sp, unsigned int slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed=true)
+         {
+             assert(m_closure_stack.size() > 0);
+             auto& ent = m_closure_stack.back();
+             TU_MATCH_HDRA( (ent), {)
+             TU_ARMA(None, e) throw "";
+             TU_ARMA(Closure, e) {
+-                mark_used_variable_closure(sp, e, slot, fields, usage);
++                mark_used_variable_closure(sp, e, slot, fields, usage, reborrowed);
+                 }
+             TU_ARMA(Coroutine, e) {
+-                mark_used_variable_generator(sp, e, slot, fields, usage);
++                mark_used_variable_generator(sp, e, slot, fields, usage, reborrowed);
+                 }
+             }
+         }
