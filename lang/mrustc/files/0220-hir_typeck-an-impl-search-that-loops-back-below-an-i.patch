@@ -1,0 +1,106 @@
+From ef4c1a6e877818c4894ea4164e5edc3e4312b82b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 04:26:46 +0000
+Subject: [PATCH] hir_typeck: an impl search that loops back below an impl
+ bound leaves that bound fuzzy
+
+find_trait_impls_crate throws RecursionDetected when the same request is
+already on its stack twice. Only find_method and check_associated caught it
+(defer / assume the method exists); the associated-type expansion run from
+equate_types did not. phf_generator 0.11.3 (ani-cli-rs 0.11.0):
+
+    SmallRng::seed_from_u64(FIXED_SEED)
+        .sample_iter(Standard)
+        .find(|key| { .. hash_fn(entry, key) .. })
+
+expands `<DistIter<Standard, SmallRng, _> as Iterator>::Item` while the sample
+type is still an ivar. The impl's bound `Standard: Distribution<_>` reaches
+rand 0.8's `impl<A> Distribution<(A,)> for Standard where Standard:
+Distribution<A>`, whose bound reaches it again:
+
+    terminate called after throwing an instance of 'TraitResolution::RecursionDetected'
+
+Deferring the expansion would not help either: the ivar is only learnt
+through the single DistIter impl. rustc treats such a cycle as ambiguous.
+ftic_check_params now runs a bound's impl search through ftic_bound_search:
+the outermost bound search catches the recursion and the bound counts as
+a fuzzy match that binds no placeholders, so the impl is a (single) fuzzy
+candidate and `Item` expands to the ivar. Inner bound searches let it
+unwind: catching at every depth re-runs the search for each of rand's ~110
+recursive bounds (tuples, arrays, Option, Wrapping) at every level.
+
+The same crash hit `let v = rng.gen(); use_u64(v);` in any rand 0.8 user.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_typeck/helpers.cpp | 43 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 80328b73..1bdf6e2c 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -3629,6 +3629,33 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+     throw "";
+ }
+ 
++namespace {
++    /// Nesting depth of the impl searches run for impl bounds by `ftic_check_params`
++    unsigned s_ftic_bound_depth = 0;
++    /// Run the impl search for an impl bound. A recursive search (`find_trait_impls_crate` throws RecursionDetected)
++    /// unwinds to the outermost bound search, which returns false with `recursed` set.
++    /// - Catching at every depth would re-run the search for each recursive impl at every level, e.g. the ~110 bounds
++    ///   of rand's `Standard: Distribution<(A, ..)>`/`<[T; N]>`/`<Option<T>>` impls.
++    template<typename F>
++    bool ftic_bound_search(bool& recursed, F search)
++    {
++        struct Guard {
++            Guard() { s_ftic_bound_depth += 1; }
++            ~Guard() { s_ftic_bound_depth -= 1; }
++        };
++        try {
++            Guard   g;
++            return search();
++        }
++        catch(const TraitResolution::RecursionDetected& ) {
++            if( s_ftic_bound_depth > 0 )
++                throw;
++            recursed = true;
++            return false;
++        }
++    }
++}
++
+ ::HIR::Compare TraitResolution::ftic_check_params(const Span& sp, const ::HIR::SimplePath& trait,
+     const ::HIR::PathParams* params_ptr, const ::HIR::TypeRef& type,
+     const ::HIR::GenericParams& impl_params_def, const ::HIR::PathParams& impl_trait_args, const ::HIR::TypeRef& impl_ty,
+@@ -3999,7 +4026,8 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+                 ::HIR::PathParams fuzzy_ph;
+                 unsigned num_fuzzy = 0;     //!< Number of detected fuzzy impls
+                 bool fuzzy_compatible = true;   //!< Indicates that the `fuzzy_ph` applies to all detected fuzzy impls
+-                auto rv = this->find_trait_impls(sp, real_trait_path.m_path, real_trait_path.m_params, real_type, [&](auto impl, auto impl_cmp) {
++                bool recursed = false;
++                auto rv = ftic_bound_search(recursed, [&]{ return this->find_trait_impls(sp, real_trait_path.m_path, real_trait_path.m_params, real_type, [&](auto impl, auto impl_cmp) {
+                     // TODO: Save and restore placeholders if this isn't a full match
+                     DEBUG("[ftic_check_params] impl_cmp = " << impl_cmp << ", impl = " << impl);
+                     auto cmp = impl_cmp;
+@@ -4103,7 +4131,18 @@ bool TraitResolution::find_trait_impls_crate(const Span& sp,
+                     }
+                     // If the match isn't a concrete equal, return false (to keep searching)
+                     return (cmp == ::HIR::Compare::Equal);
+-                    });
++                    }); });
++                // The search looped back on itself below this bound: it can't be decided yet (rustc treats the cycle
++                // as ambiguous), so the bound is fuzzy and the partial search binds no placeholders.
++                // - phf_generator 0.11.3: `<DistIter<Standard, SmallRng, _> as Iterator>::Item` checks the impl's
++                //   `Standard: Distribution<_>`, which recursed through rand's `Distribution<(A,)>` impl ->
++                //   "terminate called after throwing an instance of 'TraitResolution::RecursionDetected'"
++                if( recursed ) {
++                    DEBUG("- Bound " << real_type << " : " << real_trait_path << " recursed, assuming fuzzy");
++                    found_fuzzy_match = true;
++                    num_fuzzy = 0;
++                    placeholders = saved_ph.clone();
++                }
+                 if( rv ) {
+                     DEBUG("- Bound " << real_type << " : " << real_trait_path << " matched");
+                 }

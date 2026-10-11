@@ -1,0 +1,624 @@
+From 6761a44829a0a2fb41b44b49e48d8779652fe818 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 02:36:40 +0000
+Subject: [PATCH 216/217] hir/from_ast: exported macros turn `:pat`, `:item`
+ and any `:ty` fragment back into tokens
+
+Following 0213 (expressions, blocks, statements), the remaining fragments
+a `macro_rules!` that another macro defines can hold. Patterns and items have no
+re-lexable printer; the proc-macro input visitor already writes both (every
+derive and attribute macro input goes through it), so it now writes to
+a `TokenSink`: `ProcMacroInv` (unchanged protocol) or a `TokenCollector` that
+makes mrustc tokens. `ProcMacro_PatternTokens`/`_TypeTokens`/`_ItemTokens`
+expose it to HIR lowering. A top-level or-pattern is parenthesised, as the
+fragment was one pattern. Types other than paths (which stay as 0076 wrote
+them) go the same way: `[u32; 3]` hit "TODO: emit_type - Convert interpolated
+macro fragment".
+
+All fragments written out for one macro now share one hygiene scope (the
+re-lexed ones each had their own), so `$p => $e` with `$p:pat` binding a name
+that `$e:expr` uses resolves, as the fragments of one invocation do in rustc.
+
+Needed on the way:
+- `Token::clone` of an `:item` fragment was a TODO, hit when the definition of
+  the inner macro is parsed from its token tree; and `AST::Item::clone` had no
+  `impl`, negative impl, macro invocation or extern block (the clone functions
+  existed for the last two). Modules (and macro 2.0 items) still can't be
+  cloned, so a `mod` in such a fragment still hits that TODO.
+- the visitor now writes static/const, type alias, macro invocation (as
+  `path! { .. }`), `extern crate` and inline module items, `:meta` fragments,
+  and primitive types (were TODOs); a pattern macro was written without its
+  delimiters (`m ! x`), now `m!(x)`; `impl A + 'a` had a doubled `+`.
+- `cfg_attr` is written as is for these tokens (the visitor evaluates it for
+  proc macros, which would apply the defining crate's cfgs).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/ast/ast.cpp           |  24 ++++-
+ src/expand/proc_macro.cpp | 213 ++++++++++++++++++++++++++++++++++----
+ src/expand/proc_macro.hpp |   6 ++
+ src/hir/from_ast.cpp      |  52 ++++++++--
+ src/parse/token.cpp       |   9 +-
+ 5 files changed, 269 insertions(+), 35 deletions(-)
+
+diff --git a/src/ast/ast.cpp b/src/ast/ast.cpp
+index 3cb4bc5c..effd32e9 100644
+--- a/src/ast/ast.cpp
++++ b/src/ast/ast.cpp
+@@ -470,6 +470,17 @@ void Module::add_macro(bool is_exported, RcString name, MacroRulesPtr macro) {
+         ) );
+ }
+ 
++namespace {
++    ImplDef clone_impl_def(const ImplDef& d)
++    {
++        ImplDef rv { d.params().clone(), Spanned<Path> { d.trait().sp, d.trait().ent }, d.type().clone() };
++        if( d.is_unsafe() )
++            rv.set_is_unsafe();
++        return rv;
++    }
++}
++// NOTE: An item in an interpolated `$i:item` fragment is cloned each time a token stream holding it is read (e.g. a
++// `macro_rules!` that a macro defines, with `$i` in its body)
+ Item Item::clone() const
+ {
+     TU_MATCHA( (*this), (e),
+@@ -477,7 +488,7 @@ Item Item::clone() const
+         return Item(e);
+         ),
+     (MacroInv,
+-        TODO(Span(), "Clone on Item::MacroInv");
++        return AST::Item(e.clone());
+         ),
+     (Macro,
+         TODO(Span(), "Clone on Item::Macro");
+@@ -486,16 +497,21 @@ Item Item::clone() const
+         return Item(e.clone());
+         ),
+     (ExternBlock,
+-        TODO(Span(), "Clone on Item::" << this->tag_str());
++        return AST::Item(e.clone());
+         ),
+     (GlobalAsm,
+         TODO(Span(), "Clone on Item::" << this->tag_str());
+         ),
+     (Impl,
+-        TODO(Span(), "Clone on Item::" << this->tag_str());
++        Impl rv { clone_impl_def(e.def()) };
++        for(const auto& i : e.items()) {
++            rv.items().push_back(Impl::ImplItem { i.sp, i.attrs.clone(), i.vis, i.is_specialisable, i.name,
++                ::std::unique_ptr<Item>(new Item(i.data->clone())) });
++        }
++        return AST::Item(mv$(rv));
+         ),
+     (NegImpl,
+-        TODO(Span(), "Clone on Item::" << this->tag_str());
++        return AST::Item(clone_impl_def(e));
+         ),
+     (Module,
+         TODO(Span(), "Clone on Item::" << this->tag_str());
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 08fbac39..2bdc4c1f 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -228,8 +228,28 @@ enum class FragType
+     Block = 6,
+     Pattern = 7,
+ };
++/// Where `Visitor` writes the tokens of AST nodes: a proc macro's input, or a token list (`ProcMacro_*Tokens`)
++struct TokenSink
++{
++    virtual ~TokenSink() = default;
++    virtual void send_symbol(const char* val) = 0;
++    virtual void send_rword(const char* val) = 0;
++    virtual void send_ident(const char* val) = 0;
++    void send_ident(const Ident& val) { send_ident(val.name.c_str()); }
++    virtual void send_dollar_crate(const ::std::string& crate_name) = 0;
++    virtual void send_lifetime(const char* val) = 0;
++    virtual void send_string(const ::std::string& s) = 0;
++    virtual void send_bytestring(const ::std::string& s) = 0;
++    virtual void send_suffix(const RcString& s) = 0;
++    virtual void send_char(uint32_t ch) = 0;
++    virtual void send_int(eCoreType ct, U128 v) = 0;
++    virtual void send_float(eCoreType ct, double v) = 0;
++    /// An attribute the receiver claims (a derive's helper attributes), sent even when attributes in general aren't
++    virtual bool attr_is_used(const RcString& n) const = 0;
++};
+ struct ProcMacroInv:
+-    public TokenStream
++    public TokenStream,
++    public TokenSink
+ {
+     Span    m_parent_span;
+     Span    m_this_span;
+@@ -281,15 +301,15 @@ public:
+         m_dump_file_out.flush();
+         DEBUG("Input tokens sent");
+     }
+-    void send_symbol(const char* val) {
++    void send_symbol(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Symbol));
+         this->send_bytes(val, ::std::strlen(val));
+     }
+-    void send_rword(const char* val) {
++    void send_rword(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Ident));
+         this->send_bytes(val, ::std::strlen(val));
+     }
+-    void send_ident(const char* val) {
++    void send_ident(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Ident));
+         if( Lex_FindReservedWord(val, m_edition) != TOK_NULL ) {
+             auto size = ::std::strlen(val);
+@@ -305,7 +325,7 @@ public:
+         send_ident(val.name.c_str());
+     }
+     /// `$crate` naming another crate (`::"<crate>"` in a macro_rules expansion), mapped back on the way out
+-    void send_dollar_crate(const ::std::string& crate_name) {
++    void send_dollar_crate(const ::std::string& crate_name) override {
+         if( m_dollar_crate == "" ) {
+             m_dollar_crate = crate_name;
+         }
+@@ -315,29 +335,29 @@ public:
+         this->send_u8(static_cast<uint8_t>(TokenClass::Ident));
+         this->send_bytes("$crate", 6);
+     }
+-    void send_lifetime(const char* val) {
++    void send_lifetime(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Lifetime));
+         this->send_bytes(val, ::std::strlen(val));
+     }
+-    void send_string(const ::std::string& s) {
++    void send_string(const ::std::string& s) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::String));
+         this->send_bytes(s.data(), s.size());
+     }
+-    void send_bytestring(const ::std::string& s) {
++    void send_bytestring(const ::std::string& s) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::ByteString));
+         this->send_bytes(s.data(), s.size());
+     }
+-    void send_suffix(const RcString& s) {
++    void send_suffix(const RcString& s) override {
+         if( s.size() > 0 ) {
+             this->send_u8(static_cast<uint8_t>(TokenClass::Suffix));
+             this->send_bytes(s.c_str(), s.size());
+         }
+     }
+-    void send_char(uint32_t ch) {
++    void send_char(uint32_t ch) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::CharLit));
+         this->send_v128u(ch);
+     }
+-    void send_int(eCoreType ct, U128 v) {
++    void send_int(eCoreType ct, U128 v) override {
+         uint8_t size;
+         switch(ct)
+         {
+@@ -367,7 +387,7 @@ public:
+         }
+         this->send_v128u(v);
+     }
+-    void send_float(eCoreType ct, double v) {
++    void send_float(eCoreType ct, double v) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Float));
+         switch(ct)
+         {
+@@ -405,7 +425,7 @@ public:
+         }
+     }
+ 
+-    bool attr_is_used(const RcString& n) const {
++    bool attr_is_used(const RcString& n) const override {
+         if( n == "repr" )
+             return true;
+         return ::std::find(m_proc_macro_desc.attributes.begin(), m_proc_macro_desc.attributes.end(), n) != m_proc_macro_desc.attributes.end();
+@@ -488,13 +508,15 @@ namespace {
+     struct Visitor
+     {
+         const Span& sp;
+-        ProcMacroInv&   m_pmi;
++        TokenSink&  m_pmi;
+         bool emit_all_attrs;
+         /// The attribute macro being expanded (not part of its own input)
+         const ::AST::Attribute* invoking_attr = nullptr;
+         /// Input for a derive macro (which never sees `#[derive]` attributes)
+         bool is_derive_input = false;
+-        Visitor(const Span& sp, ProcMacroInv& pmi):
++        /// Send `#[cfg_attr]` as written, not evaluated here (tokens written back into a `macro_rules!` body)
++        bool raw_cfg_attr = false;
++        Visitor(const Span& sp, TokenSink& pmi):
+             sp(sp),
+             m_pmi(pmi)
+             //,emit_all_attrs(false)
+@@ -533,6 +555,8 @@ namespace {
+                 visit_node( const_cast<::Token&>(tok).frag_node() );
+                 break;
+             case TOK_INTERPOLATED_META:
++                visit_meta_item(const_cast<::Token&>(tok).frag_meta());
++                break;
+             case TOK_INTERPOLATED_ITEM:
+             case TOK_INTERPOLATED_VIS:
+                 TODO(sp, "TOK_INTERPOLATED_...");
+@@ -739,7 +763,10 @@ namespace {
+             TU_ARMA(Macro, e) {
+                 this->visit_path(e.inv->path(), /*is_expr=*/true);
+                 m_pmi.send_symbol("!");
++                // The invocation keeps its input without the delimiters
++                m_pmi.send_symbol("(");
+                 this->visit_tokentree(e.inv->input_tt());
++                m_pmi.send_symbol(")");
+                 }
+             TU_ARMA(Box, e) {
+                 m_pmi.send_rword("box");
+@@ -958,7 +985,7 @@ namespace {
+                 m_pmi.send_symbol(")");
+                 ),
+             (Primitive,
+-                TODO(sp, "proc_macro send primitive - " << ty);
++                m_pmi.send_ident(coretype_name(te.core_type));
+                 ),
+             (Function,
+                 ::std::stringstream ss;
+@@ -1060,7 +1087,6 @@ namespace {
+                 for(const auto& lft : te->lifetimes) {
+                     if(needs_plus)  m_pmi.send_symbol("+");
+                     needs_plus = true;
+-                    m_pmi.send_symbol("+");
+                     this->visit_lifetime(lft);
+                 }
+                 if( te->use ) {
+@@ -1467,7 +1493,7 @@ namespace {
+         }
+         void visit_attr(const ::AST::Attribute& a)
+         {
+-            if( a.name() == "cfg_attr" ) {
++            if( a.name() == "cfg_attr" && !this->raw_cfg_attr ) {
+                 auto new_attrs = check_cfg_attr(a);
+                 for(const auto& na : new_attrs) {
+                     this->visit_attr(na);
+@@ -1486,7 +1512,7 @@ namespace {
+                 m_pmi.send_symbol("]");
+             }
+             else {
+-                DEBUG("Skip " << a << " (" << m_pmi.m_proc_macro_desc.attributes << ")");
++                DEBUG("Skip " << a);
+             }
+         }
+         void visit_meta_item(const ::AST::Attribute& i)
+@@ -1851,12 +1877,66 @@ namespace {
+             m_pmi.send_symbol("}");
+         }
+ 
++        /// An item with its own attributes (a `$i:item` fragment, an item in a module)
++        void visit_named_item(const AST::Named<AST::Item>& i)
++        {
++            this->visit_attrs(i.attrs);
++            this->visit_item(i.name, i.vis, i.data);
++        }
+         void visit_item(const RcString& name, const AST::Visibility& vis, const ::AST::Item& item)
+         {
+             TU_MATCH_HDRA((item), {)
+             default:
+                 TODO(sp, "visit_item - " << item.tag_str());
+                 break;
++            TU_ARMA(None, e) {
++                // Removed (e.g. by `#[cfg]`)
++                }
++            // `path! ident? { .. }`: the invocation keeps its input without the delimiters, and braces need no `;`
++            TU_ARMA(MacroInv, e) {
++                this->visit_path(e.path());
++                m_pmi.send_symbol("!");
++                if( e.input_ident() != "" ) {
++                    m_pmi.send_ident(e.input_ident().c_str());
++                }
++                m_pmi.send_symbol("{");
++                this->visit_tokentree(e.input_tt());
++                m_pmi.send_symbol("}");
++                }
++            TU_ARMA(Crate, e) {
++                this->visit_vis(vis);
++                m_pmi.send_rword("extern");
++                m_pmi.send_rword("crate");
++                m_pmi.send_ident(e.name.c_str());
++                if( name != e.name ) {
++                    m_pmi.send_rword("as");
++                    m_pmi.send_ident(name.c_str());
++                }
++                m_pmi.send_symbol(";");
++                }
++            TU_ARMA(Module, e) {
++                this->visit_vis(vis);
++                m_pmi.send_rword("mod");
++                m_pmi.send_ident(name.c_str());
++                m_pmi.send_symbol("{");
++                for(const auto& i : e.m_items) {
++                    this->visit_named_item(*i);
++                }
++                m_pmi.send_symbol("}");
++                }
++            TU_ARMA(Type, e) {
++                this->visit_vis(vis);
++                m_pmi.send_rword("type");
++                m_pmi.send_ident(name.c_str());
++                this->visit_params(e.params());
++                this->visit_bounds(e.params());
++                m_pmi.send_symbol("=");
++                this->visit_type(e.type());
++                m_pmi.send_symbol(";");
++                }
++            TU_ARMA(Static, e) {
++                visit_static(name, vis, e);
++                }
+             TU_ARMA(Impl, e) {
+                 visit_impl(e);
+                 }
+@@ -1885,6 +1965,101 @@ namespace {
+         }
+     };
+ }
++namespace {
++    /// Collects what `Visitor` sends as mrustc tokens (for `ProcMacro_PatternTokens`/`ProcMacro_ItemTokens`)
++    struct TokenCollector:
++        public TokenSink
++    {
++        ::std::vector<Token>&   out;
++        /// Every identifier gets this hygiene (the names are all `Visitor` has)
++        Ident::Hygiene  hygiene;
++
++        TokenCollector(::std::vector<Token>& out, Ident::Hygiene hygiene):
++            out(out),
++            hygiene(::std::move(hygiene))
++        {
++        }
++
++        void send_symbol(const char* val) override {
++            auto t = Lex_FindOperator(val);
++            ASSERT_BUG(Span(), t != TOK_NULL, "Unknown symbol `" << val << "`");
++            out.push_back(::std::move(t));
++        }
++        void send_rword(const char* val) override {
++            auto t = Lex_FindOperator(val);
++            if( t == TOK_NULL )
++                t = Lex_FindReservedWord(val, AST::Edition::Rust2021);
++            if( t == TOK_NULL )
++                t = Token(TOK_IDENT, Ident(hygiene, RcString::new_interned(val)));
++            out.push_back(::std::move(t));
++        }
++        void send_ident(const char* val) override {
++            out.push_back(Token(TOK_IDENT, Ident(hygiene, RcString::new_interned(val))));
++        }
++        // `::"<crate>"`, as the macro_rules evaluator writes `$crate` naming another crate
++        void send_dollar_crate(const ::std::string& crate_name) override {
++            out.push_back(Token(TOK_DOUBLE_COLON));
++            out.push_back(Token(TOK_STRING, crate_name, hygiene));
++        }
++        void send_lifetime(const char* val) override {
++            out.push_back(Token(TOK_LIFETIME, Ident(hygiene, RcString::new_interned(val))));
++        }
++        void send_string(const ::std::string& s) override {
++            out.push_back(Token(TOK_STRING, s, hygiene));
++        }
++        void send_bytestring(const ::std::string& s) override {
++            out.push_back(Token(TOK_BYTESTRING, s, hygiene));
++        }
++        void send_suffix(const RcString& s) override {
++            if( s.size() > 0 ) {
++                ASSERT_BUG(Span(), !out.empty(), "Literal suffix with no literal");
++                out.back().set_suffix(s);
++            }
++        }
++        void send_char(uint32_t ch) override {
++            out.push_back(Token(U128(ch), CORETYPE_CHAR));
++        }
++        void send_int(eCoreType ct, U128 v) override {
++            out.push_back(Token(v, ct));
++        }
++        void send_float(eCoreType ct, double v) override {
++            out.push_back(Token::make_float(v, ct));
++        }
++        // Sent anyway: `emit_all_attrs` (and nothing gets marked used)
++        bool attr_is_used(const RcString& n) const override {
++            return false;
++        }
++    };
++}
++::std::vector<Token> ProcMacro_PatternTokens(const Span& sp, const AST::Pattern& pat, const Ident::Hygiene& hygiene)
++{
++    ::std::vector<Token>    rv;
++    TokenCollector  tc(rv, hygiene);
++    Visitor v(sp, tc);
++    v.emit_all_attrs = true;
++    v.raw_cfg_attr = true;
++    v.visit_pattern(pat);
++    return rv;
++}
++::std::vector<Token> ProcMacro_TypeTokens(const Span& sp, const TypeRef& ty, const Ident::Hygiene& hygiene)
++{
++    ::std::vector<Token>    rv;
++    TokenCollector  tc(rv, hygiene);
++    Visitor v(sp, tc);
++    v.visit_type(ty);
++    return rv;
++}
++::std::vector<Token> ProcMacro_ItemTokens(const Span& sp, const AST::Named<AST::Item>& item, const Ident::Hygiene& hygiene)
++{
++    ::std::vector<Token>    rv;
++    TokenCollector  tc(rv, hygiene);
++    Visitor v(sp, tc);
++    v.emit_all_attrs = true;
++    v.raw_cfg_attr = true;
++    v.visit_named_item(item);
++    return rv;
++}
++
+ ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree* attr_input, std::function<void(Visitor& v)> cb)
+ {
+     // 1. Create ProcMacroInv instance
+diff --git a/src/expand/proc_macro.hpp b/src/expand/proc_macro.hpp
+index 0177c309..5cdea559 100644
+--- a/src/expand/proc_macro.hpp
++++ b/src/expand/proc_macro.hpp
+@@ -7,6 +7,7 @@
+  */
+ #pragma once
+ #include <parse/tokenstream.hpp>
++#include <slice.hpp>
+ 
+ // Derive macros
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, slice<const AST::Attribute> attrs, const AST::Visibility& vis, const RcString& name, const ::AST::Struct& i);
+@@ -28,3 +29,8 @@ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(
+ // Function-like macros
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree& tt);
+ 
++// Tokens of a pattern/item as a proc macro would receive them, every identifier with `hygiene` (an interpolated
++// `:pat`/`:item` fragment written back into an exported `macro_rules!` body)
++extern ::std::vector<Token> ProcMacro_PatternTokens(const Span& sp, const AST::Pattern& pat, const Ident::Hygiene& hygiene);
++extern ::std::vector<Token> ProcMacro_TypeTokens(const Span& sp, const TypeRef& ty, const Ident::Hygiene& hygiene);
++extern ::std::vector<Token> ProcMacro_ItemTokens(const Span& sp, const AST::Named<AST::Item>& item, const Ident::Hygiene& hygiene);
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 877703ff..ae69bdc5 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -12,6 +12,7 @@
+ #include <ast/ast.hpp>
+ #include <ast/expr.hpp> // For shortcut in array size handling
+ #include <ast/crate.hpp>
++#include <expand/proc_macro.hpp>    // ProcMacro_PatternTokens, ProcMacro_ItemTokens
+ #include "from_ast.hpp"
+ #include <functional>
+ #include "visitor.hpp"
+@@ -2837,7 +2838,9 @@ public:
+     // - Convert interpolated AST items to token sequences
+     {
+         struct H {
+-            static void fix_macro_contents(std::vector<MacroExpansionEnt>& rule_contents)
++            /// `hygiene`: given to every identifier written out, so that fragments of one invocation see each other's
++            /// names (`$p => $e` with `$p:pat` binding a name that `$e:expr` uses)
++            static void fix_macro_contents(std::vector<MacroExpansionEnt>& rule_contents, const Ident::Hygiene& hygiene)
+             {
+                 for( auto it = rule_contents.begin(); it != rule_contents.end(); )
+                 {
+@@ -2845,7 +2848,9 @@ public:
+                     {
+                         //TODO: Can this share with `proc_macro`? Maybe a function on AST types to generate a token tree from the AST again.
+                         struct NewToks {
++                            const Ident::Hygiene&   hygiene;
+                             std::vector<MacroExpansionEnt>  out;
++                            NewToks(const Ident::Hygiene& hygiene): hygiene(hygiene) {}
+                             void emit_from_string(const std::string& s)
+                             {
+                                 // The lexer drops an identifier that runs into end-of-input, so terminate the text
+@@ -2856,9 +2861,29 @@ public:
+                                     if( t == TOK_EOF ) {
+                                         break;
+                                     }
++                                    // The lexer gave this text its own hygiene scope
++                                    switch(t.type())
++                                    {
++                                    case TOK_IDENT:
++                                    case TOK_LIFETIME:
++                                        t = Token(t.type(), Ident(hygiene, t.ident().name));
++                                        break;
++                                    case TOK_STRING: {
++                                        auto sfx = t.suffix();
++                                        t = Token(TOK_STRING, t.str(), hygiene);
++                                        t.set_suffix(sfx);
++                                        break; }
++                                    default:
++                                        break;
++                                    }
+                                     out.push_back(t);
+                                 }
+                             }
++                            void emit_tokens(std::vector<Token> toks)
++                            {
++                                for(auto& t : toks)
++                                    out.push_back(std::move(t));
++                            }
+                             void emit_ast(const AST::ExprNode& e)
+                             {
+                                 if( const auto* ep = dynamic_cast<const AST::ExprNode_Integer*>(&e) ) {
+@@ -2907,7 +2932,8 @@ public:
+                             void emit_type(::TypeRef& ty) {
+                                 TU_MATCH_HDRA( (ty.m_data), { )
+                                 default:
+-                                    TODO(Span(), "Convert interpolated macro fragment: " << ty);
++                                    // As a proc macro would get it (`[u32; 3]`, `&T`, `dyn A + B` in parentheses, ...)
++                                    emit_tokens(ProcMacro_TypeTokens(Span(), ty, hygiene));
+                                 TU_ARMA(Path, p) {
+                                     emit_path(*p);
+                                     }
+@@ -2928,10 +2954,19 @@ public:
+                             {
+                                 switch(tok.type())
+                                 {
+-                                case TOK_INTERPOLATED_PATTERN:
++                                // Patterns and items: as a proc macro would get them
++                                case TOK_INTERPOLATED_PATTERN: {
++                                    const auto& pat = tok.frag_pattern();
++                                    // A top-level or-pattern stays one pattern wherever it's written (`|$p|`)
++                                    bool wrap = pat.data().is_Or() && pat.bindings().empty();
++                                    if( wrap )
++                                        out.push_back(Token(TOK_PAREN_OPEN));
++                                    emit_tokens(ProcMacro_PatternTokens(Span(), pat, hygiene));
++                                    if( wrap )
++                                        out.push_back(Token(TOK_PAREN_CLOSE));
++                                    break; }
+                                 case TOK_INTERPOLATED_ITEM:
+-                                    // Emit as a token tree with no separator
+-                                    TODO(Span(), "Convert interpolated macro fragment: " << tok);
++                                    emit_tokens(ProcMacro_ItemTokens(Span(), tok.take_frag_item(), hygiene));
+                                     break;
+                                 case TOK_INTERPOLATED_STMT:
+                                 case TOK_INTERPOLATED_BLOCK:
+@@ -2974,7 +3009,7 @@ public:
+                             }
+                         };
+ 
+-                        NewToks  new_toks;
++                        NewToks  new_toks { hygiene };
+                         switch(tok->type())
+                         {
+                         case TOK_INTERPOLATED_PATH:
+@@ -3008,7 +3043,7 @@ public:
+                     }
+                     else if(auto* loop = it->opt_Loop()) {
+                         // A `$( .. )*` repetition of the inner macro (written `$dollar( .. )*` in the outer one)
+-                        fix_macro_contents(loop->entries);
++                        fix_macro_contents(loop->entries, hygiene);
+                         ++it;
+                     }
+                     else {
+@@ -3030,9 +3065,10 @@ public:
+                         if( mr.m_source_crate.size() == 0 ) {
+                             mr.m_source_crate = g_crate_name;
+                         }
++                        auto hygiene = Ident::Hygiene::new_scope();
+                         for(auto& rule : mr.m_rules)
+                         {
+-                            fix_macro_contents(rule.m_contents);
++                            fix_macro_contents(rule.m_contents, hygiene);
+                         }
+                     }
+                     if( const auto* i = mi.second->ent.opt_Import() ) {
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index fabfa18a..e514352c 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -250,10 +250,11 @@ Token Token::clone() const
+         case TOK_INTERPOLATED_VIS:
+             rv.m_data = new AST::Visibility( *reinterpret_cast<AST::Visibility*>(e) );
+             break;
+-        case TOK_INTERPOLATED_ITEM:
+-            TODO(Span(Span(),m_pos), "clone interpolated item");
+-            //rv.m_data = new AST::Named( AST::Item( reinterpret_cast<AST::Attribute*>(e)->clone() ) );
+-            break;
++        case TOK_INTERPOLATED_ITEM: {
++            // As `Token(const InterpolatedFragment&)` copies one (a `$i:item` in a `macro_rules!` that a macro defines)
++            const auto& named = *reinterpret_cast<const AST::Named<AST::Item>*>(e);
++            rv.m_data = new AST::Named<AST::Item>( named.span, named.attrs.clone(), named.vis, named.name, named.data.clone() );
++            break; }
+         default:
+             BUG(Span(Span(),m_pos), "Fragment with invalid token type (" << *this << ")");
+             break;

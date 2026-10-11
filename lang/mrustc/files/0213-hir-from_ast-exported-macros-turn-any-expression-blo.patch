@@ -1,0 +1,168 @@
+From 31db031126e7b2d96a468459cc4ed1cec5a9ba28 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 02:12:56 +0000
+Subject: [PATCH] hir/from_ast: exported macros turn any expression, block or
+ statement fragment back into tokens
+
+A `macro_rules!` that another macro defines can hold fragments the outer macro
+captured (`$r` of `$r:expr` written into the inner body). HIR lowering turns
+them back into tokens so the macro can be exported, but only integer and bool
+literals (and paths, types, vis and meta) were handled. html-escape 0.2.15
+(tree-sitter-cli) re-captures `$r.as_ref()` as `$r:expr` in `escape_impl!` and
+died with "BUG: src/hir/from_ast.cpp:2924: TODO: emit_token - Convert
+interpolated macro fragment: TOK_INTERPOLATED_EXPR:(b"&amp;").as_ref() -
+Unknown node type: N3AST19ExprNode_CallMethodE", even though that macro is
+never exported.
+
+Any other expression is now printed with the AST printer (`DumpAST_Node`, as
+proc-macro input is) and re-lexed, in parentheses so it stays one operand as
+the fragment was (`$e * 3` with `1 + 2` is 9). Literals stay bare, since an
+`$l:expr` literal may be used as a pattern, and a path is written as its path.
+`:block` and `:stmt` fragments go the same way, unparenthesised.
+
+Three bugs in the same code, all upstream:
+- after splicing in the tokens of a converted fragment the scan stepped one
+  entry too far (`insert` already returns the first inserted token): the entry
+  after the fragment was skipped, so in `if $c $b` the `$b` fragment reached
+  HIR serialisation ("Serialising interpolated macro fragment" assert), and
+  a fragment that ended the body ran the scan past the end of the vector
+- a bool literal was pushed as a bare token type, which converts to `unsigned
+  int`, i.e. a `$111` capture reference: using the macro failed with
+  `vector::_M_range_check: __n (which is 111)`
+- fragments inside a `$( .. )*` repetition of the inner macro (written
+  `$dollar( .. )*`) were never visited
+
+The AST printer wrote byte strings through `FmtEscaped`, which reads the value
+as UTF-8 and writes `\u{..}` (invalid in a byte string) and drops stray
+continuation bytes; it now writes `\xNN` for anything not printable. This also
+affects proc-macro input.
+
+Known limitation: each fragment is re-lexed with its own hygiene scope, so
+a local bound in one fragment and used in another doesn't resolve.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/ast/dump.cpp     | 21 +++++++++++++++++++-
+ src/hir/from_ast.cpp | 46 +++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 61 insertions(+), 6 deletions(-)
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index 68af24ab..c35ea29a 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -590,7 +590,26 @@ public:
+     }
+     virtual void visit(AST::ExprNode_ByteString& n) override {
+         m_expr_root = false;
+-        m_os << "b\"" << FmtEscaped(n.m_value) << "\"";
++        // Arbitrary bytes: `FmtEscaped` reads the value as UTF-8 and writes `\u{..}`, which a byte string can't hold
++        // (this text is re-lexed for proc macros and exported macros)
++        static const char HEX[] = "0123456789abcdef";
++        m_os << "b\"";
++        for(unsigned char b : n.m_value)
++        {
++            switch(b)
++            {
++            case '"':   m_os << "\\\"";   break;
++            case '\\':  m_os << "\\\\";   break;
++            case '\n':  m_os << "\\n";    break;
++            default:
++                if( ' ' <= b && b < 0x7F )
++                    m_os << b;
++                else
++                    m_os << "\\x" << HEX[b >> 4] << HEX[b & 0xF];
++                break;
++            }
++        }
++        m_os << "\"";
+     }
+     virtual void visit(AST::ExprNode_CString& n) override {
+         m_expr_root = false;
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 975dce57..c8118423 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -8,6 +8,7 @@
+ #include "common.hpp"
+ #include "hir.hpp"
+ #include "main_bindings.hpp"
++#include <include/main_bindings.hpp>  // DumpAST_Node
+ #include <ast/ast.hpp>
+ #include <ast/expr.hpp> // For shortcut in array size handling
+ #include <ast/crate.hpp>
+@@ -2850,12 +2851,38 @@ public:
+                                     out.push_back( Token(ep->m_value, ep->m_datatype) );
+                                 }
+                                 else if( const auto* ep = dynamic_cast<const AST::ExprNode_Bool*>(&e) ) {
+-                                    out.push_back( ep->m_value ? TOK_RWORD_TRUE : TOK_RWORD_FALSE );
++                                    // (a bare token type converts to `unsigned int`, i.e. a `$N` capture reference)
++                                    out.push_back( Token(ep->m_value ? TOK_RWORD_TRUE : TOK_RWORD_FALSE) );
++                                }
++                                else if( const auto* ep = dynamic_cast<const AST::ExprNode_NamedValue*>(&e) ) {
++                                    emit_path(ep->m_path);
+                                 }
+                                 else {
+-                                    throw std::runtime_error(FMT("Unknown node type: " << typeid(e).name()));
++                                    // Anything else is printed back to source and re-lexed, as proc-macro input is
++                                    // - html-escape 0.2.15 `escape_impl!`: `$r.as_ref()` re-captured as `$r:expr` in a nested `macro_rules!`
++                                    ::std::stringstream ss;
++                                    DumpAST_Node(ss, e);
++                                    // A literal stays bare (an `$l:expr` literal may be used as a pattern); anything else is
++                                    // parenthesised so it stays one operand, as the fragment was (`$e * 3` with `1 + 2`)
++                                    bool is_literal = dynamic_cast<const AST::ExprNode_Float*>(&e)
++                                        || dynamic_cast<const AST::ExprNode_String*>(&e)
++                                        || dynamic_cast<const AST::ExprNode_ByteString*>(&e)
++                                        || dynamic_cast<const AST::ExprNode_CString*>(&e)
++                                        ;
++                                    if( !is_literal )
++                                        out.push_back(Token(TOK_PAREN_OPEN));
++                                    emit_from_string(ss.str());
++                                    if( !is_literal )
++                                        out.push_back(Token(TOK_PAREN_CLOSE));
+                                 }
+                             }
++                            /// A `:block` or `:stmt` fragment: printed and re-lexed as it is
++                            void emit_stmt(const AST::ExprNode& e)
++                            {
++                                ::std::stringstream ss;
++                                DumpAST_Node(ss, e);
++                                emit_from_string(ss.str());
++                            }
+                             void emit_path(const ::AST::Path& path) {
+                                 ::std::stringstream ss;
+                                 // Plain form: the debug form wraps hygiene and bindings in comments, which the lexer
+@@ -2888,12 +2915,14 @@ public:
+                                 switch(tok.type())
+                                 {
+                                 case TOK_INTERPOLATED_PATTERN:
+-                                case TOK_INTERPOLATED_STMT:
+-                                case TOK_INTERPOLATED_BLOCK:
+                                 case TOK_INTERPOLATED_ITEM:
+                                     // Emit as a token tree with no separator
+                                     TODO(Span(), "Convert interpolated macro fragment: " << tok);
+                                     break;
++                                case TOK_INTERPOLATED_STMT:
++                                case TOK_INTERPOLATED_BLOCK:
++                                    emit_stmt(tok.frag_node());
++                                    break;
+                                 case TOK_INTERPOLATED_PATH:
+                                     // A `$p:path` written into a nested `macro_rules!` body (yansi 1.0.1 `define_property!`)
+                                     emit_path(tok.frag_path());
+@@ -2958,9 +2987,16 @@ public:
+                                 std::move_iterator< decltype(new_toks.out.begin()) >(new_toks.out.begin()+1),
+                                 std::move_iterator< decltype(new_toks.out.begin()) >(new_toks.out.end())
+                             );
+-                            it += new_toks.out.size();
++                            // `insert` returned the first inserted token: step over the rest (it skipped the entry
++                            // after them, and ran past the end when the fragment ended the body)
++                            it += new_toks.out.size() - 1;
+                         }
+                     }
++                    else if(auto* loop = it->opt_Loop()) {
++                        // A `$( .. )*` repetition of the inner macro (written `$dollar( .. )*` in the outer one)
++                        fix_macro_contents(loop->entries);
++                        ++it;
++                    }
+                     else {
+                         ++it;
+                     }
