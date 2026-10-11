@@ -1,0 +1,689 @@
+From 1722a9a506da8faa6ac0150efd6ae4d6936f4ad0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 10 Oct 2026 23:58:16 +0000
+Subject: [PATCH] libproc_macro: TokenStream::from_str lexes floats, tuple
+ indices, escapes and raw identifiers
+
+The lexer behind `TokenStream::from_str`/`Literal::from_str` (what `str::parse`,
+`syn::parse_str` and proc-macro2 use inside a proc macro) had gaps rustc's lexer
+doesn't:
+- any digit followed by `.` hit `panic!("TODO: Floating point")`: no float
+  literal could be parsed, nor `x.0.1`, `1.max(2)` or `1..2`. Numbers now follow
+  mrustc's own lexer: an integer followed by `..`, or by `.` and an identifier,
+  ends there; a number right after a single `.` is a tuple index (with its
+  suffix, never a float); any other `.`, an exponent or an `f32`/`f64` suffix
+  makes a float (`1f32` was the integer 1 followed by an identifier `f32`, `2e3`
+  an integer and `e3`). Other suffixes stay on the literal as rustc's lexer
+  allows (`10px` was an error).
+- `'\u{..}'`, `'\x41'`, unknown char escapes and byte literals (`b'a'`) panicked;
+  a byte string's `\x80`-`\xff` escapes became two UTF-8 bytes.
+- `r#type` was `r` `#` `type`.
+- the longest-symbol match recomputed its candidate range with mixed absolute
+  and relative indices, so `<<=`, `>>=` and `...` came out as two symbols, and
+  `..=` was missing.
+- a `//` comment ending the input looped forever (`"x // c".parse()` hung), and
+  an unterminated `/*` panicked instead of returning an error.
+
+Two printing fixes go with the lexing, so printed literals parse back as what
+they were: an unsuffixed float with a whole value printed as `1` (`syn::Lit`
+then takes it for an integer) and now keeps `.0` as rustc's `f64_unsuffixed`
+does, f32 literals print at f32 precision, and `'\\'` and backslashes in byte/C
+strings are escaped. A raw identifier a proc macro creates (`Ident::new_raw`, or
+`r#type` from the lexer) went to the compiler as the bare keyword; it is sent as
+`r#type`, which the compiler already strips.
+
+Needed before printing token streams the way rustc does (next commit): that
+writes `self.0.clone()` and `x.1` without spaces, and a proc macro that parses
+its own `to_string()` output would otherwise hit the float panic. Checked with
+a stock rustc 1.90 building this crate: the new unit tests pass (the four
+serialisation tests fail before and after), and 20000 random well-formed
+streams print, lex back to the same tokens (spacing included) and reprint
+identically; no input panics the lexer any more.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ lib/libproc_macro/src/lex.rs           | 474 +++++++++++++++++--------
+ lib/libproc_macro/src/serialisation.rs |   3 +-
+ lib/libproc_macro/src/token_tree.rs    |  13 +-
+ 3 files changed, 340 insertions(+), 150 deletions(-)
+
+diff --git a/lib/libproc_macro/src/lex.rs b/lib/libproc_macro/src/lex.rs
+index 443f6df4..0808c8b0 100644
+--- a/lib/libproc_macro/src/lex.rs
++++ b/lib/libproc_macro/src/lex.rs
+@@ -29,7 +29,7 @@ impl<T: Iterator<Item=char>> CharStream<T> {
+     }
+ }
+ 
+-static SYMS: [&[u8]; 53] = [
++static SYMS: [&[u8]; 54] = [
+     b"!" as &[u8],
+     b"!=",
+     b"#",
+@@ -42,7 +42,7 @@ static SYMS: [&[u8]; 53] = [
+     b"+", b"+=",
+     b",",
+     b"-", b"-=", b"->",
+-    b".", b"..", b"...",
++    b".", b"..", b"...", b"..=",
+     b"/", b"/=",
+     b":", b"::",
+     b";",
+@@ -110,6 +110,144 @@ impl ::std::str::FromStr for TokenStream {
+                 val
+             }
+         }
++        /// The character of an escape sequence: the current character is the one after the `\`, and is left on the
++        /// escape's last character
++        fn lex_escape<T: Iterator<Item=char>>(it: &mut CharStream<T>) -> Result<char, &'static str>
++        {
++            Ok(match it.cur()
++            {
++            'n' => '\n',
++            'r' => '\r',
++            't' => '\t',
++            '0' => '\0',
++            '\\' => '\\',
++            '\'' => '\'',
++            '"' => '"',
++            'x' => {
++                let mut v = 0u32;
++                for _ in 0 .. 2 {
++                    let d = some_else!(it.consume() => return Err("Unterminated `\\x` escape"));
++                    v = v * 16 + some_else!(d.to_digit(16) => return Err("Invalid hex digit in `\\x` escape"));
++                }
++                some_else!(::std::char::from_u32(v) => return Err("Invalid `\\x` escape"))
++                },
++            'u' => {
++                if it.consume() != Some('{') {
++                    return Err("Expected `{` after `\\u`");
++                }
++                let mut v = 0u32;
++                loop {
++                    let d = some_else!(it.consume() => return Err("Unterminated `\\u` escape"));
++                    if d == '}' {
++                        break ;
++                    }
++                    if d != '_' {
++                        v = v * 16 + some_else!(d.to_digit(16) => return Err("Invalid hex digit in `\\u` escape"));
++                    }
++                }
++                some_else!(::std::char::from_u32(v) => return Err("Invalid `\\u` escape"))
++                },
++            _ => return Err("Unknown escape"),
++            })
++        }
++        /// A number literal: the current character is its first digit, and is left on the character after it.
++        /// As mrustc's own lexer: an integer followed by `..`, or by `.` and an identifier (`1..2`, `1.max(2)`), ends
++        /// there; any other `.`, an exponent, or an `f32`/`f64` suffix makes a float (`1.5`, `1.`, `1e3`, `1f32`).
++        /// Other suffixes are kept, as rustc's lexer does (`10px` for a DSL macro). A tuple index (`allow_float`
++        /// false) ends before any `.` or exponent: `x.0.1` is `x . 0 . 1`.
++        fn lex_number<T: Iterator<Item=char>>(it: &mut CharStream<T>, allow_float: bool) -> Result<crate::token_tree::LiteralValue, &'static str>
++        {
++            use crate::token_tree::LiteralValue;
++            fn digits<T: Iterator<Item=char>>(it: &mut CharStream<T>, mut c: Option<char>, base: u32, v: &mut u128, text: &mut String) -> Option<char>
++            {
++                loop
++                {
++                    match c
++                    {
++                    Some('_') => {},
++                    Some(ch) if ch.is_digit(base) => {
++                        *v = v.wrapping_mul(base as u128).wrapping_add(ch.to_digit(base).unwrap() as u128);
++                        text.push(ch);
++                        },
++                    _ => return c,
++                    }
++                    c = it.consume();
++                }
++            }
++            fn parse_float(text: &str) -> Result<f64, &'static str> {
++                // `1.` is `1.0`
++                let text = if text.ends_with('.') { format!("{}0", text) } else { text.to_owned() };
++                text.parse::<f64>().map_err(|_| "Invalid float literal")
++            }
++
++            let mut base = 10;
++            if it.cur() == '0' {
++                base = match it.next() { Some('x') => 16, Some('o') => 8, Some('b') => 2, _ => 10 };
++                if base != 10 {
++                    it.consume();
++                    it.consume();
++                }
++            }
++            let mut v: u128 = 0;
++            // Decimal digits (and `.`/exponent) of a float's value
++            let mut text = String::new();
++            let mut is_float = false;
++            let first = if it.is_complete() { None } else { Some(it.cur()) };
++            let mut c = digits(it, first, base, &mut v, &mut text);
++            if text.is_empty() {
++                return Err("Missing digits in an integer literal");
++            }
++            if allow_float && base == 10 && c == Some('.') {
++                let int_ends = match it.next() { Some('.') => true, Some(n) => n == '_' || n.is_alphabetic(), None => false };
++                if !int_ends {
++                    is_float = true;
++                    text.push('.');
++                    let after_dot = it.consume();
++                    c = digits(it, after_dot, 10, &mut 0, &mut text);
++                }
++            }
++            if allow_float && base == 10 && (c == Some('e') || c == Some('E')) {
++                let is_exponent = match it.next() { Some('+') | Some('-') | Some('_') => true, Some(n) => n.is_digit(10), None => false };
++                if is_exponent {
++                    is_float = true;
++                    text.push('e');
++                    c = it.consume();
++                    if c == Some('+') || c == Some('-') {
++                        text.push(c.unwrap());
++                        c = it.consume();
++                    }
++                    c = digits(it, c, 10, &mut 0, &mut text);
++                }
++            }
++            let suffix = match c
++                {
++                Some(ch) if ch == '_' || ch.is_alphabetic() => get_ident(it, String::new()),
++                _ => String::new(),
++                };
++            Ok(match &suffix[..]
++            {
++            "" if is_float => LiteralValue::Float(parse_float(&text)?, 0),
++            "" => LiteralValue::UnsignedInt(v, 0),
++            "f32" if base == 10 => LiteralValue::Float(parse_float(&text)?, 32),
++            "f64" if base == 10 => LiteralValue::Float(parse_float(&text)?, 64),
++            "u8"    if !is_float => LiteralValue::UnsignedInt(v,   8),
++            "u16"   if !is_float => LiteralValue::UnsignedInt(v,  16),
++            "u32"   if !is_float => LiteralValue::UnsignedInt(v,  32),
++            "u64"   if !is_float => LiteralValue::UnsignedInt(v,  64),
++            "u128"  if !is_float => LiteralValue::UnsignedInt(v, 128),
++            "usize" if !is_float => LiteralValue::UnsignedInt(v,   1),
++            "i8"    if !is_float => LiteralValue::SignedInt(v as i128,   8),
++            "i16"   if !is_float => LiteralValue::SignedInt(v as i128,  16),
++            "i32"   if !is_float => LiteralValue::SignedInt(v as i128,  32),
++            "i64"   if !is_float => LiteralValue::SignedInt(v as i128,  64),
++            "i128"  if !is_float => LiteralValue::SignedInt(v as i128, 128),
++            "isize" if !is_float => LiteralValue::SignedInt(v as i128,   1),
++            _ => {
++                let inner = if is_float { LiteralValue::Float(parse_float(&text)?, 0) } else { LiteralValue::UnsignedInt(v, 0) };
++                LiteralValue::Suffixed(Box::new(inner), suffix.clone())
++                },
++            })
++        }
+ 
+         'outer: while ! it.is_complete()
+         {
+@@ -161,26 +299,13 @@ impl ::std::str::FromStr for TokenStream {
+                 else {
+                     // Char lit
+                     let new_c = if c == '\\' {
+-                            match match it.consume()
+-                                {
+-                                Some(c) => c,
+-                                None => return err("Unterminated char literal"),
+-                                }
++                            if it.consume().is_none() {
++                                return err("Unterminated char literal");
++                            }
++                            match lex_escape(&mut it)
+                             {
+-                            '0' => '\0',
+-                            'n' => '\n',
+-                            'r' => '\r',
+-                            't' => '\t',
+-                            '\\' => '\\',
+-                            '\'' => '\'',
+-                            '"' => '"',
+-                            'u' => {
+-                                if it.consume() != Some('{') {
+-                                    return err("Expected `{` after `\\u` in char literal");
+-                                }
+-                                panic!("TODO: char literal - unicode literal");
+-                                },
+-                            c @ _ => panic!("TODO: char literal with escape - '\\{}'", c),
++                            Ok(c) => c,
++                            Err(e) => return err(e),
+                             }
+                         }
+                         else {
+@@ -203,8 +328,13 @@ impl ::std::str::FromStr for TokenStream {
+             }
+             else if c == '/' && it.next() == Some('/')
+             {
+-                // Line comment
+-                while it.consume() != Some('\n') {
++                // Line comment (to the end of the line or of the input)
++                loop {
++                    match it.consume()
++                    {
++                    Some('\n') | None => break,
++                    _ => {},
++                    }
+                 }
+             }
+             else if c == '/' && it.next() == Some('*')
+@@ -232,7 +362,7 @@ impl ::std::str::FromStr for TokenStream {
+                             level += 1;
+                         }
+                         },
+-                    None => panic!("Unexpected EOF in block comment"),
++                    None => return err("Unterminated block comment"),
+                     _ => {},
+                     }
+                 }
+@@ -261,6 +391,12 @@ impl ::std::str::FromStr for TokenStream {
+                         }
+ 
+                         if c != '"' {
++                            // Raw identifier: `r#type`
++                            if !is_byte && hashes == 1 && (c.is_alphabetic() || c == '_') {
++                                let s = get_ident(&mut it, String::new());
++                                rv.push(Ident { is_raw: true, val: s, span: crate::Span::call_site() }.into());
++                                continue 'outer;
++                            }
+                             if hashes == 0 {
+                                 let s = get_ident(&mut it, ident_str.to_string());
+                                 rv.push(Ident { is_raw: false, val: s, span: crate::Span::call_site() }.into());
+@@ -316,15 +452,38 @@ impl ::std::str::FromStr for TokenStream {
+                     }
+                     else if c == '\''
+                     {
+-                        // Byte character literal?
+-                        // NOTE: That b'foo is not `b` followed by `'foo`
+-                        assert!(is_byte);
+-                        panic!("TODO: Byte character literal");
++                        // Byte character literal (`b'foo` is not `b` followed by `'foo`): `b'a'`, `b'\xff'`
++                        let b = match it.consume()
++                            {
++                            Some('\\') => {
++                                if it.consume().is_none() {
++                                    return err("Unterminated byte literal");
++                                }
++                                match lex_escape(&mut it)
++                                {
++                                Ok(c) => c,
++                                Err(e) => return err(e),
++                                }
++                                },
++                            Some(c) => c,
++                            None => return err("Unterminated byte literal"),
++                            };
++                        if b as u32 > 0xFF {
++                            return err("Non-byte character in byte literal");
++                        }
++                        if it.consume() != Some('\'') {
++                            return err("Unterminated byte literal");
++                        }
++                        it.consume();
++                        rv.push(Literal::byte_character(b as u32 as u8).into());
++                        continue 'outer;
+                     }
+                     else if c == '\"'
+                     {
+                         // String literal
+                         let mut s = String::new();
++                        // A byte string's contents: its escapes (`\xff`) are single bytes, not UTF-8 encoded characters
++                        let mut bytes: Vec<u8> = Vec::new();
+                         loop
+                         {
+                             c = some_else!(it.consume() => return err("str eof"));
+@@ -333,52 +492,41 @@ impl ::std::str::FromStr for TokenStream {
+                                 break ;
+                             }
+                             else if c == '\\' {
+-                                match some_else!(it.consume() => return err("str eof"))
+-                                {
+-                                'n' => s.push('\n'),
+-                                'r' => s.push('\r'),
+-                                't' => s.push('\t'),
+-                                '0' => s.push('\0'),
+-                                '\\' => s.push('\\'),
+-                                '\'' => s.push('\''),
+-                                '"' => s.push('"'),
+-                                'x' => {
+-                                    let mut v = 0u32;
+-                                    for _ in 0 .. 2 {
+-                                        let d = some_else!(it.consume() => return err("str eof"));
+-                                        v = v * 16 + some_else!(d.to_digit(16) => return err("Invalid hex digit in `\\x` escape"));
+-                                    }
+-                                    s.push(some_else!(::std::char::from_u32(v) => return err("Invalid `\\x` escape")));
+-                                    },
+-                                'u' => {
+-                                    if it.consume() != Some('{') {
+-                                        return err("Expected `{` after `\\u` in string literal");
+-                                    }
+-                                    let mut v = 0u32;
+-                                    loop {
+-                                        let d = some_else!(it.consume() => return err("str eof"));
+-                                        if d == '}' {
+-                                            break ;
++                                let e = match some_else!(it.consume() => return err("str eof"))
++                                    {
++                                    // A backslash at end-of-line eats the newline and the next line's leading whitespace
++                                    '\n' | '\r' => {
++                                        while it.next().map(|c| c.is_whitespace()).unwrap_or(false) {
++                                            it.consume();
+                                         }
+-                                        v = v * 16 + some_else!(d.to_digit(16) => return err("Invalid hex digit in `\\u` escape"));
++                                        continue ;
++                                        },
++                                    _ => match lex_escape(&mut it)
++                                        {
++                                        Ok(e) => e,
++                                        Err(e) => return err(e),
++                                        },
++                                    };
++                                if is_byte {
++                                    if e as u32 > 0xFF {
++                                        return err("Non-byte escape in byte string");
+                                     }
+-                                    s.push(some_else!(::std::char::from_u32(v) => return err("Invalid `\\u` escape")));
+-                                    },
+-                                // A backslash at end-of-line eats the newline and the next line's leading whitespace
+-                                '\n' | '\r' => {
+-                                    while it.next().map(|c| c.is_whitespace()).unwrap_or(false) {
+-                                        it.consume();
+-                                    }
+-                                    },
+-                                c @ _ => panic!("Unknown escape in string {}", c),
++                                    bytes.push(e as u32 as u8);
+                                 }
++                                else {
++                                    s.push(e);
++                                }
++                            }
++                            else if is_byte {
++                                let mut buf = [0u8; 4];
++                                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                             }
+                             else {
+                                 s.push(c);
+                             }
+                         }
+                         let val = if is_byte {
+-                                crate::token_tree::LiteralValue::ByteString(s.into_bytes())
++                                crate::token_tree::LiteralValue::ByteString(bytes)
+                             } else {
+                                 crate::token_tree::LiteralValue::String(s)
+                             };
+@@ -411,99 +559,54 @@ impl ::std::str::FromStr for TokenStream {
+                 }
+                 else if c.is_digit(10)
+                 {
+-                    let base =
+-                        if c == '0' {
+-                            match it.consume()
+-                            {
+-                            Some('x') => { it.consume(); 16 },
+-                            Some('o') => { it.consume(); 8 },
+-                            Some('b') => { it.consume(); 2 },
+-                            None => {
+-                                rv.push(Literal::new_u(0, 0).into());
+-                                continue 'outer;
+-                                },
+-                            _ => 10,
+-                            }
+-                        }
+-                        else {
+-                            10
++                    let val = match lex_number(&mut it, true)
++                        {
++                        Ok(v) => v,
++                        Err(e) => return err(e),
+                         };
+-                    let mut v = 0;
+-                    let mut c = it.cur();
+-                    'int: loop
+-                    {
+-                        while c == '_' {
+-                            c = some_else!( it.consume() => { break 'int; } );
+-                        }
+-                        if c == 'u' || c == 'i' {
+-                            let s = get_ident(&mut it, String::new());
+-                            rv.push(match &*s
+-                                {
+-                                "u8"    => Literal::new_u(v,   8), "i8"    => Literal::new_s(v as i128,   8),
+-                                "u16"   => Literal::new_u(v,  16), "i16"   => Literal::new_s(v as i128,  16),
+-                                "u32"   => Literal::new_u(v,  32), "i32"   => Literal::new_s(v as i128,  32),
+-                                "u64"   => Literal::new_u(v,  64), "i64"   => Literal::new_s(v as i128,  64),
+-                                "u128"  => Literal::new_u(v, 128), "i128"  => Literal::new_s(v as i128, 128),
+-                                "usize" => Literal::new_u(v,   1), "isize" => Literal::new_s(v as i128,   1),
+-                                _ => return err("Unexpected integer suffix"),
+-                                }.into());
+-                            continue 'outer;
+-                        }
+-                        else if let Some(d) = c.to_digit(base) {
+-                            v *= base as u128;
+-                            v += d as u128;
+-                            c = some_else!( it.consume() => { break 'int; } );
+-                        }
+-                        else if c == '.' {
+-                            panic!("TODO: Floating point");
+-                        }
+-                        else {
+-                            break;
+-                        }
+-                    }
+-                    rv.push(Literal::new_u(v, 0).into());
++                    rv.push(Literal { span: Span::call_site(), val: val }.into());
+                     continue 'outer;
+                 }
+                 // Punctuation?
+-                else if c as u32 <= 0xFF
++                else if c as u32 <= 0x7F
+                 {
+-                    let mut start = match SYMS.iter().position(|v| v[0] == (c as u8))
+-                        {
+-                        Some(start) => start,
+-                        None => {
+-                            eprint!("Unknown operator character '{}'\r\n", c);
+-                            return err("Unknown operator")
+-                            },
+-                        };
+-                    let mut end = start+1;
+-                    while end < SYMS.len() && SYMS[end][0] == c as u8 {
+-                        end += 1;
++                    // The longest symbol (every prefix of one is a symbol too): `<<=` is one symbol, not `<<` `=`
++                    let mut sym = [c as u8, 0, 0];
++                    let mut len = 1;
++                    if !SYMS.iter().any(|s| *s == &sym[..1]) {
++                        eprint!("Unknown operator character '{}'\r\n", c);
++                        return err("Unknown operator")
+                     }
+-
+-                    let mut ofs = 1;
+-                    loop
++                    while len < sym.len()
+                     {
+-                        let syms = &SYMS[start..end];
+-                        assert_eq!(ofs, syms[0].len(), "{:?}", syms[0]);
+-                        c = some_else!(it.consume() => break);
+-                        let step = match syms[1..].iter().position(|v| v[ofs] == (c as u8))
+-                            {
+-                            Some(s) => s+1,
+-                            None => break,
+-                            };
+-                        start += step;
+-                        end = start+1;
+-                        while end < syms.len() && syms[end][ofs] == c as u8 {
+-                            end += 1;
++                        let nc = some_else!(it.consume() => break);
++                        if nc as u32 > 0x7F {
++                            break;
+                         }
+-                        ofs += 1;
++                        sym[len] = nc as u8;
++                        if !SYMS.iter().any(|s| *s == &sym[..len+1]) {
++                            break;
++                        }
++                        len += 1;
++                    }
++                    if len == sym.len() {
++                        it.consume();
+                     }
+-                    assert_eq!(SYMS[start].len(), ofs);
+-                    for (i,&c) in Iterator::enumerate(SYMS[start].iter())
++                    for (i,&c) in Iterator::enumerate(sym[..len].iter())
+                     {
+-                        let sep = if i == SYMS[start].len() - 1 { Spacing::Alone } else { Spacing::Joint };
++                        let sep = if i == len - 1 { Spacing::Alone } else { Spacing::Joint };
+                         rv.push(Punct::new(c as char, sep).into());
+                     }
++                    // A number right after a `.` is a tuple index: `x.0.1` is `x . 0 . 1`, not `x . 0.1` (mrustc's
++                    // lexer does the same)
++                    if len == 1 && sym[0] == b'.' && !it.is_complete() && it.cur().is_digit(10) {
++                        let val = match lex_number(&mut it, false)
++                            {
++                            Ok(v) => v,
++                            Err(e) => return err(e),
++                            };
++                        rv.push(Literal { span: Span::call_site(), val: val }.into());
++                    }
+                 }
+                 else
+                 {
+@@ -610,4 +713,83 @@ mod tests {
+         assert_tt_matches!(it.next(), Ident::new("def_id", Span::call_site()).into());
+         assert_tt_matches!(it.next());
+     }
++
++    fn lit(val: crate::token_tree::LiteralValue) -> TokenTree {
++        Literal { span: Span::call_site(), val: val }.into()
++    }
++    #[test]
++    fn numbers()
++    {
++        use crate::token_tree::LiteralValue::*;
++        // `TokenStream::to_string` writes tuple indices and method calls on integers without spaces (`x.0.1`)
++        let rv = TokenStream::from_str("x.0.1 1.max(2) 1..2 1.5 1. 2e3 1.5e-3f64 1f32 0x1F_u8 10px .7u8").expect("Failed to parse");
++        let mut it = rv.inner.into_iter();
++        assert_tt_matches!(it.next(), Ident::new("x", Span::call_site()).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Literal::new_u(0,0).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Literal::new_u(1,0).into());
++        assert_tt_matches!(it.next(), Literal::new_u(1,0).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Ident::new("max", Span::call_site()).into());
++        let _ = it.next();
++        assert_tt_matches!(it.next(), Literal::new_u(1,0).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Literal::new_u(2,0).into());
++        assert_tt_matches!(it.next(), lit(Float(1.5, 0)));
++        assert_tt_matches!(it.next(), lit(Float(1.0, 0)));
++        assert_tt_matches!(it.next(), lit(Float(2000.0, 0)));
++        assert_tt_matches!(it.next(), lit(Float(1.5e-3, 64)));
++        assert_tt_matches!(it.next(), lit(Float(1.0, 32)));
++        assert_tt_matches!(it.next(), Literal::new_u(31,8).into());
++        assert_tt_matches!(it.next(), lit(Suffixed(Box::new(UnsignedInt(10, 0)), "px".to_owned())));
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Literal::new_u(7,8).into());
++        assert_tt_matches!(it.next());
++        assert_eq!(lit(Float(1.0, 0)).to_string(), "1.0");
++        assert_eq!(lit(Float(0.1f32 as f64, 32)).to_string(), "0.1f32");
++    }
++    #[test]
++    fn comment_at_end()
++    {
++        // A line comment ending the input looped forever
++        let rv = TokenStream::from_str("x // comment").expect("Failed to parse");
++        let mut it = rv.inner.into_iter();
++        assert_tt_matches!(it.next(), Ident::new("x", Span::call_site()).into());
++        assert_tt_matches!(it.next());
++        assert!(TokenStream::from_str("x /* unterminated").is_err());
++    }
++    #[test]
++    fn symbols()
++    {
++        let rv = TokenStream::from_str("<<= ..= ...").expect("Failed to parse");
++        let mut it = rv.inner.into_iter();
++        assert_tt_matches!(it.next(), Punct::new('<', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('<', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('=', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('=', Spacing::Alone).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Joint).into());
++        assert_tt_matches!(it.next(), Punct::new('.', Spacing::Alone).into());
++        assert_tt_matches!(it.next());
++    }
++    #[test]
++    fn escapes_and_raw_idents()
++    {
++        let rv = TokenStream::from_str(r#"'\u{7b}' '\x41' '\\' b'a' b'\xff' b"\xff\\" r#type"#).expect("Failed to parse");
++        let mut it = rv.inner.into_iter();
++        assert_tt_matches!(it.next(), Literal::character('{').into());
++        assert_tt_matches!(it.next(), Literal::character('A').into());
++        assert_tt_matches!(it.next(), Literal::character('\\').into());
++        assert_tt_matches!(it.next(), Literal::byte_character(b'a').into());
++        assert_tt_matches!(it.next(), Literal::byte_character(0xff).into());
++        assert_tt_matches!(it.next(), Literal::byte_string(b"\xff\\").into());
++        assert_tt_matches!(it.next(), Ident::new_raw("type", Span::call_site()).into());
++        assert_tt_matches!(it.next());
++        assert_eq!(Literal::character('\\').to_string(), r"'\\'");
++        assert_eq!(Literal::byte_string(b"\\").to_string(), r#"b"\x5c""#);
++    }
+ }
+diff --git a/lib/libproc_macro/src/serialisation.rs b/lib/libproc_macro/src/serialisation.rs
+index b8b3f2d1..b32608e1 100644
+--- a/lib/libproc_macro/src/serialisation.rs
++++ b/lib/libproc_macro/src/serialisation.rs
+@@ -130,7 +130,8 @@ pub fn send_token_stream<T: ::std::io::Write>(out_stream: T, ts: TokenStream)
+                 Delimiter::Bracket => s.write_sym_1(']'),
+                 }
+                 },
+-            TokenTree::Ident(i) => s.write_ent(Token::Ident(i.val)),
++            // A raw identifier goes as `r#name` (as the compiler sends one), not as the keyword it spells
++            TokenTree::Ident(i) => s.write_ent(Token::Ident(if i.is_raw { format!("r#{}", i.val) } else { i.val })),
+             TokenTree::Punct(p) => {
+                 if p.ch == '\'' {
+                     // Get next, must be ident, push lifetime
+diff --git a/lib/libproc_macro/src/token_tree.rs b/lib/libproc_macro/src/token_tree.rs
+index b198f0da..d5ac5ba6 100644
+--- a/lib/libproc_macro/src/token_tree.rs
++++ b/lib/libproc_macro/src/token_tree.rs
+@@ -251,7 +251,7 @@ impl ::std::fmt::Display for LiteralValue
+         LiteralValue::ByteString(ref v) => {
+             f.write_str("b\"")?;
+             for &b in v {
+-                if b != b'"' && b >= b' ' && b <= b'z' {
++                if b != b'"' && b != b'\\' && b >= b' ' && b <= b'z' {
+                     (b as char).fmt(f)?;
+                 }
+                 else {
+@@ -263,7 +263,7 @@ impl ::std::fmt::Display for LiteralValue
+         LiteralValue::CString(ref v) => {
+             f.write_str("c\"")?;
+             for &b in v {
+-                if b != b'"' && b >= b' ' && b <= b'z' {
++                if b != b'"' && b != b'\\' && b >= b' ' && b <= b'z' {
+                     (b as char).fmt(f)?;
+                 }
+                 else {
+@@ -277,6 +277,7 @@ impl ::std::fmt::Display for LiteralValue
+             '\'' => f.write_str("'\\''")?,
+             '\0' => f.write_str("'\\0'")?,
+             '\n' => f.write_str("'\\n'")?,
++            '\\' => f.write_str("'\\\\'")?,
+             ' ' ... 'z' => write!(f, "'{}'", v)?,
+             _ => write!(f, "'\\u{{{:x}}}'", v as u32)?,
+             },
+@@ -305,8 +306,14 @@ impl ::std::fmt::Display for LiteralValue
+             }
+             },
+         LiteralValue::Float(v, sz) => {
+-            v.fmt(f)?;
++            // At the literal's own precision, and an unsuffixed one keeps its `.` (as rustc's `f64_unsuffixed`):
++            // `1.0`, not `1`, which `syn::Lit` would take for an integer
++            let s = if sz == 32 { format!("{}", v as f32) } else { format!("{}", v) };
++            f.write_str(&s)?;
+             if sz == 0 {
++                if v.is_finite() && !s.contains('.') {
++                    f.write_str(".0")?;
++                }
+             }
+             else {
+                 f.write_str("f")?;

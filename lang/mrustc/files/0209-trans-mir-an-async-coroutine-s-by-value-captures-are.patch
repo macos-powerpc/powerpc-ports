@@ -1,0 +1,70 @@
+From 9929f357e23a430e010e1ce057dd1d01dd6a6905 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 10 Oct 2026 22:55:27 +0000
+Subject: [PATCH 209/209] trans/mir: an async coroutine's by-value captures are
+ dropped once
+
+The drop glue of a coroutine struct skipped the field drops (leaving them to the
+coroutine's state-aware Drop impl) only for `generator#` types. For `future#`
+types (async fns and blocks; `is_future()` was never used) it ran the Drop impl
+and then dropped every capture field again: a second drop after the body had
+dropped or moved out the value when the future completed, and after the Drop
+impl's saved-value arm when a suspended future was dropped. Every owned argument
+of an `async fn` and every `async move` capture with drop glue was dropped twice
+(a double free for `String`/`Vec`/`Box` arguments, an extra `Arc` decrement), e.g.
+tower-lsp-server `Client::log_message(.., format!(..))`'s message, or any future
+tokio drops after it completes.
+
+The drop glue now skips the field drops for futures too, and the Drop impl's
+pre-run arm drops the by-value captures itself (upstream 63579550 had limited
+that arm to borrow captures, whose drop is a no-op, so generators - no field
+drops - leaked their by-value captures when dropped before running).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/mir/from_hir.cpp     | 9 ++++-----
+ src/trans/auto_impls.cpp | 5 ++++-
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index 826d3930..8ce6a9e8 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -305,15 +305,14 @@ namespace {
+ 
+             auto entry_block = out_builder.pause_cur_block();
+             // if state is 0, then drop captures (this is the pre-run state)
++            // - Nothing has run, so every capture is still owned here. The coroutine's drop glue doesn't drop its
++            //   fields (trans auto_impls), so by-value captures must be dropped here (once running, the body and
++            //   the saved-value arms below own them); dropping a borrow capture is a no-op.
+             arms.push_back(out_builder.new_bb_unlinked());
+             out_builder.set_cur_block(arms.back());
+-            size_t arg_count = 1 + (TARGETVER_LEAST_1_74 ? 1 : 0);
+             for(size_t i = 0; i < n_captures; i ++)
+             {
+-                // TODO: State tracking on captures, what if a by-value capture is moved?
+-                if( mappings.count(arg_count+i) == 0 ) {
+-                    out_builder.push_stmt_drop(sp, ::MIR::LValue::new_Field(self.clone(), 1+i));
+-                }
++                out_builder.push_stmt_drop(sp, ::MIR::LValue::new_Field(self.clone(), 1+i));
+             }
+             out_builder.end_block(::MIR::Terminator::make_Return({}));
+ 
+diff --git a/src/trans/auto_impls.cpp b/src/trans/auto_impls.cpp
+index b480346c..f91838bb 100644
+--- a/src/trans/auto_impls.cpp
++++ b/src/trans/auto_impls.cpp
+@@ -1073,9 +1073,12 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+                             has_drop = true;
+                         }
+ 
+-                        if( ty.data().is_Path() && ty.data().as_Path().is_generator() ) {
++                        if( ty.data().is_Path() && (ty.data().as_Path().is_generator() || ty.data().as_Path().is_future()) ) {
+                             ASSERT_BUG(sp, has_drop, "");
+                             // Generators use a custom Drop impl that handles dropping values
++                            // - Including async blocks/functions (`future#`): their by-value captures were dropped again
++                            //   after the custom Drop (or after the body had dropped/moved them), so every owned
++                            //   argument of a finished or cancelled `async fn` was dropped twice
+                         }
+                         else {
+                             // NOTE: Lazy option of monomorphising and handling the two classes

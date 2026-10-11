@@ -1,0 +1,80 @@
+From 7497eb8771dd2777549bb41d3cdc3195d61b136d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 10 Oct 2026 17:19:29 +0000
+Subject: [PATCH] mir: a coroutine local whose scope has ended before a yield
+ is not saved in the state
+
+`MirBuilder::get_active_locals` (the set saved across a yield) took every slot whose
+state was not Invalid/MovedOut. Closing a scope emits the drops of its values but
+never resets their slot states, so a local from a block that ended before the yield
+still read as `Valid` and was saved: its (dead) value stayed in the coroutine state
+struct, took part in the coroutine's auto traits, and the coroutine's drop glue
+dropped it a second time when the suspended coroutine was dropped.
+
+ast-grep 0.45.3 (cli crate): ast-grep-lsp `Backend::reload_rules` takes
+a `std::sync::RwLockWriteGuard` in an inner block that ends before the next `.await`.
+The guard (`!Send`) was saved, the hidden future of `Backend::initialized` was then
+`!Send`, and the `Fut: Send` bound on tower-lsp-server's blanket `Method` impl failed
+when trans re-checked the copied bounds of the `Router::method` closure impl:
+`enumerate.cpp:1703: Item not found for <closure#I_method_5<.. initialized ..
+layers::Normal> as FnOnce<()>>::call_once`. (typeck never saw this: in
+tower-lsp-server the server type is generic, so `Send` came from the trait's
+opaque `+ Send` return type.)
+
+A slot that only completed scopes own is now skipped. Temporaries raised out of
+a completed scope (`raise_all`) are also listed by the open target scope, so they
+stay saved.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/mir/mir_builder.cpp | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/mir/mir_builder.cpp b/src/mir/mir_builder.cpp
+index b6f346bd..8b8c926e 100644
+--- a/src/mir/mir_builder.cpp
++++ b/src/mir/mir_builder.cpp
+@@ -2402,10 +2402,43 @@ void MirBuilder::moved_lvalue(const Span& sp, const ::MIR::LValue& lv)
+ std::map<unsigned, MirBuilder::SavedActiveLocal> MirBuilder::get_active_locals(const Span& sp, std::set<unsigned>& saved_drop_flags) const
+ {
+     TRACE_FUNCTION;
++    // A slot owned only by scopes that have already ended is dead here: its drop (or move) was emitted when the
++    // scope closed, but slot states are not reset at scope end, so it still reads as `Valid`. Saving it would keep
++    // the dead value (and its type) in the coroutine state - the coroutine's drop glue would then drop it a second
++    // time when the suspended coroutine is dropped, and the type takes part in the coroutine's auto traits.
++    // - ast-grep-lsp `Backend::reload_rules`: a `std::sync::RwLockWriteGuard` taken in an inner block that ends
++    //   before the next `.await` was saved, and `RwLockWriteGuard: !Send` made the whole future `!Send`, so the
++    //   tower-lsp-server `Router::method` closure lost its `FnOnce` impl ("Item not found" in enumerate)
++    // Temporaries raised out of a completed scope stay listed in it (`raise_all`), so a slot that an open scope
++    // also owns is live.
++    std::set<unsigned>  dead_slots;
++    for(const auto& sd : m_scopes)
++    {
++        if( sd.complete )
++        {
++            if( const auto* e = sd.data.opt_Owning() )
++            {
++                dead_slots.insert(e->slots.begin(), e->slots.end());
++            }
++        }
++    }
++    for(auto scope_idx : m_scope_stack)
++    {
++        if( const auto* e = m_scopes.at(scope_idx).data.opt_Owning() )
++        {
++            for(auto idx : e->slots)
++                dead_slots.erase(idx);
++        }
++    }
+     std::map<unsigned, MirBuilder::SavedActiveLocal>    rv;
+     for(size_t i = 0; i < m_slot_states.size(); i ++)
+     {
+         const auto& s = get_slot_state(sp, i, SlotType::Local);
++        if( dead_slots.count(i) )
++        {
++            DEBUG("_" << i << " : " << s << " (scope ended, not saved)");
++            continue ;
++        }
+         TU_MATCH_HDRA( (s), {)
+         default:
+             DEBUG("_" << i << " : " << s);

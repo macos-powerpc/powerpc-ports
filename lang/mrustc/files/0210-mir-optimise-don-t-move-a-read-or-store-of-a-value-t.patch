@@ -1,0 +1,195 @@
+From d90e3873ec585779c357bf2b3c8cd8c74771d868 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 10 Oct 2026 23:17:19 +0000
+Subject: [PATCH] mir/optimise: don't move a read or store of a value that a drop,
+ asm or call can access across it
+
+A drop (its glue may run a `Drop` impl), inline assembly or a called function can
+read and write statics, anything behind a pointer, and the locals/arguments whose
+address is taken somewhere in the function. Three passes moved reads or stores of
+such values across that code:
+- MIR_Optimise_DeTemporary (the per-block `_n = Use(src)` records): a Drop statement
+  only counted as a move of the dropped value, so `let n = unsafe { COUNT }; drop(g);
+  n` read COUNT after g's Drop impl had bumped it (also a local written through an
+  escaped raw pointer, and an argument).
+- DeTemporary_SingleSetAndUse walks from set to use across calls as well, and only
+  checked for direct writes/borrows/moves of the same root: a store to a static,
+  an escaped local or `*p` could be hoisted above a call that reads the old value,
+  and a read sunk below a call that changes it.
+- PropagateSingleAssignments: as DeTemporary, for local sources across drops.
+
+Each pass now builds the set of such values once (statics, Deref paths, borrowed
+locals/arguments); a drop or asm statement, and a call where the pass crosses
+block ends (the use itself excepted), stops the move.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/mir/optimise.cpp | 100 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 96 insertions(+), 4 deletions(-)
+
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index ccc058b6..f2e6bcb6 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -1724,6 +1724,62 @@ namespace {
+     {
+         return visit_mir_lvalues(term, check_invalidates_lvalue_cb(val, is_copy, also_read));
+     }
++
++    /// Values that code not visible in this function can access: a drop (the drop glue may run a `Drop` impl),
++    /// inline assembly, or a called function can read or write statics, anything behind a pointer, and locals or
++    /// arguments whose address is taken somewhere in the function. Moving a read or a write of such a value across
++    /// that code changes what either side sees.
++    /// - `let n = unsafe { COUNT }; drop(g); n` with a `Drop` impl bumping the `static mut` read the bumped value:
++    ///   DeTemporary replaced `n` with `COUNT` past the drop (the same for a local written through a raw pointer)
++    class OpaqueAccessible
++    {
++        ::std::vector<bool> m_locals;
++        ::std::vector<bool> m_args;
++    public:
++        OpaqueAccessible(const ::MIR::Function& fcn):
++            m_locals(fcn.locals.size())
++        {
++            auto cb = [&](const ::MIR::LValue& lv, ValUsage vu)->bool {
++                if( vu == ValUsage::Borrow )
++                {
++                    if( lv.m_root.is_Local() ) {
++                        m_locals.at(lv.m_root.as_Local()) = true;
++                    }
++                    else if( lv.m_root.is_Argument() ) {
++                        auto i = lv.m_root.as_Argument();
++                        if( i >= m_args.size() )
++                            m_args.resize(i+1);
++                        m_args[i] = true;
++                    }
++                }
++                return false;
++                };
++            for(const auto& bb : fcn.blocks)
++            {
++                for(const auto& stmt : bb.statements)
++                    visit_mir_lvalues(stmt, cb);
++                if( bb.terminator.tag() != ::MIR::Terminator::TAGDEAD )
++                    visit_mir_lvalues(bb.terminator, cb);
++            }
++        }
++        bool contains(const ::MIR::LValue& lv) const
++        {
++            if( lv.m_root.is_Static() )
++                return true;
++            if( ::std::any_of(lv.m_wrappers.begin(), lv.m_wrappers.end(), [](const ::MIR::LValue::Wrapper& w){ return w.is_Deref(); }) )
++                return true;
++            if( lv.m_root.is_Local() )
++                return m_locals.at(lv.m_root.as_Local());
++            if( lv.m_root.is_Argument() )
++                return lv.m_root.as_Argument() < m_args.size() && m_args[lv.m_root.as_Argument()];
++            return false;
++        }
++    };
++    /// A statement that runs code the optimiser doesn't see
++    bool stmt_runs_opaque_code(const ::MIR::Statement& stmt)
++    {
++        return stmt.is_Drop() || stmt.is_Asm() || stmt.is_Asm2();
++    }
+ }
+ 
+ // --------------------------------------------------------------------
+@@ -1801,6 +1857,9 @@ bool MIR_Optimise_DeTemporary_SingleSetAndUse(::MIR::TypeResolve& state, ::MIR::
+         visit_mir_lvalues(state, fcn, visit_cb);
+     }
+ 
++    // Values that drops/calls/asm between a set and a use could access (a read or write can't be moved across them)
++    const OpaqueAccessible  opaque(fcn);
++
+     // 2. Find any local with 1 write, 1 read, and no borrows
+     for(size_t var_idx = 0; var_idx < fcn.locals.size(); var_idx ++)
+     {
+@@ -1840,10 +1899,12 @@ bool MIR_Optimise_DeTemporary_SingleSetAndUse(::MIR::TypeResolve& state, ::MIR::
+                 // - Iterate the path(s) between the two statements to check if the destination would be invalidated
+                 //  > The iterate function doesn't (yet) support following BB chains, so assume invalidated if over a jump.
+                 // TODO: What if the set location is a call?
++                // - A static/escaped/pointed-to destination can't be written before a call or asm that may access it
++                bool dst_opaque = opaque.contains(dst);
+                 bool invalidated = IterPathRes::Complete != iter_path(fcn, set_loc_next, slot.use_loc,
+                         // TODO: What about a mutable borrow?
+-                        [&](auto loc, const auto& stmt)->bool{ return stmt.is_Drop() || check_invalidates_lvalue(stmt, dst, false, /*also_read=*/true); },
+-                        [&](auto loc, const auto& term)->bool{ return check_invalidates_lvalue(term, dst, false, /*also_read=*/true); }
++                        [&](auto loc, const auto& stmt)->bool{ return stmt.is_Drop() || (dst_opaque && stmt_runs_opaque_code(stmt)) || check_invalidates_lvalue(stmt, dst, false, /*also_read=*/true); },
++                        [&](auto loc, const auto& term)->bool{ return (dst_opaque && term.is_Call()) || check_invalidates_lvalue(term, dst, false, /*also_read=*/true); }
+                         );
+                 if( !invalidated )
+                 {
+@@ -1916,12 +1977,15 @@ bool MIR_Optimise_DeTemporary_SingleSetAndUse(::MIR::TypeResolve& state, ::MIR::
+                 bool src_copy = src.m_wrappers.empty() && state.lvalue_is_copy(src);
+ 
+                 // Check if the source of initial assignment is invalidated in the meantime.
++                // - A static/escaped/pointed-to source can be changed by a drop, asm or call before the use (the use
++                //   itself reads it first)
++                bool src_opaque = opaque.contains(src);
+                 auto use_loc_inc = slot.use_loc;
+                 use_loc_inc.stmt_idx += 1;
+                 bool invalidated = IterPathRes::Complete != iter_path(fcn, set_loc_next, use_loc_inc,
+                         // NOTE: If a mutable borrow happens, assume it invalidates the source
+-                        [&](auto loc, const auto& stmt)->bool{ return check_invalidates_lvalue(stmt, src, src_copy) || TU_TEST2(stmt, Assign, .src, Borrow, .type != HIR::BorrowType::Shared); },
+-                        [&](auto loc, const auto& term)->bool{ return check_invalidates_lvalue(term, src, src_copy); }
++                        [&](auto loc, const auto& stmt)->bool{ return (src_opaque && !(loc == slot.use_loc) && stmt_runs_opaque_code(stmt)) || check_invalidates_lvalue(stmt, src, src_copy) || TU_TEST2(stmt, Assign, .src, Borrow, .type != HIR::BorrowType::Shared); },
++                        [&](auto loc, const auto& term)->bool{ return (src_opaque && !(loc == slot.use_loc) && term.is_Call()) || check_invalidates_lvalue(term, src, src_copy); }
+                         );
+                 DEBUG("invalidated = " << invalidated);
+                 // If this is a deref, and there are move ops between definition and use - then invalidate
+@@ -2487,6 +2551,8 @@ bool MIR_Optimise_DeTemporary(::MIR::TypeResolve& state, ::MIR::Function& fcn)
+ 
+ 
+     // OLD ALGORITHM.
++    // (Calls end a block, but a drop or asm inside one runs code that can access some values)
++    const OpaqueAccessible  opaque(fcn);
+     for(unsigned int bb_idx = 0; bb_idx < fcn.blocks.size(); bb_idx ++)
+     {
+         auto& bb = fcn.blocks[bb_idx];
+@@ -2616,6 +2682,24 @@ bool MIR_Optimise_DeTemporary(::MIR::TypeResolve& state, ::MIR::Function& fcn)
+             // - Apply known relacements
+             visit_mir_lvalues_mut(stmt, cb_apply_replacements);
+ 
++            // - A drop/asm can change a static, a value behind a pointer, or a local/argument whose address was taken:
++            //   forget assignments from (or to) such values
++            if( stmt_runs_opaque_code(stmt) )
++            {
++                for(auto it = local_assignments.begin(); it != local_assignments.end(); )
++                {
++                    if( opaque.contains(bb.statements[it->second].as_Assign().src.as_Use()) || opaque.contains(::MIR::LValue::new_Local(it->first)) )
++                    {
++                        DEBUG(state << "> Opaque code can change Local(" << it->first << ") or its source");
++                        it = local_assignments.erase(it);
++                    }
++                    else
++                    {
++                        ++ it;
++                    }
++                }
++            }
++
+             // - Check if this is a new assignment
+             if( stmt.is_Assign() && stmt.as_Assign().dst.is_Local() && stmt.as_Assign().src.is_Use() )
+             {
+@@ -4720,6 +4804,8 @@ bool MIR_Optimise_PropagateSingleAssignments(::MIR::TypeResolve& state, ::MIR::F
+     //  - This includes mutation, borrowing, or moving.
+     // > Replace usage with the inner of the original `Use`
+     {
++        // Locals that a drop/asm can change (calls end the search below anyway)
++        const OpaqueAccessible  opaque(fcn);
+         // 1. Assignments (forward propagate)
+         //::std::map< ::MIR::LValue::CRef, ::MIR::RValue>    replacements;
+         ::std::vector< ::std::pair<::MIR::LValue, ::MIR::RValue> >  replacements;
+@@ -4811,6 +4897,12 @@ bool MIR_Optimise_PropagateSingleAssignments(::MIR::TypeResolve& state, ::MIR::F
+                         DEBUG("Source invalidated");
+                         break;
+                     }
++                    // A drop/asm can write a local whose address was taken
++                    if( stmt_runs_opaque_code(stmt2) && opaque.contains(e.src.as_Use()) ) {
++                        stop = true;
++                        DEBUG("Source may be changed by " << stmt2);
++                        break;
++                    }
+ 
+                     // Usage found.
+                     if( visit_mir_lvalues(stmt2, is_lvalue_usage) )

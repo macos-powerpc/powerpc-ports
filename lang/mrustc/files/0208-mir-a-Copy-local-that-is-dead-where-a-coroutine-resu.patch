@@ -1,0 +1,171 @@
+From a5a6a2a9960e1a0cb91a0a5b31cbe294503e1e75 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 10 Oct 2026 22:55:21 +0000
+Subject: [PATCH 208/209] mir: a `Copy` local that is dead where a coroutine
+ resumes is not saved in its state
+
+`MirBuilder::get_active_locals` saves every slot that is valid in an open scope,
+and the last use of a `Copy` value does not mark it moved, so the temporaries of
+the statement holding an `.await` (the receiver and argument temporaries of the
+awaited call, the raw pointers that `box_new` writes through) were all saved in
+the coroutine state. Their types took part in the coroutine's auto traits, where
+rustc only counts locals that are live across the yield.
+
+ast-grep 0.45.3 (cli crate), the culprit left after 0206 (the auto-trait walk
+stops at the first failing field): ast-grep-lsp `Backend::register_file_watchers`
+awaits `self.client.register_capability(vec![registration])`, and `vec!`'s
+`box_new` left a `*mut [Registration; 1]` (`!Send`) in the state. The
+`initialized` future was then `!Send`, and tower-lsp-server's `Router::method`
+closure lost its `FnOnce` impl: `enumerate.cpp:1703: Item not found for
+<closure#I_method_5<.. initialized .. layers::Normal> as FnOnce<()>>::call_once`.
+
+Before the state struct is built, a backwards liveness pass over the finished
+MIR removes from each yield's saved set the `Copy` locals that are never
+borrowed (a saved borrow could point at them) and are not read after the resume
+point before being overwritten. Other values are unchanged (dropping them is
+a use, and the saved set drives the coroutine's drop glue and drop flags), and
+arguments/captures are not touched.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/mir/from_hir.cpp | 120 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 120 insertions(+)
+
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index a0570c8a..826d3930 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -153,6 +153,124 @@ namespace {
+ 
+             return used_vars;
+         }
++        /// Remove `Copy` locals that are dead where a state resumes from the set saved by that state
++        ///
++        /// `get_active_locals` saves every slot that is valid in an open scope, and the last use of a `Copy` value
++        /// does not mark it moved, so the temporaries of the statement holding an `.await` (the receiver and argument
++        /// temporaries of the awaited call, the raw pointers from `box_new`) are all saved. Their types then take part
++        /// in the coroutine's auto traits, where rustc only counts locals that are live across the yield.
++        /// - ast-grep-lsp `Backend::register_file_watchers`: `self.client.register_capability(vec![registration]).await`
++        ///   saved the `*mut [Registration; 1]` of `vec!`'s `box_new`, the future was `!Send`, and tower-lsp-server's
++        ///   `Router::method` closure for `initialized` lost its `FnOnce` impl ("Item not found" in enumerate)
++        /// A `Copy` local that is never borrowed (a saved borrow could point at it) and is not read after the resume
++        /// point before being overwritten does not need to be in the state. Other values are left alone: dropping them
++        /// is a use anyway, and the saved set drives the coroutine's drop glue and drop flags.
++        void generator_prune_dead_locals(const Span& sp, const ::MIR::Function& fcn, unsigned first_local)
++        {
++            TRACE_FUNCTION;
++            auto& states = m_generator_state.states;
++            // Candidates: `Copy` locals (not arguments or captures) saved by a state that has a resume point
++            std::map<unsigned, unsigned>    bit_of;
++            for(size_t i = 0; i + 1 < states.size(); i ++)
++            {
++                for(const auto& e : states[i].saved)
++                {
++                    if( e.first >= first_local && bit_of.count(e.first) == 0 && m_builder.lvalue_is_copy(sp, ::MIR::LValue::new_Local(e.first)) )
++                    {
++                        auto b = static_cast<unsigned>(bit_of.size());
++                        bit_of.insert(std::make_pair(e.first, b));
++                    }
++                }
++            }
++            if( bit_of.empty() )
++                return ;
++            const size_t n_bits = bit_of.size();
++            const size_t n_blocks = fcn.blocks.size();
++
++            // Per block: candidates read before any overwrite (`gen`) and overwritten (`kill`); plus borrowed anywhere
++            std::vector<std::vector<bool>>  gen(n_blocks, std::vector<bool>(n_bits));
++            std::vector<std::vector<bool>>  kill(n_blocks, std::vector<bool>(n_bits));
++            std::vector<bool>   borrowed(n_bits);
++            for(size_t bb = 0; bb < n_blocks; bb ++)
++            {
++                auto& g = gen[bb];
++                auto& k = kill[bb];
++                auto cb = [&](const ::MIR::LValue& lv, ::MIR::visit::ValUsage u)->bool {
++                    if( !lv.m_root.is_Local() )
++                        return false;
++                    auto it = bit_of.find(lv.m_root.as_Local());
++                    if( it == bit_of.end() )
++                        return false;
++                    auto b = it->second;
++                    if( u == ::MIR::visit::ValUsage::Borrow ) {
++                        borrowed[b] = true;
++                    }
++                    if( u == ::MIR::visit::ValUsage::Write ) {
++                        if( lv.m_wrappers.empty() ) {
++                            k[b] = true;
++                            return false;
++                        }
++                        // Writing through the value (`(*_n).f = ..`) reads it, a partial write (`_n.0 = ..`) doesn't
++                        if( std::none_of(lv.m_wrappers.begin(), lv.m_wrappers.end(), [](const ::MIR::LValue::Wrapper& w){ return w.is_Deref(); }) )
++                            return false;
++                    }
++                    if( !k[b] )
++                        g[b] = true;
++                    return false;
++                    };
++                const auto& blk = fcn.blocks[bb];
++                for(const auto& stmt : blk.statements)
++                    ::MIR::visit::visit_mir_lvalues(stmt, cb);
++                if( blk.terminator.tag() != ::MIR::Terminator::TAGDEAD )
++                    ::MIR::visit::visit_mir_lvalues(blk.terminator, cb);
++            }
++
++            // Backwards liveness: live_in = gen | (live_out & !kill), iterated to a fixed point
++            std::vector<std::vector<bool>>  live_in(n_blocks, std::vector<bool>(n_bits));
++            for(bool changed = true; changed; )
++            {
++                changed = false;
++                for(size_t bb = n_blocks; bb --; )
++                {
++                    std::vector<bool>   live_out(n_bits);
++                    if( fcn.blocks[bb].terminator.tag() != ::MIR::Terminator::TAGDEAD )
++                    {
++                        ::MIR::visit::visit_terminator_target(fcn.blocks[bb].terminator, [&](const ::MIR::BasicBlockId& t) {
++                            for(size_t b = 0; b < n_bits; b ++)
++                                if( live_in[t][b] )
++                                    live_out[b] = true;
++                            });
++                    }
++                    for(size_t b = 0; b < n_bits; b ++)
++                    {
++                        if( !live_in[bb][b] && (gen[bb][b] || (live_out[b] && !kill[bb][b])) )
++                        {
++                            live_in[bb][b] = true;
++                            changed = true;
++                        }
++                    }
++                }
++            }
++
++            // `states[i].saved` is what stays alive while suspended in state `i+1`, which resumes at that state's entry
++            for(size_t i = 0; i + 1 < states.size(); i ++)
++            {
++                const auto& live = live_in.at(states[i+1].entrypoint);
++                for(auto it = states[i].saved.begin(); it != states[i].saved.end(); )
++                {
++                    auto b_it = bit_of.find(it->first);
++                    if( b_it != bit_of.end() && !borrowed[b_it->second] && !live[b_it->second] )
++                    {
++                        DEBUG("State " << i << ": _" << it->first << " is dead on resume, not saved");
++                        it = states[i].saved.erase(it);
++                    }
++                    else
++                    {
++                        ++ it;
++                    }
++                }
++            }
++        }
+         void generator_make_drop(
+             const Span& sp, MirBuilder& out_builder,
+             size_t n_captures, const ::std::map<unsigned, std::vector<MIR::LValue::Wrapper>>& mappings,
+@@ -3179,6 +3297,8 @@ namespace {
+ 
+             // ------------
+ 
++            // 0. `Copy` locals that are dead where a state resumes don't need saving
++            ev.generator_prune_dead_locals(gen_node->span(), fcn, args.size() + gen_node->m_capture_usages.size());
+             // 1. Generate the state machine switch (and enumerate saved variables)
+             std::set<unsigned>  saved = ev.generator_finalise(gen_node->span(), const_cast<HIR::Enum&>(resolve.m_crate.get_enum_by_path(sp, gen_node->m_state_idx_enum)));
+             // 2. Populate state structure

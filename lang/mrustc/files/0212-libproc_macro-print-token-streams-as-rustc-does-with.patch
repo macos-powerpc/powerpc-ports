@@ -1,0 +1,402 @@
+From c1faba2f67fef1b25ae5136f4b27e989a38f4f85 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 00:17:29 +0000
+Subject: [PATCH] libproc_macro: print token streams as rustc does, with no space
+ after the last token
+
+`TokenStream`'s Display wrote a space after every token that wasn't
+punctuation (and an `Alone` `Punct` printed one itself), so every
+`to_string()` of a stream ended in a space. Proc macros compare these strings.
+darling's attribute extractor matches each attribute on
+`attr.path().into_token_stream().to_string()` (proc-macro2 hands Display to the
+compiler's stream): it got `"builder "`, never `"builder"`, and silently
+ignored every `#[builder(..)]` attribute. skim 5.7.3's
+`#[builder(build_fn(name = "final_build"), setter(into, strip_option))]
+#[builder(default)]` then generated a plain `build`, and options.rs:1344 failed
+with `No applicable methods for {&mut SkimOptionsBuilder}.final_build`. Every
+darling-based derive (derive_builder and others) lost its attributes this way.
+
+Streams now print as rustc 1.90's pretty printer does for tokens a proc macro
+built (rustc_ast_pretty `print_tts`/`space_between`): joint punctuation glued
+into one token as rustc's stream building does (`::`, `..=`, `<<=`, a joint `'`
+and an identifier into a lifetime), a space between two tokens only where the
+first is `Alone` and the pair doesn't go together (`x.y`, `f(x, y)`, `#[attr]`,
+`$x`, `println!`, `a;`, but `self (x)`, `if ! x`, `a .. b`), `{ a }` and `{}` for
+braces, none-delimited groups as their contents, a negative literal starting
+with its `-`, and nothing after the last token. A `Punct` prints as its
+character alone, as rustc's does. Long streams are not line-wrapped (rustc
+breaks them near 78 columns).
+
+Checked against a stock rustc 1.90: a proc macro printing 4000 random streams
+(idents, keywords, raw idents, every punctuation character with either spacing,
+literals, nested groups of each delimiter) gives the same strings as this
+crate built with rustc, except where rustc wrapped long lines.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ lib/libproc_macro/src/lib.rs        |  12 +-
+ lib/libproc_macro/src/token_tree.rs | 305 ++++++++++++++++++++++++++--
+ 2 files changed, 288 insertions(+), 29 deletions(-)
+
+diff --git a/lib/libproc_macro/src/lib.rs b/lib/libproc_macro/src/lib.rs
+index 081fa4ce..1876b3d0 100644
+--- a/lib/libproc_macro/src/lib.rs
++++ b/lib/libproc_macro/src/lib.rs
+@@ -85,17 +85,7 @@ pub mod token_stream {
+     impl ::std::fmt::Display for TokenStream
+     {
+         fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+-            for v in &self.inner
+-            {
+-                write!(f, "{}", v)?;
+-                // Put a space after every token that isn't punctuation
+-                if let &crate::TokenTree::Punct(_) = v {
+-                }
+-                else {
+-                    write!(f, " ")?;
+-                }
+-            }
+-            Ok(())
++            crate::token_tree::fmt_stream(&self.inner, f)
+         }
+     }
+ 
+diff --git a/lib/libproc_macro/src/token_tree.rs b/lib/libproc_macro/src/token_tree.rs
+index d5ac5ba6..2791ebae 100644
+--- a/lib/libproc_macro/src/token_tree.rs
++++ b/lib/libproc_macro/src/token_tree.rs
+@@ -69,22 +69,238 @@ impl ::std::fmt::Display for Group
+ {
+     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result
+     {
++        // As rustc prints a group: no spaces inside `()` and `[]`, `{ a }` (`{}` when empty), `None` as its contents
++        let tts = &self.stream.inner[..];
+         match self.delimiter
+         {
+-        Delimiter::Parenthesis => f.write_str("(")?,
+-        Delimiter::Brace => f.write_str("{")?,
+-        Delimiter::Bracket => f.write_str("[")?,
+-        Delimiter::None => {},
++        Delimiter::Parenthesis => {
++            f.write_str("(")?;
++            fmt_stream(tts, f)?;
++            f.write_str(")")
++            },
++        Delimiter::Bracket => {
++            f.write_str("[")?;
++            fmt_stream(tts, f)?;
++            f.write_str("]")
++            },
++        Delimiter::Brace => {
++            if tts.is_empty() {
++                f.write_str("{}")
++            }
++            else {
++                f.write_str("{ ")?;
++                fmt_stream(tts, f)?;
++                f.write_str(" }")
++            }
++            },
++        Delimiter::None => fmt_stream(tts, f),
+         }
+-        self.stream.fmt(f)?;
+-        match self.delimiter
++    }
++}
++
++/// Write a token stream as rustc's pretty printer does (`TokenStream::to_string`): a space only between two tokens
++/// where the first is `Alone` and rustc's `space_between` wants one, and none after the last token.
++///
++/// Proc macros compare these strings. darling (derive_builder) finds its attributes by matching
++/// `attr.path().into_token_stream().to_string()` against `"builder"`: a space after every token (as this used to
++/// print) made that `"builder "`, and every `#[builder(..)]` attribute was silently ignored.
++pub(crate) fn fmt_stream(tts: &[TokenTree], f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result
++{
++    let mut pos = 0;
++    while pos < tts.len()
++    {
++        let (tok, next) = PrintToken::at(tts, pos);
++        tok.write_to(f)?;
++        if next < tts.len() && tok.spacing() == Spacing::Alone && space_between(&tok, &PrintToken::at(tts, next).0) {
++            f.write_str(" ")?;
++        }
++        pos = next;
++    }
++    Ok(())
++}
++
++/// A token as rustc's printer sees it. rustc glues joint punctuation into one token as a stream is built (`:` `:` is
++/// `::`, `.` `.` `=` is `..=`) and a joint `'` with the identifier after it into a lifetime, and its spacing rules
++/// look at those tokens.
++enum PrintToken<'a>
++{
++    /// Glued punctuation (at most three characters), and the spacing of its last `Punct`
++    Op([char; 3], usize, Spacing),
++    Lifetime(&'a Ident),
++    Ident(&'a Ident),
++    Literal(&'a Literal),
++    Group(&'a Group),
++}
++impl<'a> PrintToken<'a>
++{
++    /// The token that starts at `tts[pos]`, and the position after it
++    fn at(tts: &'a [TokenTree], pos: usize) -> (PrintToken<'a>, usize)
++    {
++        match tts[pos]
+         {
+-        Delimiter::Parenthesis => f.write_str(")")?,
+-        Delimiter::Brace => f.write_str("}")?,
+-        Delimiter::Bracket => f.write_str("]")?,
+-        Delimiter::None => f.write_str(" ")?,
++        TokenTree::Punct(ref p) => {
++            if p.ch == '\'' && p.spacing == Spacing::Joint {
++                if let Some(&TokenTree::Ident(ref i)) = tts.get(pos + 1) {
++                    return (PrintToken::Lifetime(i), pos + 2);
++                }
++            }
++            let mut chars = [p.ch, '\0', '\0'];
++            let mut len = 1;
++            let mut spacing = p.spacing;
++            while spacing == Spacing::Joint
++            {
++                let next_p = match tts.get(pos + len)
++                    {
++                    Some(&TokenTree::Punct(ref next_p)) => next_p,
++                    _ => break,
++                    };
++                if !op_glues(&chars[..len], next_p.ch) {
++                    break;
++                }
++                chars[len] = next_p.ch;
++                spacing = next_p.spacing;
++                len += 1;
++            }
++            (PrintToken::Op(chars, len, spacing), pos + len)
++            },
++        TokenTree::Ident(ref i) => (PrintToken::Ident(i), pos + 1),
++        TokenTree::Literal(ref l) => (PrintToken::Literal(l), pos + 1),
++        TokenTree::Group(ref g) => (PrintToken::Group(g), pos + 1),
++        }
++    }
++
++    /// Spacing after this token: tokens other than punctuation are `Alone` (as rustc makes them for proc macros)
++    fn spacing(&self) -> Spacing {
++        match *self
++        {
++        PrintToken::Op(_, _, spacing) => spacing,
++        _ => Spacing::Alone,
++        }
++    }
++    fn is_punct(&self) -> bool {
++        match *self
++        {
++        PrintToken::Op(..) => true,
++        _ => false,
++        }
++    }
++    /// Starts with punctuation: rustc splits a negative literal into `-` and the number (so `x. -1` keeps its space)
++    fn starts_with_punct(&self) -> bool {
++        match *self
++        {
++        PrintToken::Op(..) => true,
++        PrintToken::Literal(l) => l.val.is_negative(),
++        _ => false,
++        }
++    }
++    /// This is the one-character punctuation token `c` (not part of a glued one)
++    fn is_op(&self, c: char) -> bool {
++        match *self
++        {
++        PrintToken::Op(ref chars, len, _) => len == 1 && chars[0] == c,
++        _ => false,
++        }
++    }
++
++    fn write_to(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
++        match *self
++        {
++        PrintToken::Op(ref chars, len, _) => {
++            for c in &chars[..len] {
++                write!(f, "{}", c)?;
++            }
++            Ok(())
++            },
++        PrintToken::Lifetime(i) => write!(f, "'{}", i),
++        PrintToken::Ident(i) => write!(f, "{}", i),
++        PrintToken::Literal(l) => write!(f, "{}", l),
++        PrintToken::Group(g) => write!(f, "{}", g),
+         }
+-        Ok(())
++    }
++}
++
++/// rustc's `Token::glue`: the joint punctuation token `op` and a following `c` are one token
++fn op_glues(op: &[char], c: char) -> bool
++{
++    match op.len()
++    {
++    1 => match (op[0], c)
++        {
++        ('=', '=') | ('=', '>')
++        | ('<', '=') | ('<', '<') | ('<', '-')
++        | ('>', '=') | ('>', '>')
++        | ('!', '=')
++        | ('+', '=') | ('-', '=') | ('-', '>') | ('*', '=') | ('/', '=') | ('%', '=') | ('^', '=')
++        | ('&', '=') | ('&', '&') | ('|', '=') | ('|', '|')
++        | ('.', '.') | (':', ':') => true,
++        _ => false,
++        },
++    2 => match (op[0], op[1], c)
++        {
++        ('<', '<', '=') | ('>', '>', '=') | ('.', '.', '.') | ('.', '.', '=') => true,
++        _ => false,
++        },
++    _ => false,
++    }
++}
++
++/// rustc_ast_pretty's `space_between` (1.90): does rustc print a space between the `Alone` token `a` and the next token
++/// `b`? (The default is yes.)
++fn space_between(a: &PrintToken, b: &PrintToken) -> bool
++{
++    // `.` + NON-PUNCT: `x.y`, `tup.0`
++    if a.is_op('.') && !b.starts_with_punct() {
++        return false;
++    }
++    // `$` + IDENT: `$e`
++    if a.is_op('$') {
++        if let PrintToken::Ident(_) = *b {
++            return false;
++        }
++    }
++    // NON-PUNCT + `,`, `;` or `.`: `foo,`, `x = 3;`, `[T; 3]`, `x.y`
++    if !a.is_punct() && (b.is_op(',') || b.is_op(';') || b.is_op('.')) {
++        return false;
++    }
++    if let PrintToken::Ident(i) = *a {
++        // IDENT + `!`: `println!()`, but `if !x { ... }` needs a space after the `if`
++        if b.is_op('!') && (i.is_raw || !is_reserved_ident(&i.val)) {
++            return false;
++        }
++        // IDENT|`fn`|`Self`|`pub` + `(`: `f(3)`, `fn(x: u8)`, `Self()`, `pub(crate)`, but `let (a, b) = (1, 2)`
++        if let PrintToken::Group(g) = *b {
++            if g.delimiter == Delimiter::Parenthesis
++                && (i.is_raw || !is_reserved_ident(&i.val) || i.val == "fn" || i.val == "Self" || i.val == "pub")
++            {
++                return false;
++            }
++        }
++    }
++    // `#` + `[`: `#[attr]`
++    if a.is_op('#') {
++        if let PrintToken::Group(g) = *b {
++            if g.delimiter == Delimiter::Bracket {
++                return false;
++            }
++        }
++    }
++    true
++}
++
++/// rustc's `Ident::is_reserved` in 2018-2021 code: special identifiers, keywords, reserved keywords (`gen` is reserved
++/// from 2024 only, and left out)
++fn is_reserved_ident(name: &str) -> bool
++{
++    match name
++    {
++    "$crate" | "{{root}}" | "_"
++    | "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if"
++    | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self"
++    | "static" | "struct" | "super" | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while"
++    | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized"
++    | "virtual" | "yield"
++    | "async" | "await" | "dyn" | "try" => true,
++    _ => false,
+     }
+ }
+ 
+@@ -168,13 +384,8 @@ impl ::std::fmt::Display for Punct
+ {
+     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result
+     {
+-        self.ch.fmt(f)?;
+-        match self.spacing
+-        {
+-        Spacing::Alone => f.write_str(" ")?,
+-        Spacing::Joint => {},
+-        }
+-        Ok(())
++        // Just the character (as rustc): spacing applies between the tokens of a stream
++        write!(f, "{}", self.ch)
+     }
+ }
+ impl Punct {
+@@ -337,6 +548,18 @@ pub(crate) enum LiteralValue {
+     /// A literal with a suffix: any identifier may follow a literal in a token stream (lazy_regex `"re"i`)
+     Suffixed(Box<LiteralValue>, String),
+ }
++impl LiteralValue {
++    /// Its text starts with `-` (a negative number)
++    fn is_negative(&self) -> bool {
++        match *self
++        {
++        LiteralValue::SignedInt(v, _) => v < 0,
++        LiteralValue::Float(v, _) => v.is_sign_negative(),
++        LiteralValue::Suffixed(ref v, _) => v.is_negative(),
++        _ => false,
++        }
++    }
++}
+ impl Literal {
+     pub(crate) fn new_u(value: u128, bits: u8) -> Literal {
+         Literal {
+@@ -516,3 +739,49 @@ pub(crate) fn tt_eq(a: &TokenTree, b: &TokenTree) -> bool
+     _ => false,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use crate::*;
++    use ::std::str::FromStr;
++
++    fn stream(tts: Vec<TokenTree>) -> String {
++        tts.into_iter().collect::<TokenStream>().to_string()
++    }
++    fn ident(s: &str) -> TokenTree {
++        Ident::new(s, Span::call_site()).into()
++    }
++    fn punct(c: char) -> TokenTree {
++        Punct::new(c, Spacing::Alone).into()
++    }
++    fn punct_joint(c: char) -> TokenTree {
++        Punct::new(c, Spacing::Joint).into()
++    }
++    fn group(d: Delimiter, tts: Vec<TokenTree>) -> TokenTree {
++        Group::new(d, tts.into_iter().collect()).into()
++    }
++
++    #[test]
++    fn display_no_trailing_space()
++    {
++        // darling matches attribute names on `attr.path().into_token_stream().to_string()`
++        assert_eq!(stream(vec![ident("builder")]), "builder");
++        assert_eq!(TokenStream::from_str("builder").unwrap().to_string(), "builder");
++        assert_eq!(Punct::new('=', Spacing::Alone).to_string(), "=");
++        assert_eq!(stream(vec![]), "");
++    }
++    #[test]
++    fn display_spacing()
++    {
++        // rustc 1.90's printing of tokens built by a proc macro
++        assert_eq!(stream(vec![ident("a"), punct_joint(':'), punct(':'), ident("b")]), "a :: b");
++        assert_eq!(stream(vec![ident("Option"), punct('<'), ident("String"), punct('>')]), "Option < String >");
++        assert_eq!(stream(vec![punct('#'), group(Delimiter::Bracket, vec![ident("x")]), ident("f"),
++            group(Delimiter::Parenthesis, vec![ident("a"), punct(','), ident("b")]), punct(';')]), "#[x] f(a, b);");
++        assert_eq!(stream(vec![ident("x"), punct('.'), ident("y"), punct_joint('.'), punct_joint('.'), punct('='), ident("z")]),
++            "x.y ..= z");
++        assert_eq!(stream(vec![ident("let"), group(Delimiter::Parenthesis, vec![ident("a")]), punct('='),
++            group(Delimiter::Brace, vec![ident("b")]), group(Delimiter::Brace, vec![])]), "let (a) = { b } {}");
++        assert_eq!(stream(vec![ident("println"), punct('!'), punct('&'), punct_joint('\''), ident("a")]), "println! & 'a");
++    }
++}
