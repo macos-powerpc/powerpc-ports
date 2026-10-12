@@ -1,0 +1,152 @@
+From d2c1c0096dbaf3b774ccf4953bf1efda7feb03b2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 16:37:11 +0000
+Subject: [PATCH] hir: braced literals of tuple structs, `S {}` and `S { ..base }`
+
+The typecheck enumeration accepts a braced struct literal of a tuple
+struct without fields (`TupleStruct {}`, `TupleStruct { ..base }`), but
+the validation after it asserted a braced struct, and so would lifetime
+inference, value-usage annotation, the expression checker and MIR lowering.
+num-modular 0.6.5 mersenne.rs:310 (sshs 4.8.0):
+
+    pub struct FixedMersenne<const P: u8, const K: umax>();
+    impl_fixed_mersenne!(FixedMersenne, umax, udouble, 64, 128, udouble);
+        // -> impl<const P: u8, const K: umax> FixedMersenne<P, K> { .. Self {} .. }
+
+    BUG: expr_cs.cpp:1648: StructLiteral not pointing to a braced struct, instead Tuple
+
+Each of them now takes such a literal: no fields, or all of them from
+the base (moved unless all Copy). Numbered fields (`S { 0: a }`) are still
+rejected by the enumeration.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_expand/annotate_value_usage.cpp | 15 +++++++++++++++
+ src/hir_expand/lifetime_infer.cpp       | 16 ++++++++++++++++
+ src/hir_typeck/expr_check.cpp           |  9 +++++++++
+ src/hir_typeck/expr_cs.cpp              |  7 +++++++
+ src/mir/from_hir.cpp                    | 20 ++++++++++++++++++++
+ 5 files changed, 67 insertions(+)
+
+diff --git a/src/hir_expand/annotate_value_usage.cpp b/src/hir_expand/annotate_value_usage.cpp
+index 456111bb..2dd9aab6 100644
+--- a/src/hir_expand/annotate_value_usage.cpp
++++ b/src/hir_expand/annotate_value_usage.cpp
+@@ -714,6 +714,21 @@ namespace {
+                 else if( tpb.is_Union() ) {
+                     fields_ptr = &tpb.as_Union()->m_variants;
+                 }
++                else if( const auto* te = tpb.as_Struct()->m_data.opt_Tuple() ) {
++                    // `TupleStruct { ..base }`: every field comes from the base
++                    ASSERT_BUG(sp, node.m_values.empty(), "Values provided for tuple-like struct");
++                    const auto monomorph_cb = MonomorphStatePtr(nullptr, &ty_path.m_params, nullptr);
++                    for( const auto& fld : *te ) {
++                        ::HIR::TypeRef  tmp;
++                        const auto& ty_m = monomorphise_type_with_opt(node.span(), tmp, fld.ent, monomorph_cb);
++                        if( !m_resolve.type_is_copy(node.span(), ty_m) ) {
++                            is_moved = true;
++                        }
++                    }
++                    auto _ = push_usage( is_moved ? ::HIR::ValueUsage::Move : ::HIR::ValueUsage::Borrow );
++                    this->visit_node_ptr(node.m_base_value);
++                    return ;
++                }
+                 else {
+                     const auto& str = *tpb.as_Struct();
+                     ASSERT_BUG(sp, str.m_data.is_Named(), "");
+diff --git a/src/hir_expand/lifetime_infer.cpp b/src/hir_expand/lifetime_infer.cpp
+index 23ece40f..9b5ab49e 100644
+--- a/src/hir_expand/lifetime_infer.cpp
++++ b/src/hir_expand/lifetime_infer.cpp
+@@ -1919,6 +1919,22 @@ namespace {
+                     ASSERT_BUG(sp, ! node.m_base_value, "Values provided for unit-like struct");
+                     return ;
+                 }
++                // `TupleStruct {}` / `TupleStruct { ..base }`: every field comes from the base
++                if( e->m_data.is_Tuple() )
++                {
++                    ASSERT_BUG(sp, node.m_values.size() == 0, "Values provided for tuple-like struct");
++                    if( node.m_base_value ) {
++                        const auto& ty_base = node.m_base_value->m_res_type;
++                        auto ms = MonomorphStatePtr(&ty, &ty_path.m_params, nullptr);
++                        auto ms_base = MonomorphStatePtr(&ty_base, &ty_base.data().as_Path().path.m_data.as_Generic().m_params, nullptr);
++                        for(const auto& fld : e->m_data.as_Tuple()) {
++                            auto dst_ty = m_resolve.monomorph_expand(sp, fld.ent, ms);
++                            auto src_ty = m_resolve.monomorph_expand(sp, fld.ent, ms_base);
++                            this->equate_types( node.m_base_value->span(), dst_ty, src_ty );
++                        }
++                    }
++                    return ;
++                }
+ 
+                 ASSERT_BUG(sp, e->m_data.is_Named(), "StructLiteral not pointing to a braced struct, instead " << e->m_data.tag_str() << " - " << ty);
+                 fields_ptr = &e->m_data.as_Named();
+diff --git a/src/hir_typeck/expr_check.cpp b/src/hir_typeck/expr_check.cpp
+index 79ed2da3..dbbfa1ac 100644
+--- a/src/hir_typeck/expr_check.cpp
++++ b/src/hir_typeck/expr_check.cpp
+@@ -643,6 +643,15 @@ namespace {
+                     ASSERT_BUG(node.span(), ! node.m_base_value, "Values provided for unit-like struct");
+                     return ;
+                 }
++                // `TupleStruct {}` / `TupleStruct { ..base }` (base type checked above)
++                if( e->m_data.is_Tuple() )
++                {
++                    ASSERT_BUG(node.span(), node.m_values.size() == 0, "Values provided for tuple-like struct");
++                    if( node.m_base_value ) {
++                        node.m_base_value->visit( *this );
++                    }
++                    return ;
++                }
+ 
+                 ASSERT_BUG(node.span(), e->m_data.is_Named(), "StructLiteral not pointing to a braced struct, instead " << e->m_data.tag_str() << " - " << ty);
+                 fields_ptr = &e->m_data.as_Named();
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index c96a7236..6f0ceaae 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1644,6 +1644,13 @@ namespace {
+                     ASSERT_BUG(node.span(), ! node.m_base_value, "Values provided for unit-like struct");
+                     return ;
+                 }
++                // `TupleStruct {}` / `TupleStruct { ..base }`, as the enumeration accepts them (no numbered fields)
++                if( e->m_data.is_Tuple() )
++                {
++                    ASSERT_BUG(node.span(), node.m_values.size() == 0, "Values provided for tuple-like struct");
++                    ::HIR::ExprVisitorDef::visit(node);
++                    return ;
++                }
+ 
+                 ASSERT_BUG(node.span(), e->m_data.is_Named(), "StructLiteral not pointing to a braced struct, instead " << e->m_data.tag_str() << " - " << ty);
+                 fields_ptr = &e->m_data.as_Named();
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index 8ce6a9e8..d64d7f4f 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -2969,6 +2969,26 @@ namespace {
+         {
+             const Span& sp = node.span();
+ 
++            // `TupleStruct {}` / `TupleStruct { ..base }` (typecheck lets no numbered fields through)
++            if( const auto* te = str.m_data.opt_Tuple() )
++            {
++                ASSERT_BUG(sp, node.m_values.empty(), "Values provided for tuple-like struct");
++                ::std::vector< ::MIR::Param>   values;
++                if( node.m_base_value )
++                {
++                    this->visit_node_ptr(node.m_base_value);
++                    auto base_val = m_builder.get_result_in_lvalue(node.m_base_value->span(), node.m_base_value->m_res_type);
++                    for(unsigned int i = 0; i < te->size(); i ++)
++                        values.push_back( ::MIR::LValue::new_Field( base_val.clone(), i ) );
++                }
++                else if( !te->empty() )
++                {
++                    ERROR(sp, E0000, "Field '0' not specified");
++                }
++                m_builder.set_result( sp, ::MIR::RValue::make_Struct({ path.clone(), mv$(values) }) );
++                return ;
++            }
++
+             ASSERT_BUG(sp, str.m_data.is_Named(), "");
+             const ::HIR::t_struct_fields& fields = str.m_data.as_Named();
+ 

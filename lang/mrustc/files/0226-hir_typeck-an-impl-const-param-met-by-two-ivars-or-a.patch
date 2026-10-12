@@ -1,0 +1,102 @@
+From ef239f83564dfc3ee779286536a349b3edd0d4a0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 14:49:21 +0000
+Subject: [PATCH] hir_typeck: an impl const param met by two ivars, or an ivar
+ then a value, matches fuzzily
+
+Since 0192, ftic_check_params' GetParams::match_val leaves an impl const
+param that the request gives as an ivar to the impl's bounds, and keeps
+the ivar as the fallback. When the same param came up again, a second
+ivar replaced the first, and a value was recorded over it, with the match
+still Equal. check_associated's exact path then equates only the trait
+args, so the other ivar was never tied to anything. time 0.3.45
+parsing/parsed.rs:967 (xh 0.26.1), with deranged 0.5.8's
+
+    impl<const MIN: i32, const MAX: i32> From<RangedI32<MIN, MAX>>
+        for OptionRangedI32<MIN, MAX>
+
+    parsed.year = OptionRangedI32::from(RangedI32::new(year));
+
+matched `OptionRangedI32<_2, _3>: From<RangedI32<_0, _1>>` before the field
+type fixed `_2`/`_3`:
+
+    parsed.rs:967:70 BUG: expr_cs.cpp:1723: Failure to infer Infer(2) in
+    <RangedI32<{Infer(2)},{Infer(3)},>>::new
+
+Such a match is now Fuzzy (as before 0192), so the single-impl path
+equates the impl type as well as its trait args.
+
+Also in ftic_check_params: a where-clause that compares a value placeholder
+it has already bound (`where Foo<N>: Other<Arr = [u8; N]>` against
+`impl Other for Foo<3> { type Arr = [u8; 3]; }`) hit a TODO. It now
+compares like PathParams::compare_with_placeholders: equal values are Equal,
+ivars, placeholders and unevaluated values are Fuzzy, anything else Unequal.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir_typeck/helpers.cpp | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 090ce904..572dadb8 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -3704,12 +3704,27 @@ namespace {
+                 ASSERT_BUG(sp, sz.as_Infer().index != ~0u, "");
+             if( out_impl_params.m_values[g.binding] == HIR::ConstGeneric() )
+             {
++                // If the param was already met as an ivar (below), whatever it meets now (another ivar, or a value)
++                // has to be equated with that ivar, and an exact match only gets the caller to equate the trait args,
++                // not the impl type: `impl<const MIN, const MAX> From<RangedI32<MIN, MAX>> for OptionRangedI32<MIN, MAX>`
++                // asked for `OptionRangedI32<_2, _3>: From<RangedI32<_0, _1>>` left `_0`/`_1` uninferred once the
++                // field type fixed `_2`/`_3` - time 0.3.45 parsing/parsed.rs:967
++                // `parsed.year = OptionRangedI32::from(RangedI32::new(year))`, "Failure to infer Infer(2)".
++                // Fuzzy sends it to check_associated's single-impl path, which equates both.
++                const bool has_deferred = g.binding < deferred_values.size() && deferred_values[g.binding] != HIR::ConstGeneric();
+                 // An unresolved ivar is no value for the param yet. Recording it made a where-clause that would fix
+                 // the param only compare fuzzily: `impl<Color, Component, const N: usize> ColorComponents<Component, N>
+                 // for Color where Color: ArrayCast<Array = [Component; N]>` asked for `Oklab: ColorComponents<f32, _>`
+                 // compared `[f32; _]` with `[f32; 3]` and the method's N stayed uninferred - quantette 0.6.0
+                 // api/pipeline.rs:946 `ditherer.dither_image_to_image(image, color_map)`, "Failure to infer Infer(0)".
+                 if( sz.is_Infer() ) {
++                    if( has_deferred ) {
++                        if( deferred_values[g.binding] == sz ) {
++                            return ::HIR::Compare::Equal;
++                        }
++                        DEBUG("[ftic_check_params] Value param " << g.binding << " = " << sz << " and " << deferred_values[g.binding] << " (two ivars, fuzzy)");
++                        return ::HIR::Compare::Fuzzy;
++                    }
+                     deferred_values.resize(out_impl_params.m_values.size());
+                     deferred_values[g.binding] = sz.clone();
+                     DEBUG("[ftic_check_params] Value param " << g.binding << " = " << sz << " (ivar, left to the bounds)");
+@@ -3717,6 +3732,10 @@ namespace {
+                 }
+                 DEBUG("[ftic_check_params] Value param " << g.binding << " = " << sz);
+                 out_impl_params.m_values[g.binding] = sz.clone();
++                if( has_deferred ) {
++                    DEBUG("[ftic_check_params] Value param " << g.binding << " was " << deferred_values[g.binding] << " (fuzzy)");
++                    return ::HIR::Compare::Fuzzy;
++                }
+                 return ::HIR::Compare::Equal;
+             }
+             else
+@@ -3918,9 +3937,17 @@ namespace {
+                     return ::HIR::Compare::Equal;
+                 }
+                 else {
++                    // Already bound by an earlier part of the same bound (`where Foo<N>: Other<Arr = [u8; N]>` against
++                    // `impl Other for Foo<3> { type Arr = [u8; 3]; }`), as PathParams::compare_with_placeholders
+                     DEBUG("[ftic_check_params:cb_match] Compare placeholder " << i << " " << ph << " == " << v);
+-                    TODO(Span(), "[ftic_check_params:cb_match] Compare placeholder " << i << " " << ph << " == " << v);
+-                    //return ph.compare_with_placeholders(sp, ty, resolve_cb);
++                    if( ph == v ) {
++                        return ::HIR::Compare::Equal;
++                    }
++                    if( ph.is_Infer() || v.is_Infer() || ph.is_Unevaluated() || v.is_Unevaluated()
++                        || TU_TEST1(ph, Generic, .is_placeholder()) || TU_TEST1(v, Generic, .is_placeholder()) ) {
++                        return ::HIR::Compare::Fuzzy;
++                    }
++                    return ::HIR::Compare::Unequal;
+                 }
+             }
+             else {

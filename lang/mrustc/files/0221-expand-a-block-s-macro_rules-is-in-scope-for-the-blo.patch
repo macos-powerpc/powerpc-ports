@@ -1,0 +1,255 @@
+From da2548ed746efa2b81fed2d5c299069807a98bae Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 11 Oct 2026 11:00:12 +0000
+Subject: [PATCH] expand: a block's `macro_rules!` is in scope for the block's
+ items after it
+
+Items written in a block go to its anon module, and Expand ran over all of
+them before walking the block's statements, which is where a block-level
+`macro_rules!` is registered. wasmparser 0.244.0 (tree-sitter-cli 0.27.1),
+validator/core.rs `check_const_expr`:
+
+    macro_rules! define_visit_operator { .. }
+    ..
+    impl<'a> VisitOperator<'a> for VisitConstOperator<'a> {
+        crate::for_each_visit_operator!(define_visit_operator);
+    }
+
+`for_each_visit_operator!` expands to `define_visit_operator! { .. }`, which
+was unknown at that point, and Expand_Impl asserted instead of deferring:
+
+    MACRO<::"wasmparser-0_244_0_H3c064"::crate::for_each_visit_operator> BUG: ASSERT FAIL: src/expand/mod.cpp:1865:ttl: TODO: Unexpanded macro?
+
+When an outer macro has the same name, the block's items silently used that
+one instead: rustc's textual scope gives the items after a block's
+definition the block's macro, and the ones before it the outer one.
+
+The parser now records on a block's `macro_rules!` how many of the block's
+items came before it (ExprNode_Macro::m_block_items_before). The block
+visitor expands the items in runs: up to the first definition before the
+statement walk, up to the next definition each time the walk has registered
+one, and the rest (with the items the walk adds) after the walk. A run stops
+at an item address taken before anything expands, as item macros expand in
+place. Expand_Mod takes that stop item. Blocks without a `macro_rules!` in
+their source are expanded as before.
+
+Impl and trait item macros that are still unknown now wait for the next
+pass, like module and extern block items (the `else` branches were already
+there). That covers a definition that a statement macro expands to, and
+an item macro that is never defined is now an "Unknown macro" error, not a BUG.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/ast/expr.cpp   |  4 ++-
+ src/ast/expr.hpp   |  3 +++
+ src/expand/mod.cpp | 64 ++++++++++++++++++++++++++++++++++++----------
+ src/parse/expr.cpp |  8 ++++++
+ 4 files changed, 65 insertions(+), 14 deletions(-)
+
+diff --git a/src/ast/expr.cpp b/src/ast/expr.cpp
+index 79731fd8..28dd13be 100644
+--- a/src/ast/expr.cpp
++++ b/src/ast/expr.cpp
+@@ -132,7 +132,9 @@ NODE(ExprNode_Macro, {
+     }
+     os << "(" << " /*TODO*/ " << ")";
+ },{
+-    return NEWNODE(ExprNode_Macro, AST::Path(m_path), m_ident, m_tokens.clone());
++    auto rv = NEWNODE(ExprNode_Macro, AST::Path(m_path), m_ident, m_tokens.clone());
++    static_cast<ExprNode_Macro&>(*rv).m_block_items_before = m_block_items_before;
++    return rv;
+ })
+ 
+ NODE(ExprNode_Asm, {
+diff --git a/src/ast/expr.hpp b/src/ast/expr.hpp
+index 3c31f73d..9c5e78e4 100644
+--- a/src/ast/expr.hpp
++++ b/src/ast/expr.hpp
+@@ -149,6 +149,9 @@ struct ExprNode_Macro:
+     RcString   m_ident;
+     ::TokenTree m_tokens;
+     bool    m_is_braced;
++    // A `macro_rules!` written in a block: how many of the block's items were parsed before it (it is in scope for the
++    // items after those). `SIZE_MAX` otherwise.
++    size_t  m_block_items_before = SIZE_MAX;
+ 
+     ExprNode_Macro(AST::Path name, RcString ident, ::TokenTree&& tokens, bool is_braced=false):
+         m_path( ::std::move(name) ),
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 5814490f..69606ff1 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -57,7 +57,7 @@ struct ExpandState {
+ };
+ 
+ void Expand_Attrs(const ExpandState& es, const ::AST::AttributeList& attrs, AttrStage stage,  ::std::function<void(const ExpandDecorator& d,const ::AST::Attribute& a)> f);
+-void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Module& mod, unsigned int first_item = 0);
++void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Module& mod, unsigned int first_item = 0, const AST::Named<AST::Item>* stop_at = nullptr);
+ void Expand_Expr(const ExpandState& es, ::AST::ExprNodeP& node);
+ void Expand_Expr(const ExpandState& es, AST::Expr& node);
+ void Expand_Expr(const ExpandState& es, ::std::shared_ptr<AST::ExprNode>& node);
+@@ -960,18 +960,42 @@ struct CExpandExpr:
+ 
+     void visit(::AST::ExprNode_Block& node) override {
+         this->in_assign_lhs = false;
+-        unsigned int mod_item_count = 0;
+ 
+         auto prev_modstack = this->expand_state.modstack;
+         if( node.m_local_mod ) {
+             this->expand_state.modstack = LList<const ::AST::Module*>(&prev_modstack, node.m_local_mod.get());
+         }
+ 
+-        // TODO: macro_rules! invocations within the expression list influence this.
+-        // > Solution: Defer creation of the local module until during expand.
++        // A `macro_rules!` written in the block is registered when the walk below reaches it, and is in scope for the
++        // block's items after it (not the ones before). So the items are expanded in runs: those before the first
++        // definition now, those up to the next definition right after the walk registers each one, and the rest (with
++        // any the walk adds) after the walk.
++        // - A run stops at the item that followed the next definition when it was parsed, picked before anything
++        //   expands (item macros expand in place and shift the indices, the items themselves don't move)
++        ::std::vector<const AST::Named<AST::Item>*>   parsed_items;
+         if( node.m_local_mod ) {
+-            Expand_Mod(this->expand_state, node.m_local_mod->path(), *node.m_local_mod);
+-            mod_item_count = node.m_local_mod->m_items.size();
++            for(const auto& i : node.m_local_mod->m_items)
++                parsed_items.push_back(i.get());
++        }
++        unsigned int next_item = 0;
++        auto expand_items_to_next_def = [&](::std::vector<AST::ExprNode_Block::Line>::iterator it) {
++            size_t n_before = SIZE_MAX;
++            for(; it != node.m_nodes.end(); ++ it) {
++                if( const auto* m = dynamic_cast<const ::AST::ExprNode_Macro*>(it->node.get()) ) {
++                    if( m->m_block_items_before != SIZE_MAX ) {
++                        n_before = m->m_block_items_before;
++                        break;
++                    }
++                }
++            }
++            auto& lm = *node.m_local_mod;
++            const auto* stop = n_before < parsed_items.size() ? parsed_items[n_before] : nullptr;
++            Expand_Mod(this->expand_state, lm.path(), lm, next_item, stop);
++            while( next_item < lm.m_items.size() && lm.m_items[next_item].get() != stop )
++                next_item ++;
++        };
++        if( node.m_local_mod ) {
++            expand_items_to_next_def(node.m_nodes.begin());
+         }
+ 
+         auto saved = this->current_block;
+@@ -994,10 +1018,16 @@ struct CExpandExpr:
+ 
+                 assert(it->node.get() == node_mac);
+ 
++                bool is_block_def = node_mac->m_block_items_before != SIZE_MAX;
+                 ::std::vector< ::AST::ExprNode_Block::Line>    new_nodes;
+                 this->visit_macro(*node_mac, &new_nodes);
+-                for(const auto& n : new_nodes) {
++                for(auto& n : new_nodes) {
+                     DEBUG("++ " << *n.node << (n.has_semicolon ? " ;" : ""));
++                    // A `macro_rules!` from an expansion counted the items present now, not the parsed ones; the items
++                    // the expansion adds go after the walk anyway
++                    if( auto* m = dynamic_cast<::AST::ExprNode_Macro*>(n.node.get()) ) {
++                        m->m_block_items_before = SIZE_MAX;
++                    }
+                 }
+ 
+                 if(node_mac->m_path.is_valid()) {
+@@ -1022,6 +1052,11 @@ struct CExpandExpr:
+                     it = node.m_nodes.erase(it);
+                     it = node.m_nodes.insert(it, ::std::make_move_iterator(new_nodes.begin()), ::std::make_move_iterator(new_nodes.end()));
+                     // NOTE: Doesn't advance the iterator above, we want to re-visit the new node
++
++                    // A definition from the block's source is now registered: expand the items it is in scope for
++                    if( is_block_def && node.m_local_mod ) {
++                        expand_items_to_next_def(it);
++                    }
+                 }
+             }
+             else
+@@ -1039,8 +1074,9 @@ struct CExpandExpr:
+         this->current_block = saved;
+ 
+         // HACK! Run Expand_Mod twice on local modules.
++        // - Covers the items after the last definition, and the ones the walk added
+         if( node.m_local_mod ) {
+-            Expand_Mod(this->expand_state, node.m_local_mod->path(), *node.m_local_mod, mod_item_count);
++            Expand_Mod(this->expand_state, node.m_local_mod->path(), *node.m_local_mod, next_item);
+         }
+ 
+         this->expand_state.modstack = mv$(prev_modstack);
+@@ -1861,8 +1897,9 @@ void Expand_Impl(const ExpandState& es, ::AST::Path modpath, ::AST::Module& mod,
+                 // Move out of the module to avoid invalidation if a new macro invocation is added
+                 auto mi_owned = mv$(e);
+ 
++                // Not found yet: left for another pass, as for module items (e.g. a block's `macro_rules!` that a
++                // statement macro expands to)
+                 auto ttl = Expand_Macro(es, mod, mi_owned);
+-                ASSERT_BUG(mi_owned.span(), ttl, "TODO: Unexpanded macro?");
+ 
+                 if( ttl )
+                 {
+@@ -1992,9 +2029,10 @@ void Expand_ExternBlock(const ExpandState& es, ::AST::Module& mod, ::AST::Extern
+     }
+ }
+ 
+-void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Module& mod, unsigned int first_item)
++/// `stop_at`: an item of `mod` to stop before (items from `first_item` up to it are expanded), `nullptr` = to the end
++void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Module& mod, unsigned int first_item, const AST::Named<AST::Item>* stop_at)
+ {
+-    TRACE_FUNCTION_F("modpath = " << modpath << ", first_item=" << first_item);
++    TRACE_FUNCTION_F("modpath = " << modpath << ", first_item=" << first_item << (stop_at ? ", stop_at" : ""));
+ 
+     // TODO: Pre-parse all macro_rules invocations into items?
+ 
+@@ -2037,7 +2075,7 @@ void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Modul
+     std::vector<const AST::Named<AST::Item>*>   macro_recursion_stack;
+ 
+     DEBUG("Items");
+-    for( unsigned int idx = first_item; idx < mod.m_items.size(); idx ++ )
++    for( unsigned int idx = first_item; idx < mod.m_items.size() && mod.m_items[idx].get() != stop_at; idx ++ )
+     {
+         auto& i = *mod.m_items[idx];
+ 
+@@ -2387,8 +2425,8 @@ void Expand_Mod(const ExpandState& es, ::AST::AbsolutePath modpath, ::AST::Modul
+                         // Move out of the module to avoid invalidation if a new macro invocation is added
+                         auto mi_owned = mv$(e);
+ 
++                        // Not found yet: left for another pass, as for module items
+                         auto ttl = Expand_Macro(es, mod, mi_owned);
+-                        ASSERT_BUG(mi_owned.span(), ttl, "TODO: Unexpanded macro");
+ 
+                         if( ttl.get() )
+                         {
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 780af543..e4c9248f 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -127,6 +127,7 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
+         return ExprNodeP();
+     }
+ 
++    size_t macro_rules_items_before = SIZE_MAX;
+     if( tok.type() == TOK_IDENT && tok.ident().name == "macro_rules" && lex.lookahead(0) == TOK_EXCLAM )
+     {
+         // Special case - create a local module if macro_rules! is seen
+@@ -136,6 +137,8 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
+             DEBUG("Set module from " << lex.parse_state().module->path() << " to " << local_mod->path() );
+             lex.parse_state().module = local_mod.get();
+         }
++        // The definition is in scope for the block's items after this point (expand registers it in statement order)
++        macro_rules_items_before = local_mod->m_items.size();
+     }
+ 
+     switch(tok.type())
+@@ -218,6 +221,11 @@ ExprNodeP Parse_ExprBlockLine_WithItems(TokenStream& lex, ::std::shared_ptr<AST:
+     auto rv = Parse_ExprBlockLine(lex, &add_silence_if_end);
+     if( rv ) {
+         rv->set_attrs( mv$(item_attrs) );
++        if( macro_rules_items_before != SIZE_MAX ) {
++            if( auto* mac = dynamic_cast<AST::ExprNode_Macro*>(rv.get()) ) {
++                mac->m_block_items_before = macro_rules_items_before;
++            }
++        }
+     }
+     else if( item_attrs.m_items.size() > 0 ) {
+         // TODO: Is this an error? - Attributes on a expression that didn't yeild a node.
