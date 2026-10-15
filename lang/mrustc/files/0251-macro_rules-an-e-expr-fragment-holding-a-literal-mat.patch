@@ -1,0 +1,135 @@
+From f7ffd07296d834d092503b15cdc4ad9fa71ea058 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 08:22:38 +0000
+Subject: [PATCH] macro_rules: an `$e:expr` fragment holding a literal matches
+ `$l:literal`
+
+icu_locale_core 2.3.0 (tree-sitter-cli 0.27.1, via url -> idna -> icu),
+preferences/extensions/unicode/macros/enum_keyword.rs:16, expanded from
+keywords/calendar.rs:39:
+
+    BUG: src/macro_rules/eval.cpp:2308: TODO: Macro_InvokeRules_MatchPattern - No arm matched - (0, 8)
+
+`enum_keyword!` takes `$key:literal` and forwards it to
+`__enum_keyword_inner!($key:expr, ..)`, which calls `subtag!($key)`;
+`subtag!` (helpers.rs, `impl_tinystr_subtag!`) has the single arm
+`($string:literal)`. rustc accepts an expression fragment in a `:literal`
+slot when the expression is a literal or a negated literal
+(can_begin_literal_maybe_minus / parse_literal_maybe_minus); mrustc's
+matcher only took raw literal tokens, so the TOK_INTERPOLATED_EXPR
+(token 8) failed every arm.
+
+The matcher (consume_from_frag) and the capture (Macro_HandlePatternCap)
+now accept such a fragment and keep it as the expression fragment, as
+rustc does: concat!, consts and the pattern parser already take one. The
+pattern parser's fragment conversion learns the negated numeric literal
+(`-5` through a `$l:literal` into a match arm hit its TODO). Non-literal
+expressions (`X`, `-X`) still fail the `:literal` arm and fall through
+to later arms.
+
+Found on the way: `c"..."` literals were rejected by both `$l:literal`
+and `$e:expr` (TOK_CSTRING missing from both literal lists).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 58d5639a..1823990a 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -591,6 +591,28 @@ void Macro_InitDefaults()
+ {
+ }
+ 
++/// An `$e:expr` fragment can be passed on to a `$l:literal` matcher when the expression is a literal or a negated
++/// numeric literal (rustc's `can_begin_literal_maybe_minus`, icu_locale_core 2.3.0 `subtag!($key)`)
++static bool Macro_IsLiteralExprFragment(const Token& tok)
++{
++    if( tok.type() != TOK_INTERPOLATED_EXPR )
++        return false;
++    // NOTE: `frag_node` has no const overload
++    const AST::ExprNode* node = &const_cast<Token&>(tok).frag_node();
++    if( const auto* n = dynamic_cast<const AST::ExprNode_UniOp*>(node) ) {
++        if( n->m_type != AST::ExprNode_UniOp::NEGATE )
++            return false;
++        return dynamic_cast<const AST::ExprNode_Integer*>(n->m_value.get())
++            || dynamic_cast<const AST::ExprNode_Float*>(n->m_value.get());
++    }
++    return dynamic_cast<const AST::ExprNode_Integer*>(node)
++        || dynamic_cast<const AST::ExprNode_Float*>(node)
++        || dynamic_cast<const AST::ExprNode_Bool*>(node)
++        || dynamic_cast<const AST::ExprNode_String*>(node)
++        || dynamic_cast<const AST::ExprNode_ByteString*>(node)
++        || dynamic_cast<const AST::ExprNode_CString*>(node);
++}
++
+ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type type)
+ {
+     Token   tok;
+@@ -668,11 +690,17 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+         case TOK_FLOAT:
+         case TOK_STRING:
+         case TOK_BYTESTRING:
++        case TOK_CSTRING:
+         case TOK_RWORD_TRUE:
+         case TOK_RWORD_FALSE:
+             break;
++        case TOK_INTERPOLATED_EXPR:
++            // Kept as the expression fragment (as rustc does), the expression and pattern parsers both take it
++            if( Macro_IsLiteralExprFragment(tok) )
++                return InterpolatedFragment( InterpolatedFragment::EXPR, tok.take_frag_node().release() );
++            // fall through
+         default:
+-            throw ParseError::Unexpected(lex, tok, {TOK_INTEGER, TOK_FLOAT, TOK_STRING, TOK_BYTESTRING, TOK_RWORD_TRUE, TOK_RWORD_FALSE});
++            throw ParseError::Unexpected(lex, tok, {TOK_INTEGER, TOK_FLOAT, TOK_STRING, TOK_BYTESTRING, TOK_CSTRING, TOK_RWORD_TRUE, TOK_RWORD_FALSE});
+         }
+         return InterpolatedFragment( TokenTree(lex.get_edition(), lex.get_hygiene(), tok) );
+     }
+@@ -1455,6 +1483,7 @@ namespace
+             case TOK_FLOAT:
+             case TOK_STRING:
+             case TOK_BYTESTRING:
++            case TOK_CSTRING:
+             case TOK_RWORD_TRUE:
+             case TOK_RWORD_FALSE:
+                 lex.consume();
+@@ -2186,10 +2215,16 @@ namespace
+             case TOK_FLOAT:
+             case TOK_STRING:
+             case TOK_BYTESTRING:
++            case TOK_CSTRING:
+             case TOK_RWORD_TRUE:
+             case TOK_RWORD_FALSE:
+                 lex.consume();
+                 return true;
++            case TOK_INTERPOLATED_EXPR:
++                if( !Macro_IsLiteralExprFragment(lex.next_tok()) )
++                    return false;
++                lex.consume();
++                return true;
+             default:
+                 return false;
+             }
+diff --git a/src/parse/pattern.cpp b/src/parse/pattern.cpp
+index c08d4916..204ce4a3 100644
+--- a/src/parse/pattern.cpp
++++ b/src/parse/pattern.cpp
+@@ -286,6 +286,18 @@ AST::Pattern::Value Parse_PatternValue(TokenStream& lex)
+         else if( auto* n = dynamic_cast<AST::ExprNode_Float*>(e.get()) ) {
+             return AST::Pattern::Value::make_Float({n->m_datatype, n->m_value});
+         }
++        // A negated numeric literal (passed through a `$l:literal`), same as `-` followed by the literal token above
++        else if( auto* n = dynamic_cast<AST::ExprNode_UniOp*>(e.get()) ) {
++            auto* i = dynamic_cast<AST::ExprNode_Integer*>(n->m_value.get());
++            auto* f = dynamic_cast<AST::ExprNode_Float*>(n->m_value.get());
++            if( n->m_type != AST::ExprNode_UniOp::NEGATE || !(i || f) ) {
++                TODO(lex.point_span(), "Convert :expr into a pattern value - " << *e);
++            }
++            if( i ) {
++                return AST::Pattern::Value::make_Integer({i->m_datatype, ~i->m_value + 1u});
++            }
++            return AST::Pattern::Value::make_Float({f->m_datatype, -f->m_value});
++        }
+         else {
+             TODO(lex.point_span(), "Convert :expr into a pattern value - " << *e);
+         }

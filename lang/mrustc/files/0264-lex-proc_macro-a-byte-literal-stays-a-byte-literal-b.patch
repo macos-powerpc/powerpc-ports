@@ -1,0 +1,341 @@
+From 99dd0ba2a5eda45fc21a2dbead1fa4b023028137 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 16:01:21 +0000
+Subject: [PATCH] lex/proc_macro: a byte literal stays a byte literal (`b'a'`,
+ not `97u8`)
+
+cssparser 0.35.0 (ani-cli-rs 0.11.0) tokenizer.rs:475, `skip_whitespace`:
+
+    match_byte! { self.next_byte_unchecked(),
+        b' ' | b'\t' => { self.advance(1) },
+        b'\n' | b'\x0C' | b'\r' => { self.consume_newline(); },
+        ..
+    }
+
+    thread 'main' panicked at :0:0:
+    Found a pattern that wasn't a byte
+    MACRO<::"cssparser_macros-0_6_1"::match_byte> BUG:
+      src/expand/proc_macro.cpp:2449: Unexpected EOF while reading from
+      child process
+
+cssparser-macros 0.6.1 accepts only `syn::Lit::Byte` patterns. The lexer
+made `b' '` the same token as `32u8` (TOK_INTEGER of type u8), so the
+proc-macro bridge sent an integer, libproc_macro printed `32u8` and syn
+parsed a `Lit::Int`.
+
+- token.hpp/.cpp: the integer token carries `m_is_byte_char`
+  (Token::make_byte_char, is_byte_char()); it is part of token equality
+  (macro_rules tells `b'a'` from `97u8`, as rustc) and to_str() prints
+  `b'..'` with rustc's escapes (stringify!, re-lexing).
+- lex.cpp: `b'x'` makes one.
+- serialise/deserialise: the flag is the top bit of the integer token's
+  type tag, so a dependency's macro_rules body keeps it; older rlibs never
+  set the bit and still load.
+- expand/proc_macro.cpp: new bridge token class ByteChar (13) in both
+  directions (TokenSink::send_byte_char; the TokenCollector builds the
+  token too).
+- lib/libproc_macro: protocol Token::ByteChar, LiteralValue::ByteChar
+  printed as rustc does (`b'\x0c'`, `b'\''`), Literal::byte_character()
+  makes one (it gave UnsignedInt(.., 8) = `97u8`).
+
+The compiler and libproc_macro must be updated together (an older
+libproc_macro panics on tag 13). Not covered: a byte literal that went
+through the AST (an attribute macro's item, `$e:expr`) still reaches
+a proc macro as `97u8`; same value and type.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/lib/libproc_macro/src/protocol.rs b/lib/libproc_macro/src/protocol.rs
+index 613d068a..d1a2734c 100644
+--- a/lib/libproc_macro/src/protocol.rs
++++ b/lib/libproc_macro/src/protocol.rs
+@@ -11,6 +11,8 @@ pub enum Token
+     String(String),
+     ByteString(Vec<u8>),
+     Char(char),
++    /// A byte literal (`b'a'`)
++    ByteChar(u8),
+     Unsigned(u128, u8),
+     Signed(i128, u8),
+     Float(f64, u8),
+@@ -96,6 +98,11 @@ impl<R: ::std::io::Read> Reader<R>
+             end_ofs: self.get_u128v() as usize,
+             }),
+         12 => Token::Suffix(self.get_string()),
++        13 => Token::ByteChar({
++            let v = self.get_u128v();
++            assert!(v < 256, "Protocol error: malformed byte literal {:#x}", v);
++            v as u8
++            }),
+         _ => panic!("Unknown tag byte: {:#x}", hdr_b),
+         })
+     }
+@@ -205,6 +212,7 @@ impl<T: ::std::io::Write> Writer<T>
+             self.put_u128v(sd.end_ofs   as u128);
+             },
+         Token::Suffix(v) => { self.putb(12); self.put_bytes(v.as_bytes()); },
++        Token::ByteChar(v) => { self.putb(13); self.put_u128v(v as u128); },
+         }
+     }
+     pub fn write_sym(&mut self, v: &[u8])
+diff --git a/lib/libproc_macro/src/serialisation.rs b/lib/libproc_macro/src/serialisation.rs
+index b32608e1..bb6440e2 100644
+--- a/lib/libproc_macro/src/serialisation.rs
++++ b/lib/libproc_macro/src/serialisation.rs
+@@ -78,6 +78,10 @@ pub fn recv_token_stream<R: ::std::io::Read>(reader: R) -> TokenStream
+                     span: crate::Span::call_site(),
+                     val: crate::token_tree::LiteralValue::CharLit(ch),
+                     }.into(),
++                Token::ByteChar(b) => Literal {
++                    span: crate::Span::call_site(),
++                    val: crate::token_tree::LiteralValue::ByteChar(b),
++                    }.into(),
+                 Token::Unsigned(val, ty) => Literal {
+                     span: crate::Span::call_site(),
+                     val: crate::token_tree::LiteralValue::UnsignedInt(val, ty),
+@@ -171,6 +175,7 @@ pub fn send_token_stream<T: ::std::io::Write>(out_stream: T, ts: TokenStream)
+                     LiteralValue::String(v) => Token::String(v),
+                     LiteralValue::ByteString(v) => Token::ByteString(v),
+                     LiteralValue::CharLit(v) => Token::Char(v),
++                    LiteralValue::ByteChar(v) => Token::ByteChar(v),
+                     LiteralValue::UnsignedInt(v, sz) => Token::Unsigned(v, sz),
+                     LiteralValue::SignedInt(v, sz)   => Token::Signed(v, sz),
+                     LiteralValue::Float(v, sz)       => Token::Float(v, sz),
+diff --git a/lib/libproc_macro/src/token_tree.rs b/lib/libproc_macro/src/token_tree.rs
+index 2791ebae..97cde95a 100644
+--- a/lib/libproc_macro/src/token_tree.rs
++++ b/lib/libproc_macro/src/token_tree.rs
+@@ -492,6 +492,18 @@ impl ::std::fmt::Display for LiteralValue
+             ' ' ... 'z' => write!(f, "'{}'", v)?,
+             _ => write!(f, "'\\u{{{:x}}}'", v as u32)?,
+             },
++        // As rustc prints one (`u8::escape_ascii`), so `syn` reads it back as a `Lit::Byte`
++        LiteralValue::ByteChar(v) => match v
++            {
++            b'\t' => f.write_str("b'\\t'")?,
++            b'\r' => f.write_str("b'\\r'")?,
++            b'\n' => f.write_str("b'\\n'")?,
++            b'\\' => f.write_str("b'\\\\'")?,
++            b'\'' => f.write_str("b'\\''")?,
++            b'"' => f.write_str("b'\\\"'")?,
++            0x20 ... 0x7E => write!(f, "b'{}'", v as char)?,
++            _ => write!(f, "b'\\x{:02x}'", v)?,
++            },
+         LiteralValue::UnsignedInt(v,sz) => {
+             v.fmt(f)?;
+             if sz == 0 {
+@@ -542,6 +554,8 @@ pub(crate) enum LiteralValue {
+     ByteString(Vec<u8>),
+     CString(Vec<u8>),
+     CharLit(char),
++    /// `b'a'` (a `u8`, but not the same token as `97u8`)
++    ByteChar(u8),
+     UnsignedInt(u128, u8),    // Value, size (0=?,8,16,32,64,128)
+     SignedInt(i128, u8),    // Value, size (0=?,8,16,32,64,128)
+     Float(f64, u8), // Value, size (0, 32, 64)
+@@ -695,7 +709,7 @@ impl Literal {
+     pub fn byte_character(ch: u8) -> Literal {
+         Literal {
+             span: Span::call_site(),
+-            val: LiteralValue::UnsignedInt(ch as _, 8),
++            val: LiteralValue::ByteChar(ch),
+         }
+     }
+     pub fn c_string(bytes: &::std::ffi::CStr) -> Literal {
+
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 9f3b5676..8c663b72 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -214,6 +214,7 @@ enum class TokenClass
+     SpanRef  = 10,
+     SpanDef  = 11,
+     Suffix   = 12,  // Suffix of the preceding literal (see `Token::m_suffix`)
++    ByteChar = 13,  // v128, a byte literal (`b'a'`)
+ };
+ enum class FragType
+ {
+@@ -242,6 +243,7 @@ struct TokenSink
+     virtual void send_bytestring(const ::std::string& s) = 0;
+     virtual void send_suffix(const RcString& s) = 0;
+     virtual void send_char(uint32_t ch) = 0;
++    virtual void send_byte_char(uint8_t b) = 0;
+     virtual void send_int(eCoreType ct, U128 v) = 0;
+     virtual void send_float(eCoreType ct, double v) = 0;
+     /// An attribute the receiver claims (a derive's helper attributes), sent even when attributes in general aren't
+@@ -357,6 +359,10 @@ public:
+         this->send_u8(static_cast<uint8_t>(TokenClass::CharLit));
+         this->send_v128u(ch);
+     }
++    void send_byte_char(uint8_t b) override {
++        this->send_u8(static_cast<uint8_t>(TokenClass::ByteChar));
++        this->send_v128u(b);
++    }
+     void send_int(eCoreType ct, U128 v) override {
+         uint8_t size;
+         switch(ct)
+@@ -567,6 +573,10 @@ namespace {
+                 if( tok.datatype() == CORETYPE_CHAR ) {
+                     m_pmi.send_char(tok.intval().truncate_u64());
+                 }
++                // `b'a'`, not `97u8` (syn's `Lit::Byte`, cssparser-macros `match_byte!`)
++                else if( tok.is_byte_char() ) {
++                    m_pmi.send_byte_char(static_cast<uint8_t>(tok.intval().truncate_u64()));
++                }
+                 else if( tok.datatype() == CORETYPE_F32 || tok.datatype() == CORETYPE_F64 ) {
+                     // `10_f64` lexes as an integer with a float type, but it's a float literal
+                     m_pmi.send_float(tok.datatype(), tok.intval().to_double());
+@@ -2046,6 +2056,9 @@ namespace {
+         void send_char(uint32_t ch) override {
+             out.push_back(Token(U128(ch), CORETYPE_CHAR));
+         }
++        void send_byte_char(uint8_t b) override {
++            out.push_back(Token::make_byte_char(b));
++        }
+         void send_int(eCoreType ct, U128 v) override {
+             out.push_back(Token(v, ct));
+         }
+@@ -2586,6 +2599,11 @@ Token ProcMacroInv::realGetToken_() {
+         auto val = this->recv_v128u();
+         return Token(U128(val), CORETYPE_CHAR);
+         }
++    case TokenClass::ByteChar: {
++        auto val = this->recv_v128u();
++        ASSERT_BUG(this->m_parent_span, val < 256, "Byte literal out of range from child process - " << val);
++        return Token::make_byte_char(static_cast<uint8_t>(val));
++        }
+     case TokenClass::UnsignedInt: {
+         ::eCoreType ty;
+         switch(this->recv_u8())
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index 66899263..d6649b92 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -526,8 +526,10 @@ namespace {
+                 return ::Token::Data::make_Ident( Ident(std::move(hygine), std::move(name)) );
+                 }
+             case ::Token::Data::TAG_Integer: {
+-                auto dty = static_cast<eCoreType>(m_in.read_tag());
+-                return ::Token::Data::make_Integer({ dty, m_in.read_u128() });
++                auto tag = m_in.read_tag();
++                auto dty = static_cast<eCoreType>(tag & 0x7F);
++                auto val = m_in.read_u128();
++                return ::Token::Data::make_Integer({ dty, val, (tag & 0x80) != 0 });
+                 }
+             case ::Token::Data::TAG_Float: {
+                 auto dty = static_cast<eCoreType>(m_in.read_tag());
+diff --git a/src/hir/serialise.cpp b/src/hir/serialise.cpp
+index 21bea92b..d15b3144 100644
+--- a/src/hir/serialise.cpp
++++ b/src/hir/serialise.cpp
+@@ -700,7 +700,8 @@
+                 m_out.write_string(e.name);
+                 } break;
+             TU_ARM(td, Integer, e) {
+-                m_out.write_tag(e.m_datatype);
++                // A byte literal (`b'a'`) is marked by the top bit of the type tag (older rlibs never set it)
++                m_out.write_tag(e.m_datatype | (e.m_is_byte_char ? 0x80 : 0));
+                 m_out.write_u128(e.m_intval);
+                 } break;
+             TU_ARM(td, Float, e) {
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index 5bb58eb3..08ded116 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -597,12 +597,12 @@ Token Lexer::getTokenInt()
+                             uint32_t val = this->parseEscape('\'');
+                             if( this->getc() != '\'' )
+                                 throw ParseError::Generic(*this, "Multi-byte character literal");
+-                            return Token( U128(val), CORETYPE_U8);
++                            return Token::make_byte_char(static_cast<uint8_t>(val));
+                         }
+                         else {
+                             if( this->getc() != '\'' )
+                                 throw ParseError::Generic(*this, "Multi-byte character literal");
+-                            return Token( U128(ch.v), CORETYPE_U8);
++                            return Token::make_byte_char(static_cast<uint8_t>(ch.v));
+                         }
+                     }
+                     else {
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index e514352c..e03d822c 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -71,6 +71,12 @@ Token::Token(U128 val, enum eCoreType datatype):
+     m_data( Data::make_Integer({datatype, val}) )
+ {
+ }
++Token Token::make_byte_char(uint8_t val)
++{
++    Token rv(U128(val), CORETYPE_U8);
++    rv.m_data.as_Integer().m_is_byte_char = true;
++    return rv;
++}
+ Token Token::make_float(double val, enum eCoreType datatype)
+ {
+     auto rv = Token(TOK_FLOAT);
+@@ -413,6 +419,23 @@ struct EscapedByteString {
+     case TOK_LIFETIME:  return FMT("'" << m_data.as_Ident().name.c_str());
+     case TOK_INTEGER: {
+         auto v = m_data.as_Integer().m_intval;
++        if( m_data.as_Integer().m_is_byte_char ) {
++            auto b = v.truncate_u64();
++            switch(b)
++            {
++            case '\'': return "b'\\''";
++            case '\\': return "b'\\\\'";
++            case '\n': return "b'\\n'";
++            case '\r': return "b'\\r'";
++            case '\t': return "b'\\t'";
++            case '\0': return "b'\\0'";
++            default:
++                if( 0x20 <= b && b < 0x7F ) {
++                    return FMT("b'" << (char)b << "'");
++                }
++                return FMT("b'\\x" << "0123456789abcdef"[b >> 4] << "0123456789abcdef"[b & 15] << "'");
++            }
++        }
+         switch(m_data.as_Integer().m_datatype)
+         {
+         case CORETYPE_CHAR:
+diff --git a/src/parse/token.hpp b/src/parse/token.hpp
+index f5692a0c..c38824c7 100644
+--- a/src/parse/token.hpp
++++ b/src/parse/token.hpp
+@@ -79,6 +79,9 @@ class Token
+     (Integer, struct {
+         enum eCoreType  m_datatype;
+         U128    m_intval;
++        /// Written as a byte literal (`b'a'`), not a number: a different token for macros (cssparser's `match_byte!`
++        /// takes only `syn::Lit::Byte` patterns)
++        bool    m_is_byte_char = false;
+         }),
+     (Float, struct {
+         enum eCoreType  m_datatype;
+@@ -134,6 +137,8 @@ public:
+     Token(enum eTokenType type, ::std::string str, Ident::Hygiene h);
+     Token(enum eTokenType type, Ident i);
+     Token(U128 val, enum eCoreType datatype);
++    /// `b'x'`
++    static Token make_byte_char(uint8_t val);
+     static Token make_float(double val, enum eCoreType datatype);
+     Token(const InterpolatedFragment& );
+     struct TagTakeIP {};
+@@ -150,6 +155,7 @@ public:
+     void set_suffix(RcString s) { m_suffix = ::std::move(s); }
+     enum eCoreType  datatype() const { TU_MATCH_DEF(Data, (m_data), (e), (assert(!"Getting datatype of invalid token type");), (Integer, return e.m_datatype;), (Float, return e.m_datatype;)) throw ""; }
+     U128 intval() const { return m_data.as_Integer().m_intval; }
++    bool is_byte_char() const { return m_data.is_Integer() && m_data.as_Integer().m_is_byte_char; }
+     double floatval() const { return m_data.as_Float().m_floatval; }
+ 
+     // TODO: Replace these with a way of getting a InterpolatedFragment&
+@@ -176,7 +182,7 @@ public:
+         (None, return true;),
+         (Ident, return e == re; ),
+         (String, return e == re; ),
+-        (Integer, return e.m_datatype == re.m_datatype && e.m_intval == re.m_intval;),
++        (Integer, return e.m_datatype == re.m_datatype && e.m_intval == re.m_intval && e.m_is_byte_char == re.m_is_byte_char;),
+         (Float, return e.m_datatype == re.m_datatype && e.m_floatval == re.m_floatval;),
+         (Fragment, assert(!"Token equality on Fragment");)
+         )

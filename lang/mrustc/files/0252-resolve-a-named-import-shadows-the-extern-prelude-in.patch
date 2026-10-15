@@ -1,0 +1,164 @@
+From 2f705eaaef1b213bfee2dc92d2083bbcbb8163ce Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 08:50:18 +0000
+Subject: [PATCH] resolve: a named import shadows the extern prelude in 2018+ use paths
+
+async-compression 0.4.44 (tombi 1.8.4) lib.rs:161-163:
+
+    pub use compression_core as core;
+    pub use core::Level;
+
+failed with "Unable to resolve `use` target ::"core-0_0_0"::Level".
+rustc resolves the first segment of a use path in the module (items
+and named imports) before the extern prelude, so `core` is
+compression_core here. The local-shadow check added for colorgrad's
+`mod core` only counted items, so the path went to libcore.
+
+When the first segment names an extern-prelude crate, a named import of
+that name in the same module now shadows it if it binds the type
+namespace to something other than that crate (resolved on demand when
+it comes later in the module, cycle-guarded). Value- and macro-only
+imports (`use log::{log, info};`) and `use core::{self}` (same crate,
+old route kept) don't count; globs are not consulted (rustc reports
+a glob that differs from the extern prelude as ambiguous).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index ab4a58ee..45d04bf7 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -50,21 +50,17 @@ void Resolve_Use(::AST::Crate& crate)
+     Resolve_Use_Mod(crate, crate.m_root_module, ::AST::Path("", {}));
+ }
+ 
+-// Does the module containing this `use` (found by walking `base_path` from the crate root) have a local
+-// type-namespace item with this name? Such an item shadows the extern prelude (2018+) and the builtin types.
+-// Conservative: if the walk fails for any reason, say no.
+-static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name)
++// The module containing a `use` (found by walking `base_path` from the crate root), or nullptr if the walk fails
++// (anon modules aren't indexed by name)
++static const AST::Module* Resolve_Use_WalkToModule(const AST::Crate& crate, const ::AST::Path& base_path)
+ {
+-    bool has_local_shadow = false;
+     const AST::Module* cur_mod = &crate.m_root_module;
+-    bool walk_ok = true;
+-    for( unsigned int i = 0; walk_ok && i < base_path.nodes().size(); i ++ )
++    for( unsigned int i = 0; i < base_path.nodes().size(); i ++ )
+     {
+         const auto& seg_name = base_path.nodes()[i].name();
+         if( seg_name.size() > 0 && seg_name.c_str()[0] == '#' ) {
+             // Anon modules aren't indexed by name - can't safely continue the walk.
+-            walk_ok = false;
+-            break;
++            return nullptr;
+         }
+         const AST::Module* next_mod = nullptr;
+         for(const auto& item : cur_mod->m_items) {
+@@ -74,12 +70,21 @@ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AS
+             }
+         }
+         if( !next_mod ) {
+-            walk_ok = false;
+-            break;
++            return nullptr;
+         }
+         cur_mod = next_mod;
+     }
+-    if( walk_ok )
++    return cur_mod;
++}
++
++// Does the module containing this `use` have a local type-namespace item with this name? Such an item shadows
++// the extern prelude (2018+) and the builtin types.
++// Conservative: if the walk fails for any reason, say no.
++static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name)
++{
++    bool has_local_shadow = false;
++    const AST::Module* cur_mod = Resolve_Use_WalkToModule(crate, base_path);
++    if( cur_mod )
+     {
+         for(const auto& item : cur_mod->m_items) {
+             if( item->name != name )
+@@ -104,6 +109,63 @@ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AS
+     return has_local_shadow;
+ }
+ 
++::AST::Path Resolve_Use_AbsolutisePath(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path);
++
++// Does the module containing this `use` have a named import of this name that binds the type namespace to something
++// other than `prelude_crate` (the extern prelude's crate of that name)? It shadows the extern prelude (2018+) like an
++// item does: async-compression 0.4.44 lib.rs `pub use compression_core as core; pub use core::Level;` (rustc: module
++// items and imports come before the extern prelude; a glob that differs from it is an ambiguity error, so globs are
++// not consulted). A value- or macro-only import doesn't count (`use log::{log, info};`).
++// Conservative: if the walk or the import's resolution fails, say no.
++static bool Resolve_Use_LocalImportShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name, const AST::ExternCrate* prelude_crate)
++{
++    const AST::Module* cur_mod = Resolve_Use_WalkToModule(crate, base_path);
++    if( !cur_mod )
++        return false;
++    for(const auto& item : cur_mod->m_items)
++    {
++        if( !item->data.is_Use() )
++            continue;
++        for(const auto& ent : item->data.as_Use().entries)
++        {
++            if( ent.name != name )
++                continue;
++            // `use core::{self}` (or the `use` being resolved right now): a path can't resolve through its own import
++            if( ent.path.m_class.is_Relative() && !ent.path.nodes().empty() && ent.path.nodes().front().name() == name )
++                continue;
++            ::AST::Path::Bindings   b;
++            if( ent.path.m_bindings.has_binding() ) {
++                b = ent.path.m_bindings.clone();
++            }
++            else {
++                // Not resolved yet (it comes later in the module): resolve it now, guarding against import cycles
++                static ::std::vector<const ::AST::Path*> s_stack;
++                if( ::std::find(s_stack.begin(), s_stack.end(), &ent.path) != s_stack.end() ) {
++                    DEBUG("Recursion on " << ent.path);
++                    continue;
++                }
++                s_stack.push_back(&ent.path);
++                b = Resolve_Use_GetBinding(ent.sp, crate, cur_mod->path(), Resolve_Use_AbsolutisePath(ent.sp, crate, base_path, ent.path), {}, /*types_only=*/true, /*soft_fail=*/true);
++                s_stack.pop_back();
++            }
++            DEBUG("Import " << ent.name << " = " << ent.path << " - type " << b.type.binding.tag_str());
++            if( b.type.is_Unbound() )
++                continue;
++            // The extern prelude's own crate under its own name (`use core::{self}` resolved earlier): same answer
++            if( const auto* e = b.type.binding.opt_Crate() ) {
++                if( e->crate_ == prelude_crate )
++                    continue;
++            }
++            if( const auto* e = b.type.binding.opt_Module() ) {
++                if( !e->module_ && prelude_crate && e->hir.crate == prelude_crate && e->hir.mod == &prelude_crate->m_hir->m_root_module )
++                    continue;
++            }
++            return true;
++        }
++    }
++    return false;
++}
++
+ // - Convert self::/super:: paths into non-canonical absolute forms
+ ::AST::Path Resolve_Use_AbsolutisePath(const Span& span, const AST::Crate& crate, const ::AST::Path& base_path, ::AST::Path path)
+ {
+@@ -134,6 +196,16 @@ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AS
+             {
+                 auto ec_it = AST::g_implicit_crates.find(name);
+                 if(ec_it != AST::g_implicit_crates.end())
++                {
++                    auto c_it = crate.m_extern_crates.find(ec_it->second);
++                    const AST::ExternCrate* prelude_crate = c_it != crate.m_extern_crates.end() ? &c_it->second : nullptr;
++                    has_local_shadow = Resolve_Use_LocalImportShadows(crate, base_path, name, prelude_crate);
++                }
++                if( has_local_shadow )
++                {
++                    DEBUG("Local import shadows implicit crate " << name);
++                }
++                else if(ec_it != AST::g_implicit_crates.end())
+                 {
+                     DEBUG("Found implict crate " << name);
+                     e.nodes.erase(e.nodes.begin());

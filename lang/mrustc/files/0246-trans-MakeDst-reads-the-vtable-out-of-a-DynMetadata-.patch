@@ -1,0 +1,201 @@
+From d093c11753579068cdbf556a629a1152c04b6096 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 01:33:30 +0000
+Subject: [PATCH] trans: MakeDst reads the vtable out of a DynMetadata metadata
+ operand
+
+cursive_core 0.3.5 (jlq 0.1.0), in an `Rc<dyn Fn(&mut Cursive)>` method
+of alloc::rc:
+
+    libcursive_core-0_3_5.rlib.c:92022:40: error: incompatible type for argument 2 of 'make_traitobjptr'
+        var1 = make_traitobjptr(var28, var29);  // _1 = MakeDst(_28, _29)
+    note: expected 'void *' but argument is of type 'struct s_..DynMetadata<dyn Fn(&mut Cursive)>..'
+
+1.90's `Rc::from_raw` goes `byte_sub` -> `with_metadata_of` ->
+`ptr::from_raw_parts(data, ptr::metadata(meta))`. `ptr_metadata` lowers
+to DstMeta and `aggregate_raw_ptr` to MakeDst. For a trait object,
+`ptr::metadata` returns `DynMetadata<dyn Trait>` (`_vtable_ptr:
+NonNull<VTable>` plus a PhantomData), and the C backend's DstMeta already
+stores the vtable into `._0._0` of that struct. MakeDst handed the
+metadata operand to make_traitobjptr unchanged, which is only right when
+the operand is the vtable pointer itself (unsize coercions, and the
+`&VTable` metadata of the pre-1.54 world).
+
+The TraitObject arm now looks at the metadata operand's type: a pointer
+or borrow is passed through, anything else must be the DynMetadata struct
+and is read back from `._0._0`. Slices and thin pointers are unchanged.
+The old output never compiled, so nothing already built is miscompiled.
+
+The shape is generic in `with_metadata_of`, so it only shows up in
+a crate that instantiates `Rc`/`Arc`/`Weak::from_raw`, `byte_add`/
+`byte_sub` or `with_metadata_of` on a `dyn` pointer.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ dyn-metadata-makedst-test/dynmeta.rs | 39 ++++++++++++++++++++++++++++
+ dyn-metadata-makedst-test/hdr.rs     | 39 ++++++++++++++++++++++++++++
+ dyn-metadata-makedst-test/main.c     | 11 ++++++++
+ dyn-metadata-makedst-test/run.sh     | 15 +++++++++++
+ src/trans/codegen_c.cpp              | 16 +++++++++---
+ 5 files changed, 117 insertions(+), 3 deletions(-)
+ create mode 100644 dyn-metadata-makedst-test/dynmeta.rs
+ create mode 100644 dyn-metadata-makedst-test/hdr.rs
+ create mode 100644 dyn-metadata-makedst-test/main.c
+ create mode 100755 dyn-metadata-makedst-test/run.sh
+
+diff --git a/dyn-metadata-makedst-test/dynmeta.rs b/dyn-metadata-makedst-test/dynmeta.rs
+new file mode 100644
+index 00000000..7291900d
+--- /dev/null
++++ b/dyn-metadata-makedst-test/dynmeta.rs
+@@ -0,0 +1,39 @@
++pub trait Shape { fn area(&self) -> u32; fn tag(&self) -> u32; }
++pub struct Sq { side: u32 }
++impl Shape for Sq { fn area(&self) -> u32 { self.side } fn tag(&self) -> u32 { 7 } }
++pub struct Tri { base: u32 }
++impl Shape for Tri { fn area(&self) -> u32 { self.base } fn tag(&self) -> u32 { 3 } }
++
++// libstd's shape: generic `with_metadata_of`, the metadata type is `<U as Pointee>::Metadata` until monomorphisation
++#[no_mangle] pub extern "C" fn dyn_roundtrip(side: u32) -> u32 {
++    let s = Sq { side };
++    let p: *const dyn Shape = &s as *const Sq;
++    let q = with_metadata_of(&s as *const Sq, p);
++    unsafe { (*q).area() }
++}
++// user-code shape: a `DynMetadata<dyn Shape>` local fed to `from_raw_parts`
++#[no_mangle] pub extern "C" fn dyn_explicit(base: u32) -> u32 {
++    let t = Tri { base };
++    let p: *const dyn Shape = &t as *const Tri;
++    let m: DynMetadata<dyn Shape> = metadata(p);
++    let q: *const dyn Shape = from_raw_parts(&t as *const Tri as *const (), m);
++    unsafe { (*q).tag() }
++}
++// `*mut` output, data pointer from another object of the same type: the vtable travels, the data does not
++#[no_mangle] pub extern "C" fn dyn_mut_swap() -> u32 {
++    let mut a = Sq { side: 1 };
++    let mut b = Sq { side: 5 };
++    let pa: *mut dyn Shape = &mut a as *mut Sq;
++    let q: *mut dyn Shape = from_raw_parts_mut(&mut b as *mut Sq as *mut (), metadata(pa));
++    unsafe { (*q).area() }
++}
++// the other metadata kinds must keep working: slice length and thin pointers
++#[no_mangle] pub extern "C" fn slice_roundtrip(n: usize) -> usize {
++    let arr = [1u8, 2, 3, 4];
++    let p: *const [u8] = from_raw_parts(&arr as *const [u8; 4] as *const (), n);
++    metadata(p)
++}
++#[no_mangle] pub extern "C" fn thin_roundtrip(v: u32) -> u32 {
++    let p: *const u32 = from_raw_parts(&v as *const u32 as *const (), ());
++    unsafe { *p }
++}
+diff --git a/dyn-metadata-makedst-test/hdr.rs b/dyn-metadata-makedst-test/hdr.rs
+new file mode 100644
+index 00000000..0483a440
+--- /dev/null
++++ b/dyn-metadata-makedst-test/hdr.rs
+@@ -0,0 +1,39 @@
++#![feature(no_core, lang_items, intrinsics, rustc_attrs, extern_types)]
++#![no_core]
++#![crate_type = "lib"]
++#[lang = "sized"] pub trait Sized {}
++#[lang = "copy"] pub trait Copy {}
++pub mod marker { pub use super::{Copy, PhantomData}; }
++#[lang = "unsize"] pub trait Unsize<T: ?Sized> {}
++#[lang = "coerce_unsized"] pub trait CoerceUnsized<T: ?Sized> {}
++impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for *const T {}
++impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*mut U> for *mut T {}
++impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<*const U> for *mut T {}
++#[lang = "deref"] pub trait Deref { #[lang = "deref_target"] type Target: ?Sized; fn deref(&self) -> &Self::Target; }
++#[lang = "receiver"] pub trait Receiver {}
++#[lang = "fn_ptr_trait"] pub trait FnPtr {}
++#[lang = "tuple_trait"] pub trait Tuple {}
++#[lang = "discriminant_kind"] pub trait DiscriminantKind { #[lang = "discriminant_type"] type Discriminant; }
++#[lang = "pointee_trait"] pub trait Pointee { #[lang = "metadata_type"] type Metadata; }
++#[lang = "phantom_data"] pub struct PhantomData<T: ?Sized>;
++#[lang = "drop"] pub trait Drop { fn drop(&mut self); }
++pub mod ops { pub struct RangeFull; }
++impl Copy for u8 {}
++impl Copy for u32 {}
++impl Copy for usize {}
++impl<T: ?Sized> Copy for *const T {}
++impl<T: ?Sized> Copy for *mut T {}
++// core::ptr::metadata (1.90): `DynMetadata` wraps a `NonNull` to the opaque vtable type
++pub struct NonNull<T: ?Sized> { pointer: *const T }
++extern "C" { pub type VTable; }
++#[lang = "dyn_metadata"]
++pub struct DynMetadata<Dyn: ?Sized> { _vtable_ptr: NonNull<VTable>, _phantom: PhantomData<Dyn> }
++#[rustc_intrinsic] pub const fn aggregate_raw_ptr<P, D, M>(data: D, meta: M) -> P;
++#[rustc_intrinsic] pub const fn ptr_metadata<P: ?Sized, M>(ptr: *const P) -> M;
++pub const fn metadata<T: ?Sized>(ptr: *const T) -> <T as Pointee>::Metadata { ptr_metadata(ptr) }
++pub const fn from_raw_parts<T: ?Sized>(data: *const (), meta: <T as Pointee>::Metadata) -> *const T { aggregate_raw_ptr(data, meta) }
++pub const fn from_raw_parts_mut<T: ?Sized>(data: *mut (), meta: <T as Pointee>::Metadata) -> *mut T { aggregate_raw_ptr(data, meta) }
++// `<*const T>::with_metadata_of` (used by `byte_sub`, so by `Rc`/`Arc::from_raw` of a `dyn`)
++pub fn with_metadata_of<T: ?Sized, U: ?Sized>(this: *const T, meta: *const U) -> *const U {
++    from_raw_parts::<U>(this as *const (), metadata(meta))
++}
+diff --git a/dyn-metadata-makedst-test/main.c b/dyn-metadata-makedst-test/main.c
+new file mode 100644
+index 00000000..97992699
+--- /dev/null
++++ b/dyn-metadata-makedst-test/main.c
+@@ -0,0 +1,11 @@
++#include <stdio.h>
++unsigned dyn_roundtrip(unsigned); unsigned dyn_explicit(unsigned); unsigned dyn_mut_swap(void);
++unsigned long slice_roundtrip(unsigned long); unsigned thin_roundtrip(unsigned);
++int main(void) {
++    int fails = 0;
++    unsigned a = dyn_roundtrip(42), b = dyn_explicit(9), c = dyn_mut_swap(), e = thin_roundtrip(1234);
++    unsigned long d = slice_roundtrip(3);
++    printf("dyn_roundtrip=%u dyn_explicit=%u dyn_mut_swap=%u slice=%lu thin=%u\n", a, b, c, d, e);
++    fails += a != 42; fails += b != 3; fails += c != 5; fails += d != 3; fails += e != 1234;
++    return fails;
++}
+diff --git a/dyn-metadata-makedst-test/run.sh b/dyn-metadata-makedst-test/run.sh
+new file mode 100755
+index 00000000..a57d1c61
+--- /dev/null
++++ b/dyn-metadata-makedst-test/run.sh
+@@ -0,0 +1,15 @@
++#!/bin/sh
++# Kit for 0246: `MakeDst` (the `aggregate_raw_ptr` intrinsic, 1.90 `ptr::from_raw_parts`) with a trait-object
++# metadata operand passed the whole `DynMetadata<dyn Trait>` struct to make_traitobjptr(void*, void*):
++# cursive_core 0.3.5 (jlq 0.1.0) `Rc<dyn Fn(&mut Cursive)>::from_raw` -> `byte_sub` -> `with_metadata_of` ->
++# "error: incompatible type for argument 2 of 'make_traitobjptr'". `DstMeta` (`ptr_metadata`) already stored
++# `.META` into `._0._0` of the struct; the C backend now reads it back the same way. Builds the no_core crate
++# through codegen and the C compiler, then runs it: vtable and data pointer must survive the round trip for
++# `*const`/`*mut dyn`, slices keep their length, thin pointers still work. usage: ./run.sh <path/to/mrustc>
++MRUSTC=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
++cd "$(dirname "$0")"; rm -rf out; mkdir -p out; export MRUSTC_TARGET_VER=1.90
++cat hdr.rs dynmeta.rs > out/full.rs
++if "$MRUSTC" --edition 2021 --crate-type rlib out/full.rs -o out/full.rlib > out/full.log 2>&1 \
++    && ${CC:-cc} main.c out/full.rlib.o -o out/full > out/cc.log 2>&1 && ./out/full > out/run.log; then echo "PASS full: $(cat out/run.log)"
++else echo "FAIL full: $(cat out/run.log 2>/dev/null) $(cat out/full.log out/cc.log 2>/dev/null | grep -v '^(\|V V V\|core dumped' | grep -m1 'error\|BUG\|Assert\|TODO' | cut -c1-160)"; exit 1; fi
++rm -rf out; echo "ALL PASSED"
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index cfc0cde7..a96650b3 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -4586,10 +4586,20 @@ namespace {
+                         m_of << "make_sliceptr";
+                         m_of << "("; emit_param(ve.ptr_val); m_of << ", "; emit_param(ve.meta_val); m_of << ")";
+                         break;
+-                    case MetadataType::TraitObject:
++                    case MetadataType::TraitObject: {
+                         m_of << "make_traitobjptr";
+-                        m_of << "("; emit_param(ve.ptr_val); m_of << ", "; emit_param(ve.meta_val); m_of << ")";
+-                        break;
++                        m_of << "("; emit_param(ve.ptr_val); m_of << ", "; emit_param(ve.meta_val);
++                        // The metadata is either the vtable pointer itself (unsize coercions, pre-1.54 `ptr::metadata`), or
++                        // `DynMetadata<dyn Trait>` from `aggregate_raw_ptr`: `_vtable_ptr: NonNull<VTable>` plus a PhantomData.
++                        // `DstMeta` stores the vtable into `._0._0` of that struct, so read it back from the same place.
++                        ::HIR::TypeRef  tmp;
++                        const auto& meta_ty = mir_res.get_param_type(tmp, ve.meta_val);
++                        if( !(meta_ty.data().is_Primitive() || meta_ty.data().is_Pointer() || meta_ty.data().is_Borrow()) ) {
++                            MIR_ASSERT(mir_res, meta_ty.data().is_Path(), "MakeDst with unexpected trait object metadata type " << meta_ty);
++                            m_of << "._0._0";
++                        }
++                        m_of << ")";
++                        } break;
+                     case MetadataType::Zero:
+                     case MetadataType::Unknown:
+                     case MetadataType::None:

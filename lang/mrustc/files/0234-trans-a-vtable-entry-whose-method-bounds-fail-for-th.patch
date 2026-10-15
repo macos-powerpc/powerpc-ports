@@ -1,0 +1,209 @@
+From f387acdede9b0be3938e22dcf749e5ed9c1dccb1 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 14 Oct 2026 19:59:19 +0000
+Subject: [PATCH 234/241] trans: a vtable entry whose method bounds fail for
+ the type is null
+
+fend-core 1.5.8 makes a `dyn Iterator` of `Skip<BihomographicIterator>`
+(no TrustedRandomAccess). The vtable lists libcore's hidden
+
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item
+    where Self: TrustedRandomAccessNoCoerce
+
+(vtable.cpp leaves out only `where Self: Sized` methods), and Trans
+Enumerate monomorphised Skip's override for it. That body reads
+`Self::MAY_HAVE_SIDE_EFFECT`; `Skip<I>: TrustedRandomAccessNoCoerce`
+needs `I: ..`, so no impl applies and get_value falls back to the trait's
+required const. Deserialised, that const is `Generic` with no MIR, and
+enumerate dereferenced the null MIR pointer:
+
+    terminate called after throwing an instance of 'char const*'
+
+rustc leaves such an entry vacant (impossible predicates): the trait
+object can't satisfy the bound, so the entry is never called. The
+trait-provided-method check of public impls already tested a method's
+bounds; it is now Trans_Enumerate_BoundsHold, and
+Trans_Enumerate_VTableMethodPresent applies it to vtable entries in all
+three places that walk them: enumeration, the cleanup re-run's stub
+list, and Trans_AutoImpls, which writes a null pointer for the entry.
+
+A `Generic` constant without MIR now hits a BUG naming the path instead
+of the bare throw.
+
+Upstream bug: any `Box<dyn Iterator>` of `.skip(n)` over an iterator
+without TrustedRandomAccess hit it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/trans/auto_impls.cpp    |  8 ++++
+ src/trans/enumerate.cpp     | 80 ++++++++++++++++++++++++-------------
+ src/trans/main_bindings.hpp |  5 +++
+ 3 files changed, 65 insertions(+), 28 deletions(-)
+
+diff --git a/src/trans/auto_impls.cpp b/src/trans/auto_impls.cpp
+index f91838bb..def2d175 100644
+--- a/src/trans/auto_impls.cpp
++++ b/src/trans/auto_impls.cpp
+@@ -847,6 +847,14 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+                     auto src_trait_ms = MonomorphStatePtr(&type, &item_path.m_data.as_UfcsKnown().trait.m_params, nullptr);
+                     const auto& src_trait = state.resolve.m_crate.get_trait_by_path(sp, m.second.second.m_path);
+                     const auto& item = src_trait.m_values.at(m.first);
++                    // The method's bounds fail for the type: null entry, as rustc leaves it vacant (see Trans_Enumerate_VTableMethodPresent)
++                    if( item.is_Function() && !Trans_Enumerate_VTableMethodPresent(state.resolve, type, item_path.m_data.as_UfcsKnown().trait, item.as_Function()) )
++                    {
++                        DEBUG("@" << ofs << " = NULL (" << item_path << ")");
++                        vtable_data.write_uint(ofs, ptr_bytes, 0);
++                        ofs += ptr_bytes;
++                        continue ;
++                    }
+                     // If the entry is a by-value function, then emit a reference to a shim
+                     if( item.is_Function() )
+                     {
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index 8f72d14a..324321ff 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -440,6 +440,36 @@ namespace {
+         }
+     }
+ 
++    /// Whether the trait bounds of `params` (a trait method's where-clauses) hold once monomorphised by `ms`
++    bool Trans_Enumerate_BoundsHold(const StaticTraitResolve& resolve, const Span& sp, const ::HIR::GenericParams& params, const Monomorphiser& ms)
++    {
++        DEBUG("Bounds = " << params.fmt_bounds());
++        for(const auto& b : params.m_bounds)
++        {
++            if( !b.is_TraitBound() )    continue;
++            const auto& be = b.as_TraitBound();
++
++            auto b_ty_mono = resolve.monomorph_expand(sp, be.type, ms);
++            auto b_tp_mono = ms.monomorph_traitpath(sp, be.trait, false);
++            resolve.expand_associated_types_tp(sp, b_tp_mono);
++
++            DEBUG("Check " << b_ty_mono << ": " << b_tp_mono);
++            bool rv = resolve.find_impl(sp, b_tp_mono.m_path.m_path, b_tp_mono.m_path.m_params, b_ty_mono, [&](const ImplRef& impl, bool) {
++                for(const auto& ty_b : b_tp_mono.m_type_bounds) {
++                    const auto& ty = impl.get_type(ty_b.first.c_str(), ty_b.second.aty_params);
++                    DEBUG("ATY " << ty_b.first << " " << ty << " ?= exp " << ty_b.second.type);
++                    if( ty != ty_b.second.type ) {
++                        return false;
++                    }
++                }
++                return true;
++                });
++            if( !rv )
++                return false;
++        }
++        return true;
++    }
++
+     void Trans_Enumerate_Public_TraitImpl(EnumState& state, StaticTraitResolve& resolve, const ::HIR::SimplePath& trait_path, /*const*/ ::HIR::TraitImpl& impl)
+     {
+         static Span sp;
+@@ -481,32 +511,7 @@ namespace {
+                     if( vi.second.is_Function() )
+                     {
+                         const auto& fcn = vi.second.as_Function();
+-                        bool rv = true;
+-                        DEBUG("Bounds = " << fcn.m_params.fmt_bounds());
+-                        for(const auto& b : fcn.m_params.m_bounds)
+-                        {
+-                            if( !b.is_TraitBound() )    continue;
+-                            const auto& be = b.as_TraitBound();
+-
+-                            auto b_ty_mono = resolve.monomorph_expand(sp, be.type, cb_monomorph);
+-                            auto b_tp_mono = cb_monomorph.monomorph_traitpath(sp, be.trait, false);
+-                            resolve.expand_associated_types_tp(sp, b_tp_mono);
+-
+-                            DEBUG("Check " << b_ty_mono << ": " << b_tp_mono);
+-                            rv = resolve.find_impl(sp, b_tp_mono.m_path.m_path, b_tp_mono.m_path.m_params, b_ty_mono, [&](const ImplRef& impl, bool) {
+-                                for(const auto& ty_b : b_tp_mono.m_type_bounds) {
+-                                    const auto& ty = impl.get_type(ty_b.first.c_str(), ty_b.second.aty_params);
+-                                    DEBUG("ATY " << ty_b.first << " " << ty << " ?= exp " << ty_b.second.type);
+-                                    if( ty != ty_b.second.type ) {
+-                                        return false;
+-                                    }
+-                                }
+-                                return true;
+-                                });
+-                            if( !rv )
+-                                break;
+-                        }
+-                        if( !rv )
++                        if( !Trans_Enumerate_BoundsHold(resolve, sp, fcn.m_params, cb_monomorph) )
+                             continue ;
+ 
+                         DEBUG("Params = " << fcn.m_params.fmt_args());
+@@ -807,14 +812,17 @@ void Trans_Enumerate_Cleanup(const ::HIR::Crate& crate, TransList& list)
+                     continue ;
+ 
+                 auto trait_gpath = monomorph_cb_trait.monomorph_genericpath(sp, m.second.second, false);
++                const auto& src_trait = state.resolve.m_crate.get_trait_by_path(sp, m.second.second.m_path);
++                const auto& item = src_trait.m_values.at(m.first);
++                // Null entry, no function behind it
++                if( item.is_Function() && !Trans_Enumerate_VTableMethodPresent(state.resolve, type, trait_gpath, item.as_Function()) )
++                    continue ;
+                 auto item_path = ::HIR::Path(type.clone(), mv$(trait_gpath), m.first);
+ 
+                 DEBUG("++ " << item_path);
+                 new_list.m_functions.insert(std::make_pair( std::move(item_path), nullptr ));
+ 
+                 // If the entry is a by-value function, then emit a reference to a shim
+-                const auto& src_trait = state.resolve.m_crate.get_trait_by_path(sp, m.second.second.m_path);
+-                const auto& item = src_trait.m_values.at(m.first);
+                 if( item.is_Function() && item.as_Function().m_receiver == HIR::Function::Receiver::Value )
+                 {
+                     trait_gpath = monomorph_cb_trait.monomorph_genericpath(sp, m.second.second, false);
+@@ -1825,6 +1833,9 @@ void Trans_Enumerate_FillFrom_PathMono(EnumState& state, ::HIR::Path path_mono)
+         case HIR::Constant::ValueState::Unknown:
+             BUG(sp, "Unevaluated constant: " << path_mono);
+         case HIR::Constant::ValueState::Generic:
++            // A trait's required const loaded from an rlib is `Generic` without MIR (get_value falls back to it when no
++            // impl applies); was a bare `throw ""` in the MIR pointer
++            ASSERT_BUG(sp, e->m_value.m_mir, "Constant has no value: " << path_mono);
+             if( auto* slot = state.rv.add_const(mv$(path_mono)) )
+             {
+                 MIR::EnumCache  es;
+@@ -2032,6 +2043,14 @@ void Trans_Enumerate_FillFrom_MIR(MIR::EnumCache& state, const ::MIR::Function&
+     }
+ }
+ 
++bool Trans_Enumerate_VTableMethodPresent(const StaticTraitResolve& resolve, const ::HIR::TypeRef& type, const ::HIR::GenericPath& trait_path, const ::HIR::Function& fcn)
++{
++    static Span sp;
++    auto method_pp = fcn.m_params.make_empty_params(true);
++    auto ms = MonomorphStatePtr(&type, &trait_path.m_params, &method_pp);
++    return Trans_Enumerate_BoundsHold(resolve, sp, fcn.m_params, ms);
++}
++
+ void Trans_Enumerate_FillFrom_VTable(EnumState& state, ::HIR::Path vtable_path, const Trans_Params& pp)
+ {
+     static Span sp;
+@@ -2052,6 +2071,11 @@ void Trans_Enumerate_FillFrom_VTable(EnumState& state, ::HIR::Path vtable_path,
+         DEBUG("- " << m.second.first << " = " << m.second.second << " :: " << m.first);
+         auto gpath = monomorph_cb_trait.monomorph_genericpath(sp, m.second.second, false);
+         const auto& fcn = state.crate.get_trait_by_path(sp, gpath.m_path).m_values.at(m.first).as_Function();
++        // An entry whose method bounds fail for the type stays null (see Trans_Enumerate_VTableMethodPresent)
++        if( !Trans_Enumerate_VTableMethodPresent(state.resolve, type, gpath, fcn) ) {
++            DEBUG("- " << m.first << " bounds don't hold for " << type << ", null entry");
++            continue ;
++        }
+         Trans_Enumerate_FillFrom_PathMono(state, ::HIR::Path(type.clone(), mv$(gpath), m.first, fcn.m_params.make_empty_params(true)));
+     }
+     for(const auto& pt_path : tr.m_all_parent_traits)
+diff --git a/src/trans/main_bindings.hpp b/src/trans/main_bindings.hpp
+index 2a755cc2..52b42988 100644
+--- a/src/trans/main_bindings.hpp
++++ b/src/trans/main_bindings.hpp
+@@ -44,6 +44,11 @@ extern void Trans_Enumerate_Cleanup(const ::HIR::Crate& crate, TransList& list);
+ extern void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list);
+ /// Add the types used by a function generated after the main enumeration (see Trans_AutoImpls)
+ extern void Trans_Enumerate_Types_Function(const ::HIR::Crate& crate, TransList& list, const ::HIR::Path& path, const ::HIR::Function& fcn);
++/// Whether `type`'s vtable for a trait points at trait method `fcn` (of `trait_path`, monomorphised): not when the
++/// method's own where-clauses fail for the type, e.g. Iterator's `__iterator_get_unchecked` (`where Self:
++/// TrustedRandomAccessNoCoerce`) for `Skip<I>` over a plain iterator. rustc leaves such an entry null: the trait object
++/// can't call it, and the method's body may not even resolve for that type.
++extern bool Trans_Enumerate_VTableMethodPresent(const StaticTraitResolve& resolve, const ::HIR::TypeRef& type, const ::HIR::GenericPath& trait_path, const ::HIR::Function& fcn);
+ 
+ extern void Trans_Monomorphise_List(const ::HIR::Crate& crate, TransList& list);
+ 

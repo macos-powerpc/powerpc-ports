@@ -1,0 +1,151 @@
+From a5209f484aa496d5b8da9df8a4cb86ad250ec4af Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 14 Oct 2026 19:59:20 +0000
+Subject: [PATCH 239/241] trans: enumerate the dyn-method shims' receiver types
+ with the others
+
+skim 5.7.3 died in Trans Auto Impls:
+
+    BUG: ASSERT FAIL: src/trans/auto_impls.cpp:1149:!params.has_types():
+    Generic drop impl encountered during auto_impls (should have been populated during enum)
+
+A `<dyn Trait as Trait>::method` used as a function value gets a shim in
+Trans_AutoImpls, after enumeration. For `self: Box<Self>` the shim's
+receiver local is `Box<()>`, which only reached the type list through
+Trans_Enumerate_Types_Function at that point: nobody enumerated
+`<Box<()> as Drop>::drop` (a generic impl), and the drop-glue pass has
+no way to add it.
+
+The unit-receiver type is a function of the method's receiver kind
+(`&move ()`/`&()`, `Box<(), A>`, the custom receiver with `Self = ()`):
+Trans_AutoImpls_DynMethodUnitReceiver computes it, the shim builder uses
+it, and Trans_Enumerate_Types visits it for every trait_object_methods
+entry, so its Drop impl is enumerated and monomorphised like any other.
+The assertion names the type now.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/trans/auto_impls.cpp    | 53 +++++++++++++++++++++++++++++++------
+ src/trans/enumerate.cpp     |  7 +++++
+ src/trans/main_bindings.hpp |  5 ++++
+ 3 files changed, 57 insertions(+), 8 deletions(-)
+
+diff --git a/src/trans/auto_impls.cpp b/src/trans/auto_impls.cpp
+index def2d175..dbc87c8c 100644
+--- a/src/trans/auto_impls.cpp
++++ b/src/trans/auto_impls.cpp
+@@ -354,6 +354,46 @@ namespace {
+     }
+ }
+ 
++::HIR::TypeRef Trans_AutoImpls_DynMethodUnitReceiver(const StaticTraitResolve& resolve, const ::HIR::Path& path)
++{
++    static Span sp;
++    const auto& pe = path.m_data.as_UfcsKnown();
++    const auto& trait_path = pe.trait;
++    const auto& trait = resolve.m_crate.get_trait_by_path(sp, trait_path.m_path);
++    const auto& fcn_def = trait.m_values.at(pe.item).as_Function();
++    auto pp = fcn_def.m_params.make_nop_params(1, true);
++    switch(fcn_def.m_receiver)
++    {
++    case HIR::Function::Receiver::Value:
++    case HIR::Function::Receiver::BorrowOwned:
++        return ::HIR::TypeRef::new_borrow(HIR::BorrowType::Owned, ::HIR::TypeRef::new_unit());
++    case HIR::Function::Receiver::BorrowUnique:
++        return ::HIR::TypeRef::new_borrow(HIR::BorrowType::Unique, ::HIR::TypeRef::new_unit());
++    case HIR::Function::Receiver::BorrowShared:
++        return ::HIR::TypeRef::new_borrow(HIR::BorrowType::Shared, ::HIR::TypeRef::new_unit());
++    case HIR::Function::Receiver::Box: {
++        // `Box<dyn ThisTrait, A>` into `Box<(), A>`
++        MonomorphStatePtr   ms(&pe.type, &trait_path.m_params, &pp);
++        auto self_ty = ms.monomorph_type(sp, fcn_def.m_args.front().second);
++        resolve.expand_associated_types(sp, self_ty);
++        ASSERT_BUG(sp, self_ty.data().is_Path(), path << " - self: " << self_ty);
++        auto gpath = self_ty.data().as_Path().path.m_data.as_Generic().clone();
++        gpath.m_params.m_types.at(0) = ::HIR::TypeRef::new_unit();
++        return HIR::TypeRef::new_path(mv$(gpath), self_ty.data().as_Path().binding.clone());
++        }
++    case HIR::Function::Receiver::Custom: {
++        // `self: Pin<&mut Self>` (Future::poll) and other wrappers, with `Self = ()` (as hir_expand/vtable.cpp clone_self_cb)
++        static const HIR::TypeRef ty_unit = HIR::TypeRef::new_unit();
++        MonomorphStatePtr   ms_unit(&ty_unit, &trait_path.m_params, &pp);
++        auto ty = ms_unit.monomorph_type(sp, fcn_def.m_args.front().second);
++        resolve.expand_associated_types(sp, ty);
++        return ty;
++        }
++    default:
++        TODO(sp, "Handle different receiver types: " << path << " - self: " << fcn_def.m_args.front().second);
++    }
++}
++
+ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+ {
+ 
+@@ -515,9 +555,9 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+                 // - the `self` type is `Box<dyn ThisTrait>`, so need to deref through that to the right type
+                 DEBUG("<dyn " << trait_path << ">::" << name << " - Boxed");
+                 // - Need to make a new receiver (convert `Box<dyn ThisTrait>` into `Box<()>`)
+-                auto gpath = new_fcn.m_args.front().second.data().as_Path().path.m_data.as_Generic().clone();
+-                gpath.m_params.m_types.at(0) = ::HIR::TypeRef::new_unit();
+-                auto ty = HIR::TypeRef::new_path(mv$(gpath), new_fcn.m_args.front().second.data().as_Path().binding.clone());
++                // - Trans_Enumerate_Types visited this type already: `Box<()>`'s generic Drop impl has to be enumerated
++                //   there (skim 5.7.3: "Generic drop impl encountered during auto_impls")
++                auto ty = Trans_AutoImpls_DynMethodUnitReceiver(state.resolve, path);
+                 lv_ptr = get_unit_ptr(sp, builder, mv$(ty), MIR::LValue::new_Argument(0), lv_self);
+                 } break;
+             case HIR::Function::Receiver::Custom: {
+@@ -527,10 +567,7 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+                 // - tower-lsp-server 0.23.0 (ast-grep): `<dyn Future<..> + Send as Future>::poll` reached as a
+                 //   function value, "TODO: Handle different receiver types"
+                 DEBUG("<dyn " << trait_path << ">::" << name << " - Custom receiver " << new_fcn.m_args.front().second);
+-                static const HIR::TypeRef ty_unit = HIR::TypeRef::new_unit();
+-                MonomorphStatePtr   ms_unit(&ty_unit, &trait_path.m_params, &pp);
+-                auto ty = ms_unit.monomorph_type(sp, fcn_def.m_args.front().second);
+-                state.resolve.expand_associated_types(sp, ty);
++                auto ty = Trans_AutoImpls_DynMethodUnitReceiver(state.resolve, path);
+                 lv_ptr = get_unit_ptr(sp, builder, mv$(ty), MIR::LValue::new_Argument(0), lv_self);
+                 } break;
+             default:
+@@ -1154,7 +1191,7 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+                             auto p = ::HIR::Path(ty.clone(), state.resolve.m_lang_Drop, rcstring_drop);
+                             auto fcn_e = state.resolve.get_value(sp, p, /*out*/params, /*signature_only=*/false);
+                             ASSERT_BUG(sp, fcn_e.is_Function(), "Drop didn't point to a function! " << fcn_e.tag_str() << " " << p);
+-                            ASSERT_BUG(sp, !params.has_types(), "Generic drop impl encountered during auto_impls (should have been populated during enum)");
++                            ASSERT_BUG(sp, !params.has_types(), "Generic drop impl encountered during auto_impls (should have been populated during enum) - " << ty);
+                             e->force_prototype = true;
+                             e->ptr = fcn_e.as_Function();
+                             //e->pp = mv$(params);
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index 324321ff..91e14749 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -1512,6 +1512,13 @@ void Trans_Enumerate_Types(EnumState& state)
+         {
+             tv.visit_type(ty);
+         }
++        // The unit-receiver locals of the `<dyn Trait as Trait>::method` shims Trans_AutoImpls builds later: `Box<()>`
++        // has a generic Drop impl, which only this pass enumerates (skim 5.7.3: "Generic drop impl encountered during
++        // auto_impls (should have been populated during enum)")
++        for(const auto& p : state.rv.trait_object_methods)
++        {
++            tv.visit_type( Trans_AutoImpls_DynMethodUnitReceiver(state.resolve, p) );
++        }
+ 
+         constructors_added = false;
+         for(unsigned int i = types_count; i < state.rv.m_types.size(); i ++ )
+diff --git a/src/trans/main_bindings.hpp b/src/trans/main_bindings.hpp
+index 52b42988..713b933a 100644
+--- a/src/trans/main_bindings.hpp
++++ b/src/trans/main_bindings.hpp
+@@ -44,6 +44,11 @@ extern void Trans_Enumerate_Cleanup(const ::HIR::Crate& crate, TransList& list);
+ extern void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list);
+ /// Add the types used by a function generated after the main enumeration (see Trans_AutoImpls)
+ extern void Trans_Enumerate_Types_Function(const ::HIR::Crate& crate, TransList& list, const ::HIR::Path& path, const ::HIR::Function& fcn);
++/// The type of the unit-receiver local the `<dyn Trait as Trait>::method` shim (Trans_AutoImpls "Trait object methods")
++/// passes to the vtable entry: `&move ()`/`&()` for by-value/by-borrow receivers, `Box<(), A>` for `self: Box<Self>`,
++/// the receiver with `Self = ()` for custom ones (`Pin<&mut ()>`). Enumerated with the other types, so that a generic
++/// Drop impl on it (Box's) is monomorphised too.
++extern ::HIR::TypeRef Trans_AutoImpls_DynMethodUnitReceiver(const StaticTraitResolve& resolve, const ::HIR::Path& path);
+ /// Whether `type`'s vtable for a trait points at trait method `fcn` (of `trait_path`, monomorphised): not when the
+ /// method's own where-clauses fail for the type, e.g. Iterator's `__iterator_get_unchecked` (`where Self:
+ /// TrustedRandomAccessNoCoerce`) for `Skip<I>` over a plain iterator. rustc leaves such an entry null: the trait object

@@ -1,0 +1,227 @@
+From f23ca94c8a96123ef61f54089a12719712003073 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 18:15:22 +0000
+Subject: [PATCH 266/268] trans: rotate_left/rotate_right reduce the shift
+ modulo the width; narrow ctlz counts from its own width
+
+skim 5.7.3 `sk` at runtime (tokio 1.53.1): "thread 'tokio-rt-worker' panicked at :0:0:
+assertion `left == right` failed left: 0 right: 5", Abort trap. The worker's backtrace ends
+in runtime/time/wheel/level.rs Level::next_expiration, whose only equality check is
+`debug_assert_eq!(self.level, NUM_LEVELS - 1)`: a level-0 slot computed a deadline in the
+past. next_occupied_slot does `occupied.rotate_right(now_slot as u32)` with now_slot = the
+elapsed milliseconds.
+
+The C backend emitted a rotate as `(v >> shift) | (v << (64 - shift))` without reducing the
+shift modulo the width. Rust rotates by `n % BITS`; a C shift by the width or more is
+undefined. x86 masks shift counts in hardware and hid it; 32-bit PowerPC's 64-bit shift
+sequences return garbage, so every timer wheel lookup after 64 ms picked a wrong slot.
+
+Two more problems in the same emission, found by the kit:
+- rotate_right's block-local temporary was called `rv`, which is also the name of the
+  function's return slot. When the intrinsic's destination was the return value the result
+  became `rv = rv;` and every non-inlined `uN::rotate_right` returned garbage. `-O` builds
+  mostly inline it into a temporary, which is why it went unnoticed.
+- `ctlz` on u8/u16 used `__builtin_clz` of the promoted 32-bit value: `1u8.leading_zeros()`
+  was 31 instead of 7.
+
+One emission now covers every width: `shift & (BITS-1)` and `(BITS - shift) & (BITS-1)`
+(a zero shift no longer shifts by the width), temporaries rot_v/rot_s, the emulated u128 handles
+0, 64 and more than 64 explicitly, the native u128 masks, and the narrow ctlz subtracts
+`32 - BITS`.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index a96650b3..276f46cd 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -7713,133 +7713,64 @@ namespace {
+                 }
+             }
+             // Rotate
+-            else if( name == "rotate_left" ) {
++            else if( name == "rotate_left" || name == "rotate_right" ) {
++                // Rust rotates by `shift % BITS`. A C shift by the width or more (and `v << BITS` for a zero shift)
++                // is undefined: x86 masks the count in hardware and hid it, 32-bit PowerPC's 64-bit shift sequences
++                // don't (tokio's timer wheel: `occupied.rotate_right(elapsed_ms)`). The temporaries must not be
++                // called `rv` either: that is the function's return slot, so a block-local `rv` turned the result
++                // into a self-assignment whenever the destination was the return value.
++                const bool left = (name == "rotate_left");
+                 const auto& ty = params.m_types.at(0);
++                unsigned bits = 0;
+                 switch( get_real_prim_ty(ty.data().as_Primitive()) )
+                 {
+-                case ::HIR::CoreType::I8:
+-                case ::HIR::CoreType::U8:
+-                    m_of << "{";
+-                    m_of << " uint8_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v << shift) | (v >> (8 - shift));";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I16:
+-                case ::HIR::CoreType::U16:
+-                    m_of << "{";
+-                    m_of << " uint16_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v << shift) | (v >> (16 - shift));";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I32:
+-                case ::HIR::CoreType::U32:
+-                    m_of << "{";
+-                    m_of << " uint32_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v << shift) | (v >> (32 - shift));";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I64:
+-                case ::HIR::CoreType::U64:
+-                    m_of << "{";
+-                    m_of << " uint64_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v << shift) | (v >> (64 - shift));";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I128:
+-                case ::HIR::CoreType::U128:
+-                    m_of << "{";
+-                    m_of << " uint128_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << (m_options.emulated_i128 && TARGETVER_MOST_1_74 ? ".lo" : "") << ";";
+-                    if( m_options.emulated_i128 )
+-                    {
+-                        m_of << " if(shift < 64) {";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".lo = (v.lo << shift) | (v.hi >> (64 - shift));";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".hi = (v.hi << shift) | (v.lo >> (64 - shift));";
+-                        m_of << " } else {";
+-                        m_of << " shift -= 64;";    // Swap order and reduce shift
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".lo = (v.hi << shift) | (v.lo >> (64 - shift));";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".hi = (v.lo << shift) | (v.hi >> (64 - shift));";
+-                        m_of << " }";
+-                    }
+-                    else
+-                    {
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v << shift) | (v >> (128 - shift));";
+-                    }
+-                    m_of << "}";
+-                    break;
++                case ::HIR::CoreType::I8:   case ::HIR::CoreType::U8:   bits = 8;   break;
++                case ::HIR::CoreType::I16:  case ::HIR::CoreType::U16:  bits = 16;  break;
++                case ::HIR::CoreType::I32:  case ::HIR::CoreType::U32:  bits = 32;  break;
++                case ::HIR::CoreType::I64:  case ::HIR::CoreType::U64:  bits = 64;  break;
++                case ::HIR::CoreType::I128: case ::HIR::CoreType::U128: bits = 128; break;
+                 default:
+-                    MIR_TODO(mir_res, "rotate_left - " << ty);
++                    MIR_TODO(mir_res, name << " - " << ty);
+                 }
+-            }
+-            else if( name == "rotate_right" ) {
+-                const auto& ty = params.m_types.at(0);
+-                switch( get_real_prim_ty(ty.data().as_Primitive()) )
++                m_of << "{";
++                if( bits == 128 )
+                 {
+-                case ::HIR::CoreType::I8:
+-                case ::HIR::CoreType::U8:
+-                    m_of << "{";
+-                    m_of << " uint8_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " uint8_t rv = (v >> shift) | (v << (8 - shift));";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = rv;";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I16:
+-                case ::HIR::CoreType::U16:
+-                    m_of << "{";
+-                    m_of << " uint16_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " uint16_t rv = (v >> shift) | (v << (16 - shift));";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = rv;";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I32:
+-                case ::HIR::CoreType::U32:
+-                    m_of << "{";
+-                    m_of << " uint32_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " uint32_t rv = (v >> shift) | (v << (32 - shift));";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = rv;";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I64:
+-                case ::HIR::CoreType::U64:
+-                    m_of << "{";
+-                    m_of << " uint64_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << ";";
+-                    m_of << " uint64_t rv = (v >> shift) | (v << (64 - shift));";
+-                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = rv;";
+-                    m_of << "}";
+-                    break;
+-                case ::HIR::CoreType::I128:
+-                case ::HIR::CoreType::U128:
+-                    m_of << "{";
+-                    m_of << " uint128_t v = "; emit_param(e.args.at(0)); m_of << ";";
+-                    m_of << " unsigned shift = "; emit_param(e.args.at(1)); m_of << (m_options.emulated_i128 && TARGETVER_MOST_1_74 ? ".lo" : "") << ";";
++                    m_of << " uint128_t rot_v = "; emit_param(e.args.at(0)); m_of << ";";
++                    m_of << " unsigned rot_s = ("; emit_param(e.args.at(1)); m_of << (m_options.emulated_i128 && TARGETVER_MOST_1_74 ? ".lo" : "") << ") & 127;";
+                     if( m_options.emulated_i128 )
+                     {
+-                        m_of << " if(shift < 64) {";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".lo = (v.lo >> shift) | (v.hi << (64 - shift));";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".hi = (v.hi >> shift) | (v.lo << (64 - shift));";
+-                        m_of << " } else {";
+-                        m_of << " shift -= 64;";    // Swap order and reduce shift
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".lo = (v.hi >> shift) | (v.lo << (64 - shift));";
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << ".hi = (v.lo >> shift) | (v.hi << (64 - shift));";
++                        // Shifts toward `hi` (left) feed `hi` from `lo`; toward `lo` (right) the other way round.
++                        const char* a = left ? "lo" : "hi";  // the half a shift of less than 64 fills from
++                        const char* b = left ? "hi" : "lo";
++                        const char* sh = left ? "<<" : ">>";  // the direction of the rotate
++                        const char* csh = left ? ">>" : "<<"; // the carried bits go the other way
++                        m_of << " if(rot_s == 0) { "; emit_lvalue(e.ret_val); m_of << ".lo = rot_v.lo; "; emit_lvalue(e.ret_val); m_of << ".hi = rot_v.hi; }";
++                        m_of << " else if(rot_s < 64) {";
++                        m_of << " "; emit_lvalue(e.ret_val); m_of << "." << b << " = (rot_v." << b << " " << sh << " rot_s) | (rot_v." << a << " " << csh << " (64 - rot_s));";
++                        m_of << " "; emit_lvalue(e.ret_val); m_of << "." << a << " = (rot_v." << a << " " << sh << " rot_s) | (rot_v." << b << " " << csh << " (64 - rot_s));";
++                        m_of << " } else if(rot_s == 64) { "; emit_lvalue(e.ret_val); m_of << ".lo = rot_v.hi; "; emit_lvalue(e.ret_val); m_of << ".hi = rot_v.lo; }";
++                        m_of << " else { rot_s -= 64;";    // Swap the halves and reduce the shift
++                        m_of << " "; emit_lvalue(e.ret_val); m_of << "." << b << " = (rot_v." << a << " " << sh << " rot_s) | (rot_v." << b << " " << csh << " (64 - rot_s));";
++                        m_of << " "; emit_lvalue(e.ret_val); m_of << "." << a << " = (rot_v." << b << " " << sh << " rot_s) | (rot_v." << a << " " << csh << " (64 - rot_s));";
+                         m_of << " }";
+                     }
+                     else
+                     {
+-                        m_of << " "; emit_lvalue(e.ret_val); m_of << " = (v >> shift) | (v << (128 - shift));";
++                        m_of << " "; emit_lvalue(e.ret_val);
++                        if( left ) { m_of << " = (rot_v << rot_s) | (rot_v >> ((128 - rot_s) & 127));"; }
++                        else       { m_of << " = (rot_v >> rot_s) | (rot_v << ((128 - rot_s) & 127));"; }
+                     }
+-                    m_of << "}";
+-                    break;
+-                default:
+-                    MIR_TODO(mir_res, "rotate_right - " << ty);
+                 }
++                else
++                {
++                    m_of << " uint" << bits << "_t rot_v = "; emit_param(e.args.at(0)); m_of << ";";
++                    m_of << " unsigned rot_s = ("; emit_param(e.args.at(1)); m_of << ") & " << (bits - 1) << ";";
++                    m_of << " "; emit_lvalue(e.ret_val); m_of << " = (uint" << bits << "_t)(";
++                    if( left ) { m_of << "(rot_v << rot_s) | (rot_v >> ((" << bits << " - rot_s) & " << (bits - 1) << "))"; }
++                    else       { m_of << "(rot_v >> rot_s) | (rot_v << ((" << bits << " - rot_s) & " << (bits - 1) << "))"; }
++                    m_of << ");";
++                }
++                m_of << "}";
+             }
+             // Bit Twiddling
+             // - CounT Leading Zeroes
+@@ -7900,7 +7831,9 @@ namespace {
+                 {
+                     emit_param(e.args.at(0)); m_of << " != 0 ? ";
+                     if( name == "ctlz" || name == "ctlz_nonzero" ) {
+-                        m_of << "__builtin_clz("; emit_param(e.args.at(0)); m_of << ")";
++                        // `__builtin_clz` counts in the promoted 32 bits: a narrower value has `32 - BITS` extra
++                        // leading zeros (`1u8.leading_zeros()` is 7, not 31)
++                        m_of << "(__builtin_clz("; emit_param(e.args.at(0)); m_of << ") - (32 - sizeof("; emit_ctype(ty); m_of << ")*8))";
+                     }
+                     else {
+                         m_of << "__builtin_ctz("; emit_param(e.args.at(0)); m_of << ")";

@@ -1,0 +1,110 @@
+From 97deb6c326a8804c9c06dd7f284cd97347a61e42 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 12:00:38 +0000
+Subject: [PATCH] hir: an associated type bound nested in an associated type's
+ own bound list
+
+time 0.3.54 (ani-cli-rs 0.11.0) and 0.3.55 (cargo-c 0.10.25),
+format_description/parse/lexer_ast.rs:52, in HIR Lower (no span):
+
+    Assertion failed: (m_tag == TAG_Generic), function as_Generic,
+    file src/hir/type.hpp, line 236.
+
+`type Component: TryFrom<AstComponent, Error: Into<Error>>;`.
+LowerHIR_GenericParams turns an associated type bound `T: Tr<A: B>` into
+a bound on the projection `<T as Tr>::A`; for an associated type's own
+bound list that produced `<Self as TryFrom<A>>::Error: Into<E>`, and the
+associated-type arm of LowerHIR_Trait, which only expects bounds on Self
+there, `as_Generic()`'d the projection type.
+
+The self-bound list now keeps the nesting inside the trait path
+(`keep_aty_bounds`), and the two asserts say what they check. The bound
+cache shared by static and dynamic trait resolution
+(TraitResolveCommon::prep_indexes__add_trait_bound) derives
+`<<X as Tr>::Component as TryFrom<A>>::Error: Into<E>` from such
+a definition, so lexer_ast.rs:667 `try_likely_ok!(component.try_into())`
+(`Err(e) => return Err(e.into())` under `(): ParseTarget<..>`) resolves
+the conversion. Not done: checking an impl against the nested bound
+(rustc rejects `type Component = Comp` when Comp's Error is not Into<E>).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index c7db9ce0..f7a2712d 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -63,7 +63,11 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+     return ::HIR::Publicity::new_priv( ::HIR::SimplePath( (ap->crate == "" ? g_crate_name : ap->crate), ap->nodes ) );
+ }
+ 
+-::HIR::GenericParams LowerHIR_GenericParams(const ::AST::GenericParams& gp, bool* self_is_sized)
++// `keep_aty_bounds`: an associated type's own bound list (`type Component: TryFrom<A, Error: Into<E>>`, time 0.3.54
++// format_description/parse/lexer_ast.rs:52) keeps a nested associated type bound inside the trait path (the bound
++// list holds trait paths on `Self` = the associated type; the bound cache expands the nesting from there) instead of
++// splitting it into a bound on the projection `<Self as TryFrom<A>>::Error`, which that list cannot hold.
++::HIR::GenericParams LowerHIR_GenericParams(const ::AST::GenericParams& gp, bool* self_is_sized, bool keep_aty_bounds = false)
+ {
+     ::HIR::GenericParams    rv;
+ 
+@@ -117,8 +121,11 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+             }
+ 
+             auto bound_trait_path = LowerHIR_TraitPath(bound.span, e.trait, e.inner_hrbs, /*allow_bounds=*/true);
+-            auto tp_bounds = mv$(bound_trait_path.m_trait_bounds);
+-            bound_trait_path.m_trait_bounds.clear();
++            ::std::map<RcString, ::HIR::TraitPath::AtyBound>    tp_bounds;
++            if( !keep_aty_bounds ) {
++                tp_bounds = mv$(bound_trait_path.m_trait_bounds);
++                bound_trait_path.m_trait_bounds.clear();
++            }
+ 
+             // 1.90 added some traits that imply ?Sized
+             if( bound_trait_path.m_path.m_path == path_PointeeSized || bound_trait_path.m_path.m_path == path_MetadataSized ) {
+@@ -1646,16 +1653,16 @@ namespace {
+             ::HIR::LifetimeRef  lifetime_bound;
+             auto gps = LowerHIR_GenericParams(i.params(), &is_sized);
+ 
+-            auto self_bounds = LowerHIR_GenericParams(i.m_self_bounds, &is_sized);
++            auto self_bounds = LowerHIR_GenericParams(i.m_self_bounds, &is_sized, /*keep_aty_bounds=*/true);
+             for(auto& b : self_bounds.m_bounds)
+             {
+                 TU_MATCH_HDRA( (b), {)
+                 TU_ARMA(TypeLifetime, be) {
+-                    ASSERT_BUG(item.span, be.type.data().as_Generic().binding == GENERIC_Self, be.type);
++                    ASSERT_BUG(item.span, be.type.data().is_Generic() && be.type.data().as_Generic().binding == GENERIC_Self, "Associated type bound not on the type itself: " << be.type << ": " << be.valid_for);
+                     lifetime_bound = mv$(be.valid_for);
+                     }
+                 TU_ARMA(TraitBound, be) {
+-                    ASSERT_BUG(item.span, be.type.data().as_Generic().binding == GENERIC_Self, be.type);
++                    ASSERT_BUG(item.span, be.type.data().is_Generic() && be.type.data().as_Generic().binding == GENERIC_Self, "Associated type bound not on the type itself: " << be.type << ": " << be.trait);
+                     trait_bounds.push_back( mv$(be.trait) );
+                     }
+                 TU_ARMA(Lifetime, be) {
+diff --git a/src/hir_typeck/resolve_common.cpp b/src/hir_typeck/resolve_common.cpp
+index 2eef7156..f3e9fc7f 100644
+--- a/src/hir_typeck/resolve_common.cpp
++++ b/src/hir_typeck/resolve_common.cpp
+@@ -162,6 +162,22 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+                 auto* inner_hrtbs = outer_hrtbs ? outer_hrtbs : a_ty_b.m_hrtbs.get();
+                 prep_indexes__add_equality( sp, inner_hrtbs, mv$(ty_l), std::move(tb.second.type) );
+             }
++            // An associated type bound nested in the definition's bound (`type Component: TryFrom<A, Error: Into<E>>`,
++            // time 0.3.54 lexer_ast.rs:52; HIR lowering keeps it in the trait path) bounds the projection of the
++            // projection: `<<X as Tr>::Component as TryFrom<A>>::Error: Into<E>`
++            for( auto& tb : trait_mono.m_trait_bounds ) {
++                for(auto& t : tb.second.traits) {
++                    auto ty_l = ::HIR::TypeRef::new_path(
++                        ::HIR::Path( ty_a.clone(), tb.second.source_trait.clone(), tb.first, tb.second.aty_params.clone() ),
++                        ::HIR::TypePathBinding::make_Opaque({})
++                    );
++                    DEBUG("Bound (ATB) - " << ty_l << " : " << t);
++                    if( outer_hrtbs && outer_hrtbs->is_empty() ) {
++                        outer_hrtbs = nullptr;
++                    }
++                    prep_indexes__add_trait_bound(sp, outer_hrtbs ? outer_hrtbs : a_ty_b.m_hrtbs.get(), mv$(ty_l), std::move(t));
++                }
++            }
+         }
+ 
+         monomorph.pp_method = nullptr;

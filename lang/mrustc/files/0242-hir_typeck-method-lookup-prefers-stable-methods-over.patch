@@ -1,0 +1,410 @@
+From dd460af0212eb747816c609bb295bacea47c0dd3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 14 Oct 2026 21:36:30 +0000
+Subject: [PATCH] hir_typeck: method lookup prefers stable methods over
+ unstable library ones
+
+shellexpand 3.1.1 (mcfly 0.9.4) funcs.rs:394, `var_name: &str` with the
+crate's in-scope `WstrExt::as_str(&self) -> Option<&str>`:
+
+    let var_name = match var_name.as_str() {
+        Some(var_name) => var_name,
+        None => return Ok(None),
+    };
+
+    funcs.rs:398:19 error:0: Type mismatch between str and Option<_>
+
+core 1.90 has `#[unstable(feature = "str_as_str")] pub fn as_str(&self)
+-> &str` on `str`. mrustc kept no stability information and inherent
+methods win, so core's method was picked. rustc (method/probe.rs
+`pick_core`) first probes every autoderef level without the unstable
+methods of features the crate hasn't enabled, and takes one of those
+only when nothing else applies. Same class: num-integer's
+`a.div_floor(&b)` (core's unstable `i32::div_floor(self, Self)`),
+itertools' `i.intersperse(x)` through an `I: Iterator` bound (core's
+unstable `Iterator::intersperse` was the bound's method), and the path
+forms `str::as_str(s)` / `i32::div_floor(&a, &b)` in Resolve UFCS.
+
+- `HIR::Function::Markings::unstable_feature`: the item's
+  `#[unstable(feature = "..")]`, or that of an `#[unstable]` inherent
+  impl block for a method without its own stability attribute. It is
+  serialised: rlibs written by an older mrustc can't be loaded.
+- `HIR::Crate::m_enabled_features` (not serialised): `#![feature(..)]`
+  plus the crate's own unstable features (rustc never stability-checks
+  local items).
+- autoderef_find_method runs a probe that skips unstable methods
+  (inherent, bound, trait object, in-scope trait), then a second one
+  with them if the first found nothing but skipped one.
+- resolve_ufcs: an unstable inherent item is skipped, and retried
+  before "Failed to find impl".
+
+Not modelled: `implied_by`, inheritance from an unstable trait to its
+methods, `-Z force-unstable-if-unmarked`.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/hir/deserialise.cpp       |  1 +
+ src/hir/from_ast.cpp          | 53 +++++++++++++++++++++++++++++++++--
+ src/hir/hir.hpp               |  8 ++++++
+ src/hir/serialise.cpp         |  1 +
+ src/hir_conv/resolve_ufcs.cpp | 21 ++++++++++++--
+ src/hir_typeck/helpers.cpp    | 49 +++++++++++++++++++++++++++-----
+ src/hir_typeck/helpers.hpp    | 14 ++++++++-
+ 7 files changed, 134 insertions(+), 13 deletions(-)
+
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index 0f688bc3..66899263 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -825,6 +825,7 @@ namespace {
+             ::HIR::Function::Markings rv;
+             rv.rustc_legacy_const_generics = deserialise_vec<unsigned>();
+             rv.track_caller = m_in.read_bool();
++            rv.unstable_feature = m_in.read_istring();
+             return rv;
+         }
+         ::std::vector< ::std::pair< ::HIR::Pattern, ::HIR::TypeRef> >   deserialise_fcnargs()
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index ae69bdc5..c7db9ce0 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -21,10 +21,11 @@
+ #include <limits.h>
+ #include <hir_typeck/helpers.hpp>   // monomorph
+ #include <trans/target.hpp>
++#include <parse/ttstream.hpp>
+ 
+ ::HIR::ExprPtr LowerHIR_Expr(const ::AST::Expr& e);
+ ::HIR::Module LowerHIR_Module(const ::AST::Module& module, ::HIR::ItemPath path, ::std::vector< ::HIR::SimplePath> traits = {});
+-::HIR::Function LowerHIR_Function(::HIR::ItemPath path, const ::AST::AttributeList& attrs, const ::AST::Function& f, const ::HIR::TypeRef& self_type);
++::HIR::Function LowerHIR_Function(::HIR::ItemPath path, const ::AST::AttributeList& attrs, const ::AST::Function& f, const ::HIR::TypeRef& self_type, const RcString& parent_unstable = RcString());
+ ::HIR::ValueItem LowerHIR_Static(::HIR::ItemPath p, const ::AST::AttributeList& attrs, const ::AST::Static& e, const Span& sp, const RcString& name);
+ ::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc);
+ ::HIR::ConstGeneric LowerHIR_ConstGeneric(const ::AST::ExprNode& node_ref);
+@@ -1715,7 +1716,37 @@ namespace {
+ 
+     return ta;
+ }
+-::HIR::Function LowerHIR_Function(::HIR::ItemPath p, const ::AST::AttributeList& attrs, const ::AST::Function& f, const ::HIR::TypeRef& real_self_type)
++/// The feature of an item's `#[unstable(feature = "..", ..)]`, empty for `#[stable(..)]`, `parent` for neither: an
++/// unannotated item inherits an unstable parent's stability (rustc stability.rs, `#[unstable] impl X { .. }`).
++/// The crate's own unstable features are always usable by it, so they go into its enabled list.
++static RcString LowerHIR_UnstableFeature(const ::AST::AttributeList& attrs, const RcString& parent)
++{
++    if( attrs.has("stable") )
++        return RcString();
++    const auto* a = attrs.get("unstable");
++    if( !a )
++        return parent;
++    // `(feature = "name", issue = "n", implied_by = "old", soft)`; anything unexpected leaves the item stable
++    RcString rv;
++    TTStream    lex(a->span(), ParseState(), a->data());
++    if( lex.getTokenIf(TOK_PAREN_OPEN) ) {
++        while( lex.lookahead(0) == TOK_IDENT ) {
++            auto name = lex.getToken().ident().name;
++            if( lex.getTokenIf(TOK_EQUAL) ) {
++                auto tok = lex.getToken();
++                if( name == "feature" && tok.type() == TOK_STRING )
++                    rv = RcString::new_interned(tok.str());
++            }
++            if( !lex.getTokenIf(TOK_COMMA) )
++                break;
++        }
++    }
++    if( rv != "" )
++        g_crate_ptr->m_enabled_features.insert(rv);
++    return rv;
++}
++
++::HIR::Function LowerHIR_Function(::HIR::ItemPath p, const ::AST::AttributeList& attrs, const ::AST::Function& f, const ::HIR::TypeRef& real_self_type, const RcString& parent_unstable)
+ {
+     static Span sp;
+ 
+@@ -1867,6 +1898,7 @@ namespace {
+         markings.track_caller = true;
+     }
+     markings.is_naked = f.m_markings.is_naked;
++    markings.unstable_feature = LowerHIR_UnstableFeature(attrs, parent_unstable);
+ 
+     ::HIR::Linkage  linkage;
+     switch(f.m_markings.linkage) {
+@@ -2437,6 +2469,8 @@ void LowerHIR_Module_Impls(const ::AST::Module& ast_mod,  ::HIR::Crate& hir_crat
+ 
+             ::std::map< RcString, ::HIR::TypeImpl::VisImplEnt< ::HIR::Function> > methods;
+             ::std::map< RcString, ::HIR::TypeImpl::VisImplEnt< ::HIR::Constant> > constants;
++            // `#[unstable]` on the block applies to the methods without a stability attribute of their own
++            const auto impl_unstable = LowerHIR_UnstableFeature(i->attrs, RcString());
+ 
+             for(const auto& item : impl.items())
+             {
+@@ -2462,7 +2496,7 @@ void LowerHIR_Module_Impls(const ::AST::Module& ast_mod,  ::HIR::Crate& hir_crat
+                     }
+                 TU_ARMA(Function, e) {
+                     methods.insert( ::std::make_pair(item.name, ::HIR::TypeImpl::VisImplEnt< ::HIR::Function> {
+-                        get_vis(item.vis), item.is_specialisable, LowerHIR_Function(item_path, item.attrs, e, type)
++                        get_vis(item.vis), item.is_specialisable, LowerHIR_Function(item_path, item.attrs, e, type, impl_unstable)
+                         } ) );
+                     }
+                 }
+@@ -2545,6 +2579,19 @@ public:
+     g_ast_crate_ptr = &crate;
+     g_crate_name = rv.m_crate_name;
+     g_core_crate = crate.m_ext_cratename_core;
++
++    // `#![feature(..)]`: unstable library methods of these features take part in method lookup like stable ones
++    // - Every identifier in the list, anything else skipped (the attribute was never checked before)
++    for(const auto& a : crate.m_attrs.m_items)
++    {
++        if( a.name() == "feature" ) {
++            TTStream    lex(a.span(), ParseState(), a.data());
++            for(auto tok = lex.getToken(); tok.type() != TOK_EOF; tok = lex.getToken()) {
++                if( tok.type() == TOK_IDENT )
++                    rv.m_enabled_features.insert(tok.ident().name);
++            }
++        }
++    }
+     auto macros = std::map<RcString, HIR::MacroItem>();
+     //auto& macros = rv.m_exported_macros;
+ 
+diff --git a/src/hir/hir.hpp b/src/hir/hir.hpp
+index b8d7575d..6cbe0452 100644
+--- a/src/hir/hir.hpp
++++ b/src/hir/hir.hpp
+@@ -13,6 +13,7 @@
+ 
+ #include <cassert>
+ #include <unordered_map>
++#include <set>
+ #include <vector>
+ #include <memory>
+ 
+@@ -210,6 +211,9 @@ public:
+         std::vector<unsigned> rustc_legacy_const_generics;
+         bool track_caller = false;
+         bool is_naked = false;
++        /// `#[unstable(feature = "..")]` (own, or inherited from an inherent impl block): method lookup prefers stable
++        /// methods over it unless the crate enables the feature (see `TraitResolution::autoderef_find_method`)
++        RcString unstable_feature;
+         enum Inline {
+             Auto,   // no annotation
+             Never,  // #[inline(never)]
+@@ -739,6 +743,10 @@ public:
+     /// Language items avaliable through this crate (includes ones from loaded externs)
+     ::std::unordered_map< ::std::string, ::HIR::SimplePath> m_lang_items;
+ 
++    /// `#![feature(..)]` names, plus the features of this crate's own `#[unstable]` items (always usable locally)
++    // NOT SERIALISED
++    ::std::set<RcString>    m_enabled_features;
++
+     /// Referenced crates (in load order) - Used to ensure final linking order is sane
+     // NOT SERIALISED
+     ::std::vector<RcString> m_ext_crates_ordered;
+diff --git a/src/hir/serialise.cpp b/src/hir/serialise.cpp
+index 93afb675..21bea92b 100644
+--- a/src/hir/serialise.cpp
++++ b/src/hir/serialise.cpp
+@@ -1230,6 +1230,7 @@
+             auto _ = m_out.open_object("HIR::Function::Markings");
+             serialise_vec(m.rustc_legacy_const_generics);
+             m_out.write_bool(m.track_caller);
++            m_out.write_string(m.unstable_feature);
+         }
+         void serialise(const ::HIR::Constant& item)
+         {
+diff --git a/src/hir_conv/resolve_ufcs.cpp b/src/hir_conv/resolve_ufcs.cpp
+index c22ddad0..0afa1afe 100644
+--- a/src/hir_conv/resolve_ufcs.cpp
++++ b/src/hir_conv/resolve_ufcs.cpp
+@@ -632,7 +632,8 @@ namespace resolve_ufcs {
+             return false;
+         }
+ 
+-        bool resolve_UfcsUnknown_inherent(const ::HIR::SimplePath& vis_path, const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd)
++        /// - `out_skipped_unstable` (if set): skip an unstable method of a feature the crate hasn't enabled, and record that one was
++        bool resolve_UfcsUnknown_inherent(const ::HIR::SimplePath& vis_path, const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd, bool* out_skipped_unstable = nullptr)
+         {
+             auto& e = pd.as_UfcsUnknown();
+             TRACE_FUNCTION_F(e.type);
+@@ -654,6 +655,12 @@ namespace resolve_ufcs {
+                             DEBUG("Private");
+                             return false;
+                         }
++                        const auto& feature = impl.m_methods.at(e.item).data.m_markings.unstable_feature;
++                        if( out_skipped_unstable && feature != "" && m_crate.m_enabled_features.count(feature) == 0 ) {
++                            DEBUG("Unstable (feature " << feature << "), skipped");
++                            *out_skipped_unstable = true;
++                            return false;
++                        }
+                     }
+                     else if( impl.m_constants.find(e.item) != impl.m_constants.end() ) {
+                         if( !impl.m_constants.at(e.item).publicity.is_visible(vis_path) ) {
+@@ -873,7 +880,11 @@ namespace resolve_ufcs {
+ 
+                 // TODO: Control ordering with a flag in UfcsUnknown
+                 // 1. Search for applicable inherent methods (COMES FIRST!)
+-                if( this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data) ) {
++                // - Except an unstable library method of a feature the crate hasn't enabled: as for method calls (see
++                //   `TraitResolution::autoderef_find_method`), rustc takes one only if nothing else applies, so
++                //   `str::as_str(s)` with shellexpand's `WstrExt` in scope is the trait's.
++                bool skipped_unstable = false;
++                if( this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data, &skipped_unstable) ) {
+                     assert(!p.m_data.is_UfcsUnknown());
+                     return ;
+                 }
+@@ -985,6 +996,12 @@ namespace resolve_ufcs {
+                     }
+                 }
+ 
++                if( skipped_unstable && this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data) ) {
++                    DEBUG("Only an unstable inherent item applies, p = " << p);
++                    assert(!p.m_data.is_UfcsUnknown());
++                    return ;
++                }
++
+                 // Couldn't find it
+                 ERROR(sp, E0000, "Failed to find impl with '" << e.item << "' for " << e.type << " (in " << p << ")");
+             }
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index c2ff4aa7..bf4572a1 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -5017,6 +5017,29 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+         bool defer_fuzzy_impls,
+         /* Out -> */bool* out_deferred_on_fuzzy
+         ) const
++{
++    // rustc (method/probe.rs `pick_core`) first probes every autoderef level without the unstable library methods of
++    // features the crate hasn't enabled, and only takes one of those when nothing else applies. Inherent methods won
++    // regardless here, so core 1.90's `#[unstable(feature = "str_as_str")] str::as_str(&self) -> &str` beat an in-scope
++    // trait's (shellexpand 3.1.1 funcs.rs:394 `match var_name.as_str() { Some(..) => .. }` with `WstrExt::as_str(&self)
++    // -> Option<&str>`: "Type mismatch between str and Option<_>"); so did `i32::div_floor` (num-integer's
++    // `Integer::div_floor(&self, &Self)`), and `Iterator::intersperse` shadowed itertools' through an `I: Iterator` bound.
++    bool skipped_unstable = false;
++    auto rv = autoderef_find_method_probe(sp, traits, ivars, val_ivars, top_ty, method_name, possibilities, defer_fuzzy_impls, out_deferred_on_fuzzy, &skipped_unstable);
++    if( rv == 0 && possibilities.empty() && skipped_unstable )
++    {
++        DEBUG("Only unstable methods apply, probing again with them");
++        rv = autoderef_find_method_probe(sp, traits, ivars, val_ivars, top_ty, method_name, possibilities, defer_fuzzy_impls, out_deferred_on_fuzzy, nullptr);
++    }
++    return rv;
++}
++unsigned int TraitResolution::autoderef_find_method_probe(const Span& sp,
++        const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
++        /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++        bool defer_fuzzy_impls,
++        /* Out -> */bool* out_deferred_on_fuzzy,
++        /* Out -> */bool* out_skipped_unstable
++        ) const
+ {
+     try {
+     TRACE_FUNCTION_F("{" << top_ty << "}." << method_name);
+@@ -5057,24 +5080,24 @@ unsigned int TraitResolution::autoderef_find_method(const Span& sp,
+         DEBUG(deref_count << ": " << ty);
+ 
+         // Non-referenced
+-        if( this->find_method(sp, traits, ivars, val_ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, defer_fuzzy_impls) )
++        if( this->find_method(sp, traits, ivars, val_ivars, ty, method_name,  cur_access, AutoderefBorrow::None, possibilities, defer_fuzzy_impls, out_skipped_unstable) )
+         {
+             DEBUG("FOUND *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+ 
+         // Auto-ref
+         auto borrow_ty = ::HIR::TypeRef::new_borrow(::HIR::BorrowType::Shared, ty.clone());
+-        if( this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, defer_fuzzy_impls) )
++        if( this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Shared, possibilities, defer_fuzzy_impls, out_skipped_unstable) )
+         {
+             DEBUG("FOUND & *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Unique;
+-        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, defer_fuzzy_impls) )
++        if( cur_access >= MethodAccess::Unique && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Unique, possibilities, defer_fuzzy_impls, out_skipped_unstable) )
+         {
+             DEBUG("FOUND &mut *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+         borrow_ty.get_unique().as_Borrow().type = ::HIR::BorrowType::Owned;
+-        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, defer_fuzzy_impls) )
++        if( cur_access >= MethodAccess::Move && this->find_method(sp, traits, ivars, val_ivars, borrow_ty, method_name,  MethodAccess::Move, AutoderefBorrow::Owned, possibilities, defer_fuzzy_impls, out_skipped_unstable) )
+         {
+             DEBUG("FOUND &move *{" << deref_count << "}, fcn_path = " << possibilities.back().second);
+         }
+@@ -5244,7 +5267,8 @@ const ::HIR::TypeRef* TraitResolution::check_method_receiver(const Span& sp, con
+ bool TraitResolution::find_method(const Span& sp,
+     const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+     AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+-    bool defer_fuzzy_impls
++    bool defer_fuzzy_impls,
++    /* Out -> */bool* out_skipped_unstable
+     ) const
+ {
+     bool rv = false;
+@@ -5285,6 +5309,17 @@ bool TraitResolution::find_method(const Span& sp,
+         return trait_params;
+         };
+ 
++    // The stable-first probe of `autoderef_find_method`: an unstable method of a feature the crate hasn't enabled
++    // (`#![feature]`) is skipped, as rustc does (the defining crate lists its own features as enabled)
++    auto skip_unstable = [&](const ::HIR::Function& fcn)->bool {
++        const auto& feature = fcn.m_markings.unstable_feature;
++        if( !out_skipped_unstable || feature == "" || m_crate.m_enabled_features.count(feature) != 0 )
++            return false;
++        DEBUG("Skipping unstable method (feature " << feature << ")");
++        *out_skipped_unstable = true;
++        return true;
++        };
++
+     // Supertraits can share a method name with different receivers (`Ord::cmp(&self)`, `Iterator::cmp(self)`, both
+     // supertraits of typed-path's `Components<'a>`): take the first one whose receiver fits this autoref level, not the
+     // first by name - which (sorted by path, `core::cmp` < `core::iter`) was `Ord::cmp` at every level, so the by-value
+@@ -5292,7 +5327,7 @@ bool TraitResolution::find_method(const Span& sp,
+     // - typed-path 0.12.3 non_utf8/path.rs:1163: `self.components().cmp(other.components())` on
+     //   `<T as Encoding>::Components<'_>` -> "Type mismatch between &<T as Encoding>::Components and ..."
+     t_cb_method_filter receiver_fits = [&](const ::HIR::Function& fcn) {
+-        return check_method_receiver(sp, fcn, ty, access) != nullptr;
++        return check_method_receiver(sp, fcn, ty, access) != nullptr && !skip_unstable(fcn);
+         };
+ 
+     // 1. Search for inherent methods
+@@ -5307,7 +5342,7 @@ bool TraitResolution::find_method(const Span& sp,
+         }
+         ::HIR::PathParams   impl_params;
+         auto cmp = ftic_check_params(sp, ::HIR::SimplePath(), nullptr, self_ty, impl.m_params, {}, impl.m_type, impl_params);
+-        if( cmp != HIR::Compare::Unequal )
++        if( cmp != HIR::Compare::Unequal && !skip_unstable(impl.m_methods.at(method_name).data) )
+         {
+             DEBUG("Found `impl" << impl.m_params.fmt_args() << " " << impl.m_type << "` fn " << method_name/* << " - " << top_ty*/);
+             possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty.clone(), method_name, {}) ));
+diff --git a/src/hir_typeck/helpers.hpp b/src/hir_typeck/helpers.hpp
+index 9ff11e50..767a39ca 100644
+--- a/src/hir_typeck/helpers.hpp
++++ b/src/hir_typeck/helpers.hpp
+@@ -295,6 +295,16 @@ public:
+             bool defer_fuzzy_impls = false,
+             /* Out -> */bool* out_deferred_on_fuzzy = nullptr
+             ) const;
++private:
++    /// One probe of `autoderef_find_method`, skipping the unstable methods (see `find_method`) if `out_skipped_unstable` is set
++    unsigned int autoderef_find_method_probe(const Span& sp,
++            const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& top_ty, const RcString& method_name,
++            /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
++            bool defer_fuzzy_impls,
++            /* Out -> */bool* out_deferred_on_fuzzy,
++            /* Out -> */bool* out_skipped_unstable
++            ) const;
++public:
+     /// Locate the named field by applying auto-dereferencing.
+     /// \return Number of times deref was applied (or ~0 if _ was hit)
+     unsigned int autoderef_find_field(const Span& sp, const ::HIR::TypeRef& top_ty, const RcString& name,  /* Out -> */::HIR::TypeRef& field_type) const;
+@@ -320,10 +330,12 @@ public:
+         Box,
+     };
+     friend ::std::ostream& operator<<(::std::ostream& os, const AllowedReceivers& x);
++    /// - `out_skipped_unstable` (if set): skip the methods of an unstable feature the crate hasn't enabled, and record that one was
+     bool find_method(const Span& sp,
+             const HIR::t_trait_list& traits, const ::std::vector<unsigned>& ivars, const ::std::vector<unsigned>& val_ivars, const ::HIR::TypeRef& ty, const RcString& method_name, MethodAccess access,
+             AutoderefBorrow borrow_type, /* Out -> */::std::vector<::std::pair<AutoderefBorrow,::HIR::Path>>& possibilities,
+-            bool defer_fuzzy_impls = false
++            bool defer_fuzzy_impls = false,
++            /* Out -> */bool* out_skipped_unstable = nullptr
+             ) const;
+ 
+     typedef ::std::function<bool(const ::HIR::Function&)>  t_cb_method_filter;

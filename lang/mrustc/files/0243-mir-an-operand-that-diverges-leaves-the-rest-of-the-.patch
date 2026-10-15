@@ -1,0 +1,136 @@
+From e816c69df690f710912abde8d7e10978ab854b1a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 14 Oct 2026 22:17:02 +0000
+Subject: [PATCH 243/244] mir: an operand that diverges leaves the rest of the
+ expression unreachable
+
+half 2.7.1 (recall) slice.rs:469 through zerocopy 0.8.62's `transmute_ref!`,
+whose never-taken branch has
+
+    let u = AssertDstIsFromBytes(loop {});
+    u.0
+
+    BUG: src/mir/mir_builder.cpp:257: No value avaliable
+
+A tuple struct constructor whose argument diverges: MIR lowering asked
+for the argument's value after `loop {}` had ended the block. Every
+operand position fetched through get_result_in_lvalue/param did the same
+(enum variants, struct and union literals including `..base`, `[x; N]`,
+`if`/`match` scrutinees), and tuples, arrays and later call arguments hit
+"Result yielded, but no active block" / "Pushing statement with no active
+block" instead.
+
+MirBuilder::resume_after_diverged_operand: when the expression just
+lowered left no value and no active block, the rest of the enclosing
+expression is lowered into a fresh unlinked block with a never-assigned
+temporary standing in for the value, as a block does for the statements
+after a diverging one; MIR cleanup drops the dead blocks.
+get_result_in_lvalue/param use it (replacing their `allow_missing_value`
+flag, whose only caller was get_args), as do get_args and struct literal
+fields.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/mir/from_hir.cpp    | 11 +++++++++--
+ src/mir/from_hir.hpp    | 11 +++++++----
+ src/mir/mir_builder.cpp | 21 +++++++++++++++++----
+ 3 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index d64d7f4f..b3eaca70 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -2414,14 +2414,16 @@ namespace {
+             for(auto& arg : args)
+             {
+                 this->visit_node_ptr(arg);
+-                if( !m_builder.block_active() )
++                // A diverging argument: the later ones and the call/tuple/array go into an unreachable block (the ended
++                // block made a tuple or array "Result yielded, but no active block")
++                if( m_builder.resume_after_diverged_operand(arg->span()) )
+                 {
+                     auto tmp = m_builder.new_temporary(arg->m_res_type);
+                     values.push_back( mv$(tmp) );
+                 }
+                 else if( args.size() == 1 )
+                 {
+-                    values.push_back( m_builder.get_result_in_param(arg->span(), arg->m_res_type, /*allow_missing_value=*/true) );
++                    values.push_back( m_builder.get_result_in_param(arg->span(), arg->m_res_type) );
+                 }
+                 else
+                 {
+@@ -3005,6 +3007,11 @@ namespace {
+                 values_set[idx] = true;
+                 DEBUG("_StructLiteral - fld '" << ent.first << "' (idx " << idx << ")");
+                 this->visit_node_ptr(valnode);
++                if( m_builder.resume_after_diverged_operand(valnode->span()) )
++                {
++                    values.at(idx) = m_builder.new_temporary(valnode->m_res_type);
++                    continue ;
++                }
+ 
+                 auto res = m_builder.get_result(valnode->span());
+                 if( auto* e = res.opt_Constant() )
+diff --git a/src/mir/from_hir.hpp b/src/mir/from_hir.hpp
+index 94a4ca69..cabdb7dd 100644
+--- a/src/mir/from_hir.hpp
++++ b/src/mir/from_hir.hpp
+@@ -310,10 +310,13 @@ public:
+     ::MIR::RValue get_result(const Span& sp);
+     /// Obtains the result, unwrapping into a LValue (and erroring if not)
+     ::MIR::LValue get_result_unwrap_lvalue(const Span& sp);
+-    /// Obtains the result, copying into a temporary if required
+-    ::MIR::LValue get_result_in_lvalue(const Span& sp, const ::HIR::TypeRef& ty, bool allow_missing_value=false);
+-    /// Obtains a result in a param (or a lvalue)
+-    ::MIR::Param get_result_in_param(const Span& sp, const ::HIR::TypeRef& ty, bool allow_missing_value=false);
++    /// Obtains the result, copying into a temporary if required (a placeholder if it diverged, see `resume_after_diverged_operand`)
++    ::MIR::LValue get_result_in_lvalue(const Span& sp, const ::HIR::TypeRef& ty);
++    /// Obtains a result in a param (or a lvalue) (a placeholder if it diverged, see `resume_after_diverged_operand`)
++    ::MIR::Param get_result_in_param(const Span& sp, const ::HIR::TypeRef& ty);
++    /// If the expression just lowered diverged (no result, block ended), start a fresh unreachable block for the rest
++    /// of the enclosing expression and return true: the caller then uses a placeholder for the missing value
++    bool resume_after_diverged_operand(const Span& sp);
+ 
+     ::MIR::LValue get_if_cond() const {
+         return m_if_cond_lval.clone();
+diff --git a/src/mir/mir_builder.cpp b/src/mir/mir_builder.cpp
+index 8b8c926e..c76b7c22 100644
+--- a/src/mir/mir_builder.cpp
++++ b/src/mir/mir_builder.cpp
+@@ -272,9 +272,22 @@ void MirBuilder::define_variable(unsigned int idx, bool in_parent_scope)
+         BUG(sp, "LValue expected, got RValue");
+     }
+ }
+-::MIR::LValue MirBuilder::get_result_in_lvalue(const Span& sp, const ::HIR::TypeRef& ty, bool allow_missing_value/*=false*/)
++// An operand that diverges (`S(loop {})`, `(1, return)`, `match loop {} {}`, `(loop {}) as u16`) has no value and ends the
++// block, and its consumer then asked for the value: "No value avaliable" (zerocopy 0.8.62 `transmute_ref!`'s
++// `AssertDstIsFromBytes(loop {})`, half 2.7.1 slice.rs) or "Pushing statement with no active block". The rest of the
++// enclosing expression is unreachable: lower it into a fresh unlinked block, as a block does for the statements after
++// a diverging one, with a never-assigned temporary standing in for the value. MIR cleanup removes the dead blocks.
++bool MirBuilder::resume_after_diverged_operand(const Span& sp)
++{
++    if( m_result_valid || m_block_active )
++        return false;
++    DEBUG("Operand diverged, the rest is unreachable");
++    set_cur_block( new_bb_unlinked() );
++    return true;
++}
++::MIR::LValue MirBuilder::get_result_in_lvalue(const Span& sp, const ::HIR::TypeRef& ty)
+ {
+-    if( allow_missing_value && !block_active() )
++    if( resume_after_diverged_operand(sp) )
+     {
+         return new_temporary(ty);
+     }
+@@ -288,9 +301,9 @@ void MirBuilder::define_variable(unsigned int idx, bool in_parent_scope)
+         return temp;
+     }
+ }
+-::MIR::Param MirBuilder::get_result_in_param(const Span& sp, const ::HIR::TypeRef& ty, bool allow_missing_value)
++::MIR::Param MirBuilder::get_result_in_param(const Span& sp, const ::HIR::TypeRef& ty)
+ {
+-    if( allow_missing_value && !block_active() )
++    if( resume_after_diverged_operand(sp) )
+     {
+         return new_temporary(ty);
+     }
