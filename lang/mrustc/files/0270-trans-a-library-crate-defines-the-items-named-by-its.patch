@@ -1,0 +1,156 @@
+From 16e64e62f2dbd61f586169dcd8d8434e3ded577b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 15 Oct 2026 22:24:09 +0000
+Subject: [PATCH] trans: a library crate defines the items named by its impl
+ and trait-default constants
+
+objc2 0.6.5 / objc2-foundation 0.3.2 (tree-sitter-cli 0.27.1, the final link of the
+`tree-sitter` bin, unchanged after 0265 and a full rebuild): `ld: symbol(s) not found
+for architecture ppc: _ZRG1cF18objc20_6_5_H104001G11liftedC_1720g, referenced from
+_ZRG1cF18objc20_6_5_H104001G11liftedC_1584gT3Ps.. in libobjc2_foundation-0_3_2.rlib.o`.
+
+The symbols are objc2::lifted#C_172 (no generic args) and objc2-foundation's instance
+of objc2::lifted#C_158<(*const c_void, usize, usize), *const c_void, usize, usize>, the
+generic promoted static for `&[A::ENCODING_ARGUMENT, ..]` in `<(A, B, C) as
+EncodeArguments>::ENCODINGS`. That static's body names only generic paths (0265 covered
+a concrete borrow nested in such a body). The missing static is the `&Encoding::Void`
+in the VALUE of `impl RefEncode for c_void { const ENCODING_REF: Encoding =
+Encoding::Pointer(&Encoding::Void) }`, reached through `A::ENCODING` = `<c_void as
+RefEncode>::ENCODING_REF`: a known literal whose relocation points at the private
+promoted static. Downstream can only declare that static `extern`; objc2's library
+enumeration skipped trait impl constants entirely ("Constant, no codegen"), made the
+relocations of inherent impl constants roots only for non-generic impls, and never
+looked at a trait's default constants.
+
+Trans_Enumerate_PublicConstant handles all three: a known value is scanned and each
+concrete relocation becomes a root (a generic impl's value is known when it doesn't
+use the parameters; a generic relocation is left to the instantiating crate);
+a constant with MIR but no value (a generic impl, or a trait default generic in Self)
+goes through Trans_Enumerate_GenericMirItems like the body of a generic function.
+Trait-default roots don't depend on the trait's module visibility (a `pub use`).
+
+Kit impl-const-lifted-static-test: enc = objc2, user = objc2-foundation. The concrete
+trait impl constant is reached through the generic static and directly; a generic
+trait impl, a generic inherent impl and a trait default each hold a nested borrow;
+`plain` (a non-generic inherent impl constant) is the control. Static check (every
+promoted static the user declares `extern` is defined in enc's C) + link + run; the
+values are kept non-zero because an all-zero static gets no C initialiser and its
+prototype is a tentative definition. Old binary: 4 undefined statics, link fails; new:
+all pass. generic-static-lift-test (0265) still passes.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index e8928f40..9e8b8843 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -312,6 +312,57 @@ namespace {
+             Trans_Enumerate_GenericMirItems(state, sp, *e.m_code.m_mir, e.m_params, mv$(ms));
+         }
+     }
++    /// Enumerate what a library crate has to emit for an associated constant (of a trait impl, an inherent impl, or
++    /// a trait's default): downstream reads the constant's value, or evaluates its MIR when the impl is generic, so every
++    /// item named by that value (a relocation) or by that MIR has to be defined here - in particular the private
++    /// promoted statics of this crate (a nested `&CONST` borrow lifted by static_borrow_constants), which a downstream
++    /// crate can only declare `extern`.
++    /// - objc2 0.6.5 / objc2-foundation 0.3.2 (tree-sitter-cli, after 0265): `ld: _ZR..objc2..liftedC_1720g not found`
++    ///   = objc2::lifted#C_172, the `&Encoding::Void` inside `impl RefEncode for c_void { const ENCODING_REF }`, reached
++    ///   through objc2-foundation's instance of `<(A,B,C) as EncodeArguments>::ENCODINGS`; trait impl constants were
++    ///   skipped entirely ("Constant, no codegen")
++    void Trans_Enumerate_PublicConstant(EnumState& state, const Span& sp, const ::HIR::GenericParams& impl_params, const ::HIR::Constant& c, bool is_visible)
++    {
++        auto pp_impl = impl_params.make_empty_params(/*allow_lifetimes_only=*/true);
++        if( c.m_value_state == ::HIR::Constant::ValueState::Known )
++        {
++            Trans_Params    tp;
++            tp.pp_impl = pp_impl.clone();
++            Trans_Enumerate_FillFrom_Literal(state, c.m_value_res, std::move(tp));
++
++            if( is_visible )
++            {
++                auto pp_method = c.m_params.make_empty_params(/*allow_lifetimes_only=*/true);
++                // No higher-ranked params: a `for<'a>` lifetime bound inside a relocation's path (a closure's
++                // `<closure as Fn<(&'a u8,)>>::vtable#`) passes through (inquire 0.9.4 `const DEFAULT_SORTER`)
++                static const ::HIR::PathParams  no_hrb_params;
++                for(const auto& r : c.m_value_res.relocations) {
++                    if(r.p) {
++                        // A generic impl's (or a trait default's) value is known when it doesn't use the parameters, and
++                        // its relocations then name concrete items that only this crate can define. Only a relocation
++                        // that is itself generic is left to the instantiating crate.
++                        if( monomorphise_path_needed(*r.p, /*ignore_lifetimes=*/true) ) {
++                            DEBUG("Relocation " << *r.p << " - Generic");
++                            continue ;
++                        }
++                        // Still need to monomorph, as lifetimes aren't counted in `is_generic`
++                        auto ms = MonomorphStatePtr(nullptr, &pp_impl, &pp_method);
++                        ms.pp_hrb = &no_hrb_params;
++                        state.rv.m_roots.push_back( ms.monomorph_path(sp, *r.p) );
++                    }
++                }
++            }
++        }
++        // A generic impl's constant (or a trait's default, generic in `Self`) has no value here, only MIR that downstream
++        // monomorphises: the non-generic items it names (a promoted static, a function) are roots exactly as for the body
++        // of a generic function.
++        else if( c.m_value.m_mir )
++        {
++            MonomorphStatePtr   ms;
++            ms.pp_impl = &pp_impl;
++            Trans_Enumerate_GenericMirItems(state, sp, *c.m_value.m_mir, c.m_params, mv$(ms));
++        }
++    }
+     void Trans_Enumerate_ValItem(EnumState& state, const ::HIR::ValueItem& vi, bool is_visible, ::std::function<::HIR::SimplePath()> get_path)
+     {
+         TRACE_FUNCTION_F(get_path() << " : " << vi.tag_str() << " is_visible=" << is_visible);
+@@ -452,6 +503,11 @@ namespace {
+                     if( const auto* fcn = vi.second.opt_Function() ) {
+                         Trans_Enumerate_GenericFunctionItems(state, Span(), *fcn, ms);
+                     }
++                    // A default constant is evaluated by every impl that keeps it, downstream included (the trait may be
++                    // reachable through a `pub use` even when its module isn't, so its visibility isn't checked)
++                    else if( const auto* c = vi.second.opt_Constant() ) {
++                        Trans_Enumerate_PublicConstant(state, Span(), e->m_params, *c, /*is_visible=*/true);
++                    }
+                 }
+             }
+         }
+@@ -560,6 +616,11 @@ namespace {
+                 Trans_Enumerate_GenericFunctionItems(state, Span(), m.second.data, ms);
+             }
+         }
++        // Associated constants: no codegen of their own, but their values (or MIR) name items only this crate can define
++        for(const auto& c : impl.m_constants)
++        {
++            Trans_Enumerate_PublicConstant(state, sp, impl.m_params, c.second.data, /*is_visible=*/true);
++        }
+     }
+ }
+ 
+@@ -643,25 +704,7 @@ TransList Trans_Enumerate_Public(::HIR::Crate& crate, bool link_named_roots)
+             }
+             for(auto& e : impl.m_constants)
+             {
+-                Trans_Params    tp;
+-                tp.pp_impl = impl.m_params.make_empty_params(/*allow_lifetimes_only=*/true);
+-                Trans_Enumerate_FillFrom_Literal(state, e.second.data.m_value_res, std::move(tp));
+-
+-                if( e.second.publicity.is_global() && !impl.m_params.is_generic() && !e.second.data.m_params.is_generic() )
+-                {
+-                    auto pp_method = e.second.data.m_params.make_empty_params(/*allow_lifetimes_only=*/true);
+-                    // No higher-ranked params: a `for<'a>` lifetime bound inside a relocation's path (a closure's
+-                    // `<closure as Fn<(&'a u8,)>>::vtable#`) passes through (inquire 0.9.4 `const DEFAULT_SORTER`)
+-                    static const ::HIR::PathParams  no_hrb_params;
+-                    for(const auto& r : e.second.data.m_value_res.relocations) {
+-                        if(r.p) {
+-                            // Still need to monomorph, as lifetimes aren't counted in `is_generic`
+-                            auto ms = MonomorphStatePtr(nullptr, &impl_params, &pp_method);
+-                            ms.pp_hrb = &no_hrb_params;
+-                            state.rv.m_roots.push_back( ms.monomorph_path(Span(), *r.p) );
+-                        }
+-                    }
+-                }
++                Trans_Enumerate_PublicConstant(state, Span(), impl.m_params, e.second.data, e.second.publicity.is_global());
+             }
+         }
+     };
