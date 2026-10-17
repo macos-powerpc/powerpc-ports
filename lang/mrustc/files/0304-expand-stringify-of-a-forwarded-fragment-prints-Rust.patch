@@ -1,0 +1,199 @@
+From 708d6e462aa1180454bd5c49be5b45775996c5e9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 17:29:38 +0000
+Subject: [PATCH 304/304] expand: `stringify!` of a forwarded fragment prints
+ Rust source, not the debug AST
+
+handlebars 6.4.4 grammar.rs `#[derive(Parser)]` (sshs 4.8.0): "thread 'main' panicked:
+invalid token stream: LexError { span: Span }", then "src/expand/proc_macro.cpp:2481
+Unexpected EOF while reading from child process".
+
+quote 1.0.44's quote_token! has no arm for a fragment, so a macro_rules that forwards one
+into `quote!` (pest_generator 2.9.0 macros.rs `generate_rule!($name: ident, $pattern:
+expr)`, every builtin rule and the skip rule) compiles to `quote::__private::parse(&mut ts,
+stringify!($pattern))`, and that string is lexed by proc_macro2 when the derive runs.
+mrustc's stringify! printed interpolated fragments in the debug AST form:
+`((state).match_string("\n",)).or_else(|state/*1*/?: _,|->_ (state).match_string("\u{d}\n",),)`
+(trailing commas, `?: _`, `->_`, a raw newline inside the string); `$m:meta` printed as
+`/*:meta*/`; every string literal carried its hygiene (`"End-of-input"/*1*/`, `/**/` for
+none).
+
+Token::to_str now prints expr/stmt/block fragments through DumpAST_Node (the printer whose
+output proc-macro input already re-lexes), patterns through the new DumpAST_Pattern, and
+strings without the hygiene marker (the debug form is operator<<); stringify.cpp prints
+a meta fragment as its path plus arguments by recursing into the attribute's tokens.
+Identifier hygiene comments (`/*1*/x/*?*/`) stay: comments, harmless to the lexer.
+`$i:item` still prints a placeholder (L15).
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index e3893b87..4083e739 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -814,7 +814,9 @@ private:
+     void print_params(const AST::GenericParams& params);
+     void print_bounds(const AST::GenericParams& params);
+     void print_pattern_tuple(const AST::Pattern::TuplePat& v, bool is_refutable);
++public:
+     void print_pattern(const AST::Pattern& p, bool is_refutable);
++private:
+     void print_type(const TypeRef& t);
+ 
+     void inc_indent();
+@@ -1508,3 +1510,8 @@ void DumpAST_Node(::std::ostream& os, const AST::ExprNode& node)
+     RustPrinter printer(os);
+     const_cast<AST::ExprNode&>( node ).visit(printer);
+ }
++void DumpAST_Pattern(::std::ostream& os, const AST::Pattern& pat)
++{
++    RustPrinter printer(os);
++    printer.print_pattern(pat, true);
++}
+diff --git a/src/expand/stringify.cpp b/src/expand/stringify.cpp
+index cc33e11a..f0e11854 100644
+--- a/src/expand/stringify.cpp
++++ b/src/expand/stringify.cpp
+@@ -10,24 +10,35 @@
+ #include "../parse/common.hpp"
+ #include "../parse/ttstream.hpp"
+ 
+-class CExpander:
+-    public ExpandProcMacro
+-{
+-    ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
++namespace {
++    void stringify_tt(::std::string& rv, const Span& sp, const TokenTree& tt)
+     {
+         Token   tok;
+-        ::std::string rv;
+-
+         auto lex = TTStream(sp, ParseState(), tt);
+         while( GET_TOK(tok, lex) != TOK_EOF )
+         {
+             if(!rv.empty())
+                 rv += " ";
+             DEBUG(" += " << tok);
+-            if( tok.type() == TOK_IDENT  ) {
++            switch(tok.type())
++            {
++            case TOK_IDENT:
+                 rv += tok.ident().name.c_str();
+-            }
+-            else {
++                break;
++            // `$m:meta`: the attribute's path and arguments (`doc = "x"`, `inline`, `cfg(test)`)
++            case TOK_INTERPOLATED_META: {
++                const auto& a = tok.frag_meta();
++                if( a.name().has_leading )
++                    rv += "::";
++                for(const auto& e : a.name().elems)
++                {
++                    if( &e != &a.name().elems.front() )
++                        rv += "::";
++                    rv += e.c_str();
++                }
++                stringify_tt(rv, sp, a.data());
++                break; }
++            default: {
+                 auto v = tok.to_str();
+                 const char* s = v.c_str();
+                 // Very hacky strip of hygine information (e.g. from paths)
+@@ -38,8 +49,19 @@ class CExpander:
+                     s ++;
+                 }
+                 rv += s;
++                break; }
+             }
+         }
++    }
++}
++
++class CExpander:
++    public ExpandProcMacro
++{
++    ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
++    {
++        ::std::string rv;
++        stringify_tt(rv, sp, tt);
+ 
+         // TODO: Strip out any `{...}` sequences that aren't from nested
+         // strings.
+diff --git a/src/include/main_bindings.hpp b/src/include/main_bindings.hpp
+index 5d2f9659..1b0da120 100644
+--- a/src/include/main_bindings.hpp
++++ b/src/include/main_bindings.hpp
+@@ -15,6 +15,7 @@
+ namespace AST {
+     class Crate;
+     class ExprNode;
++    class Pattern;
+ }
+ 
+ /// Parse a crate from the given file
+@@ -28,6 +29,8 @@ extern void Expand_ProcMacro(::AST::Crate& crate);
+ /// Dump the crate AST as annotated rust
+ extern void Dump_Rust(const char *Filename, const AST::Crate& crate);
+ extern void DumpAST_Node(::std::ostream& os, const AST::ExprNode& node);
++// Source form of a pattern fragment (`stringify!` of an interpolated `$p:pat`, re-lexed by proc macros)
++extern void DumpAST_Pattern(::std::ostream& os, const AST::Pattern& pat);
+ 
+ #endif
+ 
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index e03d822c..7b8e2186 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -9,6 +9,7 @@
+ #include <ast/types.hpp>
+ #include <ast/ast.hpp>
+ #include <ast/expr.hpp> // for reasons
++#include <main_bindings.hpp>    // DumpAST_Node & co (source form of interpolated fragments)
+ #include <limits>
+ #include <sstream>
+ #include <cstdlib>
+@@ -391,6 +392,10 @@ struct EscapedByteString {
+     case TOK_NEWLINE:    return "\n";
+     case TOK_WHITESPACE: return " ";
+     case TOK_COMMENT:    return "/*" + m_data.as_String() + "*/";
++    // Interpolated fragments print as Rust source (the AST dump used for proc macro input), not the debug form:
++    // `stringify!($e)` of an `$e:expr` is re-lexed at run time by quote's `parse(stringify!($other))` (the
++    // `$other:tt` arm takes every forwarded fragment), and the debug printer's `|state/*1*/?: _,|->_ (state).f(,)`
++    // doesn't lex (pest_generator 2.9.0 generate_rule! `$pattern:expr` -> handlebars 6.4.4 "invalid token stream").
+     case TOK_INTERPOLATED_TYPE:
+         reinterpret_cast<const ::TypeRef*>(m_data.as_Fragment())->print(ss, false);
+         return ss.str();
+@@ -398,15 +403,13 @@ struct EscapedByteString {
+         reinterpret_cast<const ::AST::Path*>(m_data.as_Fragment())->print_pretty(ss, true);
+         return ss.str();
+     case TOK_INTERPOLATED_PATTERN:
+-        // TODO: Use a pretty printer too?
+-        return FMT( *reinterpret_cast<const ::AST::Pattern*>(m_data.as_Fragment()) );
++        DumpAST_Pattern(ss, *reinterpret_cast<const ::AST::Pattern*>(m_data.as_Fragment()));
++        return ss.str();
+     case TOK_INTERPOLATED_STMT:
+     case TOK_INTERPOLATED_BLOCK:
+-    case TOK_INTERPOLATED_EXPR: {
+-        ::std::stringstream ss;
+-        reinterpret_cast<const ::AST::ExprNode*>(m_data.as_Fragment())->print(ss);
++    case TOK_INTERPOLATED_EXPR:
++        DumpAST_Node(ss, *reinterpret_cast<const ::AST::ExprNode*>(m_data.as_Fragment()));
+         return ss.str();
+-        }
+     case TOK_INTERPOLATED_META: return "/*:meta*/";
+     case TOK_INTERPOLATED_ITEM: return "/*:item*/";
+     case TOK_INTERPOLATED_VIS: {
+@@ -481,8 +484,10 @@ struct EscapedByteString {
+             return FMT(s << "_" << coretype_name(m_data.as_Float().m_datatype));
+         }
+         }
+-    case TOK_STRING:    return FMT("\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix << m_hygiene);
+-    case TOK_CSTRING:   return FMT("c\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix << m_hygiene);
++    // No hygiene marker (`"x"/*1*/`, and `/**/` for none): this is the `stringify!` text, re-lexed at run time by proc
++    // macros and shown in panic messages (the debug form is `operator<<`)
++    case TOK_STRING:    return FMT("\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix);
++    case TOK_CSTRING:   return FMT("c\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix);
+     case TOK_BYTESTRING:return FMT("b\"" << EscapedByteString(m_data.as_String()) << "\"" << m_suffix);
+     case TOK_HASH:  return "#";
+     case TOK_UNDERSCORE:return "_";
