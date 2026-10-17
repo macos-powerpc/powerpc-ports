@@ -33,11 +33,18 @@
 #    baz    author/baz  branch  abcdef12345678...commit...abcdef12345678  fedcba654321...
 #
 # Crates that need fixes for powerpc or old macOS are patched from the shared
-# patches in _resources/port1.0/crate_patches (see the README there), so ports
-# don't carry their own copies. A port can add its own directories of crate
-# patches, named the same way:
+# patches in _resources/port1.0/crate_patches of the ports trees in sources.conf
+# (see rust::crate_patches), so ports don't carry their own copies. A port can
+# add its own directories of crate patches, named the same way; prepend them to
+# replace shared patches of the same name:
 #
 # cargo.crate_patch_dirs-append ${filespath}/crate_patches
+#
+# Ports whose own build system runs cargo (PortGroup rust 1.0, which selects
+# this PortGroup on powerpc) get cargo and rustc stand-ins in ${cargo.home}/bin
+# that build with minicargo, see mrustc.cargo_shim. By default this is on for
+# ports that use the python PortGroup, i.e. Python packages built by
+# setuptools-rust or maturin (binaries and cdylib extension modules).
 #
 
 # This portgroup is modelled upon rust 1.0, with extra overrides to support powerpc.
@@ -67,6 +74,9 @@ options     cargo.bin \
 
 set mrustc_root                 ${prefix}/libexec/mrustc
 
+# Rust version mrustc implements (MRUSTC_TARGET_VER); keep in step with the mrustc port
+set rustc_target_ver            1.90
+
 default     cargo.bin           {${mrustc_root}/bin/minicargo}
 default     cargo.home          {${workpath}/.home/.cargo}
 default     cargo.crates        {}
@@ -84,19 +94,30 @@ default     cargo.update        {no}
 # sources and rebuilt dependencies trigger a rebuild (needs `port -o` as well, for the Portfile mtime):
 #   sudo port -o build <port> mrustc.incremental=yes
 default     mrustc.incremental  {no}
+
+# cargo and rustc stand-ins for build systems that run cargo themselves (see
+# rust::write_cargo_shim). They need a Python interpreter, so the default is on
+# for ports that use the python PortGroup (not for its py-foo stub port).
+options     mrustc.cargo_shim
+default     mrustc.cargo_shim   {[info exists ::python.version]}
+
 pre-build {
     if {[option mrustc.incremental]} {
         build.env-append        MINICARGO_IGNTOOLS=1
     }
+    if {[option mrustc.cargo_shim]} {
+        rust::write_cargo_shim
+    }
 }
 
-# Directories of per-crate patches, see rust::apply_crate_patches.
-# The shared ones live next to this PortGroup; [info script] is only this file
-# while it is being sourced, so resolve the path now.
+# This PortGroup's files: _resources/port1.0/crate_patches next to it holds the
+# shared crate patches (see rust::crate_patches) and cargo-shim.py. [info script]
+# is only this file while it is being sourced, so resolve the path now.
 namespace eval rust {
-    variable crate_patches_dir [file normalize [file join [file dirname [info script]] .. crate_patches]]
+    variable resource_dir [file normalize [file join [file dirname [info script]] .. crate_patches]]
+    variable cargo_shim_script [file join ${resource_dir} cargo-shim.py]
 }
-default     cargo.crate_patch_dirs  {[list ${::rust::crate_patches_dir}]}
+default     cargo.crate_patch_dirs  {[rust::default_crate_patch_dirs]}
 
 # Use `--remap-path-prefix` to prevent build information from being included in installed binaries
 options     rust.remap
@@ -547,11 +568,13 @@ proc rust::old_macos_compatibility {cname cversion} {
 #     <crate>@<version>.patch         this version only
 #     <crate>@<from>..<to>.patch      from <= version <= to
 #     <crate>@<from>+.patch           from <= version
-# Every patch whose range includes the crate's version is applied right after
-# the crate is unpacked, in directory order and then by name. Paths in the
-# patches are relative to the crate's root (a/src/lib.rs, b/src/lib.rs), so one
-# file serves every version the patch applies to. Versions are compared with
-# vercmp. Crates from GitHub only match <crate>@<commit>.patch.
+# A file name found in several directories is taken from the first of them (an
+# overlay's copy replaces the synced tree's, as with Portfiles and PortGroups);
+# differently named files all count. Every patch whose range includes the
+# crate's version is applied right after the crate is unpacked, by name. Paths
+# in the patches are relative to the crate's root (a/src/lib.rs, b/src/lib.rs),
+# so one file serves every version the patch applies to. Versions are compared
+# with vercmp. Crates from GitHub only match <crate>@<commit>.patch.
 
 proc rust::crate_patch_matches {spec cversion exact_only} {
     if {${spec} eq ${cversion}} {
@@ -572,14 +595,105 @@ proc rust::crate_patch_matches {spec cversion exact_only} {
     return [expr {[vercmp ${cversion} >= ${from}] && [vercmp ${cversion} <= ${to}]}]
 }
 
-proc rust::crate_patches {cname cversion exact_only} {
-    set patches [list]
-    foreach dir [option cargo.crate_patch_dirs] {
-        foreach patchfile [lsort [glob -nocomplain -types f -directory ${dir} -- ${cname}@*.patch]] {
-            set spec [string range [file tail ${patchfile}] [string length ${cname}@] end-[string length .patch]]
-            if {[rust::crate_patch_matches ${spec} ${cversion} ${exact_only}]} {
-                lappend patches ${patchfile}
+# The `_resources/port1.0/crate_patches` directories of the ports trees in
+# sources.conf, in its order, as PortGroups are found by MacPorts' hierarchical
+# PortGroup search (a local overlay usually comes before the synced trees): the
+# port's own tree first if sources.conf flags it `own_portgroups_first`, then
+# every tree, then the one next to this PortGroup when its tree isn't listed (e.g.
+# a port built from another directory). Computed once per port.
+proc rust::default_crate_patch_dirs {} {
+    variable default_crate_patch_dirs
+    if {[info exists default_crate_patch_dirs]} {
+        return ${default_crate_patch_dirs}
+    }
+    global porturl
+    # The trees' `_resources/port1.0` directories, in that order.
+    # getlocaltreeoptions/getlocalporttreelist: MacPorts with the hierarchical PortGroup search (powerpc-ports
+    # sysutils/MacPorts 0007, rsync trees with 0015); stock MacPorts: read sources.conf
+    set roots [list]
+    if {![catch {getlocaltreeoptions [file dirname [getportresourcepath ${porturl}]]} options]
+            && "own_portgroups_first" in ${options}} {
+        lappend roots [getportresourcepath ${porturl} port1.0 no]
+    }
+    if {![catch {getlocalporttreelist} trees]} {
+        foreach tree ${trees} {
+            lappend roots [file join ${tree} _resources port1.0]
+        }
+    } else {
+        foreach url [rust::sources_conf_urls] {
+            if {[catch {
+                if {[getprotocol ${url}] eq "file"} {
+                    set root [file join [string range ${url} [string length file://] end] _resources port1.0]
+                } else {
+                    # rsync/https: the directory `port sync` keeps the tree in
+                    set root [getportresourcepath ${url} port1.0 no]
+                }
+            }]} {
+                continue
             }
+            lappend roots ${root}
+        }
+    }
+    lappend roots [file dirname ${::rust::resource_dir}]
+
+    set dirs [list]
+    foreach root ${roots} {
+        rust::add_crate_patch_dir dirs [file join ${root} crate_patches]
+    }
+    set default_crate_patch_dirs ${dirs}
+    return ${dirs}
+}
+
+proc rust::add_crate_patch_dir {dirs_var dir} {
+    upvar ${dirs_var} dirs
+    set dir [file normalize ${dir}]
+    if {[file isdirectory ${dir}] && ${dir} ni ${dirs}} {
+        lappend dirs ${dir}
+    }
+}
+
+# The source URLs of sources.conf, in order (stock MacPorts doesn't export its list to ports)
+proc rust::sources_conf_urls {} {
+    global prefix
+    set urls [list]
+    set conf_dir ${prefix}/etc/macports
+    set sources_conf ${conf_dir}/sources.conf
+    # (macports.conf can name another sources.conf)
+    if {![catch {open ${conf_dir}/macports.conf r} fd]} {
+        while {[gets ${fd} line] >= 0} {
+            regexp {^\s*sources_conf\s+(\S+)} ${line} -> sources_conf
+        }
+        close ${fd}
+    }
+    if {![catch {open ${sources_conf} r} fd]} {
+        while {[gets ${fd} line] >= 0} {
+            set url [lindex [regexp -inline {^\s*([^#\s]\S*)} ${line}] 1]
+            if {${url} ne ""} {
+                lappend urls ${url}
+            }
+        }
+        close ${fd}
+    }
+    return ${urls}
+}
+
+proc rust::crate_patches {cname cversion exact_only} {
+    set files [dict create]
+    foreach dir [option cargo.crate_patch_dirs] {
+        foreach patchfile [glob -nocomplain -types f -directory ${dir} -- ${cname}@*.patch] {
+            set pname [file tail ${patchfile}]
+            if {[dict exists ${files} ${pname}]} {
+                ui_debug "Crate patch ${patchfile} is replaced by [dict get ${files} ${pname}]"
+                continue
+            }
+            dict set files ${pname} ${patchfile}
+        }
+    }
+    set patches [list]
+    foreach pname [lsort [dict keys ${files}]] {
+        set spec [string range ${pname} [string length ${cname}@] end-[string length .patch]]
+        if {[rust::crate_patch_matches ${spec} ${cversion} ${exact_only}]} {
+            lappend patches [dict get ${files} ${pname}]
         }
     }
     return ${patches}
@@ -589,7 +703,7 @@ proc rust::apply_crate_patches {cname cversion cdirname exact_only} {
     set patchbin [findBinary patch ${portutil::autoconf::patch_path}]
     foreach patchfile [rust::crate_patches ${cname} ${cversion} ${exact_only}] {
         set pname [file tail ${patchfile}]
-        ui_info "Applying ${pname} to ${cdirname}"
+        ui_info "Applying ${pname} ([file dirname ${patchfile}]) to ${cdirname}"
         if {[catch {system -W "[option cargo.home]/macports/${cdirname}" "${patchbin} -p1 -t -N < [shellescape ${patchfile}]"} result]} {
             ui_error "${pname} ([file dirname ${patchfile}]) does not apply to ${cname} ${cversion}."
             ui_error "If ${cname} ${cversion} no longer needs it, rename the patch so its version range ends before ${cversion}; otherwise update the patch or add one for ${cname} ${cversion}."
@@ -769,12 +883,55 @@ proc rust::get_sdkroot {sdk_version} {
     return {}
 }
 
+# Python build backends drive cargo: setuptools-rust (which also builds maturin)
+# and maturin run `rustc -vV/--print cfg/--print deployment-target`, `cargo
+# metadata` and `cargo build`/`cargo rustc --lib --crate-type cdylib` with
+# `--message-format json-render-diagnostics`, then install the files named in
+# cargo's JSON messages. ${cargo.home}/bin, first in PATH, gets `cargo` and
+# `rustc` that answer these with minicargo and mrustc (mrustc/cargo-shim.py next
+# to the PortGroups says what is covered). Extension modules need mrustc and
+# minicargo with cdylib support (mrustc patches 0272-0275).
+proc rust::write_cargo_shim {} {
+    global mrustc_root rustc_target_ver
+    if {![info exists ::python.version]} {
+        return -code error "mrustc.cargo_shim runs on the interpreter of the python PortGroup, which this port does not use"
+    }
+    set bindir [option cargo.home]/bin
+    file mkdir ${bindir}
+    xinstall -m 0644 ${::rust::cargo_shim_script} ${bindir}/cargo-shim.py
+    set vars [list \
+        MRUSTC_TARGET_VER       ${rustc_target_ver} \
+        MRUSTC_SHIM_MINICARGO   [option cargo.bin] \
+        MRUSTC_SHIM_MRUSTC      ${mrustc_root}/bin/mrustc \
+        MRUSTC_SHIM_LIBDIR      ${mrustc_root}/lib \
+        MRUSTC_SHIM_VENDOR_DIR  [option cargo.home]/macports \
+        MRUSTC_SHIM_JOBS        [option build.jobs] \
+        MRUSTC_SHIM_HOST        [cargo.rust_platform] \
+        MRUSTC_SHIM_DEPLOYMENT_TARGET [option macosx_deployment_target]]
+    foreach tool {cargo rustc} {
+        set fd [open ${bindir}/${tool} w 0755]
+        puts ${fd} "#!/bin/sh"
+        puts ${fd} "# ${tool} stand-in of the mrustc PortGroup, see cargo-shim.py"
+        foreach {var value} ${vars} {
+            puts ${fd} "export ${var}=[shellescape ${value}]"
+        }
+        puts ${fd} "exec [shellescape [option python.bin]] [shellescape ${bindir}/cargo-shim.py] ${tool} \"\$@\""
+        close ${fd}
+    }
+}
+
 proc rust::set_environment {} {
     global prefix configure.pkg_config_path
     global subport configure.build_arch configure.universal_archs
+    global env rustc_target_ver
 
     rust::append_envs     "RUST_BACKTRACE=1"
     rust::append_envs     "MRUSTC_LIFETIME_ERRORS=warn"     {build destroot}
+    rust::append_envs     MRUSTC_TARGET_VER=${rustc_target_ver} {build destroot}
+
+    if {[option mrustc.cargo_shim]} {
+        rust::append_envs PATH=[option cargo.home]/bin:$env(PATH) {build destroot}
+    }
 
     rust::append_envs     CC=[compwrap::wrap_compiler cc]   {build destroot}
     rust::append_envs     CXX=[compwrap::wrap_compiler cxx] {build destroot}

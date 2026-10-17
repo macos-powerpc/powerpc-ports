@@ -20,10 +20,8 @@ global os.arch
 # On powerpc mrustc is used, since the full rustc is still broken:
 # https://github.com/thepowersgang/mrustc/issues/300
 if {${os.arch} eq "powerpc"} {
+    # (also sets rustc_target_ver, the Rust version of the mrustc port)
     PortGroup                   mrustc 1.0
-
-    # Rustc version used by mrustc port:
-    set rustc_target_ver        1.90
 
     default universal_variant   no
 
