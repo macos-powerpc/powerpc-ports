@@ -1,0 +1,271 @@
+--- a/src/mach/load_command.rs
++++ b/src/mach/load_command.rs
+@@ -392,9 +392,13 @@
+     pub count: u32,
+ 
+     /// The raw thread state, details of which varies by CPU
+-    pub thread_state: [u32; 70],
++    pub thread_state: [u32; THREAD_STATE_MAX_COUNT],
+ }
+ 
++/// The longest thread state flavor handled, in 32-bit words: PPC_THREAD_STATE64_COUNT (76; ARM_THREAD_STATE64 is
++/// 68, x86_THREAD_STATE64 42)
++pub const THREAD_STATE_MAX_COUNT: usize = 76;
++
+ impl ThreadCommand {
+     pub fn instruction_pointer(&self, cputype: super::cputype::CpuType) -> error::Result<u64> {
+         // The thread command includes a `flavor` value which distinguishes between related thread
+@@ -481,12 +485,30 @@
+                 Ok(pc)
+             }
+             // https://github.com/m4b/goblin/issues/64
+-            // Probably a G4
+-            super::cputype::CPU_TYPE_POWERPC => Ok(u64::from(self.thread_state[0])),
+-            // I think the G5 was the last motorola powerpc processor used by apple before switching to intel cpus.
+-            // unfortunately I don't have any binaries on hand to see what its thread state looks like :/
+-            // super::cputype::CPU_TYPE_POWERPC64 => {
+-            // }
++            super::cputype::CPU_TYPE_POWERPC => {
++                // struct ppc_thread_state_t {
++                //   uint32_t srr0;   /* the PC */
++                //   uint32_t srr1;
++                //   uint32_t r[32];
++                //   uint32_t cr, xer, lr, ctr, mq, vrsave;
++                // }
++                Ok(u64::from(self.thread_state[0]))
++            }
++            super::cputype::CPU_TYPE_POWERPC64 => {
++                // #pragma pack(4)
++                // struct ppc_thread_state64_t {
++                //   uint64_t srr0;   /* the PC */
++                //   uint64_t srr1;
++                //   uint64_t r[32];
++                //   uint32_t cr;
++                //   uint64_t xer, lr, ctr;
++                //   uint32_t vrsave;
++                // }
++                // ppc64 Mach-O files are big-endian: the high word comes first
++                let srr0: u64 =
++                    ((u64::from(self.thread_state[0])) << 32) | (u64::from(self.thread_state[1]));
++                Ok(srr0)
++            }
+             // Assuming above is added, I don't believe apple ever ported mach-o the mach kernel
+             // (and hence its binary format) to any other machines except the above,
+             // but I would be happy to learn otherwise
+@@ -507,10 +529,10 @@
+         let flavor: u32 = bytes.pread_with(8, le)?;
+         let count: u32 = bytes.pread_with(12, le)?;
+ 
+-        if count > 70 {
++        if count as usize > THREAD_STATE_MAX_COUNT {
+             return Err(error::Error::Malformed(format!(
+-                "thread command specifies {} longs for thread state but we handle only 70",
+-                count
++                "thread command specifies {} longs for thread state but we handle only {}",
++                count, THREAD_STATE_MAX_COUNT
+             )));
+         }
+ 
+@@ -529,7 +551,7 @@
+         let thread_state_bytes = &bytes[16..16 + thread_state_byte_length];
+ 
+         // read the thread state
+-        let mut thread_state: [u32; 70] = [0; 70];
++        let mut thread_state: [u32; THREAD_STATE_MAX_COUNT] = [0; THREAD_STATE_MAX_COUNT];
+         for (i, state) in thread_state.iter_mut().enumerate().take(count as usize) {
+             *state = thread_state_bytes.pread_with(i * 4, le)?;
+         }
+--- a/src/mach/relocation.rs
++++ b/src/mach/relocation.rs
+@@ -24,22 +24,64 @@
+ // absolute symbols which need no further relocation.
+ use crate::mach;
+ use core::fmt;
+-use scroll::{IOread, IOwrite, Pread, Pwrite, SizeWith};
++use scroll::{ctx, Cread, Cwrite, Endian, Pread, Pwrite, SizeWith};
+ 
+ // TODO: armv7 relocations are scattered, must and r_address with 0x8000_0000 to check if its scattered or not
+-#[derive(Copy, Clone, Pread, Pwrite, IOwrite, SizeWith, IOread)]
++#[derive(Copy, Clone, SizeWith)]
+ #[repr(C)]
+ pub struct RelocationInfo {
+     /// Offset in the section to what is being relocated
+     pub r_address: i32,
+     /// Contains all of the relocation info as a bitfield.
+     /// r_symbolnum, 24 bits, r_pcrel 1 bit, r_length 2 bits, r_extern 1 bit, r_type 4 bits
++    /// (from the least significant bit up, the layout of little-endian files). Big-endian files (ppc, ppc64)
++    /// allocate the same bitfields from the most significant bit down; reading and writing with a big-endian
++    /// context converts them, so the accessors below work for both.
+     pub r_info: u32,
+ }
+ 
+ pub const SIZEOF_RELOCATION_INFO: usize = 8;
+ 
++/// Set in the first word (`r_address`) of a scattered relocation entry, whose second word is `r_value`, not the
++/// bitfields above (both byte orders put `r_scattered` in the most significant bit)
++pub const R_SCATTERED: u32 = 0x8000_0000;
++
++/// `r_info` as a big-endian file stores it -> the layout of the accessors
++#[inline]
++fn r_info_from_big_endian(w: u32) -> u32 {
++    (w >> 8) | ((w >> 7) & 1) << 24 | ((w >> 5) & 3) << 25 | ((w >> 4) & 1) << 27 | (w & 0xf) << 28
++}
++
++/// The layout of the accessors -> `r_info` as a big-endian file stores it
++#[inline]
++fn r_info_to_big_endian(w: u32) -> u32 {
++    (w & 0x00ff_ffff) << 8 | ((w >> 24) & 1) << 7 | ((w >> 25) & 3) << 5 | ((w >> 27) & 1) << 4 | (w >> 28)
++}
++
+ impl RelocationInfo {
++    /// Builds the entry from the two words as read with `endian` (the file's byte order)
++    fn from_file_words(r_address: i32, r_info: u32, endian: Endian) -> Self {
++        let r_info = if endian.is_little() || (r_address as u32) & R_SCATTERED != 0 {
++            r_info
++        } else {
++            r_info_from_big_endian(r_info)
++        };
++        RelocationInfo { r_address, r_info }
++    }
++    /// The second word as a file with byte order `endian` stores it
++    fn file_r_info(&self, endian: Endian) -> u32 {
++        if endian.is_little() || self.is_scattered() {
++            self.r_info
++        } else {
++            r_info_to_big_endian(self.r_info)
++        }
++    }
++    /// If true, this is a scattered relocation entry (`r_info` holds its `r_value`); the bitfield accessors
++    /// don't apply to it
++    #[inline]
++    pub fn is_scattered(self) -> bool {
++        (self.r_address as u32) & R_SCATTERED != 0
++    }
+     /// Symbol index if `r_extern` == 1 or section ordinal if `r_extern` == 0. In bits :24
+     #[inline]
+     pub fn r_symbolnum(self) -> usize {
+@@ -84,6 +126,57 @@
+ /// Absolute relocation type for Mach-O files
+ pub const R_ABS: u8 = 0;
+ 
++impl<'a> ctx::TryFromCtx<'a, Endian> for RelocationInfo {
++    type Error = scroll::Error;
++    fn try_from_ctx(src: &'a [u8], endian: Endian) -> Result<(Self, usize), Self::Error> {
++        let r_address: i32 = src.pread_with(0, endian)?;
++        let r_info: u32 = src.pread_with(4, endian)?;
++        Ok((
++            RelocationInfo::from_file_words(r_address, r_info, endian),
++            SIZEOF_RELOCATION_INFO,
++        ))
++    }
++}
++
++impl ctx::FromCtx<Endian> for RelocationInfo {
++    fn from_ctx(src: &[u8], endian: Endian) -> Self {
++        RelocationInfo::from_file_words(
++            src.cread_with(0usize, endian),
++            src.cread_with(4usize, endian),
++            endian,
++        )
++    }
++}
++
++impl<'a> ctx::TryIntoCtx<Endian> for &'a RelocationInfo {
++    type Error = scroll::Error;
++    fn try_into_ctx(self, dst: &mut [u8], endian: Endian) -> Result<usize, Self::Error> {
++        dst.pwrite_with(self.r_address, 0, endian)?;
++        dst.pwrite_with(self.file_r_info(endian), 4, endian)?;
++        Ok(SIZEOF_RELOCATION_INFO)
++    }
++}
++
++impl ctx::TryIntoCtx<Endian> for RelocationInfo {
++    type Error = scroll::Error;
++    fn try_into_ctx(self, dst: &mut [u8], endian: Endian) -> Result<usize, Self::Error> {
++        (&self).try_into_ctx(dst, endian)
++    }
++}
++
++impl<'a> ctx::IntoCtx<Endian> for &'a RelocationInfo {
++    fn into_ctx(self, dst: &mut [u8], endian: Endian) {
++        dst.cwrite_with(self.r_address, 0usize, endian);
++        dst.cwrite_with(self.file_r_info(endian), 4usize, endian);
++    }
++}
++
++impl ctx::IntoCtx<Endian> for RelocationInfo {
++    fn into_ctx(self, dst: &mut [u8], endian: Endian) {
++        (&self).into_ctx(dst, endian)
++    }
++}
++
+ impl fmt::Debug for RelocationInfo {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         f.debug_struct("RelocationInfo")
+@@ -165,6 +258,40 @@
+ /// Must be followed by ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12.
+ pub const ARM64_RELOC_ADDEND: RelocType = 10;
+ 
++// powerpc and powerpc64 relocations (cctools mach-o/ppc/reloc.h)
++/// Generic relocation (a pointer: r_length 2, or 3 on ppc64)
++pub const PPC_RELOC_VANILLA: RelocType = 0;
++/// The second relocation entry of a pair
++pub const PPC_RELOC_PAIR: RelocType = 1;
++/// 14 bit branch displacement (to a word address)
++pub const PPC_RELOC_BR14: RelocType = 2;
++/// 24 bit branch displacement (to a word address)
++pub const PPC_RELOC_BR24: RelocType = 3;
++/// A PAIR follows with the low half
++pub const PPC_RELOC_HI16: RelocType = 4;
++/// A PAIR follows with the high half
++pub const PPC_RELOC_LO16: RelocType = 5;
++/// Same as PPC_RELOC_HI16, but the low half is sign extended when the halves are added
++pub const PPC_RELOC_HA16: RelocType = 6;
++/// Same as PPC_RELOC_LO16, but the low 2 bits are not stored in the instruction (always zero)
++pub const PPC_RELOC_LO14: RelocType = 7;
++/// A PAIR follows with the subtract symbol value
++pub const PPC_RELOC_SECTDIFF: RelocType = 8;
++/// Prebound lazy pointer
++pub const PPC_RELOC_PB_LA_PTR: RelocType = 9;
++/// Section difference form of PPC_RELOC_HI16; a PAIR follows with the subtract symbol value
++pub const PPC_RELOC_HI16_SECTDIFF: RelocType = 10;
++/// Section difference form of PPC_RELOC_LO16; a PAIR follows with the subtract symbol value
++pub const PPC_RELOC_LO16_SECTDIFF: RelocType = 11;
++/// Section difference form of PPC_RELOC_HA16; a PAIR follows with the subtract symbol value
++pub const PPC_RELOC_HA16_SECTDIFF: RelocType = 12;
++/// A branch island ("jbsr") reference
++pub const PPC_RELOC_JBSR: RelocType = 13;
++/// Section difference form of PPC_RELOC_LO14; a PAIR follows with the subtract symbol value
++pub const PPC_RELOC_LO14_SECTDIFF: RelocType = 14;
++/// Like PPC_RELOC_SECTDIFF, but the symbol referenced was local
++pub const PPC_RELOC_LOCAL_SECTDIFF: RelocType = 15;
++
+ pub fn reloc_to_str(reloc: RelocType, cputype: mach::cputype::CpuType) -> &'static str {
+     use crate::mach::constants::cputype::*;
+     match cputype {
+@@ -217,6 +344,25 @@
+             GENERIC_RELOC_TLV => "GENERIC_RELOC_TLV",
+             _ => "UNKNOWN",
+         },
++        CPU_TYPE_POWERPC | CPU_TYPE_POWERPC64 => match reloc {
++            PPC_RELOC_VANILLA => "PPC_RELOC_VANILLA",
++            PPC_RELOC_PAIR => "PPC_RELOC_PAIR",
++            PPC_RELOC_BR14 => "PPC_RELOC_BR14",
++            PPC_RELOC_BR24 => "PPC_RELOC_BR24",
++            PPC_RELOC_HI16 => "PPC_RELOC_HI16",
++            PPC_RELOC_LO16 => "PPC_RELOC_LO16",
++            PPC_RELOC_HA16 => "PPC_RELOC_HA16",
++            PPC_RELOC_LO14 => "PPC_RELOC_LO14",
++            PPC_RELOC_SECTDIFF => "PPC_RELOC_SECTDIFF",
++            PPC_RELOC_PB_LA_PTR => "PPC_RELOC_PB_LA_PTR",
++            PPC_RELOC_HI16_SECTDIFF => "PPC_RELOC_HI16_SECTDIFF",
++            PPC_RELOC_LO16_SECTDIFF => "PPC_RELOC_LO16_SECTDIFF",
++            PPC_RELOC_HA16_SECTDIFF => "PPC_RELOC_HA16_SECTDIFF",
++            PPC_RELOC_JBSR => "PPC_RELOC_JBSR",
++            PPC_RELOC_LO14_SECTDIFF => "PPC_RELOC_LO14_SECTDIFF",
++            PPC_RELOC_LOCAL_SECTDIFF => "PPC_RELOC_LOCAL_SECTDIFF",
++            _ => "UNKNOWN",
++        },
+         _ => "BAD_CPUTYPE",
+     }
+ }
