@@ -1,0 +1,101 @@
+From 7b53643cbaa7d79f899845e7400a6c5289537460 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 19:42:22 +0000
+Subject: [PATCH] resolve: a `use` of another crate's tuple struct leaves out a constructor
+ it can't name
+
+swash 0.2.7 (agg 1.9.0) src/internal/var.rs:247, in `pub fn adjust_axis(.., coord: Fixed) -> Option<Fixed>`
+(the module's own `use super::fixed::Fixed`, a `pub struct Fixed(pub i32)`):
+    use skrifa::raw::{tables::avar::Avar, types::Fixed, FontData, FontRead};
+    Some(Fixed(mapping.apply(Fixed::from_bits(coord.0)).to_bits()))
+= "<null> error:0: Type mismatch between swash::internal::fixed::Fixed and font_types::fixed::Fixed".
+
+font_types 0.11.3 declares `pub struct Fixed(i32)` (private field) in a private module and re-exports it with
+`pub use fixed::{.., Fixed}`. rustc gives a tuple struct's constructor the narrowest of the struct's and its
+fields' visibilities, and import resolution treats a binding the importing module can't access as absent in that
+namespace: the body-local `use` imports only the TYPE `Fixed` (so `Fixed::from_bits` is font_types'), and the call
+`Fixed(..)` resolves further out to swash's own constructor. mrustc imported font_types' constructor too.
+
+Both places that bind another crate's constructor at the end of an import chain now skip it unless every field is
+`pub` (the HIR keeps per-field publicity): Resolve_Use_GetBinding (use.cpp, a single `use`) and the HIR glob in
+Resolve_Index_Module_Wildcard__glob_in_hir_mod (index.cpp). Not covered: the same rule for a crate's own items
+(AST side), and `#[non_exhaustive]` structs (their constructor is `pub(crate)`; the HIR doesn't record the
+attribute).
+
+Assisted-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/resolve/index.cpp b/src/resolve/index.cpp
+index 57764172..5424f5e0 100644
+--- a/src/resolve/index.cpp
++++ b/src/resolve/index.cpp
+@@ -20,6 +20,7 @@ enum class IndexName
+ };
+ 
+ void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst_mod, const AST::UseItem::Ent& i_data, const AST::Visibility& vis);
++extern bool Resolve_Use_HirStructCtorVisible(const ::HIR::Struct& str);   // use.cpp
+ 
+ ::std::ostream& operator<<(::std::ostream& os, const IndexName& loc)
+ {
+@@ -469,12 +470,19 @@ void Resolve_Index_Module_Wildcard__glob_in_hir_mod(
+                 pb.binding = ::AST::PathBinding_Value::make_Struct({ nullptr, &crate.m_extern_crates.at(e.ty.crate_name()).m_hir->get_typeitem_by_path(sp, e.ty, true).as_Struct() });
+                 }
+             TU_ARMA(StructConstructor, e) {
+-                pb.binding = ::AST::PathBinding_Value::make_Struct({ nullptr, &crate.m_extern_crates.at(e.ty.crate_name()).m_hir->get_typeitem_by_path(sp, e.ty, true).as_Struct() });
++                const auto& str = crate.m_extern_crates.at(e.ty.crate_name()).m_hir->get_typeitem_by_path(sp, e.ty, true).as_Struct();
++                // A glob skips a constructor this crate can't name (as a single `use` does, see use.cpp)
++                if( Resolve_Use_HirStructCtorVisible(str) )
++                    pb.binding = ::AST::PathBinding_Value::make_Struct({ nullptr, &str });
++                else
++                    DEBUG("Glob: skip constructor of " << e.ty << " (private fields)");
+                 }
+             TU_ARMA(Function, e) {
+                 pb.binding = ::AST::PathBinding_Value::make_Function({nullptr});
+                 }
+             }
++            if( pb.binding.is_Unbound() )
++                continue ;
+             _add_item_value( sp, dst_mod, it.first, vis, mv$(pb), false );
+         }
+     }
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index 97965df6..40f021e5 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -25,6 +25,23 @@ namespace {
+     const RcString rcstring_crate_builtins = RcString::new_interned(CRATE_BUILTINS);
+ }
+ 
++/// Can another crate name this tuple struct's constructor? (rustc: the constructor's visibility is the narrowest of
++/// the struct's and its fields', so outside the crate one non-`pub` field hides it: a `use` of the struct then imports
++/// only the type, and a value of that name resolves further out)
++/// - swash 0.2.7 internal/var.rs `use skrifa::raw::{.., types::Fixed, ..}` in a body (font_types `pub struct
++///   Fixed(i32)`), then `Fixed(..)` = the module's own `use super::fixed::Fixed`
++/// TODO: The same rule within a crate, and `#[non_exhaustive]` (a `pub(crate)` constructor; not recorded in the HIR)
++bool Resolve_Use_HirStructCtorVisible(const ::HIR::Struct& str)
++{
++    if( const auto* fields = str.m_data.opt_Tuple() ) {
++        for(const auto& f : *fields) {
++            if( !f.publicity.is_global() )
++                return false;
++        }
++    }
++    return true;
++}
++
+ 
+ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path path, ::std::span< const ::AST::Module* > parent_modules={});
+ ::AST::Path::Bindings Resolve_Use_GetBinding(
+@@ -1179,7 +1196,11 @@ namespace {
+                     }
+                 TU_ARMA(StructConstructor, e) {
+                     ASSERT_BUG(span, crate.m_extern_crates.count(e.ty.crate_name()), "Crate '" << e.ty.crate_name() << "' not loaded for " << e.ty);
+-                    rv.value.set( ap, ::AST::PathBinding_Value::make_Struct({ nullptr, &crate.m_extern_crates.at(e.ty.crate_name()).m_hir->get_typeitem_by_path(span, e.ty, true).as_Struct() }) );
++                    const auto& str = crate.m_extern_crates.at(e.ty.crate_name()).m_hir->get_typeitem_by_path(span, e.ty, true).as_Struct();
++                    if( Resolve_Use_HirStructCtorVisible(str) )
++                        rv.value.set( ap, ::AST::PathBinding_Value::make_Struct({ nullptr, &str }) );
++                    else
++                        DEBUG("E : Value " << nodes.back().name() << " = constructor of " << e.ty << " with private fields [private]");
+                     }
+                 TU_ARMA(Function, e) {
+                     rv.value.set( ap, ::AST::PathBinding_Value::make_Function({ nullptr }) );
