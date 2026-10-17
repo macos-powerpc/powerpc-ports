@@ -1,0 +1,83 @@
+From 05a1c4d17e315513b52e5dad0757b788c84a4fb5 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 07:33:38 +0000
+Subject: [PATCH] mir: match against `&[T]` constants for any T, not only u8
+
+rustls 0.23.42 (xh 0.26.2) died lowering a match:
+
+    src/error.rs:786:1 BUG: src/mir/from_hir_match.cpp:1383: TODO:
+    append_from_lit - Match literal Borrow: ty=&'#local0 [usize]
+    lit={&::"webpki-0_103_13_H23"::lifted#C_43}0000100000000009
+
+    match &*values {
+        KeyUsage::CLIENT_AUTH_REPR => Self::ClientAuth,
+        KeyUsage::SERVER_AUTH_REPR => Self::ServerAuth,
+        _ => Self::Other(values),
+    }
+
+with webpki's `pub const CLIENT_AUTH_REPR: &[usize] = &[1, 3, 6, 1, 5, 5,
+7, 3, 2];`. A constant pattern of type `&[T]` was only handled for `&str`
+and `&[u8]` (as a value comparison).
+
+Any other `&[T]` constant now becomes the slice pattern of its elements,
+as `&[1, 3, 6, ..]` would: the length and the data come from the
+constant's relocation (a static's value, from another crate here, or
+inline bytes), and each element goes through append_from_lit, so
+elements with their own relocations (`&[&str]`) and enums work too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/mir/from_hir_match.cpp b/src/mir/from_hir_match.cpp
+index 99175bef..e90a0cbb 100644
+--- a/src/mir/from_hir_match.cpp
++++ b/src/mir/from_hir_match.cpp
+@@ -1379,6 +1379,48 @@ void PatternRulesetBuilder::append_from_lit(const Span& sp, EncodedLiteralSlice
+                 this->push_rule(PatternRule::make_Value( std::vector<uint8_t>(r->bytes.data() + ptr, r->bytes.data() + ptr + len) ));
+             }
+         }
++        else if( const auto* se = e.inner.data().opt_Slice() ) {
++            // Any other `&[T]` constant (rustls 0.23 `match &*values { KeyUsage::CLIENT_AUTH_REPR => .. }`, webpki's
++            // `const CLIENT_AUTH_REPR: &[usize] = &[1, 3, 6, ..]`): the slice pattern of its elements, as `&[1, 3, ..]`
++            size_t elem_size = 0;
++            ASSERT_BUG(sp, Target_GetSizeOf(sp, m_resolve, se->inner, elem_size), "Matching with generic constant type not valid - " << ty);
++            auto ptr_size = Target_GetPointerBits()/8;
++            auto ptr = lit.read_uint(ptr_size).truncate_u64();
++            auto len = lit.slice(ptr_size, ptr_size).read_uint(ptr_size).truncate_u64();
++            // The elements: a static's value (with its own relocations) or inline bytes
++            EncodedLiteral  inline_data;
++            const EncodedLiteral* data = &inline_data;
++            if( len > 0 )
++            {
++                auto* r = lit.get_reloc();
++                ASSERT_BUG(sp, r, "Null relocation for slice in pattern generation - " << lit);
++                ASSERT_BUG(sp, ptr >= EncodedLiteral::PTR_BASE, "");
++                ptr -= EncodedLiteral::PTR_BASE;
++                if( r->p ) {
++                    MonomorphState  val_params;
++                    auto v = m_resolve.get_value(sp, *r->p, val_params);
++                    ASSERT_BUG(sp, v.is_Static(), "Slice match with borrow of non-static (" << *r->p << ") - " << v.tag_str());
++                    const HIR::Static& s = *v.as_Static();
++                    ASSERT_BUG(sp, s.m_value_generated, "Slice match with borrow of non-resolved static (" << *r->p << ")");
++                    data = &s.m_value_res;
++                }
++                else {
++                    inline_data.bytes.assign(r->bytes.begin(), r->bytes.end());
++                }
++                ASSERT_BUG(sp, ptr + len * elem_size <= data->bytes.size(), "Slice constant out of range of its data - " << lit);
++            }
++            PatternRulesetBuilder   sub_builder { this->m_resolve };
++            sub_builder.m_field_path = m_field_path;
++            sub_builder.m_field_path.push_back(0);
++            ASSERT_BUG(sp, len < FIELD_INDEX_MAX, "Too many slice elements to fit encoding");
++            for(size_t i = 0; i < len; i ++)
++            {
++                sub_builder.append_from_lit( sp, EncodedLiteralSlice(*data).slice(ptr + i * elem_size, elem_size), se->inner );
++                sub_builder.m_field_path.back() ++;
++            }
++            ASSERT_BUG(sp, sub_builder.m_rulesets.size() == 1, "Literal slice pattern produced " << sub_builder.m_rulesets.size() << " rulesets");
++            this->push_rule( PatternRule::make_Slice({ static_cast<unsigned int>(len), mv$(sub_builder.m_rulesets[0].m_rules) }) );
++        }
+         else {
+             TODO(sp, "Match literal Borrow: ty=" << ty << " lit=" << lit);
+         }

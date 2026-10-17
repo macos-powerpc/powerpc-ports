@@ -1,0 +1,846 @@
+From 3249eb4c3bc92ec84bec8a012a7b153f31bd658f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 05:55:26 +0000
+Subject: [PATCH] enums: `#[repr(u128)]` / `#[repr(i128)]`, and the enum cast
+ fold's 32-bit discriminants
+
+repr128 is stable since Rust 1.89; mrustc rejected the attribute:
+
+    error: Unknown enum repr 'u128'
+
+Supporting it touches every stage that holds a discriminant:
+
+- expand/AST/HIR: the u128/i128 reprs (HIR::Enum::Repr appended, so the
+  serialised tags of the others are unchanged); discriminants are U128.
+  Narrow reprs keep exactly the old value (the 64-bit pattern, negative
+  values sign-extended to 64) and the 64-bit wrap of the implicit `+ 1`;
+  u128/i128 keep all 128 bits.
+- serialisation: the high words are written only for u128/i128 enums, so
+  rlibs of existing crates are unchanged (an 0281-built rlib loads).
+- layout: a 128-bit tag always uses the `Values` mode (also for data enums
+  without explicit discriminants and for repr(C, u128)), and never serves
+  as a niche: the `Linear`/niche paths treat a tag as a C scalar, and an
+  emulated i128 is a struct.
+- const eval: discriminant_value and the variant lookup from a literal
+  read 128 bits; the lookup compares modulo the tag width (TypeRepr's
+  new find_value, also used by get_enum_variant).
+- codegen_c: a match on a 128-bit tag is an `if` chain (an emulated i128
+  can't be switched on, a native `case` label holds 64 bits), tag values
+  are emitted with emit_constant, `as` casts of an emulated tag copy both
+  halves (128-bit targets) or take `.lo` (narrower ones). The `Values` tag
+  paths now go through emit_enum_path, as the `Linear` ones did, so the
+  leading tag of repr(C) data enums is `.TAG`, not `.DATA.TAG`.
+
+Found on the way, a silent miscompile in existing builds: MIR constant
+propagation folded `Variant as T` for a known variant through
+HIR::Enum::get_value, which returns uint32_t. `Ordering::Less as i64`
+(repr(i8), -1) folded to 4294967295, and a repr(u64) discriminant past
+2^32 lost its high bits (the old binary: -1 -> 4294967295,
+0x100000006 -> 0x6). The fold now takes the discriminant as a value of
+the repr type (sign- or zero-extended) and truncates it like the integer
+casts next to it.
+
+Known difference from rustc: `Option<E>` of a repr(u128) enum gets its own
+tag, while rustc uses the invalid tag values as a niche, so the sizes
+differ.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/ast/ast.hpp b/src/ast/ast.hpp
+index 9491cbaf..f4050f93 100644
+--- a/src/ast/ast.hpp
++++ b/src/ast/ast.hpp
+@@ -427,7 +427,9 @@ public:
+             I16,
+             I32,
+             I64,
+-            Isize
++            Isize,
++            U128,
++            I128,
+         } repr = Repr::Rust;
+         bool is_repr_c = false;
+     } m_markings;
+diff --git a/src/expand/codegen.cpp b/src/expand/codegen.cpp
+index d6860885..b316247a 100644
+--- a/src/expand/codegen.cpp
++++ b/src/expand/codegen.cpp
+@@ -232,6 +232,8 @@ class CHandler_Repr:
+                 else if( repr_str == "i32"  ) { set_repr( ::AST::Enum::Markings::Repr::I32); }
+                 else if( repr_str == "i64"  ) { set_repr( ::AST::Enum::Markings::Repr::I64); }
+                 else if( repr_str == "isize") { set_repr( ::AST::Enum::Markings::Repr::Isize); }
++                else if( repr_str == "u128" ) { set_repr( ::AST::Enum::Markings::Repr::U128); }
++                else if( repr_str == "i128" ) { set_repr( ::AST::Enum::Markings::Repr::I128); }
+                 else {
+                     ERROR(lex.point_span(), E0000, "Unknown enum repr '" << repr_str << "'");
+                 }
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index 83a1b250..fadfc612 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -41,12 +41,19 @@ namespace {
+         RcString m_crate_name;
+         ::std::vector<HIR::TypeRef> m_types;
+         ::HIR::serialise::Reader&   m_in;
++        // (see HirSerialiser::m_wide_discriminants)
++        bool    m_wide_discriminants = false;
+     public:
+         HirDeserialiser(::HIR::serialise::Reader& in):
+             m_in(in)
+         {}
+ 
+         RcString read_istring() { return m_in.read_istring(); }
++        U128 read_discriminant() {
++            auto lo = m_in.read_u64();
++            auto hi = m_wide_discriminants ? m_in.read_u64() : 0;
++            return U128(lo, hi);
++        }
+         ::std::string read_string() { return m_in.read_string(); }
+         bool read_bool() { return m_in.read_bool(); }
+         uint8_t read_u8() { return m_in.read_u8(); }
+@@ -1329,11 +1336,17 @@ namespace {
+                 }
+             }
+         };
++        auto params = deserialise_genericparams();
++        auto is_c_repr = m_in.read_bool();
++        auto tag_repr = static_cast< ::HIR::Enum::Repr>(m_in.read_tag());
++        m_wide_discriminants = (tag_repr == ::HIR::Enum::Repr::U128 || tag_repr == ::HIR::Enum::Repr::I128);
++        auto data = H::deserialise_enumclass(*this);
++        m_wide_discriminants = false;
+         return ::HIR::Enum {
+-            deserialise_genericparams(),
+-            m_in.read_bool(),
+-            static_cast< ::HIR::Enum::Repr>(m_in.read_tag()),
+-            H::deserialise_enumclass(*this),
++            mv$(params),
++            is_c_repr,
++            tag_repr,
++            mv$(data),
+             true,
+             deserialise_markings()
+             };
+@@ -1342,12 +1355,14 @@ namespace {
+     {
+         auto name = m_in.read_istring();
+         DEBUG("Enum::DataVariant " << name);
++        auto is_struct = m_in.read_bool();
++        auto type = deserialise_type();
+         return ::HIR::Enum::DataVariant {
+             mv$(name),
+-            m_in.read_bool(),
+-            deserialise_type(),
++            is_struct,
++            mv$(type),
+             ::HIR::ExprPtr {},
+-            m_in.read_u64()
++            read_discriminant()
+             };
+     }
+     ::HIR::Enum::ValueVariant HirDeserialiser::deserialise_enumvaluevariant()
+@@ -1357,7 +1372,7 @@ namespace {
+         return ::HIR::Enum::ValueVariant {
+             mv$(name),
+             ::HIR::ExprPtr {},
+-            m_in.read_u64()
++            read_discriminant()
+             };
+     }
+     ::HIR::Union HirDeserialiser::deserialise_union()
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index f7a2712d..ba026d90 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -1476,6 +1476,8 @@ namespace {
+     case ::AST::Enum::Markings::Repr::I32: repr = ::HIR::Enum::Repr::I32; break;
+     case ::AST::Enum::Markings::Repr::I64: repr = ::HIR::Enum::Repr::I64; break;
+     case ::AST::Enum::Markings::Repr::Isize: repr = ::HIR::Enum::Repr::Isize; break;
++    case ::AST::Enum::Markings::Repr::U128: repr = ::HIR::Enum::Repr::U128; break;
++    case ::AST::Enum::Markings::Repr::I128: repr = ::HIR::Enum::Repr::I128; break;
+     }
+ 
+     auto params = LowerHIR_GenericParams(ent.params(), nullptr);
+@@ -1488,7 +1490,7 @@ namespace {
+         {
+             // TODO: Quick consteval on the expression?
+             variants.push_back({
+-                var.m_name, LowerHIR_Expr(var.m_discriminant_value), 0
++                var.m_name, LowerHIR_Expr(var.m_discriminant_value), U128(0)
+                 });
+         }
+ 
+diff --git a/src/hir/hir.cpp b/src/hir/hir.cpp
+index 1f79af10..14086e57 100644
+--- a/src/hir/hir.cpp
++++ b/src/hir/hir.cpp
+@@ -272,7 +272,7 @@ uint32_t HIR::Enum::get_value(size_t idx) const
+         const auto& e = m_data.as_Value();
+         assert(idx < e.variants.size());
+ 
+-        return e.variants[idx].val;
++        return e.variants[idx].val.truncate_u64();
+     }
+     else
+     {
+@@ -297,6 +297,8 @@ uint32_t HIR::Enum::get_value(size_t idx) const
+     case ::HIR::Enum::Repr::I16: return ::HIR::CoreType::I16; break;
+     case ::HIR::Enum::Repr::I32: return ::HIR::CoreType::I32; break;
+     case ::HIR::Enum::Repr::I64: return ::HIR::CoreType::I64; break;
++    case ::HIR::Enum::Repr::U128: return ::HIR::CoreType::U128; break;
++    case ::HIR::Enum::Repr::I128: return ::HIR::CoreType::I128; break;
+     }
+     throw "";
+ }
+diff --git a/src/hir/hir.hpp b/src/hir/hir.hpp
+index 6cbe0452..65bc190f 100644
+--- a/src/hir/hir.hpp
++++ b/src/hir/hir.hpp
+@@ -341,20 +341,24 @@ public:
+ 
+         /// Optional explicit descriminant value, only valid when repr isn't Repr::Auto
+         ::HIR::ExprPtr  discriminant_expr;
+-        // Constant-evaluated descriminant value
+-        uint64_t discriminant_value;
++        // Constant-evaluated descriminant value: the low 64 bits (sign-extended to 64 for signed reprs) as before
++        // `repr(u128)`/`repr(i128)`, all 128 bits for those
++        U128 discriminant_value;
+     };
+     enum class Repr
+     {
+         Auto,
+         Usize, U8, U16, U32, U64,
+         Isize, I8, I16, I32, I64,
++        // NOTE: Appended, the serialised tag of the others is unchanged
++        U128, I128,
+     };
+     struct ValueVariant {
+         RcString   name;
+         ::HIR::ExprPtr  expr;
+         // TODO: Signed.
+-        uint64_t val;
++        // (As DataVariant::discriminant_value)
++        U128 val;
+     };
+     TAGGED_UNION(Class, Data,
+         (Data, ::std::vector<DataVariant>),
+diff --git a/src/hir/serialise.cpp b/src/hir/serialise.cpp
+index d15b3144..9c6094d2 100644
+--- a/src/hir/serialise.cpp
++++ b/src/hir/serialise.cpp
+@@ -17,6 +17,8 @@
+     {
+         ::std::map<std::string, size_t>    m_types;
+         ::HIR::serialise::Writer&   m_out;
++        // The enum being written has a `repr(u128)`/`repr(i128)` tag: its discriminants are written as 128 bits
++        bool    m_wide_discriminants = false;
+     public:
+         HirSerialiser(::HIR::serialise::Writer& out):
+             m_out( out )
+@@ -1291,7 +1293,10 @@
+             serialise_generics(item.m_params);
+             m_out.write_bool( item.m_is_c_repr );
+             m_out.write_tag( static_cast<int>(item.m_tag_repr) );
++            // Only these (new) reprs write the high words, so other enums keep the old encoding
++            m_wide_discriminants = (item.m_tag_repr == ::HIR::Enum::Repr::U128 || item.m_tag_repr == ::HIR::Enum::Repr::I128);
+             serialise( item.m_data );
++            m_wide_discriminants = false;
+ 
+             serialise(item.m_markings);
+         }
+@@ -1311,14 +1316,18 @@
+         {
+             m_out.write_string(v.name);
+             // NOTE: No expr, no longer needed
+-            m_out.write_u64(v.val);
++            m_out.write_u64(v.val.get_lo());
++            if( m_wide_discriminants )
++                m_out.write_u64(v.val.get_hi());
+         }
+         void serialise(const ::HIR::Enum::DataVariant& v)
+         {
+             m_out.write_string(v.name);
+             m_out.write_bool(v.is_struct);
+             serialise(v.type);
+-            m_out.write_u64(v.discriminant_value);
++            m_out.write_u64(v.discriminant_value.get_lo());
++            if( m_wide_discriminants )
++                m_out.write_u64(v.discriminant_value.get_hi());
+         }
+ 
+         void serialise(const ::HIR::TraitMarkings& m)
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index 8a209f36..439b9178 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -2562,10 +2562,9 @@ namespace HIR {
+                 }
+                 }
+             TU_ARMA(Values, ve) {
+-                auto v = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size).truncate_u64();
+-                auto it = std::find(ve.values.begin(), ve.values.end(), v);
+-                ASSERT_BUG(state.sp, it != ve.values.end(), "Invalid enum tag: " << v << " for " << ty);
+-                var_idx = it - ve.values.begin();
++                auto v = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size);
++                var_idx = ve.find_value(v);
++                ASSERT_BUG(state.sp, var_idx != SIZE_MAX, "Invalid enum tag: " << v << " for " << ty);
+                 }
+             TU_ARMA(NonZero, ve) {
+                 size_t ofs = enm_repr->get_offset(state.sp, resolve, ve.field);
+@@ -3174,7 +3173,7 @@ namespace HIR {
+                     auto ti = TypeInfo::for_type(ret_ty);
+                     // Same tag decoding as `Switch` (and codegen_c): `Values` stores the declared discriminants, the other
+                     // modes have discriminant == variant index. Non-enums yield 0.
+-                    uint64_t discr = 0;
++                    U128 discr(0);
+                     if( const auto* enm_repr = Target_GetTypeRepr(state.sp, resolve, ty) )
+                     {
+                         TU_MATCH_HDRA( (enm_repr->variants), { )
+@@ -3183,10 +3182,10 @@ namespace HIR {
+                             }
+                         TU_ARMA(Linear, ve) {
+                             auto v = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size).truncate_u64();
+-                            discr = (v < ve.offset) ? ve.field.index : v - ve.offset;
++                            discr = U128( (v < ve.offset) ? ve.field.index : v - ve.offset );
+                             }
+                         TU_ARMA(Values, ve) {
+-                            discr = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size).truncate_u64();
++                            discr = lit.slice( enm_repr->get_offset(state.sp, resolve, ve.field), ve.field.size).read_uint(state, 8*ve.field.size);
+                             }
+                         TU_ARMA(NonZero, ve) {
+                             size_t ofs = enm_repr->get_offset(state.sp, resolve, ve.field);
+@@ -3197,11 +3196,11 @@ namespace HIR {
+                                     break;
+                                 }
+                             }
+-                            discr = is_nonzero ? 1 - ve.zero_variant : ve.zero_variant;
++                            discr = U128( is_nonzero ? 1 - ve.zero_variant : ve.zero_variant );
+                             }
+                         }
+                     }
+-                    dst.write_uint(state, ti.bits, U128(discr));
++                    dst.write_uint(state, ti.bits, discr);
+                 }
+                 else {
+                     MIR_TODO(state, "Call intrinsic \"" << te->name << "\" - " << terminator);
+@@ -3955,7 +3954,7 @@ namespace {
+             case ::HIR::CoreType::I32:
+             case ::HIR::CoreType::I64:
+             case ::HIR::CoreType::Isize:
+-            case ::HIR::CoreType::I128: // TODO: Emulation
++            case ::HIR::CoreType::I128:
+                 is_signed = true;
+                 break;
+             case ::HIR::CoreType::Bool:
+@@ -3965,7 +3964,7 @@ namespace {
+             case ::HIR::CoreType::U64:
+             case ::HIR::CoreType::Usize:
+             case ::HIR::CoreType::Char:
+-            case ::HIR::CoreType::U128: // TODO: Emulation
++            case ::HIR::CoreType::U128:
+                 is_signed = false;
+                 break;
+             case ::HIR::CoreType::F16:
+@@ -3977,9 +3976,25 @@ namespace {
+             case ::HIR::CoreType::Str:
+                 BUG(Span(), "Unsized tag?!");
+             }
++            // `repr(u128)`/`repr(i128)` keep all 128 bits; the narrower reprs keep the 64-bit value (sign-extended for
++            // signed reprs) and its 64-bit wrap on the implicit `+ 1`, as before
++            const bool is_wide = (ty == ::HIR::CoreType::U128 || ty == ::HIR::CoreType::I128);
++            auto read_discriminant = [&](const EncodedLiteral& val)->U128 {
++                if( is_signed ) {
++                    auto v = EncodedLiteralSlice(val).read_sint();
++                    return is_wide ? v.get_inner() : U128(static_cast<uint64_t>(v.truncate_i64()));
++                }
++                else {
++                    auto v = EncodedLiteralSlice(val).read_uint();
++                    return is_wide ? v : U128(v.truncate_u64());
++                }
++                };
++            auto next_discriminant = [&](U128 v)->U128 {
++                return is_wide ? v + 1u : U128(v.truncate_u64() + 1);
++                };
+             TU_MATCH_HDRA((item.m_data), {)
+             TU_ARMA(Value, e) {
+-                uint64_t i = 0;
++                U128 i(0);
+                 for(auto& var : e.variants)
+                 {
+                     if( var.expr )
+@@ -3991,12 +4006,7 @@ namespace {
+                         {
+                             auto val = eval.evaluate_constant(p, var.expr, ty);
+                             DEBUG("enum variant: " << p << "::" << var.name << " = " << val);
+-                            if( is_signed ) {
+-                                i = EncodedLiteralSlice(val).read_sint().truncate_i64();
+-                            }
+-                            else {
+-                                i = EncodedLiteralSlice(val).read_uint().truncate_u64();
+-                            }
++                            i = read_discriminant(val);
+                         }
+                         catch(const Defer&)
+                         {
+@@ -4008,11 +4018,11 @@ namespace {
+                     {
+                         DEBUG("enum variant: " << p << "::" << var.name << " = " << var.val << " (auto)");
+                     }
+-                    i ++;
++                    i = next_discriminant(i);
+                 }
+                 }
+             TU_ARMA(Data, e) {
+-                uint64_t i = 0;
++                U128 i(0);
+                 for(auto& var : e)
+                 {
+                     if( var.discriminant_expr )
+@@ -4024,12 +4034,7 @@ namespace {
+                         {
+                             auto val = eval.evaluate_constant(p, var.discriminant_expr, ty);
+                             DEBUG("enum variant: " << p << "::" << var.name << " = " << val);
+-                            if( is_signed ) {
+-                                i = EncodedLiteralSlice(val).read_sint().truncate_i64();
+-                            }
+-                            else {
+-                                i = EncodedLiteralSlice(val).read_uint().truncate_u64();
+-                            }
++                            i = read_discriminant(val);
+                         }
+                         catch(const Defer&)
+                         {
+@@ -4037,7 +4042,7 @@ namespace {
+                         }
+                     }
+                     var.discriminant_value = i;
+-                    i ++;
++                    i = next_discriminant(i);
+                 }
+                 }
+             }
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index f44d9e00..0f00e67d 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -129,7 +129,7 @@ namespace {
+                 m_builder.end_block( ::MIR::Terminator::make_Goto(s.entrypoint) );
+ 
+                 enum_variants.push_back(HIR::Enum::ValueVariant {
+-                    RcString(), ::HIR::ExprPtr(), arm_targets.size()-1
++                    RcString(), ::HIR::ExprPtr(), U128(arm_targets.size()-1)
+                     });
+                 for(const auto& e : s.saved)
+                 {
+@@ -142,7 +142,7 @@ namespace {
+             m_builder.end_block( ::MIR::Terminator::make_Diverge({}) );
+ 
+             enum_variants.push_back(HIR::Enum::ValueVariant {
+-                RcString::new_interned("END"), ::HIR::ExprPtr(), arm_targets.size()-1
++                RcString::new_interned("END"), ::HIR::ExprPtr(), U128(arm_targets.size()-1)
+                 });
+             state_enm.m_data = ::HIR::Enum::Class::make_Value({ mv$(enum_variants) });
+ 
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index f2e6bcb6..aea68e9d 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -3769,7 +3769,29 @@ bool MIR_Optimise_ConstPropagate(::MIR::TypeResolve& state, ::MIR::Function& fcn
+                         const auto& src_ty = state.get_lvalue_type(tmp, se.val);
+                         const HIR::Enum& enm = *src_ty.data().as_Path().binding.as_Enum();
+                         MIR_ASSERT(state, enm.is_value(), "Casting non-value enum to value");
+-                        auto v = enm.get_value(variant_idx);
++                        // The discriminant as a value of the repr type, then cast like an integer: `Ordering::Less as
++                        // i64` is -1 (the stored value is the 64-bit pattern), a `repr(u128)` one has 128 bits.
++                        // (`HIR::Enum::get_value` is 32-bit: `repr(u64)` values past 2^32 and negative values cast to
++                        // 64 bits used to fold wrongly.)
++                        const auto raw = enm.m_data.as_Value().variants.at(variant_idx).val;
++                        U128 v;
++                        switch(::HIR::Enum::get_repr_type(enm.m_tag_repr))
++                        {
++                        case ::HIR::CoreType::U128:
++                        case ::HIR::CoreType::I128:
++                            v = raw;
++                            break;
++                        case ::HIR::CoreType::I8:
++                        case ::HIR::CoreType::I16:
++                        case ::HIR::CoreType::I32:
++                        case ::HIR::CoreType::I64:
++                        case ::HIR::CoreType::Isize:
++                            v = S128(static_cast<int64_t>(raw.truncate_u64())).get_inner();
++                            break;
++                        default:
++                            v = U128(raw.truncate_u64());
++                            break;
++                        }
+ 
+                         auto ct = se.type.data().as_Primitive();
+                         switch(ct)
+@@ -3780,7 +3802,7 @@ bool MIR_Optimise_ConstPropagate(::MIR::TypeResolve& state, ::MIR::Function& fcn
+                         case ::HIR::CoreType::U64:
+                         case ::HIR::CoreType::U128:
+                         case ::HIR::CoreType::Usize:
+-                            new_value = ::MIR::Constant::make_Uint({ U128(v), ct });
++                            new_value = ::MIR::Constant::make_Uint({ H::truncate_u(ct, v), ct });
+                             break;
+                         case ::HIR::CoreType::I8:
+                         case ::HIR::CoreType::I16:
+@@ -3788,7 +3810,7 @@ bool MIR_Optimise_ConstPropagate(::MIR::TypeResolve& state, ::MIR::Function& fcn
+                         case ::HIR::CoreType::I64:
+                         case ::HIR::CoreType::I128:
+                         case ::HIR::CoreType::Isize:
+-                            new_value = ::MIR::Constant::make_Int({ S128(U128(v)), ct });
++                            new_value = ::MIR::Constant::make_Int({ H::truncate_s(ct, S128(v)), ct });
+                             break;
+                         case ::HIR::CoreType::F16:
+                         case ::HIR::CoreType::F32:
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index e801222e..af0bf45c 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -3986,6 +3986,17 @@ namespace {
+             }
+         }
+ 
++        /// A value enum whose tag (`repr(u128)`/`repr(i128)`) is an emulated i128, i.e. a two-word struct in the C
++        bool enum_tag_is_emulated_i128(const ::HIR::TypeRef& ty) const
++        {
++            if( !m_options.emulated_i128 || !TU_TEST1(ty.data(), Path, .binding.is_Enum()) )
++                return false;
++            const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
++            if( !repr || !repr->variants.is_Values() )
++                return false;
++            const auto& ve = repr->variants.as_Values();
++            return type_is_emulated_i128(Target_GetInnerType(sp, m_resolve, *repr, ve.field.index, ve.field.sub_fields));
++        }
+         bool type_is_emulated_i128(const ::HIR::TypeRef& ty) const
+         {
+             return m_options.emulated_i128 && (ty == ::HIR::CoreType::I128 || ty == ::HIR::CoreType::U128);
+@@ -4737,12 +4748,8 @@ namespace {
+                         }
+                         }
+                     TU_ARMA(Values, re) {
+-                        if( re.field.index == 0 ) {
+-                            emit_lvalue(e.dst); m_of << ".TAG = "; emit_enum_variant_val(repr, ve.index);
+-                        }
+-                        else {
+-                            emit_lvalue(e.dst); m_of << ".DATA.TAG = "; emit_enum_variant_val(repr, ve.index);
+-                        }
++                        // (`.DATA.TAG` for an embedded tag, `.TAG` for value enums and the leading tag of repr(C) data)
++                        emit_lvalue(e.dst); emit_enum_path(repr, re.field); m_of << " = "; emit_enum_variant_val(repr, ve.index);
+                         if( !enm_p->is_value() )
+                         {
+                             emit_composite_assign(mir_res, [&](){ emit_lvalue(e.dst); m_of << ".DATA.var_" << ve.index; }, ve.vals, indent_level, true);
+@@ -4825,6 +4832,17 @@ namespace {
+                         emit_lvalue(ve.val);
+                         m_of << ".hi";
+                     }
++                    else if( enum_tag_is_emulated_i128(ty) ) {
++                        // `repr(u128)`/`repr(i128)`: the tag is a two-word struct too (of the other signedness, maybe)
++                        emit_lvalue(dst);
++                        m_of << ".lo = ";
++                        emit_lvalue(ve.val);
++                        m_of << ".TAG.lo; ";
++                        emit_lvalue(dst);
++                        m_of << ".hi = ";
++                        emit_lvalue(ve.val);
++                        m_of << ".TAG.hi";
++                    }
+                     else if( ty.data().is_Path() && ty.data().as_Path().binding.is_Enum() ) {
+                         emit_lvalue(dst);
+                         m_of << ".lo = ";
+@@ -4989,6 +5007,9 @@ namespace {
+                 emit_lvalue(ve.val);
+                 // NOTE: Embedded tag enums can't be cast
+                 m_of << ".TAG";
++                // An emulated 128-bit tag to a narrower integer: `as` truncates (the 128-bit destinations returned above)
++                if( enum_tag_is_emulated_i128(ty) )
++                    m_of << ".lo";
+                 special = true;
+             }
+             if (!special)
+@@ -5125,6 +5146,7 @@ namespace {
+             TU_ARMA(Values, e) {
+                 const auto& tag_ty = Target_GetInnerType(sp, m_resolve, *repr, e.field.index, e.field.sub_fields);
+                 bool is_signed = false;
++                bool is_wide = false;
+                 switch(tag_ty.data().as_Primitive())
+                 {
+                 case ::HIR::CoreType::I8:
+@@ -5143,8 +5165,12 @@ namespace {
+                 case ::HIR::CoreType::Char:
+                     is_signed = false;
+                     break;
+-                case ::HIR::CoreType::I128: // TODO: Emulation
+-                case ::HIR::CoreType::U128: // TODO: Emulation
++                case ::HIR::CoreType::I128:
++                    is_signed = true;
++                    is_wide = true;
++                    break;
++                case ::HIR::CoreType::U128:
++                    is_wide = true;
+                     break;
+                 case ::HIR::CoreType::F16:
+                 case ::HIR::CoreType::F32:
+@@ -5155,22 +5181,41 @@ namespace {
+                 case ::HIR::CoreType::Str:
+                     MIR_BUG(mir_res, "Unsized tag?!");
+                 }
++                // (`.DATA.TAG` for an embedded tag, `.TAG` for value enums and the leading tag of repr(C) data)
++                auto emit_tag = [&]() { emit_lvalue(val); emit_enum_path(repr, e.field); };
++
++                // `repr(u128)`/`repr(i128)`: an `if` chain - an emulated i128 is a struct, and a native `case` label
++                // can't hold more than 64 bits
++                if( is_wide )
++                {
++                    for(size_t j = 0; j < n_arms; j ++)
++                    {
++                        m_of << indent << (j == 0 ? "if( " : "else if( ");
++                        if( m_options.emulated_i128 ) {
++                            emit_tag(); m_of << ".lo == " << e.values[j].get_lo() << "ull && ";
++                            emit_tag(); m_of << ".hi == " << e.values[j].get_hi() << "ull";
++                        }
++                        else {
++                            emit_tag(); m_of << " == "; emit_constant(enum_tag_constant(tag_ty, e.values[j]));
++                        }
++                        m_of << " ) { "; cb(j); m_of << " }\n";
++                    }
++                    m_of << indent << "else abort();\n";
++                    return ;
++                }
+ 
+                 // Optimisation: If there's only one arm with a different value, then emit an `if` isntead of a `switch`
+                 if( odd_arm != static_cast<size_t>(-1) )
+                 {
+-                    m_of << indent << "if("; emit_lvalue(val);
+-                    if( e.field.index != 0 ) {
+-                        m_of << ".DATA";
+-                    }
+-                    m_of << ".TAG == ";
++                    m_of << indent << "if("; emit_tag();
++                    m_of << " == ";
+                     // Handle signed values
+                     if( is_signed ) {
+-                        m_of << static_cast<int64_t>(e.values[odd_arm]);
++                        m_of << static_cast<int64_t>(e.values[odd_arm].truncate_u64());
+                         m_of << "ll";
+                     }
+                     else {
+-                        m_of << e.values[odd_arm];
++                        m_of << e.values[odd_arm].truncate_u64();
+                         m_of << "ull";
+                     }
+                     m_of << ") {"; cb(odd_arm); m_of << "} else {"; cb(odd_arm == 0 ? 1 : 0); m_of << "}\n";
+@@ -5178,19 +5223,16 @@ namespace {
+                 }
+ 
+                 m_of << indent << "switch(";
+-                emit_lvalue(val);
+-                if( e.field.index != 0 ) {
+-                    m_of << ".DATA";
+-                }
+-                m_of << ".TAG) {\n";
++                emit_tag();
++                m_of << ") {\n";
+                 for(size_t j = 0; j < n_arms; j ++)
+                 {
+                     // Handle signed values
+                     if( is_signed ) {
+-                        m_of << indent << "case " << static_cast<int64_t>(e.values[j]) << "ll: ";
++                        m_of << indent << "case " << static_cast<int64_t>(e.values[j].truncate_u64()) << "ll: ";
+                     }
+                     else {
+-                        m_of << indent << "case " << e.values[j] << "ull: ";
++                        m_of << indent << "case " << e.values[j].truncate_u64() << "ull: ";
+                     }
+                     cb(j);
+                     m_of << "break;\n";
+@@ -8628,6 +8670,14 @@ namespace {
+             }
+         }
+ 
++        /// A `repr(u128)`/`repr(i128)` discriminant as a constant of the tag type
++        static ::MIR::Constant enum_tag_constant(const ::HIR::TypeRef& tag_ty, U128 v)
++        {
++            if( tag_ty == ::HIR::CoreType::I128 )
++                return ::MIR::Constant::make_Int({ S128(v), ::HIR::CoreType::I128 });
++            else
++                return ::MIR::Constant::make_Uint({ v, ::HIR::CoreType::U128 });
++        }
+         void emit_enum_variant_val(const TypeRepr* repr, unsigned idx)
+         {
+             const auto& ve = repr->variants.as_Values();
+@@ -8639,7 +8689,7 @@ namespace {
+             case ::HIR::CoreType::I32:
+             case ::HIR::CoreType::I64:
+             case ::HIR::CoreType::Isize:
+-                m_of << static_cast<int64_t>(ve.values[idx]) << "ll";
++                m_of << static_cast<int64_t>(ve.values[idx].truncate_u64()) << "ll";
+                 break;
+             case ::HIR::CoreType::Bool:
+             case ::HIR::CoreType::U8:
+@@ -8648,11 +8698,12 @@ namespace {
+             case ::HIR::CoreType::U64:
+             case ::HIR::CoreType::Usize:
+             case ::HIR::CoreType::Char:
+-                m_of << ve.values[idx] << "ull";
++                m_of << ve.values[idx].truncate_u64() << "ull";
+                 break;
+-            case ::HIR::CoreType::I128: // TODO: Emulation
+-            case ::HIR::CoreType::U128: // TODO: Emulation
+-                MIR_TODO(*m_mir_res, "Emulated i128 tag");
++            case ::HIR::CoreType::I128:
++            case ::HIR::CoreType::U128:
++                // `repr(u128)`/`repr(i128)`: as a constant of the tag type (emulated or a native __int128)
++                emit_constant(enum_tag_constant(tag_ty, ve.values[idx]));
+                 break;
+             case ::HIR::CoreType::F16:
+             case ::HIR::CoreType::F32:
+diff --git a/src/trans/codegen_mmir.cpp b/src/trans/codegen_mmir.cpp
+index bd36e58c..c0c063a1 100644
+--- a/src/trans/codegen_mmir.cpp
++++ b/src/trans/codegen_mmir.cpp
+@@ -597,11 +597,11 @@ namespace
+                 m_of << "\t" << e.offset << " = " << fmt(e.ty) << ";\n";
+             }
+ 
+-            auto emit_value = [&](const TypeRepr::FieldPath& path, uint64_t v) {
++            auto emit_value = [&](const TypeRepr::FieldPath& path, U128 v) {
+                 m_of << "\"";
+                 for(size_t i = 0; i < path.size; i ++)
+                 {
+-                    int val = (v >> (i*8)) & 0xFF;
++                    int val = (v >> static_cast<unsigned>(i*8)).truncate_u64() & 0xFF;
+                     if(val < 16)
+                         m_of << ::std::hex << "\\x0" << val << ::std::dec;
+                     else
+@@ -625,7 +625,7 @@ namespace
+                         m_of << "*";
+                     }
+                     else {
+-                        emit_value(e.field, e.offset + i);
++                        emit_value(e.field, U128(e.offset + i));
+                     }
+                     // - Data field number (optional)
+                     if( !item.is_value() )
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index 5225705b..eed21793 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -1683,16 +1683,18 @@ namespace {
+                 TU_ARMA(Values, ve) {
+                     auto ofs = get_offset(sp, resolve, r, ve.field);
+                     DEBUG("Values - Tag offset: " << ofs);
+-                    if(min_offset <= ofs && ofs + ve.field.size < max_offset)
++                    // A 128-bit tag (`repr(u128)`/`repr(i128)`) is never a niche: the niche users (Linear tags) treat
++                    // the tag as a C scalar, an emulated i128 is a struct
++                    if(min_offset <= ofs && ofs + ve.field.size < max_offset && ve.field.size < 16)
+                     {
+                         auto last_value = *std::max_element(ve.values.begin(), ve.values.end());
+-                        if(last_value < UINT_MAX)
++                        if(last_value < U128(UINT_MAX))
+                         {
+                             out_path.size = ve.field.size;
+                             out_path.sub_fields.clear();
+                             out_path.sub_fields.insert(out_path.sub_fields.begin(), ve.field.sub_fields.rbegin(), ve.field.sub_fields.rend());
+                             out_path.sub_fields.push_back(ve.field.index);
+-                            return last_value + 1;
++                            return last_value.truncate_u64() + 1;
+                         }
+                     }
+                     return 0;
+@@ -1796,7 +1798,17 @@ namespace {
+                 rv.align = std::max(tag_align, max_align);
+                 while(rv.size % rv.align != 0)
+                     rv.size ++;
+-                rv.variants = TypeRepr::VariantMode::make_Linear({ { e.size(), tag_size, {} }, 0, e.size() });
++                if( tag_size >= 16 ) {
++                    // `repr(C, u128)`: a 128-bit tag only goes through the `Values` paths (see below)
++                    ::std::vector<U128> vals;
++                    for(const auto& v : e) {
++                        vals.push_back(v.discriminant_value);
++                    }
++                    rv.variants = TypeRepr::VariantMode::make_Values({ { e.size(), tag_size, {} }, ::std::move(vals) });
++                }
++                else {
++                    rv.variants = TypeRepr::VariantMode::make_Linear({ { e.size(), tag_size, {} }, 0, e.size() });
++                }
+             }
+             else if( enm.m_tag_repr == ::HIR::Enum::Repr::Auto && e.size() <= 1 )
+             {
+@@ -2285,8 +2297,9 @@ namespace {
+                         rv.size ++;
+                     rv.align = max_align;
+ 
+-                    if( has_explcit_value ) {
+-                        ::std::vector<uint64_t> vals;
++                    // A 128-bit tag always gets `Values`: only those paths handle a tag that isn't a C scalar
++                    if( has_explcit_value || tag_size >= 16 ) {
++                        ::std::vector<U128> vals;
+                         for(const auto& v : e) {
+                             vals.push_back(v.discriminant_value);
+                         }
+@@ -2314,7 +2327,7 @@ namespace {
+                 int pow8 = 0;
+                 for( const auto& v : e.variants )
+                 {
+-                    auto v2 = static_cast<int64_t>(v.val);
++                    auto v2 = static_cast<int64_t>(v.val.truncate_u64());
+                     if( -0x80 <= v2 && v2 < 0x80 )
+                     {
+                         pow8 = ::std::max(pow8, 1);
+@@ -2360,7 +2373,7 @@ namespace {
+                 // Can't return false or unsized
+                 Target_GetSizeAndAlignOf(sp, resolve, rv.fields.back().ty, rv.size, rv.align);
+ 
+-                ::std::vector<uint64_t> vals;
++                ::std::vector<U128> vals;
+                 for(const auto& v : e.variants)
+                 {
+                     vals.push_back(v.val);
+@@ -2671,14 +2684,9 @@ std::pair<unsigned,bool> TypeRepr::get_enum_variant(const Span& sp, const Static
+         }
+     TU_ARMA(Values, ve) {
+         auto v = lit.slice( this->get_offset(sp, resolve, ve.field), ve.field.size).read_uint(ve.field.size);
+-        // Compare modulo the tag width: negative discriminants (e.g. `Ordering::Less
+-        // = -1`, repr(i8)) are stored sign-extended to 64 bits in `values`, while the
+-        // encoded tag is just the truncated bytes.
+-        uint64_t mask = ve.field.size >= 8 ? ~0ull : ((1ull << (8*ve.field.size)) - 1);
+-        uint64_t vv = v.truncate_u64() & mask;
+-        auto it = std::find_if(ve.values.begin(), ve.values.end(), [&](uint64_t x){ return (x & mask) == vv; });
+-        ASSERT_BUG(sp, it != ve.values.end(), "Invalid enum tag: " << v);
+-        var_idx = it - ve.values.begin();
++        auto idx = ve.find_value(v);
++        ASSERT_BUG(sp, idx != SIZE_MAX, "Invalid enum tag: " << v);
++        var_idx = idx;
+         DEBUG("VariantMode::Values - #" << var_idx);
+         }
+     TU_ARMA(NonZero, ve) {
+diff --git a/src/trans/target.hpp b/src/trans/target.hpp
+index 50fa0632..a51b0bba 100644
+--- a/src/trans/target.hpp
++++ b/src/trans/target.hpp
+@@ -117,10 +117,22 @@ struct TypeRepr
+     (Values, struct {
+         // NOTE: `field.sub_path` should always be empty?
+         FieldPath   field;
+-        ::std::vector<uint64_t> values;
++        // The discriminants as HIR::Enum holds them: all 128 bits for a 128-bit tag, else the low 64 bits (negative
++        // values of signed tags sign-extended to 64)
++        ::std::vector<U128> values;
+         bool is_tag(unsigned var_idx) const {
+             return var_idx == field.index;
+         }
++        /// Index of the variant whose discriminant is `tag` (the tag field's bytes, zero-extended), SIZE_MAX if none.
++        /// Compared modulo the tag width: an encoded tag is just the truncated bytes (`Ordering::Less = -1`, repr(i8)).
++        size_t find_value(U128 tag) const {
++            U128 mask = field.size >= 16 ? U128::max() : (U128(1) << static_cast<unsigned>(8*field.size)) - 1u;
++            for(size_t i = 0; i < values.size(); i ++) {
++                if( (values[i] & mask) == (tag & mask) )
++                    return i;
++            }
++            return SIZE_MAX;
++        }
+         }),
+     // Tag is based on a range of values
+     //(Ranges, struct {

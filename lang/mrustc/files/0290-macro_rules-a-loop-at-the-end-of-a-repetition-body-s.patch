@@ -1,0 +1,156 @@
+From 76d567a2f9ef9ec4e79be4b9a097cacba2cc7853 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 09:44:18 +0000
+Subject: [PATCH] macro_rules: a loop at the end of a repetition body sees what
+ follows it
+
+minijinja 2.19.0 (py314-maturin 1.15.0) died expanding `type_erase!`:
+
+    src/value/object.rs:634-670 BUG: src/macro_rules/eval.cpp:2369: TODO:
+    Macro_InvokeRules_MatchPattern - No arm matched - (95, 14)
+
+    $(fn $f:ident(&self $(, $p:ident: $t:ty $(,)?)*) $(-> $r:ty)?;)*
+
+    fn call(
+        &self,
+        state: &State<'_, '_>,
+        args: &[Value]
+    ) -> Result<Value, Error>;
+
+Arms are compiled to a program that decides each loop by lookahead: the
+loop's entry tokens against its skip tokens, extended by up to two more
+tokens where they overlap. A loop's skip set was taken from the rest of
+its own pattern only. For `$(,)?` at the end of the
+`$(, $p:ident: $t:ty $(,)?)*` body that's nothing (EOF), so the `,` that
+starts the next repetition didn't count as a skip token, and `$(,)?`
+took it.
+
+macro_pattern_to_simple_inner now gets a tail: what can follow the
+pattern. A loop body's tail is the loop again (after its separator, if
+any) followed by whatever comes after the loop. A loop's skip set and
+its lookahead extension are taken from the rest of its pattern plus that
+tail. Here that gives skip `[, IDENT]` and `[)]` against entry `[, ,]`
+and `[, )]`. Top-level loops are unchanged (empty tail). If the longer
+follow set leaves an overlap the extension can't resolve, the conditions
+are recomputed without the tail (the previous greedy choice) rather than
+hitting the definition-time ambiguity TODO for a macro that worked
+before.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/macro_rules/parse.cpp b/src/macro_rules/parse.cpp
+index 675bb376..5d05ec17 100644
+--- a/src/macro_rules/parse.cpp
++++ b/src/macro_rules/parse.cpp
+@@ -836,7 +836,10 @@ namespace {
+         return rv;
+     }
+ 
+-    void macro_pattern_to_simple_inner(const Span& sp, ::std::vector<SimplePatEnt>& rv, const ::std::vector<MacroPatEnt>& pattern)
++    /// `tail` is what can follow `pattern` (empty at the top level): for a loop body, the loop again (after its separator)
++    /// and whatever follows the loop. A loop at the end of a body takes its skip set from it - `$(,)?` in
++    /// `$(, $p:ident: $t:ty $(,)?)*` (minijinja 2.19 `type_erase!`) must skip a `,` that starts the next repetition.
++    void macro_pattern_to_simple_inner(const Span& sp, ::std::vector<SimplePatEnt>& rv, const ::std::vector<MacroPatEnt>& pattern, const ::std::vector<MacroPatEnt>& tail)
+     {
+         size_t level_start = rv.size();
+         TRACE_FUNCTION_FR("[" << pattern << "]", "[" << FMT_CB(ss, for(auto it = rv.begin()+level_start; it != rv.end(); ++it) { ss << *it << ", "; }) << "]");
+@@ -854,10 +857,29 @@ namespace {
+             switch(ent.type)
+             {
+             case MacroPatEnt::PAT_LOOP: {
++                // What follows this loop: the rest of this pattern, then the enclosing pattern's continuation
++                ::std::vector<MacroPatEnt>  after(pattern.begin() + idx + 1, pattern.end());
++                after.insert(after.end(), tail.begin(), tail.end());
++                // What follows this loop's body: the loop again (`*`/`+`, after the separator), then `after`
++                ::std::vector<MacroPatEnt>  body_tail;
++                if( ent.name != "?" )
++                {
++                    ::std::vector<MacroPatEnt>  rep_body;
++                    if( ent.tok != TOK_NULL )
++                        rep_body.push_back( MacroPatEnt(ent.sp, ent.tok) );
++                    rep_body.insert(rep_body.end(), ent.subpats.begin(), ent.subpats.end());
++                    body_tail.push_back( MacroPatEnt(ent.sp, Token(TOK_NULL), "*", ent.name_index, mv$(rep_body)) );
++                }
++                body_tail.insert(body_tail.end(), after.begin(), after.end());
++                // The tail-less follow set, as before: used when the full one leaves an ambiguity the lookahead can't
++                // resolve (the old greedy choice instead of a new failure)
++                ::std::vector<MacroPatEnt>  after_local(pattern.begin() + idx + 1, pattern.end());
++                for(int attempt = 0; attempt < 2; attempt ++) {
++                const auto& follow = (attempt == 0 ? after : after_local);
+                 auto entry_pats1 = macro_pattern_get_head_set(ent.subpats, 0, {});
+                 DEBUG("Entry = [" << entry_pats1 << "]");
+                 ASSERT_BUG(ent.sp, entry_pats1.size() > 0, "No entry conditions extracted from sub-pattern [" << ent.subpats << "]");
+-                auto skip_pats1 = macro_pattern_get_head_set(pattern, idx+1, {});
++                auto skip_pats1 = macro_pattern_get_head_set(follow, 0, {});
+                 DEBUG("Skip = [" << skip_pats1 << "]");
+ 
+                 // TODO: If EOF is in both entry and skip, then remove from entry
+@@ -906,7 +928,7 @@ namespace {
+                                 entry_pats2.erase( ::std::find(entry_pats2.begin(), entry_pats2.end(), TOK_EOF) );
+                                 entry_pats2.insert(entry_pats2.end(), skip_pats1.begin(), skip_pats1.end());
+                             }
+-                            auto skip_pats2 = macro_pattern_get_head_set(pattern, idx+1, path);
++                            auto skip_pats2 = macro_pattern_get_head_set(follow, 0, path);
+                             assert(skip_pats2.size() > 0);
+                             DEBUG("entry_pats2 = [" << entry_pats2 << "]");
+                             DEBUG("skip_pats2 = [" << skip_pats2 << "]");
+@@ -939,14 +961,22 @@ namespace {
+                     }
+                 }
+                 // - If there's three-level needed, error?
++                bool ambiguous = false;
+                 for(auto e_it = entry_conds.begin(); e_it != entry_conds.end(); ++e_it)
+                 {
+                     auto s_it = ::std::find(skip_conds.begin(), skip_conds.end(), *e_it);
+                     if( s_it != skip_conds.end() )
+                     {
++                        if( attempt == 0 && follow.size() != after_local.size() ) {
++                            DEBUG("Ambiguous with the enclosing continuation, use the local follow set - " << *e_it);
++                            ambiguous = true;
++                            break;
++                        }
+                         TODO(ent.sp, "Entry and skip patterns share an entry (max extend " << MAX_CONDITION_ADD << "), ambigious - " << *e_it);
+                     }
+                 }
++                if( ambiguous )
++                    continue;
+                 for(const auto& e : entry_conds) {
+                     DEBUG("Entry += [" << e << "]");
+                 }
+@@ -988,7 +1018,7 @@ namespace {
+                 {
+                     push( SimplePatEnt::make_LoopStart({ ent.name_index }) );
+                     size_t start = rv.size();
+-                    macro_pattern_to_simple_inner(sp, rv, ent.subpats);
++                    macro_pattern_to_simple_inner(sp, rv, ent.subpats, body_tail);
+                     push( SimplePatEnt::make_LoopNext({ /*ent.name_index*/ }) );
+                     size_t rewrite_start = rv.size();
+                     if( ent.tok != TOK_NULL )
+@@ -1065,7 +1095,7 @@ namespace {
+                         }
+                     }
+ 
+-                    macro_pattern_to_simple_inner(sp, rv, ent.subpats);
++                    macro_pattern_to_simple_inner(sp, rv, ent.subpats, body_tail);
+                     push( SimplePatEnt::make_LoopNext({ /*ent.name_index*/ }) );
+ 
+                     if( ent.name == "*" )
+@@ -1127,6 +1157,8 @@ namespace {
+                 {
+                     TODO(sp, "Handle loop type '" << ent.name << "'");
+                 }
++                break;
++                }   // attempt
+                 } break;
+             case MacroPatEnt::PAT_TOKEN:
+                 push( SimplePatEnt::make_ExpectTok(ent.tok) );
+@@ -1156,7 +1188,7 @@ namespace {
+     {
+         ::std::vector<SimplePatEnt> rv;
+         TRACE_FUNCTION_FR(pattern, rv);
+-        macro_pattern_to_simple_inner(sp, rv, pattern);
++        macro_pattern_to_simple_inner(sp, rv, pattern, {});
+         return rv;
+     }
+ }

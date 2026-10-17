@@ -1,0 +1,154 @@
+From 1e1858b18f61b4afcae8a0b4cb8a5136fb32869a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 05:09:10 +0000
+Subject: [PATCH 281/281] mir, codegen_c: i128/u128 matches, values outside 64
+ bits and both halves
+
+num-order 1.2.0 (sshs 4.8.0) died lowering a match to MIR:
+
+    src/hash.rs:40:1 BUG: src/mir/from_hir_match.cpp:3810: TODO:
+    gen_dispatch__primitive - Handle 128-bit values in SwitchValue
+
+    impl NumHash for i128 {
+        fn num_hash<H: Hasher>(&self, state: &mut H) {
+            const MINP1: i128 = i128::MIN + 1;
+            match *self {
+                i128::MAX | MINP1 => 0i128.hash(state),
+                i128::MIN => (-1i128).hash(state),
+                u => u.hash(state),
+            }
+        }
+    }
+
+SwitchValue holds 64-bit values. The unsigned dispatch already switches on
+the values that fit and chains `if` equality tests after it for those
+above u64, and before it for `Constant::Const` values. The signed dispatch
+had a TODO for both and now does the same.
+
+Found on the way: with emulated i128 (powerpc-apple-darwin) the C backend
+switched on the low half alone ("TODO: Ensure that .hi is zero"), so
+`match x { 1 => .. }` on a u128 also took `(1 << 64) | 1`, and a `-1` arm
+on an i128 took `u64::MAX`. Such a SwitchValue now becomes an `if` chain
+comparing both halves (the values fit in 64 bits, the high half is the
+zero or sign extension of the low one). Native __int128 switches are
+unchanged. Only match lowering creates SwitchValues, and const evaluation
+already compared all 128 bits.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/mir/from_hir_match.cpp b/src/mir/from_hir_match.cpp
+index 4d3046f6..99175bef 100644
+--- a/src/mir/from_hir_match.cpp
++++ b/src/mir/from_hir_match.cpp
+@@ -3792,6 +3792,8 @@ void MatchGenGrouped::gen_dispatch__primitive(::HIR::TypeRef ty, ::MIR::LValue v
+             // NOTE: Rules are currently sorted
+             // TODO: If there are Constant::Const values in the list, they need to come first! (with equality checks)
+ 
++            // (as for the unsigned types above)
++            ::std::vector< ::std::pair<::MIR::Constant, ::MIR::BasicBlockId> >  large_values;
+             ::std::vector< int64_t>  values;
+             ::std::vector< ::MIR::BasicBlockId> targets;
+             size_t tgt_ofs = 0;
+@@ -3803,19 +3805,41 @@ void MatchGenGrouped::gen_dispatch__primitive(::HIR::TypeRef ty, ::MIR::LValue v
+                 const auto& r = rules[i][0][ofs];
+                 ASSERT_BUG(sp, r.is_Value(), "Matching without _Value pattern - " << r.tag_str());
+                 const auto& re = r.as_Value();
+-                if(re.is_Const())
+-                    TODO(sp, "Handle Constant::Const in match");
+-
+-                if( re.as_Int().v > S128(INT64_MAX) || re.as_Int().v < S128(INT64_MIN) )
+-                    TODO(sp, "Handle 128-bit values in SwitchValue");
+-                values.push_back( re.as_Int().v.truncate_i64() );
+-                targets.push_back( arm_targets[tgt_ofs] );
++                if(re.is_Const()) {
++                    // Inject a `If` chained to a new block
++                    auto next_block = m_builder.new_bb_unlinked();
++                    push_if_equal(sp, m_builder, val.clone(), ::MIR::Param(re.clone()), arm_targets[tgt_ofs], next_block);
++                    m_builder.set_cur_block(next_block);
++                }
++                else if( re.as_Int().v > S128(INT64_MAX) || re.as_Int().v < S128(INT64_MIN) ) {
++                    large_values.push_back(std::make_pair(re.clone(), arm_targets[tgt_ofs]));
++                }
++                else {
++                    values.push_back( re.as_Int().v.truncate_i64() );
++                    targets.push_back( arm_targets[tgt_ofs] );
++                }
+ 
+                 tgt_ofs += rules[i].size();
+             }
+-            m_builder.end_block( ::MIR::Terminator::make_SwitchValue({
+-                mv$(val), def_blk, mv$(targets), ::MIR::SwitchValues(mv$(values))
+-                }) );
++            // If there were any values that don't fit in i64, then emit those as a chain of `if` terminators
++            if( !large_values.empty() ) {
++                auto tail_block = m_builder.new_bb_unlinked();
++                m_builder.end_block( ::MIR::Terminator::make_SwitchValue({
++                    val.clone(), tail_block, mv$(targets), ::MIR::SwitchValues(mv$(values))
++                    }) );
++                m_builder.set_cur_block(tail_block);
++                for(auto& v : large_values) {
++                    auto next_block = m_builder.new_bb_unlinked();
++                    push_if_equal(sp, m_builder, val.clone(), mv$(v.first), v.second, next_block);
++                    m_builder.set_cur_block(next_block);
++                }
++                m_builder.end_block(::MIR::Terminator::make_Goto(def_blk));
++            }
++            else {
++                m_builder.end_block( ::MIR::Terminator::make_SwitchValue({
++                    mv$(val), def_blk, mv$(targets), ::MIR::SwitchValues(mv$(values))
++                    }) );
++            }
+         }
+         break;
+ 
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 7f239995..e801222e 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -5249,11 +5249,32 @@ namespace {
+                 m_of << indent << "default: "; cb(SIZE_MAX); m_of << "\n";
+                 m_of << indent << "} }\n";
+             }
++            else if( type_is_emulated_i128(ty) ) {
++                // A `switch` on `.lo` alone would also take values with any high half (`match x { 1 => .. }` on
++                // `(1 << 64) | 1`), so compare both halves: the values all fit in 64 bits, the high half is the
++                // zero/sign extension of the low one.
++                ::std::vector< ::std::pair<uint64_t, uint64_t> >  halves;  // lo, hi
++                if( const auto* ve = values.opt_Unsigned() ) {
++                    for(auto v : *ve)
++                        halves.push_back(::std::make_pair(v, uint64_t(0)));
++                }
++                else if( const auto* ve = values.opt_Signed() ) {
++                    for(auto v : *ve)
++                        halves.push_back(::std::make_pair(static_cast<uint64_t>(v), v < 0 ? UINT64_MAX : uint64_t(0)));
++                }
++                else {
++                    MIR_BUG(mir_res, "SwitchValue on " << ty << " with " << values.tag_str() << " values");
++                }
++                for(size_t i = 0; i < halves.size(); i++)
++                {
++                    m_of << indent << (i == 0 ? "if( " : "else if( ");
++                    emit_lvalue(val); m_of << ".lo == " << halves[i].first << "ull && ";
++                    emit_lvalue(val); m_of << ".hi == " << halves[i].second << "ull ) { "; cb(i); m_of << " }\n";
++                }
++                m_of << indent << (halves.empty() ? "{ " : "else { "); cb(SIZE_MAX); m_of << " }\n";
++            }
+             else if( const auto* ve = values.opt_Unsigned() ) {
+                 m_of << indent << "switch("; emit_lvalue(val);
+-                // TODO: Ensure that .hi is zero
+-                if(m_options.emulated_i128 && ty == ::HIR::CoreType::U128)
+-                    m_of << ".lo";
+                 m_of << ") {\n";
+                 for(size_t i = 0; i < ve->size(); i++)
+                 {
+@@ -5265,9 +5286,6 @@ namespace {
+             else if( const auto* ve = values.opt_Signed() ) {
+                 //assert(ve->size() == e.targets.size());
+                 m_of << indent << "switch("; emit_lvalue(val);
+-                // TODO: Ensure that .hi is zero
+-                if(m_options.emulated_i128 && ty == ::HIR::CoreType::I128)
+-                    m_of << ".lo";
+                 m_of << ") {\n";
+                 for(size_t i = 0; i < ve->size(); i++)
+                 {

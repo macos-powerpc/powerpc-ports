@@ -1,0 +1,132 @@
+From 27ff9f0fcc6b87f90bb705a2387154609f3f6dc6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 15:28:39 +0000
+Subject: [PATCH] resolve: every `super` skips the anonymous modules in its way
+
+pest_meta 2.9.0 (sshs 4.8.0) src/grammar.rs, the code pest_generator emits
+for every `#[derive(Parser)]`:
+
+    impl ::pest::Parser<Rule> for PestParser {
+        fn parse<'i>(rule: Rule, input: &'i str) -> .. {
+            mod rules {
+                #![allow(clippy::upper_case_acronyms)]
+                pub mod hidden { use super::super::Rule; .. }
+                pub mod visible { use super::super::Rule; .. }
+                pub use self::visible::*;
+            }
+
+died with "BUG: ASSERT FAIL: src/resolve/use.cpp:885: parent_modules.size()
+> 0: Anon module with no parent modules - crate::parser::grammar::#0".
+
+`super` names the parent's nearest named module (rustc: resolve_self of the
+parent, its nearest_parent_mod): a block's anonymous module is not a module
+for `super`, wherever it sits in the path. All three resolvers skipped the
+anonymous modules at one point only. Resolve_Use_AbsolutisePath skipped those
+trailing the current module, so from `grammar::#0::rules::hidden` the
+`super::super` stopped at `#0`, whose lookup from a named child has no parent
+chain (the assert), or found a body-local item of the same name. Resolve
+Absolute skipped those at the landing point: `super::super::K` from
+`outer::m::#0::a` was `outer::m::K`. The macro/module lookup in common.cpp
+popped one level whatever the count: `super::super::mk!()` found the parent's
+`mk`. Each `super` now pops a level and then every anonymous module above it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/resolve/absolute.cpp b/src/resolve/absolute.cpp
+index 21cc2147..7286bbf9 100644
+--- a/src/resolve/absolute.cpp
++++ b/src/resolve/absolute.cpp
+@@ -2029,10 +2029,19 @@ void Resolve_Absolute_Path(/*const*/ Context& context, const Span& sp, Context::
+         // - Determine how many components of the `self` path to use
+         const auto& mp_nodes = context.m_mod.path().nodes;
+         assert( e.count >= 1 );
+-        // TODO: The first super should ignore any anon modules.
+-        unsigned int start_len = e.count > mp_nodes.size() ? 0 : mp_nodes.size() - e.count;
++        // Every `super` names the parent's nearest NAMED module (rustc resolve_self / nearest_parent_mod): anonymous
++        // (block) modules are skipped wherever they sit in the path, not only at the landing point
++        // - `mod a { fn k() -> u32 { super::super::K } }` in a fn body of `outer::m` is `outer::m::#0::a`, and
++        //   `super::super` is `outer` (was `outer::m`); the `use` form is pest_meta 2.9.0's grammar.rs (see use.cpp)
++        unsigned int start_len = mp_nodes.size();
+         while( start_len > 0 && mp_nodes[start_len-1].c_str()[0] == '#' )
+             start_len --;
++        for( unsigned int s = 0; s < e.count && start_len > 0; s ++ )
++        {
++            start_len --;
++            while( start_len > 0 && mp_nodes[start_len-1].c_str()[0] == '#' )
++                start_len --;
++        }
+ 
+         // - Create a new path
+         ::AST::Path np("", {});
+diff --git a/src/resolve/common.cpp b/src/resolve/common.cpp
+index 6f358a45..772fb17f 100644
+--- a/src/resolve/common.cpp
++++ b/src/resolve/common.cpp
+@@ -262,14 +262,22 @@ namespace {
+             TU_ARMA(Super, e) {
+                 DEBUG("Super " << path);
+                 //ASSERT_BUG(sp, !base_nodes.empty(), "Super in empty path");
+-                // Pop current non-anon module, then look up in anon modules
++                // Pop the current non-anon module once per `super` (the count was ignored: `super::super::mk!()`
++                // looked in the parent), skipping anonymous modules wherever they sit (see use.cpp / absolute.cpp)
+                 size_t i = 0;
+-                while( i < base_nodes.size() && base_nodes[base_nodes.size() - i - 1].name().c_str()[0] == '#' )
++                auto skip_anon = [&]() {
++                    while( i < base_nodes.size() && base_nodes[base_nodes.size() - i - 1].name().c_str()[0] == '#' )
++                    {
++                        i += 1;
++                    }
++                };
++                skip_anon();
++                for( unsigned int s = 0; s < e.count; s ++ )
+                 {
+                     i += 1;
++                    skip_anon();
+                 }
+-                i += 1;
+-                ASSERT_BUG(sp, i <= base_nodes.size(), "");
++                ASSERT_BUG(sp, i <= base_nodes.size(), "Too many `super` components in " << path);
+                 const auto& start_mod = this->get_mod_by_true_path(base_nodes, base_nodes.size() - i);
+                 return get_module_ast(start_mod, path, 0, ignore_last, out_path);
+                 }
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index 45d04bf7..97965df6 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -327,15 +327,27 @@ static bool Resolve_Use_LocalImportShadows(const AST::Crate& crate, const ::AST:
+         DEBUG("Super " << path);
+         assert(e.count >= 1);
+         AST::Path   np("", {});
+-        if( e.count > base_path.nodes().size() ) {
+-            ERROR(span, E0000, "Too many `super` components");
++        // Every `super` names the parent's nearest NAMED module (rustc: `resolve_self` of the parent, i.e. its
++        // `nearest_parent_mod`): anonymous (block) modules are not modules for `super`, wherever they sit in the path.
++        // - The current module's own trailing anon modules (`use super::x` in a fn body, `..::#0::#1`) as before, and
++        //   the ones an earlier `super` lands on: pest_meta 2.9.0 grammar.rs (sshs, every pest_generator output)
++        //   `fn parse(..) { mod rules { pub mod hidden { use super::super::Rule; .. } .. } }` is `..::grammar::#0::rules::hidden`,
++        //   and `super::super` is `grammar` (the old code stopped at `#0`, whose `use` lookup has no parent chain
++        //   from a named child: "ASSERT FAIL: Anon module with no parent modules")
++        auto is_anon = [&](unsigned int i) { return base_path.nodes()[i].name().c_str()[0] == '#'; };
++        unsigned int n = base_path.nodes().size();
++        while( n > 0 && is_anon(n-1) )
++            n --;
++        for( unsigned int s = 0; s < e.count; s ++ )
++        {
++            if( n == 0 ) {
++                ERROR(span, E0000, "Too many `super` components");
++            }
++            n --;
++            while( n > 0 && is_anon(n-1) )
++                n --;
+         }
+-        // TODO: Do this in a cleaner manner.
+-        unsigned int n_anon = 0;
+-        // Skip any anon modules in the way (i.e. if the current module is an anon, go to the parent)
+-        while( base_path.nodes().size() > n_anon && base_path.nodes()[ base_path.nodes().size()-1-n_anon ].name().c_str()[0] == '#' )
+-            n_anon ++;
+-        for( unsigned int i = 0; i < base_path.nodes().size() - e.count - n_anon; i ++ )
++        for( unsigned int i = 0; i < n; i ++ )
+             np.nodes().push_back( base_path.nodes()[i] );
+         np += path;
+         return np;

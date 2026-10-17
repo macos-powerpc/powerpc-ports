@@ -1,0 +1,252 @@
+From fecee3cd451b7c1ee7d7abfa43e57eb91108d86f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 16 Oct 2026 23:33:24 +0000
+Subject: [PATCH 272/274] trans: a cdylib carries the runtime glue, exports
+ only its link-named functions; `-C link-arg`
+
+maturin builds Python extension modules (py-cryptography, pydantic-core, ...) with
+`cargo rustc --lib --crate-type cdylib` and the macOS flags `-C link-arg=-undefined
+-C link-arg=dynamic_lookup` (for every crate, via CARGO_ENCODED_RUSTFLAGS) and
+`-C link-args=-Wl,-install_name,@rpath/<module>.so`. None of that worked:
+
+- `--crate-type cdylib` was rejected on the command line (only `#![crate_type]` knew it).
+- `-C link-arg`/`-C link-args`: "Unknown codegen option".
+- The allocator/panic glue (`__rust_alloc` -> `__rdl_alloc`, the alloc error handler,
+  `__rust_no_alloc_shim_is_unstable_v2`, `panic_impl`, the `mrustc_panic_target` TLS)
+  was only written for executables and static archives, and the panic runtime crate
+  was only loaded for them. With `-undefined dynamic_lookup` the library still links;
+  the module fails when Python imports it ("Symbol not found: ___rust_alloc").
+- Every C function of the crate, its dependencies and std was exported. In a dylib
+  ld64 keeps every exported symbol, so `-dead_strip` (in the ppc-darwin link options)
+  dropped nothing, and references from dead code to symbols the system lacks, which
+  executables get rid of, become import-time failures with dynamic_lookup.
+
+Now:
+- `--crate-type cdylib` selects CDylib (default output lib<name>.dylib on macOS, .so
+  elsewhere); like a staticlib it loads the allocator/panic runtime crates and gets no
+  `mrustc-main`.
+- The glue is written for a cdylib too, in a second C file (`<out>.glue.c`) compiled
+  in the same compiler run: it declares the panic handler with a C signature, which
+  conflicts with the handler's definition when the library's own crate has it.
+- A cdylib exports only the functions the crate itself defines with `#[no_mangle]` or
+  `#[export_name]` (rustc also exports its dependencies' such items; not done here):
+  `-Wl,-exported_symbols_list,<out>.exports` on macOS, a `--version-script` elsewhere.
+- `-C link-arg=<arg>` and `-C link-args=<args>` (split at spaces) are appended to the
+  link of an executable or dynamic library, as with rustc; other crate types accept
+  and ignore them.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 95794817..44c09914 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -7,6 +7,7 @@
+  */
+ #include <iostream>
+ #include <iomanip>
++#include <sstream>
+ #include <string>
+ #include <set>
+ #include <algorithm>
+@@ -94,6 +95,7 @@ struct ProgramParams
+         ::std::string   codegen_type;
+         ::std::string   emit_build_command;
+         ::std::string   panic_type;
++        ::std::vector<::std::string>    link_args;
+     } codegen;
+ 
+     ProgramParams(int argc, char *argv[]);
+@@ -370,6 +372,9 @@ int main(int argc, char *argv[])
+             case ::AST::Crate::Type::StaticLib:
+                 params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << ".a");
+                 break;
++            case ::AST::Crate::Type::CDylib:
++                params.outfile = FMT(params.output_dir << "lib" << crate.m_crate_name_set << (Target_GetCurSpec().m_os_name == "macos" ? ".dylib" : ".so"));
++                break;
+             case ::AST::Crate::Type::Executable:
+                 params.outfile = FMT(params.output_dir << crate.m_crate_name_set << EXESUF);
+                 break;
+@@ -397,9 +402,9 @@ int main(int argc, char *argv[])
+ 
+         // Allocator and panic strategies
+         CompilePhaseV("Implicit Crates", [&]() {
+-            // A static archive is a whole program minus `main`, so it needs the allocator and panic runtime too
++            // A static archive or a cdylib is a whole program minus `main`, so it needs the allocator and panic runtime too
+             if( crate.m_crate_type == ::AST::Crate::Type::Executable || params.test_harness || crate.m_crate_type == ::AST::Crate::Type::ProcMacro
+-                || crate.m_crate_type == ::AST::Crate::Type::StaticLib )
++                || crate.m_crate_type == ::AST::Crate::Type::StaticLib || crate.m_crate_type == ::AST::Crate::Type::CDylib )
+             {
+                 bool allocator_crate_loaded = false;
+                 RcString    alloc_crate_name;
+@@ -454,8 +459,8 @@ int main(int argc, char *argv[])
+                     crate.load_extern_crate(Span(), panic_crate.c_str());
+                 }
+ 
+-                // - `mrustc-main` lang item default (a static archive has no entry point)
+-                if( crate.m_crate_type != ::AST::Crate::Type::StaticLib )
++                // - `mrustc-main` lang item default (a static archive or a cdylib has no entry point)
++                if( crate.m_crate_type != ::AST::Crate::Type::StaticLib && crate.m_crate_type != ::AST::Crate::Type::CDylib )
+                 {
+                     crate.m_lang_items.insert(::std::make_pair( ::std::string("mrustc-main"), ::AST::AbsolutePath("", {"main"}) ));
+                 }
+@@ -752,6 +757,8 @@ int main(int argc, char *argv[])
+         trans_opt.build_command_file = params.codegen.emit_build_command;
+         trans_opt.opt_level = params.opt_level;
+         trans_opt.panic_crate = params.codegen.panic_type == "" ? "panic_abort" : "panic_"+params.codegen.panic_type;
++        trans_opt.link_args = params.codegen.link_args;
++        trans_opt.is_cdylib = (crate_type == ::AST::Crate::Type::CDylib);
+         for(const char* libdir : params.lib_search_dirs ) {
+             // Store these paths for use in final linking.
+             hir_crate->m_link_paths.push_back( libdir );
+@@ -1066,6 +1073,19 @@ ProgramParams::ProgramParams(int argc, char *argv[])
+                     get_optval();
+                     this->codegen.panic_type = optval;
+                 }
++                // -C link-arg=<arg>, -C link-args=<space-separated args>: extra linker arguments, as rustc (only used
++                // when linking an executable or dynamic library; maturin passes them to every crate via RUSTFLAGS)
++                else if( optname == "link-arg" ) {
++                    get_optval();
++                    this->codegen.link_args.push_back(optval);
++                }
++                else if( optname == "link-args" ) {
++                    get_optval();
++                    ::std::istringstream    iss(optval);
++                    for(::std::string a; iss >> a; ) {
++                        this->codegen.link_args.push_back(a);
++                    }
++                }
+                 else {
+                     ::std::cerr << "Unknown codegen option: '" << optname << "'" << ::std::endl;
+                     exit(1);
+@@ -1269,6 +1289,10 @@ ProgramParams::ProgramParams(int argc, char *argv[])
+                 else if( strcmp(type_str, "dylib") == 0 ) {
+                     this->crate_type = ::AST::Crate::Type::RustDylib;
+                 }
++                // A library for C consumers, e.g. a Python extension module (minicargo/maturin pass it)
++                else if( strcmp(type_str, "cdylib") == 0 ) {
++                    this->crate_type = ::AST::Crate::Type::CDylib;
++                }
+                 else if( strcmp(type_str, "staticlib") == 0 ) {
+                     this->crate_type = ::AST::Crate::Type::StaticLib;
+                 }
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 276f46cd..7f239995 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -277,6 +277,8 @@ namespace {
+ 
+         ::std::set< ::HIR::TypeRef> m_emitted_fn_types;
+         ::std::set< const TypeRepr*>    m_embedded_tags;
++        // Link names of the functions this crate defines (`#[no_mangle]`/`#[export_name]`): a cdylib exports only these
++        ::std::vector< ::std::string>   m_defined_link_names;
+     public:
+         CodeGenerator_C(const ::HIR::Crate& crate, const ::std::string& outfile):
+             m_crate(crate),
+@@ -889,7 +891,10 @@ namespace {
+ 
+         void finalise(const TransOptions& opt, CodegenOutput out_ty, const ::std::string& hir_file) override
+         {
+-            const bool create_shims = (out_ty == CodegenOutput::Executable || out_ty == CodegenOutput::StaticArchive);
++            // A cdylib is a final artifact too: without the glue its `__rust_alloc` etc. stay undefined, which a Python
++            // extension (linked with `-undefined dynamic_lookup`) only reports when it is imported
++            const bool is_cdylib = (out_ty == CodegenOutput::DynamicLibrary && opt.is_cdylib);
++            const bool create_shims = (out_ty == CodegenOutput::Executable || out_ty == CodegenOutput::StaticArchive || is_cdylib);
+ 
+             // TODO: Support dynamic libraries too
+             // - No main, but has the rest.
+@@ -928,8 +933,10 @@ namespace {
+             // A static archive gets the glue in its own object: when two mrustc archives are linked into one program,
+             // each crate object is pulled in (it defines the symbols the program asked for), but an archive member is
+             // only loaded for a still-undefined symbol, so only one copy of the glue is.
++            // A cdylib compiles it as a second source file: the glue declares the panic handler with a C signature,
++            // which conflicts with the handler's definition when the library's own crate has it.
+             ::std::string   glue_path_c;
+-            if( out_ty == CodegenOutput::StaticArchive )
++            if( out_ty == CodegenOutput::StaticArchive || (is_cdylib && m_compiler == Compiler::Gcc) )
+             {
+                 m_of.flush();
+                 m_of.close();
+@@ -1423,6 +1430,10 @@ namespace {
+                     break;
+                 }
+                 args.push_back(m_outfile_path_c.c_str());
++                if( out_ty == CodegenOutput::DynamicLibrary && glue_path_c != "" )
++                {
++                    args.push_back(glue_path_c);
++                }
+                 switch(out_ty)
+                 {
+                 case CodegenOutput::DynamicLibrary:
+@@ -1467,6 +1478,43 @@ namespace {
+                     {
+                         args.push_back( a.c_str() );
+                     }
++                    if( is_cdylib )
++                    {
++                        // Export only the crate's link-named functions, as rustc does for a cdylib. Besides the size:
++                        // ld64 keeps every exported symbol of a dylib, so `-dead_strip` would keep all of std and the
++                        // dependencies, and their references to symbols the system lacks would remain.
++                        // - Upstream crates' `#[no_mangle]` items are not exported (rustc exports them too)
++                        ::std::sort(m_defined_link_names.begin(), m_defined_link_names.end());
++                        m_defined_link_names.erase(::std::unique(m_defined_link_names.begin(), m_defined_link_names.end()), m_defined_link_names.end());
++                        if( Target_GetCurSpec().m_os_name == "macos" )
++                        {
++                            auto list_path = m_outfile_path + ".exports";
++                            ::std::ofstream os(list_path);
++                            for(const auto& n : m_defined_link_names)
++                                os << get_asm_symbol_name(n) << "\n";
++                            ASSERT_BUG(Span(), os.good(), "Failed to write " << list_path);
++                            args.push_back("-Wl,-exported_symbols_list," + list_path);
++                        }
++                        else if( Target_GetCurSpec().m_family == "unix" )
++                        {
++                            auto script_path = m_outfile_path + ".version";
++                            ::std::ofstream os(script_path);
++                            os << "{\n";
++                            if( !m_defined_link_names.empty() ) {
++                                os << "global:\n";
++                                for(const auto& n : m_defined_link_names)
++                                    os << "\t" << get_asm_symbol_name(n) << ";\n";
++                            }
++                            os << "local:\n\t*;\n};\n";
++                            ASSERT_BUG(Span(), os.good(), "Failed to write " << script_path);
++                            args.push_back("-Wl,--version-script=" + script_path);
++                        }
++                    }
++                    // `-C link-arg(s)`, last as with rustc
++                    for( const auto& a : opt.link_args )
++                    {
++                        args.push_back( a.c_str() );
++                    }
+                     // TODO: Include the HIR file as a magic object?
+                     break;
+                 case CodegenOutput::StaticLibrary:
+@@ -3392,6 +3440,9 @@ namespace {
+         void emit_function_code(const ::HIR::Path& p, const ::HIR::Function& item, const Trans_Params& params, bool is_extern_def, const ::MIR::FunctionPointer& code) override
+         {
+             emit_function_code_inner(p, item, params, is_extern_def, code);
++            if( !is_extern_def && item.m_linkage.name != "" ) {
++                m_defined_link_names.push_back(item.m_linkage.name);
++            }
+ 
+             // Scalarised C ABI signature: emit the `<name>__cabi` wrapper that external callers use (see `get_cabi_scalar`)
+             CAbiSig cabi;
+diff --git a/src/trans/main_bindings.hpp b/src/trans/main_bindings.hpp
+index 713b933a..6b6ed29d 100644
+--- a/src/trans/main_bindings.hpp
++++ b/src/trans/main_bindings.hpp
+@@ -24,6 +24,12 @@ struct TransOptions
+ 
+     ::std::vector< ::std::string>   library_search_dirs;
+     ::std::vector< ::std::string>   libraries;
++
++    // `-C link-arg`/`-C link-args`: appended to the link of an executable or dynamic library
++    ::std::vector< ::std::string>   link_args;
++    // `--crate-type cdylib`: a final artifact for C consumers (e.g. a Python extension module) - it carries the runtime
++    // glue and exports only the crate's own link-named (`#[no_mangle]`/`#[export_name]`) functions
++    bool is_cdylib = false;
+ };
+ 
+ enum class CodegenOutput {

@@ -1,0 +1,100 @@
+From 6207cad6361c07ad8f6dd0f251a6a89d949b2129 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 05:09:10 +0000
+Subject: [PATCH 280/281] hir: brace literals of unit and tuple enum variants, `E::Unit {}`
+
+just 1.59.0 died lowering the crate to HIR:
+
+    src/config_error.rs:3:10-24 BUG: ASSERT FAIL: src/hir/from_ast.cpp:602:
+    !path.m_bindings.type.is_Unbound(): Encountered unbound type path -
+    crate::config_error::ConfigError::SearchDirConflict
+
+`#[derive(Snafu)]` (snafu-derive 0.9.2) builds every variant with braces,
+including the unit variant `SearchDirConflict` in its context selector's
+`build()` and `into_error()`:
+
+    ConfigError::SearchDirConflict { }
+
+That is valid Rust: `E::Unit {}` is `E::Unit`, and `E::Tuple {}` is
+`E::Tuple()` for a tuple variant without fields. mrustc binds unit and
+tuple variants in the value namespace only, and lowered every struct
+literal through the type binding. Patterns (`E::Unit { .. }`) already go
+through the value binding.
+
+A struct literal without fields whose path has only an enum variant value
+binding now lowers to the node the plain path gives (UnitVariant, or
+a TupleVariant with no arguments, so a tuple variant with fields gets the
+usual argument count error). Fields or a base value on such a variant are
+errors ("has no field named", "requires a struct") instead of BUGs.
+Resolve looks up `Var {}`, `self::Var {}` and `super::Var {}` without
+fields in the pattern mode, as `Var { .. }` patterns are, so
+a glob-imported unit variant is found ("Couldn't find type name 'A'"
+before). Other paths keep the type mode: the pattern mode rejects UFCS,
+and `<S as Tr>::Out {}` works.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir/from_ast_expr.cpp b/src/hir/from_ast_expr.cpp
+index 936fff43..040a2f0d 100644
+--- a/src/hir/from_ast_expr.cpp
++++ b/src/hir/from_ast_expr.cpp
+@@ -700,6 +700,42 @@ struct LowerHIR_ExprNode_Visitor:
+         }
+     }
+     virtual void visit(::AST::ExprNode_StructLiteral& v) override {
++        // `Enum::Unit {}` / `Enum::Tuple {}`: a variant that only lives in the value namespace (no type binding) - the
++        // literal is the variant's value or a call of its constructor, as `Enum::Unit` / `Enum::Tuple()`
++        if( v.m_path.m_bindings.type.is_Unbound() && v.m_path.m_bindings.value.binding.is_EnumVar() )
++        {
++            const auto& e = v.m_path.m_bindings.value.binding.as_EnumVar();
++            ASSERT_BUG(v.span(), e.enum_ || e.hir, "StructLiteral bound to an enum variant but pointer not set - " << v.m_path);
++            const auto& var_name = v.m_path.nodes().back().name();
++            if( !v.m_values.empty() )
++                ERROR(v.span(), E0000, "Variant " << v.m_path << " has no field named `" << v.m_values.front().name << "`");
++            if( v.m_base_value )
++                ERROR(v.span(), E0000, "Functional record update syntax requires a struct - " << v.m_path);
++            bool is_unit;
++            if( e.enum_ )
++            {
++                const auto& vars = e.enum_->variants();
++                auto it = ::std::find_if(vars.begin(), vars.end(), [&](const auto& x){ return x.m_name == var_name; });
++                ASSERT_BUG(v.span(), it != vars.end(), "Variant " << v.m_path << " isn't present");
++                ASSERT_BUG(v.span(), !it->m_data.is_Struct(), "Struct-like variant " << v.m_path << " without a type binding");
++                is_unit = it->m_data.is_Unit();
++            }
++            else
++            {
++                auto idx = e.hir->find_variant(var_name);
++                ASSERT_BUG(v.span(), idx != SIZE_MAX, "Variant " << v.m_path << " isn't present");
++                const auto* data = e.hir->m_data.opt_Data();
++                is_unit = !data || data->at(idx).type == ::HIR::TypeRef::new_unit();
++            }
++            auto path = LowerHIR_GenericPath(v.span(), v.m_path, FromAST_PathClass::Value);
++            if( is_unit ) {
++                m_rv.reset( new ::HIR::ExprNode_UnitVariant( v.span(), mv$(path), false ) );
++            }
++            else {
++                m_rv.reset( new ::HIR::ExprNode_TupleVariant( v.span(), mv$(path), false, {} ) );
++            }
++            return ;
++        }
+         if( v.m_path.m_bindings.type.binding.is_Union() )
+         {
+             if( v.m_values.size() != 1 )
+diff --git a/src/resolve/absolute.cpp b/src/resolve/absolute.cpp
+index e6e2c65e..21cc2147 100644
+--- a/src/resolve/absolute.cpp
++++ b/src/resolve/absolute.cpp
+@@ -2477,7 +2477,10 @@ void Resolve_Absolute_ExprNode(Context& context,  ::AST::ExprNode& node)
+         }
+         void visit(AST::ExprNode_StructLiteral& node) override {
+             DEBUG("ExprNode_StructLiteral");
+-            Resolve_Absolute_Path(this->context, node.span(), Context::LookupMode::Type, node.m_path);
++            // `Var {}` with a unit/tuple variant imported by name is only in the value namespace: look it up as the
++            // `Var { .. }` pattern does (`Var`, `self::Var`, `super::Var` only, the pattern mode rejects UFCS: `<T as Tr>::Out {}`)
++            bool any_variant = node.m_values.empty() && !node.m_base_value && node.m_path.is_relative();
++            Resolve_Absolute_Path(this->context, node.span(), any_variant ? Context::LookupMode::PatternType : Context::LookupMode::Type, node.m_path);
+             AST::NodeVisitorDef::visit(node);
+         }
+         void visit(AST::ExprNode_StructLiteralPattern& node) override {

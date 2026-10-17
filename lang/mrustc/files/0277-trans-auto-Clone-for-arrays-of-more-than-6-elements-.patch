@@ -1,0 +1,127 @@
+From db98ed60d48cf14a17e659acc86b9c54e9b2d4ea Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 01:30:38 +0000
+Subject: [PATCH] trans: auto Clone for arrays of more than 6 elements is a loop,
+ no 255-element cap
+
+ruzstd 0.8.2 (py314-maturin 1.15.0, via twox-hash) died in Trans Auto Impls:
+
+    <null> BUG: ASSERT FAIL: src/trans/auto_impls.cpp:147:te.size.as_Known() < 256:
+    TODO: Is more than 256 elements sane for auto-generated non-Copy Clone impl?
+    [::"ruzstd-0_8_2_H420"::fse::fse_encoder::SymbolStates/*S*/; 256]
+
+fse_encoder.rs keeps a `[SymbolStates; 256]` table in a `#[derive(Clone)]`
+struct. mrustc implements `Clone` for arrays itself (the magic impl in
+StaticTraitResolve::find_impl wins over core's), and Trans_AutoImpl_Clone
+unrolled it: one `Clone::clone` call block, a panic block and two locals
+per element, with the assert capping that at 255 elements.
+
+Arrays of more than 6 elements now get a counted loop instead, the shape the
+array drop glue in the same file uses:
+
+    bb0: idx = 0; goto bb1
+    bb1: borrow = &(*self)[idx]; res = <T as Clone>::clone(borrow) -> bb3 (panic bb2)
+    bb3: RETURN[idx] = res; idx = idx + 1; cmp = (idx == N); if cmp { bb4 } else { bb1 }
+    bb4: return
+
+with no size limit; arrays of up to 6 elements keep the unrolled form.
+The validator's value-state pass cannot see a return slot filled through
+an index, but auto impls are never validated (no HIR node, so
+MIR_CleanupCrate skips them); MRUSTC_MIR_CHECK=all passes the kit.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/trans/auto_impls.cpp b/src/trans/auto_impls.cpp
+index dbc87c8c..703aae02 100644
+--- a/src/trans/auto_impls.cpp
++++ b/src/trans/auto_impls.cpp
+@@ -144,21 +144,75 @@ void Trans_AutoImpl_Clone(State& state, ::HIR::TypeRef ty)
+             }
+             }
+         TU_ARMA(Array, te) {
+-            ASSERT_BUG(sp, te.size.as_Known() < 256, "TODO: Is more than 256 elements sane for auto-generated non-Copy Clone impl? " << ty);
+-            ::std::vector< ::MIR::Param>   values; values.reserve(te.size.as_Known());
+-            for(size_t i = 0; i < te.size.as_Known(); i ++)
++            const auto size = te.size.as_Known();
++            if( size <= 6 )
+             {
+-                auto fld_lvalue = ::MIR::LValue::new_Field( ::MIR::LValue::new_Deref(::MIR::LValue::new_Argument(0)), static_cast<unsigned>(values.size()) );
+-                values.push_back( clone_field(state, sp, mir_fcn, te.inner, mv$(fld_lvalue)) );
++                // Small arrays: one `Clone::clone` call per element, then build the result from the values
++                ::std::vector< ::MIR::Param>   values; values.reserve(size);
++                for(size_t i = 0; i < size; i ++)
++                {
++                    auto fld_lvalue = ::MIR::LValue::new_Field( ::MIR::LValue::new_Deref(::MIR::LValue::new_Argument(0)), static_cast<unsigned>(values.size()) );
++                    values.push_back( clone_field(state, sp, mir_fcn, te.inner, mv$(fld_lvalue)) );
++                }
++                // Construct the result
++                ::MIR::BasicBlock   bb;
++                bb.statements.push_back(::MIR::Statement::make_Assign({
++                    ::MIR::LValue::new_Return(),
++                    ::MIR::RValue::make_Array({ mv$(values) })
++                    }));
++                bb.terminator = ::MIR::Terminator::make_Return({});
++                mir_fcn.blocks.push_back(::std::move( bb ));
++            }
++            else
++            {
++                // Larger arrays (`[SymbolStates; 256]` in ruzstd 0.8.2, `[Vec<T>; 1024]`, ...): a counted loop that
++                // clones each element straight into the return slot, the same shape as the array drop glue below.
++                // Unrolling used to be capped at 255 elements (one call block and two locals per element).
++                //  bb0: idx = 0; goto bb1
++                //  bb1: borrow = &(*self)[idx]; res = <T as Clone>::clone(borrow) -> bb3 (panic: bb2)
++                //  bb3: RETURN[idx] = res; idx = idx + 1; cmp = (idx == size); if cmp { bb4 } else { bb1 }
++                //  bb4: return
++                auto idx_lv = ::MIR::LValue::new_Local( mir_fcn.locals.size() );
++                mir_fcn.locals.push_back( ::HIR::CoreType::Usize );
++                auto cmp_lv = ::MIR::LValue::new_Local( mir_fcn.locals.size() );
++                mir_fcn.locals.push_back( ::HIR::CoreType::Bool );
++                {
++                    ::MIR::BasicBlock   bb;
++                    bb.statements.push_back(::MIR::Statement::make_Assign({
++                        idx_lv.clone(),
++                        ::MIR::RValue::make_Constant( ::MIR::Constant::make_Uint({ U128(0), ::HIR::CoreType::Usize }) )
++                        }));
++                    bb.terminator = ::MIR::Terminator::make_Goto( static_cast<unsigned>(mir_fcn.blocks.size() + 1) );
++                    mir_fcn.blocks.push_back(::std::move( bb ));
++                }
++                const auto bb_loop = static_cast<unsigned>(mir_fcn.blocks.size());
++                auto elem_lvalue = ::MIR::LValue::new_Index( ::MIR::LValue::new_Deref(::MIR::LValue::new_Argument(0)), idx_lv.as_Local() );
++                auto res = clone_field(state, sp, mir_fcn, te.inner, mv$(elem_lvalue));
++                {
++                    ::MIR::BasicBlock   bb;
++                    bb.statements.push_back(::MIR::Statement::make_Assign({
++                        ::MIR::LValue::new_Index( ::MIR::LValue::new_Return(), idx_lv.as_Local() ),
++                        res.is_LValue()
++                            ? ::MIR::RValue::make_Use( mv$(res.as_LValue()) )
++                            : ::MIR::RValue::make_Constant( mv$(res.as_Constant()) )
++                        }));
++                    bb.statements.push_back(::MIR::Statement::make_Assign({
++                        idx_lv.clone(),
++                        ::MIR::RValue::make_BinOp({ idx_lv.clone(), ::MIR::eBinOp::ADD, ::MIR::Constant::make_Uint({ U128(1), ::HIR::CoreType::Usize }) })
++                        }));
++                    bb.statements.push_back(::MIR::Statement::make_Assign({
++                        cmp_lv.clone(),
++                        ::MIR::RValue::make_BinOp({ idx_lv.clone(), ::MIR::eBinOp::EQ, ::MIR::Constant::make_Uint({ U128(size), ::HIR::CoreType::Usize }) })
++                        }));
++                    bb.terminator = ::MIR::Terminator::make_If({ cmp_lv.clone(), /*bb_true=*/static_cast<unsigned>(mir_fcn.blocks.size() + 1), /*bb_false=*/bb_loop });
++                    mir_fcn.blocks.push_back(::std::move( bb ));
++                }
++                {
++                    ::MIR::BasicBlock   bb;
++                    bb.terminator = ::MIR::Terminator::make_Return({});
++                    mir_fcn.blocks.push_back(::std::move( bb ));
++                }
+             }
+-            // Construct the result
+-            ::MIR::BasicBlock   bb;
+-            bb.statements.push_back(::MIR::Statement::make_Assign({
+-                ::MIR::LValue::new_Return(),
+-                ::MIR::RValue::make_Array({ mv$(values) })
+-                }));
+-            bb.terminator = ::MIR::Terminator::make_Return({});
+-            mir_fcn.blocks.push_back(::std::move( bb ));
+             }
+         TU_ARMA(Tuple, te) {
+             assert(te.size() > 0);

@@ -1,0 +1,108 @@
+From d2ad92ea89d74e484afd0cd0bf88eab5186af4fa Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 07:17:54 +0000
+Subject: [PATCH] trans: `align_of` of an empty enum or `!` is 1, not 0
+
+just 1.59.0 died in Trans Monomorph:
+
+    error:0: Constant evaluation panicked while evaluating
+    ::"core-0_0_0"::ptr::alignment::lifted#0<::"core-0_0_0"::ptr::alignment::Alignment,
+    ::"just-1_59_0"::warning::Warning,>
+
+just has `pub(crate) enum Warning {}` and keeps a `Vec<Warning>`. RawVec
+asks for `Alignment::of::<Warning>()`, which core 1.90 defines as
+
+    const { Alignment::new(align_of::<T>()).unwrap() }
+
+The layout code gives empty enums and `!` alignment 0 ("no constraint").
+0 isn't a power of two, so `new` returned None and the `unwrap` in the
+lifted inline const panicked. rustc reports size 0, align 1.
+
+The layout keeps 0: an align-1 zero-sized field makes codegen_c emit
+an explicit `aligned` attribute on the containing struct (and target.cpp's
+Darwin ppc32 user-alignment model follows it), which could move fields of
+types around it and break compatibility with code compiled before. Only
+what Rust code sees changes: the new Target_GetRustAlignOf reports 1 for
+those types, used by the `align_of`/`min_align_of` intrinsic in codegen_c,
+constant evaluation and the MIR optimiser's fold. `align_of_val` already
+gave 1 (C `_Alignof` of the empty struct).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index 439b9178..388dddd1 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -2637,7 +2637,7 @@ namespace HIR {
+                 else if( te->name == "align_of" || te->name == "min_align_of" ) {
+                     auto ty = local_state.monomorph_expand(te->params.m_types.at(0));
+                     size_t  align_val;
+-                    if( Target_GetAlignOf(state.sp, this->resolve, ty, align_val) )
++                    if( Target_GetRustAlignOf(state.sp, this->resolve, ty, align_val) )
+                         dst.write_uint(state, Target_GetPointerBits(), U128(align_val));
+                     else
+                         throw Defer();
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index aea68e9d..a93f2c9a 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -3328,7 +3328,7 @@ bool MIR_Optimise_ConstPropagate(::MIR::TypeResolve& state, ::MIR::Function& fcn
+         else if( tef.name == "align_of" || tef.name == "min_align_of" )
+         {
+             size_t align_val = 0;
+-            if( Target_GetAlignOf(state.sp, state.m_resolve, tef.params.m_types.at(0), align_val) )
++            if( Target_GetRustAlignOf(state.sp, state.m_resolve, tef.params.m_types.at(0), align_val) )
+             {
+                 DEBUG("align_of = " << align_val);
+                 auto val = ::MIR::Constant::make_Uint({ U128(align_val), ::HIR::CoreType::Usize });
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index af0bf45c..cc71c82f 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -6911,7 +6911,7 @@ namespace {
+             }
+             else if( name == "min_align_of" || name == "align_of" ) {
+                 size_t align = 0;
+-                MIR_ASSERT(mir_res, Target_GetAlignOf(sp, m_resolve, params.m_types.at(0), align), "Can't get alignment of " << params.m_types.at(0));
++                MIR_ASSERT(mir_res, Target_GetRustAlignOf(sp, m_resolve, params.m_types.at(0), align), "Can't get alignment of " << params.m_types.at(0));
+                 emit_lvalue(e.ret_val); m_of << " = " << align;
+             }
+             else if( name == "size_of_val" ) {
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index eed21793..d5cba327 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -1006,6 +1006,18 @@ bool Target_GetAlignOf(const Span& sp, const StaticTraitResolve& resolve, const
+         BUG(sp, "Getting alignment of Unsized type - " << ty);
+     return rv;
+ }
++bool Target_GetRustAlignOf(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty, size_t& out_align)
++{
++    if( !Target_GetAlignOf(sp, resolve, ty, out_align) )
++        return false;
++    // Empty enums and `!` have no alignment constraint in the layout code (align 0), but 0 isn't a power of two:
++    // core 1.90's `Alignment::of::<T>()` (`const { Alignment::new(align_of::<T>()).unwrap() }`, RawVec for a
++    // `Vec<Warning>` with `enum Warning {}`) panicked in constant evaluation. The layout keeps 0: an align-1 ZST
++    // field makes codegen_c emit an explicit `aligned` attribute, which changes Darwin ppc32 layouts.
++    if( out_align == 0 )
++        out_align = 1;
++    return true;
++}
+ 
+ 
+ namespace {
+diff --git a/src/trans/target.hpp b/src/trans/target.hpp
+index a51b0bba..80453b0d 100644
+--- a/src/trans/target.hpp
++++ b/src/trans/target.hpp
+@@ -189,6 +189,9 @@ static inline unsigned Target_GetPointerBits() { return Target_GetCurSpec().m_ar
+ 
+ extern bool Target_GetSizeOf(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty, size_t& out_size);
+ extern bool Target_GetAlignOf(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty, size_t& out_align);
++/// The alignment Rust code sees (`align_of::<T>()`): as Target_GetAlignOf, except that a type with no alignment
++/// constraint in the layout (align 0: an empty enum, `!`) reports 1, as rustc does
++extern bool Target_GetRustAlignOf(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty, size_t& out_align);
+ extern bool Target_GetSizeAndAlignOf(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& ty, size_t& out_size, size_t& out_align);
+ 
+ /// This function is for the MIR Optimisation tool, which has to be able to read and use existing layouts

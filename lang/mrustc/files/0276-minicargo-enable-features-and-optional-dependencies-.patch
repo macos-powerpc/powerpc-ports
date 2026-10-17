@@ -1,0 +1,172 @@
+From e0790ac14b1e92841824dbc2345383689ac8cb3b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 16 Oct 2026 23:51:27 +0000
+Subject: [PATCH] minicargo: enable features and optional dependencies as cargo does
+
+Three differences from cargo's feature resolver, found while exporting the graph for
+maturin (0275):
+
+- The implicit feature `<name> = ["dep:<name>"]` was created for every dependency;
+  cargo creates it only for optional ones (and not when [features] says
+  `dep:<name>`).
+- `<dep>/<feature>` always turned `<dep>` on as a feature of the package; cargo
+  enables only an optional `<dep>`, with its implicit feature if it has one.
+- `dep:<name>` was activated as a feature named "dep:<name>" (that is how the optional
+  dependency got enabled).
+
+So a package with `x = ["regex/std"]` was compiled with `--cfg feature="regex"` and
+`--cfg feature="dep:regex"`, and its build script saw CARGO_FEATURE_REGEX=1 and
+CARGO_FEATURE_DEP:REGEX=1, although regex isn't optional and cargo knows no such
+features. With maturin 1.15.0's graph, 43 of 284 crates had such features (goblin
+`scroll`, serde `serde_core`, sha2 `digest`, pyo3 `pyo3-ffi`, ...).
+
+Now implicit features exist for optional dependencies only (PackageManifest::
+m_implicit_dep_features); `dep:<name>` enables the dependency directly; a non-weak
+`<dep>/<feature>` enables an optional `<dep>` and adds its implicit feature only when
+there is one. The crate set doesn't change (same 284 crates for maturin).
+
+NOTE: the feature bitmask in rlib names (`_H<mask>`) covers all features, so most
+crate rlibs get new names: everything is rebuilt once, no incremental resume.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index 65e2b067..22942b10 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -112,15 +112,8 @@ namespace {
+                 << ",\"version\":" << json_str(p.version().to_string_full())
+                 << ",\"manifest_path\":" << json_str((p.directory().to_absolute() / "Cargo.toml").str())
+                 << ",\"features\":[";
+-            // (`dep:<name>` entries are how minicargo enables optional dependencies, not features)
+-            bool first = true;
+-            for(const auto& f : p.active_features())
+-            {
+-                if( f.compare(0, 4, "dep:") == 0 )
+-                    continue;
+-                os << (first ? "" : ",") << json_str(f);
+-                first = false;
+-            }
++            for(size_t k = 0; k < p.active_features().size(); k ++)
++                os << (k == 0 ? "" : ",") << json_str(p.active_features()[k]);
+             os << "],\"deps\":[" << deps << "]}";
+         }
+         os << "\n]}\n";
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index a23f7c47..93a227c9 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -364,12 +364,19 @@ PackageManifest PackageManifest::load_from_toml(const ::std::string& path, const
+         }
+         note_dep_refs(rv.m_default_features);
+ 
++        // - Only for optional dependencies: a plain dependency's name is no feature (a `foo/bar` feature used to turn
++        //   `foo` and `dep:foo` on as features, i.e. `--cfg feature="foo"` and CARGO_FEATURE_FOO for non-optional `foo`)
+         auto cb2 = [&](const PackageRef& dep) {
++            if( !dep.m_optional ) {
++                return;
++            }
+             if( explicit_dep_refs.count(dep.key()) > 0 ) {
+                 DEBUG("No implicit feature for optional dependency '" << dep.key() << "' - [features] uses `dep:` for it");
+                 return;
+             }
+-            rv.m_features[dep.key()].push_back( "dep:" + dep.key() );
++            if( rv.m_implicit_dep_features.insert(dep.key()).second ) {
++                rv.m_features[dep.key()].push_back( "dep:" + dep.key() );
++            }
+             };
+         auto cb = [&](const Dependencies& deps) {
+             for(const auto& dep : deps.main) {
+@@ -1370,28 +1377,42 @@ void PackageManifest::set_features(const ::std::vector<::std::string>& features,
+                 cb(dep);
+         });
+     };
++    // `dep:<name>`: turns the optional dependency <name> on (it is not a feature)
++    auto enable_dep = [&](const ::std::string& depname) {
++        iter_all_deps([&](PackageRef& dep) {
++            if( dep.m_key == depname && dep.m_optional && !dep.m_optional_enabled ) {
++                DEBUG("Enable optional dependency '" << depname << "'");
++                dep.m_optional_enabled = true;
++                m_dependencies_loaded = false;
++            }
++            });
++    };
+     // `<dep>/<feature>` (`<dep>?/<feature>`: only if the dependency is enabled otherwise): a dependency's feature,
+     // from a feature list or requested directly - as maturin does (`--features pyo3/extension-module`), or a dependency
+     // declaration's `features = [..]`. Returns false for a plain feature name.
++    // - As cargo: the non-weak form also turns an optional `<dep>` on, with its implicit feature `<dep>` if it has one;
++    //   a plain dependency gets no feature of its name.
+     auto activate_dep_feature = [&](const ::std::string& sub_feat)->bool {
+         auto slash_pos = sub_feat.find('/');
+         if( slash_pos == ::std::string::npos ) {
+             return false;
+         }
+         ::std::string depname = sub_feat.substr(0, slash_pos);
+-        bool enable_optional = true;
++        bool weak = false;
+         if( depname.back() == '?' ) {
+             depname.pop_back();
+-            enable_optional = false;
+-        }
+-        else {
+-            add_feature(depname);
++            weak = true;
+         }
+         ::std::string depfeat = sub_feat.substr(slash_pos+1);
+         DEBUG("Activate feature '" << depfeat << "' from dependency '" << depname << "'");
++        if( !weak ) {
++            if( m_implicit_dep_features.count(depname) ) {
++                add_feature(depname);
++            }
++            enable_dep(depname);
++        }
+         iter_all_deps([&](PackageRef& dep) {
+             if(dep.m_key == depname) {
+-                dep.m_optional_enabled |= enable_optional;
+                 dep.m_features.push_back(depfeat);
+                 // TODO: Does this need to call `set_features` again?
+             }
+@@ -1426,17 +1447,14 @@ void PackageManifest::set_features(const ::std::vector<::std::string>& features,
+             DEBUG("Activating feature " << featname << " = [" << *feat_list << "]");
+             for(const auto& sub_feat : *feat_list)
+             {
+-                if( !activate_dep_feature(sub_feat) ) {
++                if( sub_feat.compare(0, 4, "dep:") == 0 ) {
++                    enable_dep(sub_feat.substr(4));
++                }
++                else if( !activate_dep_feature(sub_feat) ) {
+                     add_feature(sub_feat);
+                 }
+             }
+         }
+-
+-        iter_all_deps([&](PackageRef& dep) {
+-            if( "dep:"+dep.m_key == featname ) {
+-                dep.m_optional_enabled = true;
+-            }
+-            });
+     }
+ 
+     // Return true if any features were activated
+diff --git a/tools/minicargo/manifest.h b/tools/minicargo/manifest.h
+index 9b18644c..76c688a4 100644
+--- a/tools/minicargo/manifest.h
++++ b/tools/minicargo/manifest.h
+@@ -10,6 +10,7 @@
+ #include <string>
+ #include <vector>
+ #include <map>
++#include <set>
+ #include <memory>
+ #include <functional>
+ #include <path.h>
+@@ -425,6 +426,8 @@ class PackageManifest
+ 
+     // Cleared if any features mention `dep:`
+     bool m_enable_implicit_optional_dep_features = true;
++    // Optional dependencies with the implicit feature `<name> = ["dep:<name>"]` (those `[features]` doesn't name as `dep:<name>`)
++    ::std::set<::std::string>   m_implicit_dep_features;
+ 
+     PackageManifest();
+ 

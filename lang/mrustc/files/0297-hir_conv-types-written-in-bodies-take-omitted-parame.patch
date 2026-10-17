@@ -1,0 +1,347 @@
+From c62c92f62b7a972745094f0959e815be8a5574ec Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 14:12:55 +0000
+Subject: [PATCH] hir_conv: types written in bodies take omitted parameter defaults
+
+Found while fixing 0295 (object 0.38.1): Resolve Type Aliases and Resolve Bind filled every omitted generic list
+inside a body with inference variables. rustc does that only for the head of a value path (`W::new()`, `W(..)`,
+`W { .. }`, patterns); a type written anywhere else in a body takes the defaults. So
+- `let x: W = W(3)` with `struct W<T = u8>` was `W<i32>` (rustc `W<u8>`), and `W(3u32)` there was accepted;
+- `let x: Id = Id(3)` with `struct Id<const D: bool = false>` died in typeck: "Failure to infer Infer(1) in _";
+- `size_of::<Arr>()` with `type Arr<const N: usize = 3> = [u8; N]` died in Trans Enumerate: "Encountered unknown
+  array size - [u8; Infer(0)]".
+
+Both passes now mark the type of a value path (`Foo::new` / `Foo { .. }`) as the head; any other type in a body
+takes the defaults when every parameter of that kind has one (a list with an undefaulted parameter is still left to
+inference, lenient where rustc errors). Alias expansion monomorphises type defaults against the list filled so far
+(a default naming an earlier defaulted parameter, `type C<T = u8, U = W<T>>`), and an alias's own type gets its
+struct/enum/union defaults before it is copied into a body (`type B = Br;` + `B { .. }` is `Br<false>`).
+object's `Builder { dynamic_symbols: Symbols::new() }` (a head, `Symbols<'data, true>` field) still infers.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_conv/bind.cpp b/src/hir_conv/bind.cpp
+index a0bc74e7..bff0bff4 100644
+--- a/src/hir_conv/bind.cpp
++++ b/src/hir_conv/bind.cpp
+@@ -94,7 +94,11 @@ namespace {
+     void fix_param_count(
+         const Span& sp,
+         const ::HIR::GenericPath& path, const ::HIR::GenericParams& param_defs, ::HIR::PathParams& params,
+-        bool fill_infer=true, const ::HIR::TypeRef* self_ty=nullptr
++        bool fill_infer=true, const ::HIR::TypeRef* self_ty=nullptr,
++        // `fill_infer` for a type written in a body: rustc leaves an omitted list to inference only for the head of a
++        // value path (`Foo::new()`); any other type there (`let x: Foo`, a cast, a turbofish argument) takes the
++        // defaults when every parameter of that kind has one (else the list is still inferred: a rustc error anyway)
++        bool infer_defaulted=true
+         )
+     {
+         TRACE_FUNCTION_FR(param_defs.fmt_args() << " -> " << params << " (fill_infer=" << fill_infer << ")", params);
+@@ -108,7 +112,9 @@ namespace {
+         {
+             TRACE_FUNCTION_FR(path, params);
+ 
+-            if( params.m_types.size() == 0 && fill_infer ) {
++            bool all_defaulted = std::all_of(param_defs.m_types.begin(), param_defs.m_types.end(),
++                [](const ::HIR::TypeParamDef& p){ return !p.m_default.data().is_Infer(); });
++            if( params.m_types.size() == 0 && fill_infer && (infer_defaulted || !all_defaulted) ) {
+                 params.m_types.resize( param_defs.m_types.size() );
+             }
+             else if( params.m_types.size() > param_defs.m_types.size() ) {
+@@ -131,7 +137,9 @@ namespace {
+         }
+         if( params.m_values.size() != param_defs.m_values.size() )
+         {
+-            if( params.m_values.size() == 0 && fill_infer ) {
++            bool all_defaulted = std::all_of(param_defs.m_values.begin(), param_defs.m_values.end(),
++                [](const ::HIR::ValueParamDef& p){ return !p.m_default.is_Infer(); });
++            if( params.m_values.size() == 0 && fill_infer && (infer_defaulted || !all_defaulted) ) {
+                 params.m_values.resize(param_defs.m_values.size());
+             }
+             else if( params.m_values.size() > param_defs.m_values.size() ) {
+@@ -169,6 +177,8 @@ namespace {
+         } m_cur_module;
+ 
+         unsigned m_in_expr;
++        // The next type visited is the head of a value path (`Foo::new()`): its omitted lists are inferred
++        bool m_value_head = false;
+ 
+         ::HIR::ItemPath* m_fcn_path = nullptr;
+         ::HIR::Function* m_fcn_ptr = nullptr;
+@@ -375,6 +385,14 @@ namespace {
+                 fix_param_count(sp, bound.m_path, trait.m_params, bound.m_path.m_params, /*fill_infer=*/false, &ty);
+             }
+         }
++        void visit_path(::HIR::Path& p, ::HIR::Visitor::PathContext pc) override
++        {
++            // The type of `Foo::new` is visited first
++            if( m_in_expr && pc == ::HIR::Visitor::PathContext::VALUE && (p.m_data.is_UfcsUnknown() || p.m_data.is_UfcsInherent()) )
++                m_value_head = true;
++            ::HIR::Visitor::visit_path(p, pc);
++            m_value_head = false;
++        }
+         void visit_type(::HIR::TypeRef& ty) override
+         {
+             visit_type_inner(ty);
+@@ -383,6 +401,9 @@ namespace {
+         {
+             //TRACE_FUNCTION_F(ty);
+             static Span sp;
++            // Only this level: the parameters of a value path's type are type positions again (`Wrap::<Foo>::new()`)
++            bool value_head = m_value_head;
++            m_value_head = false;
+ 
+             if(auto* e = ty.data_mut().opt_Path())
+             {
+@@ -404,17 +425,17 @@ namespace {
+                         DEBUG("- " << ty);
+                         ),
+                     (Struct,
+-                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0);
++                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0, nullptr, /*infer_defaulted=*/value_head);
+                         e->binding = ::HIR::TypePathBinding::make_Struct(&e3);
+                         DEBUG("- " << ty);
+                         ),
+                     (Union,
+-                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0);
++                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0, nullptr, /*infer_defaulted=*/value_head);
+                         e->binding = ::HIR::TypePathBinding::make_Union(&e3);
+                         DEBUG("- " << ty);
+                         ),
+                     (Enum,
+-                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0);
++                        fix_param_count(sp, pe, e3.m_params,  pe.m_params, /*fill_infer=*/m_in_expr!=0, nullptr, /*infer_defaulted=*/value_head);
+                         e->binding = ::HIR::TypePathBinding::make_Enum(&e3);
+                         DEBUG("- " << ty);
+                         ),
+@@ -805,7 +826,11 @@ namespace {
+                 {
+                     upper_visitor.visit_type_inner(node.m_type, false);
+ 
++                    // `Foo { .. }` is a value path head (the default visit binds `m_type` first)
++                    if( node.m_type != ::HIR::TypeRef() )
++                        upper_visitor.m_value_head = true;
+                     ::HIR::ExprVisitorDef::visit(node);
++                    upper_visitor.m_value_head = false;
+                 }
+                 void visit(::HIR::ExprNode_ArraySized& node) override
+                 {
+diff --git a/src/hir_conv/expand_type.cpp b/src/hir_conv/expand_type.cpp
+index 9aecaba7..57cd300b 100644
+--- a/src/hir_conv/expand_type.cpp
++++ b/src/hir_conv/expand_type.cpp
+@@ -12,16 +12,25 @@
+ #include <hir_typeck/common.hpp>    // monomorphise_type_with
+ 
+ namespace {
+-    HIR::PathParams get_path_params(const Span& sp, const ::HIR::GenericParams& params_def, const ::HIR::GenericPath& path, bool is_expr)
++    // `is_expr`: the path is inside a body, where an omitted list is left to inference. rustc does that only for the head
++    // of a value path (`Foo::new()`, `Foo { .. }`, a pattern) = `infer_defaulted`; any other type written in a body
++    // (`let x: Foo`, a cast, a turbofish argument) takes the defaults as it would outside one. When a parameter without
++    // a default is omitted there (a rustc error), the list is still left to inference.
++    HIR::PathParams get_path_params(const Span& sp, const ::HIR::GenericParams& params_def, const ::HIR::GenericPath& path, bool is_expr, bool infer_defaulted)
+     {
+         auto pp = path.m_params.clone();
+ 
++        bool all_types_defaulted = std::all_of(params_def.m_types.begin(), params_def.m_types.end(),
++            [](const HIR::TypeParamDef& p){ return p.m_default != ::HIR::TypeRef(); });
++        bool all_values_defaulted = std::all_of(params_def.m_values.begin(), params_def.m_values.end(),
++            [](const HIR::ValueParamDef& p){ return !p.m_default.is_Infer(); });
++
+         // Empty list, fill with ivars
+-        if( is_expr && pp.m_types.empty() )
++        if( is_expr && pp.m_types.empty() && (infer_defaulted || !all_types_defaulted) )
+         {
+             pp.m_types.resize( params_def.m_types.size() );
+         }
+-        if( is_expr && pp.m_values.empty() )
++        if( is_expr && pp.m_values.empty() && (infer_defaulted || !all_values_defaulted) )
+         {
+             pp.m_values.resize( params_def.m_values.size() );
+         }
+@@ -32,23 +41,23 @@ namespace {
+             pp.m_lifetimes.resize( params_def.m_lifetimes.size() );
+         }
+ 
+-        auto ms_o = MonomorphStatePtr(nullptr, &path.m_params, nullptr);
++        // A default may name an earlier parameter that was itself defaulted (`type A<T = u8, U = Vec<T>>`,
++        // `type A<const N: usize = 2, const M: usize = N>`), so monomorphise against the list filled so far.
++        auto ms = MonomorphStatePtr(nullptr, &pp, nullptr);
+ 
+         pp.m_types.reserve( params_def.m_types.size() );
+         while( pp.m_types.size() < params_def.m_types.size() && params_def.m_types[pp.m_types.size()].m_default != ::HIR::TypeRef() ) {
+-            pp.m_types.push_back( ms_o.monomorph_type(sp, params_def.m_types[pp.m_types.size()].m_default) );
++            auto ty = ms.monomorph_type(sp, params_def.m_types[pp.m_types.size()].m_default);
++            pp.m_types.push_back( std::move(ty) );
+         }
+         if( pp.m_types.size() != params_def.m_types.size() ) {
+             ERROR(sp, E0000, "Mismatched type-generic count in " << path << ", expected " << params_def.m_types.size() << " got " << pp.m_types.size());
+         }
+ 
+-        // A value default may name an earlier value parameter that was itself defaulted
+-        // (`type A<const N: usize = 2, const M: usize = N>`), so monomorphise against the list filled so far.
+         // object 0.38.1 build/elf.rs: `pub type Symbols<'data, const DYNAMIC: bool = false> = Table<Symbol<'data, DYNAMIC>>;`
+-        auto ms_v = MonomorphStatePtr(nullptr, &pp, nullptr);
+         pp.m_values.reserve( params_def.m_values.size() );
+         while( pp.m_values.size() < params_def.m_values.size() && !params_def.m_values[pp.m_values.size()].m_default.is_Infer() ) {
+-            auto v = ms_v.monomorph_constgeneric(sp, params_def.m_values[pp.m_values.size()].m_default, /*allow_infer=*/true);
++            auto v = ms.monomorph_constgeneric(sp, params_def.m_values[pp.m_values.size()].m_default, /*allow_infer=*/true);
+             pp.m_values.push_back( std::move(v) );
+         }
+         if( pp.m_values.size() != params_def.m_values.size() ) {
+@@ -57,30 +66,81 @@ namespace {
+ 
+         return pp;
+     }
++
++    // An alias's own type is a type position, also when the alias is used in a body: a struct/enum/union path in it
++    // with an omitted list takes the defaults here, before Resolve Bind sees the copy in the body and treats it like
++    // something written there (`type B = Br;` + `B::new()` is `Br<false>` in rustc, not `Br<_>`). Lists that are not all
++    // defaulted are left for Resolve Bind to report.
++    void fill_alias_type_defaults(const Span& sp, const ::HIR::Crate& crate, ::HIR::TypeRef& ty)
++    {
++        struct V: public ::HIR::Visitor {
++            const Span& sp;
++            const ::HIR::Crate& crate;
++            V(const Span& sp, const ::HIR::Crate& crate): sp(sp), crate(crate) {}
++            void visit_type(::HIR::TypeRef& ty) override
++            {
++                // The expansion shares nodes with the alias's own type (TypeRef copies are shallow)
++                ty.get_unique();
++                ::HIR::Visitor::visit_type(ty);
++                auto* e = ty.data_mut().opt_Path();
++                if( !e || !e->path.m_data.is_Generic() )
++                    return ;
++                auto& gp = e->path.m_data.as_Generic();
++                const auto& ti = crate.get_typeitem_by_path(sp, gp.m_path);
++                const ::HIR::GenericParams* defs = nullptr;
++                if( const auto* i = ti.opt_Struct() )   defs = &i->m_params;
++                else if( const auto* i = ti.opt_Enum() )    defs = &i->m_params;
++                else if( const auto* i = ti.opt_Union() )   defs = &i->m_params;
++                if( !defs )
++                    return ;
++                auto& pp = gp.m_params;
++                auto ms = MonomorphStatePtr(nullptr, &pp, nullptr);
++                if( pp.m_types.empty() && !defs->m_types.empty() && std::all_of(defs->m_types.begin(), defs->m_types.end(),
++                        [](const HIR::TypeParamDef& p){ return p.m_default != ::HIR::TypeRef(); }) )
++                {
++                    for(size_t i = 0; i < defs->m_types.size(); i ++) {
++                        auto t = ms.monomorph_type(sp, defs->m_types[i].m_default);
++                        pp.m_types.push_back( std::move(t) );
++                    }
++                }
++                if( pp.m_values.empty() && !defs->m_values.empty() && std::all_of(defs->m_values.begin(), defs->m_values.end(),
++                        [](const HIR::ValueParamDef& p){ return !p.m_default.is_Infer(); }) )
++                {
++                    for(size_t i = 0; i < defs->m_values.size(); i ++) {
++                        auto v = ms.monomorph_constgeneric(sp, defs->m_values[i].m_default, /*allow_infer=*/true);
++                        pp.m_values.push_back( std::move(v) );
++                    }
++                }
++                DEBUG("- " << ty);
++            }
++        } v(sp, crate);
++        v.visit_type(ty);
++    }
+ }
+-::HIR::TypeRef ConvertHIR_ExpandAliases_GetExpansion_GP(const Span& sp, const ::HIR::Crate& crate, const ::HIR::GenericPath& path, bool is_expr)
++::HIR::TypeRef ConvertHIR_ExpandAliases_GetExpansion_GP(const Span& sp, const ::HIR::Crate& crate, const ::HIR::GenericPath& path, bool is_expr, bool infer_defaulted=true)
+ {
+     const auto& ti = crate.get_typeitem_by_path(sp, path.m_path);
+     if(const auto* ep = ti.opt_TypeAlias() )
+     {
+         const auto& ta = *ep;
+         DEBUG(path << " -> type " << ta.m_params.fmt_args() << " = " << ta.m_type);
+-        auto pp = get_path_params(sp, ta.m_params, path, is_expr);
++        auto pp = get_path_params(sp, ta.m_params, path, is_expr, infer_defaulted);
+         // Monomorphise the exapnded type using the created params
+         auto ms = MonomorphStatePtr(nullptr, &pp, nullptr);
+         HIR::TypeRef rv = ms.monomorph_type(sp, ta.m_type);
++        fill_alias_type_defaults(sp, crate, rv);
+         DEBUG(path << " -> " << path.m_path << pp << " -> " << rv);
+         return rv;
+     }
+     return ::HIR::TypeRef();
+ }
+ 
+-::HIR::TypeRef ConvertHIR_ExpandAliases_GetExpansion(const ::HIR::Crate& crate, const ::HIR::Path& path, bool is_expr)
++::HIR::TypeRef ConvertHIR_ExpandAliases_GetExpansion(const ::HIR::Crate& crate, const ::HIR::Path& path, bool is_expr, bool infer_defaulted=true)
+ {
+     static Span sp;
+     TU_MATCH(::HIR::Path::Data, (path.m_data), (e),
+     (Generic,
+-        return ConvertHIR_ExpandAliases_GetExpansion_GP(sp, crate, e, is_expr);
++        return ConvertHIR_ExpandAliases_GetExpansion_GP(sp, crate, e, is_expr, infer_defaulted);
+         ),
+     (UfcsInherent,
+         DEBUG("TODO: Locate impl blocks for types - path=" << path);
+@@ -101,7 +161,7 @@ std::vector<HIR::TraitPath> ConvertHIR_ExpandAliases_GetTraitExpansion_GP(const
+     if(const auto* ep = ti.opt_TraitAlias() )
+     {
+         const auto& ta = *ep;
+-        auto pp = get_path_params(sp, ta.m_params, path, is_expr);
++        auto pp = get_path_params(sp, ta.m_params, path, is_expr, /*infer_defaulted=*/true);
+         auto ms = MonomorphStatePtr(nullptr, &pp, nullptr);
+         std::vector<HIR::TraitPath> rv;
+         rv.reserve(ta.m_traits.size());
+@@ -176,6 +236,8 @@ class Expander:
+ {
+     const ::HIR::Crate& m_crate;
+     bool m_in_expr = false;
++    // The next type visited is the head of a value path (`Foo::new()`, `Foo { .. }`): its omitted lists are inferred
++    bool m_value_head = false;
+     const ::HIR::TypeRef*   m_impl_type = nullptr;
+ 
+ public:
+@@ -200,6 +262,9 @@ public:
+     void visit_type(::HIR::TypeRef& ty) override
+     {
+         static Span sp;
++        // Only this level: the parameters of a value path's type are type positions again (`Wrap::<Foo>::new()`)
++        bool value_head = m_value_head;
++        m_value_head = false;
+ 
+         if( auto* e = ty.data_mut().opt_ErasedType() )
+         {
+@@ -221,7 +286,7 @@ public:
+ 
+         if( const auto* e = ty.data().opt_Path() ) 
+         {
+-            ::HIR::TypeRef  new_type = ConvertHIR_ExpandAliases_GetExpansion(m_crate, e->path, m_in_expr);
++            ::HIR::TypeRef  new_type = ConvertHIR_ExpandAliases_GetExpansion(m_crate, e->path, m_in_expr, /*infer_defaulted=*/value_head);
+             // Keep trying to expand down the chain
+             unsigned int num_exp = 1;
+             const unsigned int MAX_RECURSIVE_TYPE_EXPANSIONS = 100;
+@@ -231,7 +296,8 @@ public:
+                 ::HIR::Visitor::visit_type(new_type);
+                 if( const auto* e = new_type.data().opt_Path() )
+                 {
+-                    auto nt = ConvertHIR_ExpandAliases_GetExpansion(m_crate, e->path, m_in_expr);
++                    // The alias's own type is a type position
++                    auto nt = ConvertHIR_ExpandAliases_GetExpansion(m_crate, e->path, m_in_expr, /*infer_defaulted=*/false);
+                     if( nt == ::HIR::TypeRef() )
+                         break;
+                     num_exp ++;
+@@ -488,6 +554,21 @@ public:
+             {
+                 upper_visitor.visit_pattern(pat);
+             }
++            // The type of `Foo::new` / `Foo { .. }` is a value path head (visited first)
++            void visit_path(::HIR::Visitor::PathContext pc, ::HIR::Path& path) override
++            {
++                if( pc == ::HIR::Visitor::PathContext::VALUE && (path.m_data.is_UfcsUnknown() || path.m_data.is_UfcsInherent()) )
++                    upper_visitor.m_value_head = true;
++                ::HIR::ExprVisitorDef::visit_path(pc, path);
++                upper_visitor.m_value_head = false;
++            }
++            void visit(::HIR::ExprNode_StructLiteral& node) override
++            {
++                if( node.m_type != ::HIR::TypeRef() )
++                    upper_visitor.m_value_head = true;
++                ::HIR::ExprVisitorDef::visit(node);
++                upper_visitor.m_value_head = false;
++            }
+ 
+             // Custom impl to visit the inner expression
+             void visit(::HIR::ExprNode_ArraySized& node) override

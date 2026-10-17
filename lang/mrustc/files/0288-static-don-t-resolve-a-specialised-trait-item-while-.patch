@@ -1,0 +1,93 @@
+From 3f0595aee30a721eb771a0e674cd3866eb9e6d86 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 08:49:33 +0000
+Subject: [PATCH] static: don't resolve a specialised trait item while the type
+ is generic
+
+scraper 0.24.0 (ani-cli-rs 0.11.0) died in Trans Enumerate:
+
+    BUG: src/trans/enumerate.cpp:1778: Item not found for
+    <(QualName, Tendril<UTF8, NonAtomic>) as
+    core::slice::sort::shared::smallsort::UnstableSmallSortFreezeTypeImpl>::small_sort_threshold
+
+from `attrs.sort_unstable_by(..)` on a `Vec<(QualName, StrTendril)>`.
+core 1.90's sort picks its small-sort strategy by specialisation:
+
+    impl<T> UnstableSmallSortTypeImpl for T { default fn small_sort_threshold() .. }
+    impl<T: FreezeMarker> UnstableSmallSortTypeImpl for T {
+        fn small_sort_threshold() -> usize { <T as UnstableSmallSortFreezeTypeImpl>::small_sort_threshold() }
+    }
+    impl<T: Freeze> FreezeMarker for T {}
+
+MIR optimisation of core's generic sort functions resolved
+`<T as UnstableSmallSortTypeImpl>::small_sort_threshold` for the generic
+`T` to the most specific impl and inlined it. StaticTraitResolve::get_value
+only deferred when the chosen item was `default`, which it isn't here, and
+`T: Freeze` counts as holding for a bare type parameter. Every user of the
+sort thus called `<T as UnstableSmallSortFreezeTypeImpl>`, which has no
+impl for a `!Freeze` element (Tendril holds a Cell and an UnsafeCell), so
+any sort of such elements failed. The stable sort's
+StableSmallSortTypeImpl has the same shape.
+
+get_value now also returns NotYetKnown when the type (or trait params)
+is still generic and more than one impl provides the item: the most
+specific one isn't the choice for every instance unless its bounds are
+known to hold. The monomorphised MIR is resolved and inlined again ("MIR
+Optimise Inline"), with concrete types. Coherent impls only overlap
+through specialisation, so other calls resolve as before.
+
+The wrong call lives in the generic MIR of core's rlib, so libstd has to
+be rebuilt for this to take effect.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index 8350adf6..11361385 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -3603,10 +3603,11 @@ StaticTraitResolve::ValuePtr StaticTraitResolve::get_value(const Span& sp, const
+         else
+         {
+             bool best_is_spec = false;
++            size_t n_candidates = 0;
+             ImplRef best_impl;
+             ValuePtr    rv;
+             this->find_impl(sp, pe.trait.m_path, &pe.trait.m_params, pe.type, [&](auto impl, bool is_fuzz)->bool{
+-                DEBUG(impl);
++                DEBUG(impl << (is_fuzz ? " (fuzzy)" : ""));
+                 if( ! impl.m_data.is_TraitImpl() )
+                     return false;
+                 const ::HIR::TraitImpl& ti = *impl.m_data.as_TraitImpl().impl;
+@@ -3648,7 +3649,8 @@ StaticTraitResolve::ValuePtr StaticTraitResolve::get_value(const Span& sp, const
+                     DEBUG("- Missing the target item");
+                     return false;
+                 }
+-                else if( !impl.more_specific_than(best_impl) ) {
++                n_candidates ++;
++                if( !impl.more_specific_than(best_impl) ) {
+                     // Keep searching
+                     DEBUG("- Less specific");
+                     return false;
+@@ -3708,6 +3710,21 @@ StaticTraitResolve::ValuePtr StaticTraitResolve::get_value(const Span& sp, const
+                     return ValuePtr::make_NotYetKnown({});
+                 }
+             }
++            // More than one impl applies to a still-generic type (specialisation): the most specific one isn't the
++            // choice for every instance when its bounds can't be proven yet. core 1.90's sort has `impl<T>
++            // UnstableSmallSortTypeImpl for T` (`default` items) and `impl<T: FreezeMarker> ..` (not `default`);
++            // committing to the latter in the generic MIR of the sort functions (`T: Freeze` holds for a bare `T`
++            // here) made `!Freeze` elements (scraper's `(QualName, StrTendril)`) call `<T as
++            // UnstableSmallSortFreezeTypeImpl>`, which has no impl for them ("Item not found" in Trans Enumerate).
++            // Leave it to the monomorphised MIR, which is optimised (inlined) again.
++            if( n_candidates > 1 )
++            {
++                if( monomorphise_type_needed(pe.type, true) || monomorphise_pathparams_needed(pe.trait.m_params, true) )
++                {
++                    DEBUG("Several candidate impls and still generic, return NotYetKnown");
++                    return ValuePtr::make_NotYetKnown({});
++                }
++            }
+ 
+             if( ! best_impl.m_data.is_TraitImpl() )
+                 TODO(sp, "Use bounded constant values for " << p);

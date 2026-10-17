@@ -1,0 +1,173 @@
+From cbd47e663d46d0a64eec2dcf47de89d5c1de2b20 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 16 Oct 2026 23:43:22 +0000
+Subject: [PATCH] minicargo: `--emit-graph <file>` writes the resolved package
+ graph as JSON
+
+maturin decides how to build a Python extension from `cargo metadata`: it walks the
+resolved dependency graph from the root package to find pyo3/pyo3-ffi/uniffi, reads
+their versions, active features (abi3, abi3-pyXY, ...) and pyo3-ffi's
+`[package.metadata.cpython]` (the supported Python range). On powerpc `cargo` is the
+mrustc PortGroup's stand-in (cargo-shim.py), which has to report the same packages
+and features minicargo will build.
+
+`--emit-graph <file>` stops after dependency resolution and writes every package
+reachable from the root through enabled normal/build (and loaded dev) dependencies:
+name, version, absolute manifest path, active features (without minicargo's internal
+`dep:<name>` entries) and the dependency edges (key, package name, index, kind).
+Package 0 is the root. The shim describes each package from its Cargo.toml.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index cadbf183..65e2b067 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -45,6 +45,88 @@ namespace {
+         }
+         return *s == '\0';
+     }
++
++    ::std::string json_str(const ::std::string& s)
++    {
++        ::std::string rv = "\"";
++        for(unsigned char c : s)
++        {
++            switch(c)
++            {
++            case '"':   rv += "\\\"";  break;
++            case '\\':  rv += "\\\\"; break;
++            case '\n':  rv += "\\n";   break;
++            case '\r':  rv += "\\r";   break;
++            case '\t':  rv += "\\t";   break;
++            default:
++                if( c < 0x20 ) {
++                    const char* hex = "0123456789abcdef";
++                    rv += "\\u00";
++                    rv += hex[c >> 4];
++                    rv += hex[c & 15];
++                }
++                else {
++                    rv += static_cast<char>(c);
++                }
++                break;
++            }
++        }
++        return rv + "\"";
++    }
++
++    /// `--emit-graph`: every package reachable from the root through enabled dependencies (normal, build and dev ones,
++    /// those that were loaded), with its version, manifest, active features and dependency edges. Package 0 is the root.
++    void emit_package_graph(const char* path, const PackageManifest& root)
++    {
++        ::std::vector<const PackageManifest*>   packages;
++        ::std::map<const PackageManifest*, size_t>  index;
++        auto get_index = [&](const PackageManifest& p)->size_t {
++            auto it = index.find(&p);
++            if( it != index.end() )
++                return it->second;
++            index[&p] = packages.size();
++            packages.push_back(&p);
++            return packages.size() - 1;
++        };
++        get_index(root);
++
++        ::std::ofstream os(path);
++        os << "{\"version\":1,\"root\":0,\"packages\":[";
++        // (`packages` grows while this runs)
++        for(size_t i = 0; i < packages.size(); i ++)
++        {
++            const PackageManifest& p = *packages[i];
++            ::std::string deps;
++            auto add = [&](const PackageRef& dep, const char* kind) {
++                if( dep.is_disabled() || !dep.has_package() )
++                    return;
++                size_t j = get_index(dep.get_package());
++                deps += ::format(deps.empty() ? "" : ",", "{\"key\":", json_str(dep.key()), ",\"name\":", json_str(dep.name()),
++                    ",\"package\":", j, ",\"kind\":\"", kind, "\"}");
++            };
++            p.iter_main_dependencies([&](const PackageRef& d) { add(d, "normal"); });
++            p.iter_build_dependencies([&](const PackageRef& d) { add(d, "build"); });
++            p.iter_dev_dependencies([&](const PackageRef& d) { add(d, "dev"); });
++
++            os << (i == 0 ? "" : ",") << "\n{\"name\":" << json_str(p.name())
++                << ",\"version\":" << json_str(p.version().to_string_full())
++                << ",\"manifest_path\":" << json_str((p.directory().to_absolute() / "Cargo.toml").str())
++                << ",\"features\":[";
++            // (`dep:<name>` entries are how minicargo enables optional dependencies, not features)
++            bool first = true;
++            for(const auto& f : p.active_features())
++            {
++                if( f.compare(0, 4, "dep:") == 0 )
++                    continue;
++                os << (first ? "" : ",") << json_str(f);
++                first = false;
++            }
++            os << "],\"deps\":[" << deps << "]}";
++        }
++        os << "\n]}\n";
++        if( !os.good() )
++            throw ::std::runtime_error(::format("Failed to write ", path));
++    }
+ }
+ 
+ struct ProgramOptions
+@@ -102,6 +184,8 @@ struct ProgramOptions
+     ::std::vector<PackageTarget::CrateType> root_crate_types;
+     /// `--link-arg <arg>` (repeatable): linker argument for the root package's binaries and cdylib
+     ::std::vector<::std::string>    link_args;
++    /// `--emit-graph <file>`: write the resolved package graph as JSON instead of building
++    const char* emit_graph = nullptr;
+ 
+     /// Workspace member (package name) to build when the manifest is a virtual
+     /// workspace root ([workspace] with no [package])
+@@ -493,6 +577,13 @@ int main(int argc, const char* argv[])
+             m.load_dependencies(repo, !bs_override_dir.is_valid(), /*include_dev=*/opts.test);
+         }
+ 
++        if( opts.emit_graph )
++        {
++            Debug_SetPhase("Emit Graph");
++            emit_package_graph(opts.emit_graph, m);
++            return 0;
++        }
++
+         // 3. Build dependency tree and build program.
+         BuildOptions    build_opts;
+         build_opts.build_script_overrides = ::std::move(bs_override_dir);
+@@ -745,6 +836,13 @@ int ProgramOptions::parse(int argc, const char* argv[])
+                     pos = end + 1;
+                 }
+             }
++            // `--emit-graph <file>`: the packages and features this build would use, as JSON (cargo-shim.py turns it into
++            // `cargo metadata` for maturin)
++            else if( ::std::strcmp(flag, "--emit-graph") == 0 ) {
++                const char* v = get_value();
++                if( !v )    return 1;
++                this->emit_graph = v;
++            }
+             // `--link-arg <arg>`: a linker argument (`-C link-arg`) for the root package's binaries and cdylib
+             else if( ::std::strcmp(flag, "--link-arg") == 0 ) {
+                 const char* v = get_value();
+@@ -799,6 +897,8 @@ void ProgramOptions::help() const
+         << "--lib                    : Build only the package's library\n"
+         << "--crate-type <types>     : Crate types of the package's library, replacing the manifest's (e.g. `cdylib`)\n"
+         << "--link-arg <arg>         : Pass <arg> to the linker for the package's binaries and cdylib (repeatable)\n"
++        << "--emit-graph <file>      : Write the resolved packages (version, manifest, features, dependencies) as JSON\n"
++        << "                           to <file> and stop\n"
+         << "--bin <name>             : Build only this binary of the package (repeatable; default is every binary\n"
+         << "                           whose `required-features` are active)\n"
+         << "--no-default-features    : \n"
+diff --git a/tools/minicargo/manifest.h b/tools/minicargo/manifest.h
+index 43274872..9b18644c 100644
+--- a/tools/minicargo/manifest.h
++++ b/tools/minicargo/manifest.h
+@@ -217,6 +217,7 @@ public:
+     const PackageVersionSpec& get_version() const { return m_version; }
+ 
+     bool is_disabled() const { return m_optional && !m_optional_enabled; }
++    bool has_package() const { return static_cast<bool>(m_manifest); }
+ 
+     const bool has_path() const { return m_path != ""; }
+     const ::std::string& path() const { return m_path; }

@@ -1,0 +1,455 @@
+From f3eae2ea7f99ae8a78dd84bcd3b611cbdb65d2a6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 16 Oct 2026 23:33:44 +0000
+Subject: [PATCH 274/274] minicargo: build cdylib libraries; `--lib`,
+ `--crate-type`, `--link-arg`, build-script link args
+
+maturin builds a Python extension module with `cargo rustc --lib --crate-type cdylib`
+(plus link args, see the previous trans patch); pyo3-build-config's
+add_extension_module_link_args prints `cargo:rustc-cdylib-link-arg=-undefined` and
+`=dynamic_lookup`. minicargo built a `cdylib` library as an rlib ("only ever consumed
+as a Rust dependency"), had no `--lib`/`--crate-type`, and ignored every
+`cargo:rustc-link-arg*` line.
+
+- The root package's library gets a `--crate-type cdylib` compiler run beside the rlib
+  when its crate types list `cdylib`, as 0148 does for `staticlib` (the two now share
+  the FinalLib job kind); output lib<name>.dylib for -apple- targets, .dll for
+  -windows, else .so, as cargo names it.
+- `--crate-type <types>` (repeatable, comma-separated) replaces the manifest's crate
+  types of the root library; `--lib` builds only the library. `--lib` with only
+  non-Rust types (maturin) skips the rlib: one compilation of the crate, not two.
+- `--link-arg <arg>` and the package's own build-script `rustc-link-arg`,
+  `rustc-link-arg-cdylib` (= `rustc-cdylib-link-arg`), `rustc-link-arg-bins`,
+  `rustc-link-arg-bin=BIN=`, `rustc-link-arg-tests` become `-C link-arg=` on the links
+  they are meant for (cargo applies them only to the package that printed them).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/tools/minicargo/build.cpp b/tools/minicargo/build.cpp
+index 39f51cc4..454706ac 100644
+--- a/tools/minicargo/build.cpp
++++ b/tools/minicargo/build.cpp
+@@ -37,9 +37,18 @@
+ bool deferred_codegen_enabled() {
+     return getenv("MINICARGO_DEFER_CODEGEN") != 0;
+ }
+-/// `crate-type` of a library target lists `staticlib`
+-static bool target_wants_staticlib(const PackageTarget& target) {
+-    return ::std::find(target.m_crate_types.begin(), target.m_crate_types.end(), PackageTarget::CrateType::staticlib) != target.m_crate_types.end();
++/// A library artifact of the root package for non-Rust consumers, from a compiler run beside the rlib one
++enum class FinalLib {
++    None,
++    StaticLib,  // `crate-type = ["staticlib", ..]`: lib<name>.a
++    CDylib,     // `crate-type = ["cdylib", ..]` (e.g. a Python extension module): lib<name>.dylib/.so/.dll
++};
++/// Crate types of the root package's library: `--crate-type` replaces those of the manifest
++static const ::std::vector<PackageTarget::CrateType>& root_lib_crate_types(const BuildOptions& opts, const PackageTarget& target) {
++    return opts.root_crate_types.empty() ? target.m_crate_types : opts.root_crate_types;
++}
++static bool crate_types_contain(const ::std::vector<PackageTarget::CrateType>& types, PackageTarget::CrateType ty) {
++    return ::std::find(types.begin(), types.end(), ty) != types.end();
+ }
+ 
+ static bool has_suffix(const ::std::string& s, const char* suffix) {
+@@ -120,8 +129,11 @@ struct RunState
+         return get_output_dir(true) / get_build_script_out(manifest);
+     }
+     /// Get the output file for a crate (e.g. libfoo.rlib, or foo.exe)
+-    /// - `staticlib`: the C-consumable archive of a `crate-type = ["staticlib", ..]` library (its rlib is what Rust dependants use)
+-    ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, bool staticlib=false) const;
++    /// - `final_lib`: the C-consumable archive or dynamic library of a `crate-type = ["staticlib"/"cdylib", ..]`
++    ///   library (its rlib is what Rust dependants use)
++    ::helpers::path get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, FinalLib final_lib=FinalLib::None) const;
++    /// Dynamic library suffix of the target (`cdylib`)
++    const char* dylib_suffix() const;
+     
+     // If `is_for_host` and cross compiling, use a different directory
+     // - TODO: Include the target arch in the output dir too?
+@@ -174,15 +186,16 @@ class Job_BuildTarget: public Job_Build
+ {
+     const PackageTarget&    m_target;
+     const bool  m_is_for_host;
+-    /// Build the `staticlib` archive of this library (a second mrustc run beside the rlib one)
+-    const bool  m_staticlib;
++    /// Build the `staticlib` archive or the `cdylib` of this library (a compiler run beside the rlib one)
++    const FinalLib  m_final_lib;
+ 
+ public:
+-    Job_BuildTarget(RunState& parent, const PackageManifest& manifest, const PackageTarget& target, bool is_host, bool staticlib=false)
+-        : Job_Build(parent, manifest, parent.get_key(manifest, false, is_host, &target) + (staticlib ? " [staticlib]" : ""))
++    Job_BuildTarget(RunState& parent, const PackageManifest& manifest, const PackageTarget& target, bool is_host, FinalLib final_lib=FinalLib::None)
++        : Job_Build(parent, manifest, parent.get_key(manifest, false, is_host, &target)
++            + (final_lib == FinalLib::StaticLib ? " [staticlib]" : final_lib == FinalLib::CDylib ? " [cdylib]" : ""))
+         , m_target(target)
+         , m_is_for_host(is_host)
+-        , m_staticlib(staticlib)
++        , m_final_lib(final_lib)
+     {
+     }
+     helpers::path   m_build_script;
+@@ -534,6 +547,25 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+             continue ;
+         }
+ 
++        // The root package's library: its crate types (`--crate-type` replaces the manifest's) decide the artifacts.
++        // `staticlib`/`cdylib` are second compiler runs beside the rlib, which the package's binaries and dependants
++        // use; `--lib` without a Rust crate type (maturin's `--lib --crate-type cdylib`) skips the rlib: one
++        // compilation of the (usually biggest) crate instead of two.
++        ::std::vector<FinalLib> final_libs;
++        bool want_rlib = true;
++        if( &p == &m_root_manifest && opts.mode == BuildOptions::Mode::Normal )
++        {
++            const auto& types = root_lib_crate_types(opts, p.get_library());
++            if( crate_types_contain(types, PackageTarget::CrateType::staticlib) )
++                final_libs.push_back(FinalLib::StaticLib);
++            if( crate_types_contain(types, PackageTarget::CrateType::cdylib) )
++                final_libs.push_back(FinalLib::CDylib);
++            bool has_rust_type = crate_types_contain(types, PackageTarget::CrateType::rlib)
++                || crate_types_contain(types, PackageTarget::CrateType::dylib)
++                || crate_types_contain(types, PackageTarget::CrateType::proc_macro);
++            want_rlib = !(opts.lib_only && opts.bins.empty() && !final_libs.empty() && !has_rust_type);
++        }
++
+         auto job = ::std::make_unique<Job_BuildTarget>(run_state, p, p.get_library(), e.is_host);
+         DEBUG("> Considering " << job->name());
+ 
+@@ -555,50 +587,52 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+             }
+         });
+         job->m_is_dirty = is_dirty;
+-        auto job_p = job.get();
+-        convert_state.add_job(std::move(job), output_ts, is_dirty);
+-
+-        // If deferring codegen, add a new job for running the codegen backend
+-        if( job_p->get_codegen() != helpers::path() )
++        const auto build_script = job->m_build_script;
++        if( want_rlib )
+         {
+-            // TODO: Codegen should re-run if the output file from it is missing
+-            auto job_codegen = ::std::make_unique<Job_Codegen>(run_state, job_p->name(), job_p->get_outfile(), job_p->get_codegen());
+-            job_codegen->m_is_dirty = is_dirty || run_state.outfile_needs_rebuild(job_codegen->get_outfile());
+-            convert_state.add_job(std::move(job_codegen), output_ts, is_dirty);
+-            // HACK: Ensure that the dependencies for this job all are for codegen
+-            for(auto& d : job_p->m_dependencies) {
+-                make_dep_codegen(d);
++            auto job_p = job.get();
++            convert_state.add_job(std::move(job), output_ts, is_dirty);
++
++            // If deferring codegen, add a new job for running the codegen backend
++            if( job_p->get_codegen() != helpers::path() )
++            {
++                // TODO: Codegen should re-run if the output file from it is missing
++                auto job_codegen = ::std::make_unique<Job_Codegen>(run_state, job_p->name(), job_p->get_outfile(), job_p->get_codegen());
++                job_codegen->m_is_dirty = is_dirty || run_state.outfile_needs_rebuild(job_codegen->get_outfile());
++                convert_state.add_job(std::move(job_codegen), output_ts, is_dirty);
++                // HACK: Ensure that the dependencies for this job all are for codegen
++                for(auto& d : job_p->m_dependencies) {
++                    make_dep_codegen(d);
++                }
+             }
+         }
+ 
+-        // `crate-type = ["staticlib", ..]` on the root package: also produce the C-consumable archive, with a second
+-        // mrustc run (dependants, e.g. the package's own binaries, keep using the rlib built above)
+-        if( &p == &m_root_manifest && opts.mode == BuildOptions::Mode::Normal && target_wants_staticlib(p.get_library()) )
++        for(auto final_lib : final_libs)
+         {
+-            auto job_sl = ::std::make_unique<Job_BuildTarget>(run_state, p, p.get_library(), e.is_host, /*staticlib=*/true);
+-            auto sl_ts = Timestamp::for_file(job_sl->get_outfile());
+-            bool sl_dirty = run_state.outfile_needs_rebuild(job_sl->get_outfile());
++            auto job_fl = ::std::make_unique<Job_BuildTarget>(run_state, p, p.get_library(), e.is_host, final_lib);
++            auto fl_ts = Timestamp::for_file(job_fl->get_outfile());
++            bool fl_dirty = run_state.outfile_needs_rebuild(job_fl->get_outfile());
+             if( bs_job_name != "" ) {
+-                job_sl->m_dependencies.push_back(bs_job_name);
+-                sl_dirty = true;
++                job_fl->m_dependencies.push_back(bs_job_name);
++                fl_dirty = true;
+             }
+-            job_sl->m_build_script = job_p->m_build_script;
++            job_fl->m_build_script = build_script;
+             p.iter_main_dependencies([&](const PackageRef& dep) {
+                 if( !dep.is_disabled() )
+                 {
+                     auto k = run_state.get_key(dep.get_package(), false, e.is_host);
+-                    sl_dirty |= convert_state.handle_dep(job_sl->m_dependencies, sl_ts, k);
++                    fl_dirty |= convert_state.handle_dep(job_fl->m_dependencies, fl_ts, k);
+                 }
+             });
+-            job_sl->m_is_dirty = sl_dirty;
+-            auto job_sl_p = job_sl.get();
+-            convert_state.add_job(std::move(job_sl), sl_ts, sl_dirty);
+-            if( job_sl_p->get_codegen() != helpers::path() )
++            job_fl->m_is_dirty = fl_dirty;
++            auto job_fl_p = job_fl.get();
++            convert_state.add_job(std::move(job_fl), fl_ts, fl_dirty);
++            if( job_fl_p->get_codegen() != helpers::path() )
+             {
+-                auto job_codegen = ::std::make_unique<Job_Codegen>(run_state, job_sl_p->name(), job_sl_p->get_outfile(), job_sl_p->get_codegen());
+-                job_codegen->m_is_dirty = sl_dirty || run_state.outfile_needs_rebuild(job_codegen->get_outfile());
+-                convert_state.add_job(std::move(job_codegen), sl_ts, sl_dirty);
+-                for(auto& d : job_sl_p->m_dependencies) {
++                auto job_codegen = ::std::make_unique<Job_Codegen>(run_state, job_fl_p->name(), job_fl_p->get_outfile(), job_fl_p->get_codegen());
++                job_codegen->m_is_dirty = fl_dirty || run_state.outfile_needs_rebuild(job_codegen->get_outfile());
++                convert_state.add_job(std::move(job_codegen), fl_ts, fl_dirty);
++                for(auto& d : job_fl_p->m_dependencies) {
+                     make_dep_codegen(d);
+                 }
+             }
+@@ -660,6 +694,9 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+     switch(opts.mode)
+     {
+     case BuildOptions::Mode::Normal: {
++        // `--lib` alone: the library only, as with cargo
++        if( opts.lib_only && opts.bins.empty() )
++            break;
+         // As cargo: `--bin <name>` builds just those binaries (an unknown name, or one whose `required-features`
+         // aren't active, is an error); without it, every binary whose `required-features` are active, the others
+         // skipped. `required-features` had been read from the manifest but never consulted.
+@@ -966,7 +1003,16 @@ bool RunState::outfile_needs_rebuild(const helpers::path& outfile) const
+ {
+     return std::string("build_") + manifest.name().c_str() + (manifest.version() == PackageVersion() ? "" : get_crate_suffix(manifest).c_str());
+ }
+-::helpers::path RunState::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, bool staticlib) const
++const char* RunState::dylib_suffix() const
++{
++    const char* target = m_opts.target_name ? m_opts.target_name : HOST_TARGET;
++    if( ::std::strstr(target, "-apple-") )
++        return ".dylib";
++    if( ::std::strstr(target, "-windows") )
++        return ".dll";
++    return ".so";
++}
++::helpers::path RunState::get_crate_path(const PackageManifest& manifest, const PackageTarget& target, bool is_for_host, const char** crate_type, ::std::string* out_crate_suffix, FinalLib final_lib) const
+ {
+     auto outfile = this->get_output_dir(is_for_host);
+ 
+@@ -983,7 +1029,15 @@ bool RunState::outfile_needs_rebuild(const helpers::path& outfile) const
+     switch(target.m_type)
+     {
+     case PackageTarget::Type::Lib:
+-        if( staticlib )
++        if( final_lib == FinalLib::CDylib )
++        {
++            // Named like cargo's (`lib<name>.dylib` on macOS): a final product for a non-Rust consumer (maturin renames
++            // it to the extension module's file name)
++            if(crate_type)  *crate_type = "cdylib";
++            outfile /= ::format("lib", target.m_name, dylib_suffix());
++            break;
++        }
++        if( final_lib == FinalLib::StaticLib )
+         {
+             // Named like cargo's (`lib<name>.a`, no version suffix): it is a final product for a non-Rust consumer, which
+             // looks for that name (e.g. GCC's makefiles for gccrs's libformat_parser/ffi-polonius)
+@@ -1121,7 +1175,7 @@ void Job_Build::push_args_common(StringList& args, const helpers::path& outfile,
+ //
+ helpers::path Job_BuildTarget::get_outfile() const
+ {
+-    return parent.get_crate_path(m_manifest, m_target, m_is_for_host, nullptr, nullptr, m_staticlib);
++    return parent.get_crate_path(m_manifest, m_target, m_is_for_host, nullptr, nullptr, m_final_lib);
+ }
+ helpers::path Job_BuildTarget::get_codegen() const
+ {
+@@ -1135,7 +1189,7 @@ RunnableJob Job_BuildTarget::start()
+ {
+     const char* crate_type;
+     ::std::string   crate_suffix;
+-    auto outfile = parent.get_crate_path(m_manifest, m_target, m_is_for_host,  &crate_type, &crate_suffix, m_staticlib);
++    auto outfile = parent.get_crate_path(m_manifest, m_target, m_is_for_host,  &crate_type, &crate_suffix, m_final_lib);
+     auto depfile = outfile + ".d";
+ 
+     StringList  args;
+@@ -1189,6 +1243,39 @@ RunnableJob Job_BuildTarget::start()
+     for(const auto& flag : m_manifest.build_script_output().rustc_flags) {
+         args.push_back(flag.c_str());
+     }
++    // Linker flags of a linked target: the package's own build script's (cargo applies `rustc-link-arg*` only to the
++    // package that printed them) and `--link-arg` (only root package targets are linked)
++    // - pyo3-build-config's add_extension_module_link_args: `rustc-cdylib-link-arg=-undefined`/`=dynamic_lookup`
++    {
++        const auto& bso = m_manifest.build_script_output();
++        ::std::vector<::std::string>    link_args;
++        bool is_linked = true;
++        if( m_final_lib == FinalLib::CDylib ) {
++            link_args = bso.rustc_link_arg;
++            link_args.insert(link_args.end(), bso.rustc_link_arg_cdylib.begin(), bso.rustc_link_arg_cdylib.end());
++        }
++        else if( m_final_lib == FinalLib::None && m_target.m_type == PackageTarget::Type::Bin ) {
++            link_args = bso.rustc_link_arg;
++            link_args.insert(link_args.end(), bso.rustc_link_arg_bins.begin(), bso.rustc_link_arg_bins.end());
++            for(const auto& e : bso.rustc_link_arg_bin) {
++                if( e.first == m_target.m_name )
++                    link_args.push_back(e.second);
++            }
++        }
++        else if( m_final_lib == FinalLib::None && m_target.m_type == PackageTarget::Type::Test ) {
++            link_args = bso.rustc_link_arg;
++            link_args.insert(link_args.end(), bso.rustc_link_arg_tests.begin(), bso.rustc_link_arg_tests.end());
++        }
++        else {
++            is_linked = false;
++        }
++        if( is_linked ) {
++            link_args.insert(link_args.end(), parent.m_opts.link_args.begin(), parent.m_opts.link_args.end());
++            for(const auto& a : link_args) {
++                args.push_back("-C"); args.push_back(format("link-arg=", a));
++            }
++        }
++    }
+ 
+     // If not building the package's library, but the package has a library
+     if( m_target.m_type != PackageTarget::Type::Lib && m_manifest.has_library() )
+diff --git a/tools/minicargo/build.h b/tools/minicargo/build.h
+index 89e23d81..93006173 100644
+--- a/tools/minicargo/build.h
++++ b/tools/minicargo/build.h
+@@ -26,6 +26,13 @@ struct BuildOptions
+     /// `--bin <name>`: build only these binaries of the root package (empty = every binary whose
+     /// `required-features` are active)
+     ::std::vector<::std::string>    bins;
++    /// `--lib`: build only the root package's library (no binaries)
++    bool lib_only = false;
++    /// `--crate-type <type>` (as `cargo rustc --crate-type`): replaces the crate types of the root package's library
++    /// - maturin: `cargo rustc --lib --crate-type cdylib`
++    ::std::vector<PackageTarget::CrateType> root_crate_types;
++    /// `--link-arg <arg>`: passed to the links of the root package's binaries and cdylib (`-C link-arg`)
++    ::std::vector<::std::string>    link_args;
+     enum class Mode {
+         /// Build the binary/library
+         Normal,
+diff --git a/tools/minicargo/main.cpp b/tools/minicargo/main.cpp
+index 415f22b6..cadbf183 100644
+--- a/tools/minicargo/main.cpp
++++ b/tools/minicargo/main.cpp
+@@ -96,6 +96,12 @@ struct ProgramOptions
+ 
+     /// `--bin <name>` (repeatable): binaries of the root package to build; empty = all that the active features allow
+     ::std::vector<::std::string>    bins;
++    /// `--lib`: build only the root package's library
++    bool lib_only = false;
++    /// `--crate-type <types>` (repeatable, comma-separated): crate types of the root package's library
++    ::std::vector<PackageTarget::CrateType> root_crate_types;
++    /// `--link-arg <arg>` (repeatable): linker argument for the root package's binaries and cdylib
++    ::std::vector<::std::string>    link_args;
+ 
+     /// Workspace member (package name) to build when the manifest is a virtual
+     /// workspace root ([workspace] with no [package])
+@@ -497,6 +503,9 @@ int main(int argc, const char* argv[])
+         build_opts.target_name = opts.target;
+         build_opts.panic_strategy = opts.panic_strategy;
+         build_opts.bins = opts.bins;
++        build_opts.lib_only = opts.lib_only;
++        build_opts.root_crate_types = opts.root_crate_types;
++        build_opts.link_args = opts.link_args;
+         for(const auto* d : opts.lib_search_dirs)
+             build_opts.lib_search_dirs.push_back( ::helpers::path(d) );
+         // Indicate desire to build tests (or examples) instead of the primary target
+@@ -704,6 +713,44 @@ int ProgramOptions::parse(int argc, const char* argv[])
+             }
+             else if( ::std::strcmp(arg, "--bins") == 0 ) {
+             }
++            // `--lib`, `--crate-type <types>`: as `cargo rustc --lib --crate-type cdylib` (maturin): the root package's
++            // library alone, with these crate types instead of the manifest's
++            else if( ::std::strcmp(arg, "--lib") == 0 ) {
++                this->lib_only = true;
++            }
++            else if( ::std::strcmp(flag, "--crate-type") == 0 ) {
++                const char* v = get_value();
++                if( !v )    return 1;
++                ::std::string   list = v;
++                size_t pos = 0;
++                while( pos <= list.size() ) {
++                    size_t end = list.find(',', pos);
++                    if( end == ::std::string::npos )
++                        end = list.size();
++                    ::std::string ty = list.substr(pos, end - pos);
++                    if( ty == "lib" || ty == "rlib" )
++                        this->root_crate_types.push_back(PackageTarget::CrateType::rlib);
++                    else if( ty == "dylib" )
++                        this->root_crate_types.push_back(PackageTarget::CrateType::dylib);
++                    else if( ty == "cdylib" )
++                        this->root_crate_types.push_back(PackageTarget::CrateType::cdylib);
++                    else if( ty == "staticlib" )
++                        this->root_crate_types.push_back(PackageTarget::CrateType::staticlib);
++                    else if( ty == "proc-macro" )
++                        this->root_crate_types.push_back(PackageTarget::CrateType::proc_macro);
++                    else {
++                        ::std::cerr << "Unknown crate type `" << ty << "` for --crate-type" << ::std::endl;
++                        return 1;
++                    }
++                    pos = end + 1;
++                }
++            }
++            // `--link-arg <arg>`: a linker argument (`-C link-arg`) for the root package's binaries and cdylib
++            else if( ::std::strcmp(flag, "--link-arg") == 0 ) {
++                const char* v = get_value();
++                if( !v )    return 1;
++                this->link_args.push_back(v);
++            }
+             else if( ::std::strcmp(arg, "--pause") == 0 ) {
+                 this->pause_before_quit = true;
+             }
+@@ -749,6 +796,9 @@ void ProgramOptions::help() const
+         << "-n                       : Don't build any packages, just list the packages that would be built\n"
+         << "-g                       : Pass `-g` to compiler\n"
+         << "--package,-p <name>      : Workspace member to build (for virtual workspace roots)\n"
++        << "--lib                    : Build only the package's library\n"
++        << "--crate-type <types>     : Crate types of the package's library, replacing the manifest's (e.g. `cdylib`)\n"
++        << "--link-arg <arg>         : Pass <arg> to the linker for the package's binaries and cdylib (repeatable)\n"
+         << "--bin <name>             : Build only this binary of the package (repeatable; default is every binary\n"
+         << "                           whose `required-features` are active)\n"
+         << "--no-default-features    : \n"
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index c900cc97..a23f7c47 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -1604,6 +1604,25 @@ void PackageManifest::load_build_script(const ::std::string& path)
+ 
+                 rv.rustc_env.push_back(std::make_pair( std::string(value.begin(), eq), std::string(eq+1, value.end()) ));
+             }
++            // cargo:rustc-link-arg=FLAG and the per-target-kind variants (see BuildScriptOutput)
++            else if( key == "rustc-link-arg" ) {
++                rv.rustc_link_arg.push_back(value);
++            }
++            else if( key == "rustc-link-arg-cdylib" || key == "rustc-cdylib-link-arg" ) {
++                rv.rustc_link_arg_cdylib.push_back(value);
++            }
++            else if( key == "rustc-link-arg-bins" ) {
++                rv.rustc_link_arg_bins.push_back(value);
++            }
++            else if( key == "rustc-link-arg-bin" ) {
++                auto eq = std::find(value.begin(), value.end(), '=');
++                if( eq == value.end() )
++                    throw ::std::runtime_error(::format("rustc-link-arg-bin has no `=` - `", value, "`"));
++                rv.rustc_link_arg_bin.push_back(std::make_pair( std::string(value.begin(), eq), std::string(eq+1, value.end()) ));
++            }
++            else if( key == "rustc-link-arg-tests" ) {
++                rv.rustc_link_arg_tests.push_back(value);
++            }
+             // cargo:rerun-if-changed=foo.rs
+             else if( key == "rerun-if-changed" ) {
+                 DEBUG("TODO: '" << key << "' = '" << value << "'");
+diff --git a/tools/minicargo/manifest.h b/tools/minicargo/manifest.h
+index 2acb12bd..43274872 100644
+--- a/tools/minicargo/manifest.h
++++ b/tools/minicargo/manifest.h
+@@ -325,6 +325,15 @@ public:
+     ::std::vector<::std::string>    rustc_flags;
+     // cargo:rustc-env=FOO=BAR
+     ::std::vector<::std::pair<::std::string, ::std::string>>    rustc_env;
++    // Linker flags for this package's linked targets (cargo ignores them for the targets of other packages):
++    // cargo:rustc-link-arg=FLAG (binaries, cdylib, tests), cargo:rustc-link-arg-cdylib=FLAG (older spelling
++    // cargo:rustc-cdylib-link-arg=FLAG, which pyo3-build-config's add_extension_module_link_args prints),
++    // cargo:rustc-link-arg-bins=FLAG, cargo:rustc-link-arg-bin=BIN=FLAG, cargo:rustc-link-arg-tests=FLAG
++    ::std::vector<::std::string>    rustc_link_arg;
++    ::std::vector<::std::string>    rustc_link_arg_cdylib;
++    ::std::vector<::std::string>    rustc_link_arg_bins;
++    ::std::vector<::std::pair<::std::string, ::std::string>>    rustc_link_arg_bin;
++    ::std::vector<::std::string>    rustc_link_arg_tests;
+ 
+     // cargo:foo=bar when [package]links=baz
+     ::std::vector<::std::pair<::std::string, ::std::string>>    downstream_env;
+-- 
+2.43.0
+
