@@ -28,6 +28,9 @@ This script answers those calls:
   RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS) go to minicargo's `--link-arg`;
   `--remap-path-prefix` (the PortGroup's rust.remap, which maturin passes on
   from cargo.home/config.toml) is dropped.
+- `cargo update` / `cargo generate-lockfile` (a Portfile's own `pre-build { system "cargo update" }`, as in
+  py-pydantic_core, to make the sdist's Cargo.lock match cargo.crates): nothing to do, minicargo doesn't read
+  Cargo.lock but resolves from the vendored crates, i.e. cargo.crates.
 - `rustc`: version and `--print` queries; anything else goes to mrustc.
 
 Not supported, exit status 101 with a message: other rustc flags, Rust
@@ -693,6 +696,10 @@ def cargo_main(args):
         die("no command given")
     if args[0] in ("-V", "--version"):
         print(f"cargo {os.environ.get('MRUSTC_TARGET_VER', '1.90')}.0 (minicargo)")
+        return
+    if args[0] in ("update", "generate-lockfile"):
+        sys.stderr.write(f"{TOOL} (mrustc PortGroup stand-in): `cargo {args[0]}`: nothing to do, minicargo resolves "
+                         "from the vendored crates (cargo.crates), not from Cargo.lock\n")
         return
     command, opts = args[0], parse_options(args[1:])
     if command == "metadata":

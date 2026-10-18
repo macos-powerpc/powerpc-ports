@@ -918,6 +918,13 @@ proc rust::write_cargo_shim {} {
         puts ${fd} "exec [shellescape [option python.bin]] [shellescape ${bindir}/cargo-shim.py] ${tool} \"\$@\""
         close ${fd}
     }
+    # Portfiles run cargo themselves as well, e.g. py-pydantic_core's `pre-build { system -W ${worksrcpath} "cargo
+    # update" }` (this pre-build runs before the Portfile's). `system` doesn't use build.env, so the stand-ins go first
+    # in the PATH of this process too.
+    global env
+    if {[lindex [split $env(PATH) :] 0] ne ${bindir}} {
+        set env(PATH) ${bindir}:$env(PATH)
+    }
 }
 
 proc rust::set_environment {} {
