@@ -1,0 +1,591 @@
+From 010bae8915a11cd8bc60cca847d1473529ae2669 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 06:47:14 +0000
+Subject: [PATCH] hir_typeck: of several inherent impls matching a type, the one
+ whose `where` bounds hold is the candidate
+
+cryptography-rust 48.0.0 (py314-cryptography) src/backend/aead.rs:846, `#[pyo3::pymethods] impl AesCcm
+{ #[new] fn new(..) -> CryptographyResult<AesCcm> }`:
+    BUG: src/hir_typeck/expr_cs__enum.cpp:1997: TODO: visit - Revisit _PathValue when UfcsInherent has
+    multiple options - <pyo3::impl_::pyclass::probes::IsPyClass<Result<AesCcm, CryptographyError>>>::VALUE
+
+pyo3 0.28.3 src/impl_/pyclass/probes.rs has two inherent impls of the probe:
+    impl<T> IsPyClass<T> where T: PyClass { pub const VALUE: bool = true; }
+    impl<T, E> IsPyClass<Result<T, E>> where T: PyClass { pub const VALUE: bool = true; }
+Both match `IsPyClass<Result<AesCcm, CryptographyError>>` by type pattern; rustc's candidates are the
+impls whose where clauses hold, which leaves the second (two holding would be an ambiguity error).
+0324 taught Resolve UFCS that rule for the inherent-vs-trait decision; typeck still counted the impls
+that match by type and gave up at two.
+
+Fix: the 0324 helper moves to src/hir_typeck/impl_bounds.{hpp,cpp} (HIR_InherentImplBoundsHold,
+a generic parameter counts as undecidable when the resolver carries no generics), with a selector
+HIR_SelectInherentImpl (of several impls with the item: typeck's recorded impl parameter count when it
+tells them apart, else the one whose bounds hold; null = keep the first match as before). Typeck's
+value-path revisit and the call cache select by bounds (with a static resolver carrying the item's
+generics); the validation pass, StaticTraitResolve::get_value (consteval, MIR, trans) and Resolve UFCS's
+pattern constants select the same impl instead of the first with the item, which asserted
+"Path impl_params cache is missized - 2 != 1" once typeck had chosen the second.
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/Makefile b/Makefile
+index bb8e64a4..0242963a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -113,7 +113,7 @@ OBJ +=  hir/visitor.o hir/crate_post_load.o
+ OBJ +=  hir/inherent_cache.o
+ OBJ += hir_conv/expand_type.o hir_conv/constant_evaluation.o hir_conv/resolve_ufcs.o hir_conv/bind.o hir_conv/markings.o
+ OBJ +=  hir_conv/lifetime_elision.o
+-OBJ += hir_typeck/outer.o hir_typeck/common.o hir_typeck/helpers.o hir_typeck/static.o hir_typeck/impl_ref.o
++OBJ += hir_typeck/outer.o hir_typeck/common.o hir_typeck/helpers.o hir_typeck/static.o hir_typeck/impl_ref.o hir_typeck/impl_bounds.o
+ OBJ +=  hir_typeck/resolve_common.o
+ OBJ +=  hir_typeck/expr_visit.o
+ OBJ +=  hir_typeck/expr_cs.o hir_typeck/expr_cs__enum.o
+
+diff --git a/src/hir_conv/resolve_ufcs.cpp b/src/hir_conv/resolve_ufcs.cpp
+index eb68dae7..1ba9aaed 100644
+--- a/src/hir_conv/resolve_ufcs.cpp
++++ b/src/hir_conv/resolve_ufcs.cpp
+@@ -15,6 +15,7 @@
+ #include <hir/expr.hpp>
+ #include <hir/visitor.hpp>
+ #include <hir_typeck/static.hpp>
++#include <hir_typeck/impl_bounds.hpp>
+ #include <algorithm>    // std::remove_if
+ 
+ namespace resolve_ufcs {
+@@ -632,113 +633,6 @@ namespace resolve_ufcs {
+             return false;
+         }
+ 
+-        /// Do an inherent impl's `where` bounds hold with `impl.m_type` matched against `type`? rustc takes an inherent
+-        /// candidate only when they do and searches the traits in scope otherwise: pyo3 0.28's probes
+-        /// (`impl<T: PyClass> IsPyClass<T> { pub const VALUE: bool = true; }` next to `impl<T> Probe for IsPyClass<T> {}`,
+-        /// whose `VALUE` is `false`, read as `IsPyClass::<T>::VALUE` under `use Probe as _`) select by that rule.
+-        /// Anything not decidable here (inference variables, impl parameters the type doesn't fix, bounds with associated
+-        /// type bindings or HRTBs, opaque projections) counts as holding.
+-        bool inherent_impl_bounds_hold(const Span& sp, const ::HIR::TypeImpl& impl, const ::HIR::TypeRef& type) const
+-        {
+-            if( !::std::any_of(impl.m_params.m_bounds.begin(), impl.m_params.m_bounds.end(), [](const ::HIR::GenericBound& b){ return b.is_TraitBound(); }) ) {
+-                return true;
+-            }
+-            TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type << impl.m_params.fmt_bounds() << " for " << type);
+-            auto is_undecidable = [](const ::HIR::TypeRef& t)->bool {
+-                return t.data().is_Infer() || t.data().is_ErasedType()
+-                    || (t.data().is_Path() && (t.data().as_Path().binding.is_Unbound() || t.data().as_Path().binding.is_Opaque()));
+-                };
+-            if( visit_ty_with(type, is_undecidable) ) {
+-                DEBUG("- Not decidable (inference variable or opaque type in " << type << ")");
+-                return true;
+-            }
+-            // Capture the impl parameters from the matched type
+-            struct CaptureParams:
+-                public ::HIR::MatchGenerics
+-            {
+-                Span    sp;
+-                ::HIR::PathParams&  out;
+-                ::std::vector<bool> set_tys;
+-                ::std::vector<bool> set_vals;
+-                CaptureParams(const Span& sp, const ::HIR::GenericParams& def, ::HIR::PathParams& out)
+-                    : sp(sp), out(out)
+-                {
+-                    out.m_lifetimes.resize(def.m_lifetimes.size());
+-                    out.m_types.resize(def.m_types.size());
+-                    out.m_values.resize(def.m_values.size());
+-                    set_tys.resize(def.m_types.size());
+-                    set_vals.resize(def.m_values.size());
+-                }
+-                ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty, ::HIR::t_cb_resolve_type resolve_cb) override {
+-                    if( g.group() != 0 || g.idx() >= out.m_types.size() ) {
+-                        return ::HIR::Compare::Fuzzy;
+-                    }
+-                    if( !set_tys[g.idx()] ) {
+-                        set_tys[g.idx()] = true;
+-                        out.m_types[g.idx()] = ty.clone();
+-                        return ::HIR::Compare::Equal;
+-                    }
+-                    return out.m_types[g.idx()].compare_with_placeholders(sp, ty, resolve_cb);
+-                }
+-                ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::ConstGeneric& v) override {
+-                    if( g.group() != 0 || g.idx() >= out.m_values.size() ) {
+-                        return ::HIR::Compare::Fuzzy;
+-                    }
+-                    if( !set_vals[g.idx()] ) {
+-                        set_vals[g.idx()] = true;
+-                        out.m_values[g.idx()] = v.clone();
+-                        return ::HIR::Compare::Equal;
+-                    }
+-                    return out.m_values[g.idx()] == v ? ::HIR::Compare::Equal : ::HIR::Compare::Unequal;
+-                }
+-            };
+-            ::HIR::PathParams   impl_params;
+-            CaptureParams   cp(sp, impl.m_params, impl_params);
+-            auto cb_ident = HIR::ResolvePlaceholdersNop();
+-            if( impl.m_type.match_test_generics_fuzz(sp, type, cb_ident, cp) == ::HIR::Compare::Unequal ) {
+-                DEBUG("- Type mismatch?");
+-                return true;
+-            }
+-            if( ::std::find(cp.set_tys.begin(), cp.set_tys.end(), false) != cp.set_tys.end()
+-             || ::std::find(cp.set_vals.begin(), cp.set_vals.end(), false) != cp.set_vals.end() ) {
+-                DEBUG("- An impl parameter isn't fixed by the type");
+-                return true;
+-            }
+-            auto ms = MonomorphStatePtr(&type, &impl_params, nullptr);
+-            for(const auto& b : impl.m_params.m_bounds)
+-            {
+-                const auto* be = b.opt_TraitBound();
+-                if( !be ) {
+-                    continue;
+-                }
+-                if( (be->hrtbs && !be->hrtbs->is_empty()) || (be->trait.m_hrtbs && !be->trait.m_hrtbs->is_empty())
+-                 || !be->trait.m_type_bounds.empty() || !be->trait.m_trait_bounds.empty() ) {
+-                    DEBUG("- " << b << ": not decided here");
+-                    continue;
+-                }
+-                auto b_ty = ms.monomorph_type(sp, be->type, /*allow_infer=*/true);
+-                m_resolve.expand_associated_types(sp, b_ty);
+-                auto b_tp = ms.monomorph_genericpath(sp, be->trait.m_path, /*allow_infer=*/true);
+-                bool undecidable = visit_ty_with(b_ty, is_undecidable);
+-                for(auto& t : b_tp.m_params.m_types) {
+-                    m_resolve.expand_associated_types(sp, t);
+-                    undecidable |= visit_ty_with(t, is_undecidable);
+-                }
+-                if( undecidable ) {
+-                    DEBUG("- " << b_ty << ": " << b_tp << ": not decided here");
+-                    continue;
+-                }
+-                // Trait arguments not yet filled to the trait's count (defaults): match any
+-                const auto& trait = m_resolve.m_crate.get_trait_by_path(sp, b_tp.m_path);
+-                const ::HIR::PathParams* tp = (b_tp.m_params.m_types.size() == trait.m_params.m_types.size() ? &b_tp.m_params : nullptr);
+-                if( !m_resolve.find_impl(sp, b_tp.m_path, tp, b_ty, [](const auto&, bool)->bool { return true; }) ) {
+-                    DEBUG("- " << b_ty << ": " << b_tp << " doesn't hold");
+-                    return false;
+-                }
+-            }
+-            return true;
+-        }
+-
+         /// - `out_skipped_unstable` (if set): skip an unstable method of a feature the crate hasn't enabled, and record that one was
+         /// - `out_skipped_bounds` (if set): skip an inherent impl whose bounds don't hold for the type, and record that one was
+         bool resolve_UfcsUnknown_inherent(const ::HIR::SimplePath& vis_path, const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd, bool* out_skipped_unstable = nullptr, bool* out_skipped_bounds = nullptr)
+@@ -789,7 +683,7 @@ namespace resolve_ufcs {
+                 // An inherent item whose impl bounds fail for this type isn't the candidate (the traits in scope are
+                 // searched next); cryptography 48.0.0 oid.rs:21 via pyo3's `IsPyClass::<CryptographyResult<Self>>::VALUE`:
+                 // "Failed to find an impl of PyClass for Result<ObjectIdentifier, CryptographyError>"
+-                if( out_skipped_bounds && !inherent_impl_bounds_hold(sp, impl, e.type) ) {
++                if( out_skipped_bounds && !HIR_InherentImplBoundsHold(sp, m_resolve, impl, e.type) ) {
+                     DEBUG("Impl bounds don't hold, skipped");
+                     *out_skipped_bounds = true;
+                     return false;
+@@ -1177,7 +1071,11 @@ namespace resolve_ufcs {
+                     BUG(sp, "UfcsUnknown still in pattern value - " << pat);
+                     }
+                 TU_ARMA(UfcsInherent, pe) {
++                    // Several impls with the constant: the one whose bounds hold (0330)
++                    const auto* chosen = HIR_SelectInherentImpl(sp, m_resolve, pe.type, pe.item);
+                     bool rv = m_crate.find_type_impls(pe.type, HIR::ResolvePlaceholdersNop(), [&](const auto& impl) {
++                        if( chosen && &impl != chosen )
++                            return false;
+                         DEBUG("- matched inherent impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+                         // Search for item in this block
+                         auto it = impl.m_constants.find(pe.item);
+diff --git a/src/hir_typeck/expr_check.cpp b/src/hir_typeck/expr_check.cpp
+index dbbfa1ac..1bf01ba4 100644
+--- a/src/hir_typeck/expr_check.cpp
++++ b/src/hir_typeck/expr_check.cpp
+@@ -10,6 +10,7 @@
+ #include <hir_typeck/static.hpp>
+ #include "main_bindings.hpp"
+ #include <algorithm>
++#include "impl_bounds.hpp"
+ 
+ namespace {
+     typedef ::std::vector< ::std::pair< ::HIR::Pattern, ::HIR::TypeRef> >   t_args;
+@@ -767,8 +768,12 @@ namespace {
+             TU_ARMA(UfcsInherent, e) {
+                 // - Locate function (and impl block)
+                 const ::HIR::TypeImpl* impl_ptr = nullptr;
++                // The impl typeck chose when several have the method (0330)
++                const auto* chosen = HIR_SelectInherentImpl(sp, m_resolve, e.type, e.item, e.impl_params.m_types.empty() ? SIZE_MAX : e.impl_params.m_types.size());
+                 m_resolve.m_crate.find_type_impls(e.type, HIR::ResolvePlaceholdersNop(),
+                     [&](const auto& impl) {
++                        if( chosen && &impl != chosen )
++                            return false;
+                         DEBUG("- impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+                         auto it = impl.m_methods.find(e.item);
+                         if( it == impl.m_methods.end() )
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 01ce262f..60f0d8e3 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -9,6 +9,7 @@
+ #include "expr_visit.hpp"
+ #include <hir/expr.hpp>
+ #include <hir_conv/main_bindings.hpp>
++#include <hir_typeck/impl_bounds.hpp>
+ 
+ #include <algorithm>
+ 
+@@ -234,6 +235,30 @@ namespace typecheck
+ 
+     /// (HELPER) Populate the cache for nodes that use visit_call
+     /// TODO: If the function has multiple mismatched options, tell the caller to try again later?
++    /// Of several inherent impls matching `type` (by type pattern), the one whose `where` bounds hold, or null when
++    /// that leaves none or more than one (not decidable yet, or a genuine ambiguity)
++    const ::HIR::TypeImpl* select_inherent_impl_by_bounds(Context& context, const Span& sp, const ::std::vector<const ::HIR::TypeImpl*>& candidates, const ::HIR::TypeRef& type)
++    {
++        auto ty = type.clone();
++        context.m_ivars.expand_ivars(ty);
++        // The bounds are decided statically, with the enclosing item's generics (as Resolve UFCS does)
++        StaticTraitResolve  static_resolve(context.m_crate);
++        static_resolve.set_both_generics_raw(context.m_resolve.m_impl_generics, context.m_resolve.m_item_generics);
++        const ::HIR::TypeImpl* rv = nullptr;
++        for(const auto* impl : candidates)
++        {
++            if( !HIR_InherentImplBoundsHold(sp, static_resolve, *impl, ty) ) {
++                DEBUG("- impl" << impl->m_params.fmt_args() << " " << impl->m_type << ": bounds don't hold for " << ty);
++                continue;
++            }
++            if( rv ) {
++                DEBUG("- impl" << impl->m_params.fmt_args() << " " << impl->m_type << ": a second applicable impl");
++                return nullptr;
++            }
++            rv = impl;
++        }
++        return rv;
++    }
+     bool visit_call_populate_cache(Context& context, const Span& sp, ::HIR::Path& path, ::HIR::ExprCallCache& cache, bool defer_fuzzy_inherent)
+     {
+         TRACE_FUNCTION_FR(path, path);
+@@ -430,25 +455,30 @@ namespace typecheck
+ 
+         const ::HIR::TypeImpl* impl_ptr = nullptr;
+         // Detect multiple applicable methods and get the caller to try again later if there are multiple
+-        unsigned int count = 0;
++        ::std::vector<const ::HIR::TypeImpl*>   candidates;
+         context.m_crate.find_type_impls(e.type, context.m_ivars.callback_resolve_infer(),
+             [&](const auto& impl) {
+                 DEBUG("- impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+-                auto it = impl.m_methods.find(e.item);
+-                if( it == impl.m_methods.end() )
+-                    return false;
+-                fcn_ptr = &it->second.data;
+-                impl_ptr = &impl;
+-                count ++;
++                if( impl.m_methods.find(e.item) != impl.m_methods.end() ) {
++                    candidates.push_back(&impl);
++                }
+                 return false;
+             });
+-        if( !fcn_ptr ) {
++        if( candidates.empty() ) {
+             ERROR(sp, E0000, "Failed to locate function " << path);
+         }
+-        if( count > 1 ) {
+-            // Return a status to the caller so it can try again when there may be more information
+-            return false;
++        if( candidates.size() > 1 ) {
++            // The impls whose `where` bounds hold for the type (as for an associated value, 0330)
++            impl_ptr = select_inherent_impl_by_bounds(context, sp, candidates, e.type);
++            if( !impl_ptr ) {
++                // Return a status to the caller so it can try again when there may be more information
++                return false;
++            }
+         }
++        else {
++            impl_ptr = candidates[0];
++        }
++        fcn_ptr = &impl_ptr->m_methods.at(e.item).data;
+         assert(impl_ptr);
+         DEBUG("Found impl" << impl_ptr->m_params.fmt_args() << " " << impl_ptr->m_type);
+         // A receiver without ivars can only match fuzzily through a projection in the impl type (`impl<L: Link>
+@@ -1965,36 +1995,39 @@ namespace typecheck
+                 const ::HIR::Constant* const_ptr = nullptr;
+                 const ::HIR::TypeImpl* impl_ptr = nullptr;
+                 // TODO: Support mutiple matches here (if there's a fuzzy match) and retry if so
+-                unsigned int count = 0;
++                ::std::vector<const ::HIR::TypeImpl*>   candidates;
+                 this->context.m_crate.find_type_impls(e.type, context.m_ivars.callback_resolve_infer(),
+                     [&](const auto& impl) {
+                         DEBUG("- impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+-                        {
+-                            auto it = impl.m_methods.find(e.item);
+-                            if( it != impl.m_methods.end() ) {
+-                                fcn_ptr = &it->second.data;
+-                                impl_ptr = &impl;
+-                                count += 1;
+-                                return false;
+-                                //return true;
+-                            }
+-                        }
+-                        {
+-                            auto it = impl.m_constants.find(e.item);
+-                            if( it != impl.m_constants.end() ) {
+-                                const_ptr = &it->second.data;
+-                                impl_ptr = &impl;
+-                                count += 1;
+-                                return false;
+-                            }
++                        if( impl.m_methods.find(e.item) != impl.m_methods.end() || impl.m_constants.find(e.item) != impl.m_constants.end() ) {
++                            candidates.push_back(&impl);
+                         }
+                         return false;
+                     });
+-                if( count == 0 ) {
++                if( candidates.empty() ) {
+                     ERROR(sp, E0000, "Failed to locate associated value " << node.m_path);
+                 }
+-                if( count > 1 ) {
+-                    TODO(sp, "Revisit _PathValue when UfcsInherent has multiple options - " << node.m_path);
++                if( candidates.size() > 1 ) {
++                    // rustc's candidates are the impls whose `where` bounds hold for the type (two of them is an
++                    // ambiguity error there): pyo3 0.28.3 probes.rs `impl<T: PyClass> IsPyClass<T>` next to
++                    // `impl<T: PyClass, E> IsPyClass<Result<T, E>>`, read as `IsPyClass::<Result<AesCcm,
++                    // CryptographyError>>::VALUE` by `#[new]` in cryptography-rust 48.0.0 aead.rs:846
++                    impl_ptr = select_inherent_impl_by_bounds(this->context, sp, candidates, e.type);
++                    if( !impl_ptr ) {
++                        TODO(sp, "Revisit _PathValue when UfcsInherent has multiple options - " << node.m_path);
++                    }
++                }
++                else {
++                    impl_ptr = candidates[0];
++                }
++                {
++                    auto it = impl_ptr->m_methods.find(e.item);
++                    if( it != impl_ptr->m_methods.end() ) {
++                        fcn_ptr = &it->second.data;
++                    }
++                    else {
++                        const_ptr = &impl_ptr->m_constants.at(e.item).data;
++                    }
+                 }
+ 
+                 assert(fcn_ptr || const_ptr);
+diff --git a/src/hir_typeck/impl_bounds.cpp b/src/hir_typeck/impl_bounds.cpp
+new file mode 100644
+index 00000000..072ccb89
+--- /dev/null
++++ b/src/hir_typeck/impl_bounds.cpp
+@@ -0,0 +1,170 @@
++/*
++ * MRustC - Rust Compiler
++ * - By John Hodge (Mutabah/thePowersGang)
++ *
++ * hir_typeck/impl_bounds.cpp
++ * - Do an inherent impl's `where` bounds hold for a type? (shared by Resolve UFCS, typeck and the static resolver)
++ */
++#include "impl_bounds.hpp"
++#include <algorithm>
++
++/// Do an inherent impl's `where` bounds hold with `impl.m_type` matched against `type`? rustc takes an inherent
++/// candidate only when they do and searches the traits in scope otherwise: pyo3 0.28's probes
++/// (`impl<T: PyClass> IsPyClass<T> { pub const VALUE: bool = true; }` next to `impl<T> Probe for IsPyClass<T> {}`,
++/// whose `VALUE` is `false`, read as `IsPyClass::<T>::VALUE` under `use Probe as _`) select by that rule.
++/// Anything not decidable here (inference variables, impl parameters the type doesn't fix, bounds with associated
++/// type bindings or HRTBs, opaque projections; generic parameters too when the resolver carries no generics, i.e. not
++/// the enclosing item's bounds) counts as holding.
++/// Used by Resolve UFCS (an inherent candidate whose bounds fail yields to the traits in scope, 0324) and, where several
++/// inherent impls match a type, by typeck and the static value lookup to keep the one whose bounds hold (0330: pyo3
++/// 0.28.3 probes.rs `impl<T: PyClass> IsPyClass<T>` next to `impl<T: PyClass, E> IsPyClass<Result<T, E>>`).
++bool HIR_InherentImplBoundsHold(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeImpl& impl, const ::HIR::TypeRef& type)
++{
++    const bool generics_undecidable = (resolve.m_impl_generics == nullptr && resolve.m_item_generics == nullptr);
++    if( !::std::any_of(impl.m_params.m_bounds.begin(), impl.m_params.m_bounds.end(), [](const ::HIR::GenericBound& b){ return b.is_TraitBound(); }) ) {
++        return true;
++    }
++    TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type << impl.m_params.fmt_bounds() << " for " << type);
++    auto is_undecidable = [generics_undecidable](const ::HIR::TypeRef& t)->bool {
++        return t.data().is_Infer() || t.data().is_ErasedType() || (generics_undecidable && t.data().is_Generic())
++            || (t.data().is_Path() && (t.data().as_Path().binding.is_Unbound() || t.data().as_Path().binding.is_Opaque()));
++        };
++    if( visit_ty_with(type, is_undecidable) ) {
++        DEBUG("- Not decidable (inference variable or opaque type in " << type << ")");
++        return true;
++    }
++    // Capture the impl parameters from the matched type
++    struct CaptureParams:
++        public ::HIR::MatchGenerics
++    {
++        Span    sp;
++        ::HIR::PathParams&  out;
++        ::std::vector<bool> set_tys;
++        ::std::vector<bool> set_vals;
++        CaptureParams(const Span& sp, const ::HIR::GenericParams& def, ::HIR::PathParams& out)
++            : sp(sp), out(out)
++        {
++            out.m_lifetimes.resize(def.m_lifetimes.size());
++            out.m_types.resize(def.m_types.size());
++            out.m_values.resize(def.m_values.size());
++            set_tys.resize(def.m_types.size());
++            set_vals.resize(def.m_values.size());
++        }
++        ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty, ::HIR::t_cb_resolve_type resolve_cb) override {
++            if( g.group() != 0 || g.idx() >= out.m_types.size() ) {
++                return ::HIR::Compare::Fuzzy;
++            }
++            if( !set_tys[g.idx()] ) {
++                set_tys[g.idx()] = true;
++                out.m_types[g.idx()] = ty.clone();
++                return ::HIR::Compare::Equal;
++            }
++            return out.m_types[g.idx()].compare_with_placeholders(sp, ty, resolve_cb);
++        }
++        ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::ConstGeneric& v) override {
++            if( g.group() != 0 || g.idx() >= out.m_values.size() ) {
++                return ::HIR::Compare::Fuzzy;
++            }
++            if( !set_vals[g.idx()] ) {
++                set_vals[g.idx()] = true;
++                out.m_values[g.idx()] = v.clone();
++                return ::HIR::Compare::Equal;
++            }
++            return out.m_values[g.idx()] == v ? ::HIR::Compare::Equal : ::HIR::Compare::Unequal;
++        }
++    };
++    ::HIR::PathParams   impl_params;
++    CaptureParams   cp(sp, impl.m_params, impl_params);
++    auto cb_ident = HIR::ResolvePlaceholdersNop();
++    if( impl.m_type.match_test_generics_fuzz(sp, type, cb_ident, cp) == ::HIR::Compare::Unequal ) {
++        DEBUG("- Type mismatch?");
++        return true;
++    }
++    if( ::std::find(cp.set_tys.begin(), cp.set_tys.end(), false) != cp.set_tys.end()
++     || ::std::find(cp.set_vals.begin(), cp.set_vals.end(), false) != cp.set_vals.end() ) {
++        DEBUG("- An impl parameter isn't fixed by the type");
++        return true;
++    }
++    auto ms = MonomorphStatePtr(&type, &impl_params, nullptr);
++    for(const auto& b : impl.m_params.m_bounds)
++    {
++        const auto* be = b.opt_TraitBound();
++        if( !be ) {
++            continue;
++        }
++        if( (be->hrtbs && !be->hrtbs->is_empty()) || (be->trait.m_hrtbs && !be->trait.m_hrtbs->is_empty())
++         || !be->trait.m_type_bounds.empty() || !be->trait.m_trait_bounds.empty() ) {
++            DEBUG("- " << b << ": not decided here");
++            continue;
++        }
++        auto b_ty = ms.monomorph_type(sp, be->type, /*allow_infer=*/true);
++        resolve.expand_associated_types(sp, b_ty);
++        auto b_tp = ms.monomorph_genericpath(sp, be->trait.m_path, /*allow_infer=*/true);
++        bool undecidable = visit_ty_with(b_ty, is_undecidable);
++        for(auto& t : b_tp.m_params.m_types) {
++            resolve.expand_associated_types(sp, t);
++            undecidable |= visit_ty_with(t, is_undecidable);
++        }
++        if( undecidable ) {
++            DEBUG("- " << b_ty << ": " << b_tp << ": not decided here");
++            continue;
++        }
++        // Trait arguments not yet filled to the trait's count (defaults): match any
++        const auto& trait = resolve.m_crate.get_trait_by_path(sp, b_tp.m_path);
++        const ::HIR::PathParams* tp = (b_tp.m_params.m_types.size() == trait.m_params.m_types.size() ? &b_tp.m_params : nullptr);
++        if( !resolve.find_impl(sp, b_tp.m_path, tp, b_ty, [](const auto&, bool)->bool { return true; }) ) {
++            DEBUG("- " << b_ty << ": " << b_tp << " doesn't hold");
++            return false;
++        }
++    }
++    return true;
++}
++
++
++const ::HIR::TypeImpl* HIR_SelectInherentImpl(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& type, const RcString& item, size_t n_impl_types_hint)
++{
++    ::std::vector<const ::HIR::TypeImpl*>   candidates;
++    resolve.m_crate.find_type_impls(type, HIR::ResolvePlaceholdersNop(), [&](const auto& impl) {
++        if( impl.m_methods.find(item) != impl.m_methods.end() || impl.m_constants.find(item) != impl.m_constants.end() ) {
++            candidates.push_back(&impl);
++        }
++        return false;
++        });
++    if( candidates.size() <= 1 ) {
++        return nullptr;
++    }
++    TRACE_FUNCTION_F(candidates.size() << " impls of " << type << " with `" << item << "`, hint=" << n_impl_types_hint);
++    if( n_impl_types_hint != SIZE_MAX )
++    {
++        ::std::vector<const ::HIR::TypeImpl*>   with_count;
++        for(const auto* impl : candidates) {
++            if( impl->m_params.m_types.size() == n_impl_types_hint ) {
++                with_count.push_back(impl);
++            }
++        }
++        if( with_count.size() == 1 ) {
++            DEBUG("By parameter count: impl" << with_count[0]->m_params.fmt_args() << " " << with_count[0]->m_type);
++            return with_count[0];
++        }
++        if( !with_count.empty() ) {
++            candidates = ::std::move(with_count);
++        }
++    }
++    const ::HIR::TypeImpl* rv = nullptr;
++    for(const auto* impl : candidates)
++    {
++        if( !HIR_InherentImplBoundsHold(sp, resolve, *impl, type) ) {
++            DEBUG("- impl" << impl->m_params.fmt_args() << " " << impl->m_type << ": bounds don't hold");
++            continue;
++        }
++        if( rv ) {
++            DEBUG("- impl" << impl->m_params.fmt_args() << " " << impl->m_type << ": a second impl whose bounds hold, no choice");
++            return nullptr;
++        }
++        rv = impl;
++    }
++    if( rv ) {
++        DEBUG("By bounds: impl" << rv->m_params.fmt_args() << " " << rv->m_type);
++    }
++    return rv;
++}
+diff --git a/src/hir_typeck/impl_bounds.hpp b/src/hir_typeck/impl_bounds.hpp
+new file mode 100644
+index 00000000..305f073f
+--- /dev/null
++++ b/src/hir_typeck/impl_bounds.hpp
+@@ -0,0 +1,18 @@
++/*
++ * MRustC - Rust Compiler
++ * - By John Hodge (Mutabah/thePowersGang)
++ *
++ * hir_typeck/impl_bounds.hpp
++ * - Do an inherent impl's `where` bounds hold for a type? (shared by Resolve UFCS, typeck and the static resolver)
++ */
++#pragma once
++#include <hir/hir.hpp>
++#include <hir_typeck/static.hpp>
++
++/// Do an inherent impl's `where` bounds hold with `impl.m_type` matched against `type`? See impl_bounds.cpp
++extern bool HIR_InherentImplBoundsHold(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeImpl& impl, const ::HIR::TypeRef& type);
++/// Of several inherent impls of `type` that have a method or constant `item`, the one to use: with
++/// `n_impl_types_hint` (typeck's recorded impl parameter count, SIZE_MAX for none) the one with that many type
++/// parameters, else the one whose `where` bounds hold. Null when there is nothing to choose between (one or no impl)
++/// or the choice isn't decidable: callers then keep their first match, as before 0330.
++extern const ::HIR::TypeImpl* HIR_SelectInherentImpl(const Span& sp, const StaticTraitResolve& resolve, const ::HIR::TypeRef& type, const RcString& item, size_t n_impl_types_hint=SIZE_MAX);
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index bc4350e1..034a7fe2 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <hir/expr.hpp>
+ #include <hir_conv/main_bindings.hpp>
++#include "impl_bounds.hpp"
+ 
+ namespace {
+     const HIR::GenericParams    empty_params;
+@@ -3751,7 +3752,14 @@ StaticTraitResolve::ValuePtr StaticTraitResolve::get_value(const Span& sp, const
+         out_params.pp_impl = &pe.impl_params;
+         out_params.pp_method = &pe.params;
+         ValuePtr    rv;
++        // Several impls with the item match the type: the one typeck chose (its parameter count, else the one whose
++        // `where` bounds hold; 0330: pyo3 0.28.3 probes.rs `impl<T: PyClass> IsPyClass<T>` next to
++        // `impl<T: PyClass, E> IsPyClass<Result<T, E>>`), the first match as before when that isn't decidable
++        const auto* chosen = HIR_SelectInherentImpl(sp, *this, pe.type, pe.item, pe.impl_params.m_types.empty() ? SIZE_MAX : pe.impl_params.m_types.size());
+         m_crate.find_type_impls(pe.type, HIR::ResolvePlaceholdersNop(), [&](const auto& impl) {
++            if( chosen && &impl != chosen ) {
++                return false;
++            }
+             DEBUG("Found impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+             // Populate pp_impl if not populated
+             if( !pe.impl_params.has_params() ) {

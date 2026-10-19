@@ -1,0 +1,162 @@
+From fd0afa2f40cf38c5265b362081585bdbd5b6ec8a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 08:43:33 +0000
+Subject: [PATCH] hir_typeck: a higher-ranked lifetime under a nested `for<>`
+ belongs to the innermost pushed binder that declares it
+
+cryptography-rust 48.0.0 (py314-cryptography) src/pkcs7.rs:807, `try_list_of_certificates(py, data,
+|data, cb| { .. cb(c)?; .. })`:
+    <null> BUG: ASSERT FAIL: src/hir_typeck/helpers.cpp:38:g.idx() < hrls.m_lifetimes.size(): HRL index out of range
+
+The callee's bound is
+    F: for<'a> FnOnce(&'a Py<PyBytes>, &mut dyn FnMut(RawCertificate<'a>) -> CryptographyResult<()>) -> ..
+and the closure's `cb` parameter is deduced from it. Every binder (a bound's `for<'a>`, a trait object's,
+a function pointer's) numbers its lifetimes from zero, and Monomorphiser::monomorph_lifetime left every
+higher-ranked lifetime under ANY pushed binder untouched ("TODO: Ensure that the param is in range"), so
+when apply_bounds_as_rules replaced the bound's `'a` with an omitted lifetime, the `'a` under the dyn's
+own (empty) `for<>` stayed: `cb: &mut dyn for<> FnMut(Certificate<'H0>)`. Calling `cb` finds FnOnce
+through the dyn's supertraits and collects the dyn binder's lifetimes from `<(Certificate<'H0>,)>`,
+where `'H0` is past the end.
+
+Fix: HIR::TrackHrbStack::hrb_declaring_lifetime walks the pushed binders innermost-first for the one
+whose lifetimes reach the index. monomorph_lifetime keeps a higher-ranked lifetime only when a pushed
+binder declares it and otherwise resolves it like one outside the binder (MonomorphiserPP without
+an HRL batch passes it through inside a binder, the previous behaviour for whatever does not resolve);
+MatchHrls (helpers.cpp and static.cpp) collects an HRL that no pushed binder declares, so an outer
+binder's lifetimes under an inner `dyn for<'c>` reach the batch too; the call cache's HRL branch
+compared the index against the function's lifetimes instead of the batch it indexes.
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir/type.cpp b/src/hir/type.cpp
+index 1cac97b0..389cfb82 100644
+--- a/src/hir/type.cpp
++++ b/src/hir/type.cpp
+@@ -763,6 +763,14 @@ HIR::TrackHrbStack::PopOnDrop HIR::TrackHrbStack::push_hrb(const std::unique_ptr
+     static HIR::GenericParams  empty_params;
+     return params ? push_hrb(*params) : PopOnDrop();
+ }
++const HIR::GenericParams* HIR::TrackHrbStack::hrb_declaring_lifetime(unsigned idx) const {
++    for(auto it = m_hrb_stack.rbegin(); it != m_hrb_stack.rend(); ++it) {
++        if( *it && idx < (*it)->m_lifetimes.size() ) {
++            return *it;
++        }
++    }
++    return nullptr;
++}
+ ::HIR::Compare HIR::MatchGenerics::cmp_path(const Span& sp, const ::HIR::Path& path_l, const ::HIR::Path& path_r, t_cb_resolve_type resolve_placeholder)
+ {
+     ::HIR::Compare  rv = Compare::Unequal;
+diff --git a/src/hir/type_ref.hpp b/src/hir/type_ref.hpp
+index b1d5e963..d760192b 100644
+--- a/src/hir/type_ref.hpp
++++ b/src/hir/type_ref.hpp
+@@ -74,6 +74,10 @@ public:
+     const HIR::GenericParams* has_hrb() const {
+         return !m_hrb_stack.empty() ? m_hrb_stack.back() : nullptr;
+     }
++    /// The innermost pushed binder whose lifetimes reach index `idx`, or null. Every binder (`for<'a>` on a bound, a
++    /// trait object or a function pointer) numbers its own lifetimes from zero, so a higher-ranked lifetime under a
++    /// nested binder that declares fewer belongs to the first enclosing binder that reaches its index.
++    const HIR::GenericParams* hrb_declaring_lifetime(unsigned idx) const;
+ };
+ 
+ class MatchGenerics:
+diff --git a/src/hir_typeck/common.cpp b/src/hir_typeck/common.cpp
+index 26129670..87671424 100644
+--- a/src/hir_typeck/common.cpp
++++ b/src/hir_typeck/common.cpp
+@@ -443,10 +443,16 @@ bool monomorphise_type_needed(const ::HIR::TypeRef& tpl, bool ignore_lifetimes/*
+         // Have a flag/stack here for current defined HRL batches (trait paths and function pointers), if in one then do the hack
+         // - Otherwise, pass to `get_lifetime`
+         if( g.group() == HIR::GENERIC_Hrtb )  {
+-            if( const auto* hrtb = has_hrb() ) {
+-                // TODO: Ensure that the param is in range (has some issues with nested?)
+-                //ASSERT_BUG(sp, g.idx() < hrtb->m_lifetimes.size(), "Found HRTB out of range - " << g << " from for" << hrtb->fmt_args());
+-                return lft;
++            if( has_hrb() ) {
++                // Bound by one of the binders being monomorphised through (a trait path's or function pointer's
++                // `for<>`): left as it is. Every binder numbers its lifetimes from zero, so the index is looked up
++                // from the innermost binder outwards; one that no binder on the stack declares belongs to the HRL
++                // batch being applied (a bound's `for<'a>` reaching into its `dyn FnMut(Foo<'a>)` argument, with only
++                // that argument's binder pushed) and is resolved like a lifetime outside the binder.
++                if( hrb_declaring_lifetime(g.idx()) ) {
++                    return lft;
++                }
++                DEBUG("HRL " << lft << " is not declared by any pushed binder - resolving");
+             }
+         }
+ 
+@@ -802,6 +808,12 @@ struct CloneTyWith_Monomorph: Monomorphiser {
+             }
+             return p->m_lifetimes[lft_ref.idx()];
+         }
++        else if( has_hrb() ) {
++            // Inside a nested binder with no HRL batch to apply: bound by an enclosing `for<>` of the type being
++            // monomorphised (a bound's `for<'a>` under its `dyn FnMut(Foo<'a>)` argument), kept for that binder's user
++            DEBUG("HRL " << lft_ref << " of an enclosing binder - passthrough");
++            return HIR::LifetimeRef(lft_ref.binding);
++        }
+         else {
+             BUG(sp, "Higher-ranked lifetime parameters were not expected (got " << lft_ref << ")");
+             //DEBUG("No HRBs " << lft_ref);
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 60f0d8e3..aac7165c 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -362,7 +362,7 @@ namespace typecheck
+                 }
+                 else if( e.group() == 3 ) {
+                     auto idx = e.idx();
+-                    ASSERT_BUG(sp, idx < fcn_params.m_lifetimes.size(), "Generic lifetime out of input range - " << e << " >= " << hrl_params.m_lifetimes.size());
++                    ASSERT_BUG(sp, idx < hrl_params.m_lifetimes.size(), "Generic lifetime out of input range - " << e << " >= " << hrl_params.m_lifetimes.size());
+                     return hrl_params.m_lifetimes[idx];
+                 }
+                 else {
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 158773b4..bd57c125 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -34,10 +34,14 @@ namespace {
+                 : ::HIR::Compare::Unequal;
+         }
+         virtual ::HIR::Compare match_lft(const ::HIR::GenericRef& g, const ::HIR::LifetimeRef& lft) {
+-            if( !::HIR::MatchGenerics::has_hrb() && g.group() == ::HIR::GENERIC_Hrtb ) {
+-                ASSERT_BUG(Span(), g.idx() < hrls.m_lifetimes.size(), "HRL index out of range");
+-                hrls.m_lifetimes.at(g.idx()) = lft;
+-                return ::HIR::Compare::Equal;
++            if( g.group() == ::HIR::GENERIC_Hrtb ) {
++                // Ours to collect unless a nested binder pushed by the comparison (a `dyn for<..>` or fn pointer in
++                // the params) declares it: every binder numbers its lifetimes from zero
++                if( !::HIR::MatchGenerics::hrb_declaring_lifetime(g.idx()) ) {
++                    ASSERT_BUG(Span(), g.idx() < hrls.m_lifetimes.size(), "HRL index out of range - " << g << " with " << hrls);
++                    hrls.m_lifetimes.at(g.idx()) = lft;
++                    return ::HIR::Compare::Equal;
++                }
+             }
+             return lft.binding == g.binding
+                 ? ::HIR::Compare::Equal
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index 034a7fe2..60f78822 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -35,10 +35,14 @@ namespace {
+                 : ::HIR::Compare::Unequal;
+         }
+         virtual ::HIR::Compare match_lft(const ::HIR::GenericRef& g, const ::HIR::LifetimeRef& lft) {
+-            if( !::HIR::MatchGenerics::has_hrb() && g.group() == ::HIR::GENERIC_Hrtb ) {
+-                ASSERT_BUG(Span(), g.idx() < hrls.m_lifetimes.size(), "HRL index out of range");
+-                hrls.m_lifetimes.at(g.idx()) = lft;
+-                return ::HIR::Compare::Equal;
++            if( g.group() == ::HIR::GENERIC_Hrtb ) {
++                // Ours to collect unless a nested binder pushed by the comparison (a `dyn for<..>` or fn pointer in
++                // the params) declares it: every binder numbers its lifetimes from zero
++                if( !::HIR::MatchGenerics::hrb_declaring_lifetime(g.idx()) ) {
++                    ASSERT_BUG(Span(), g.idx() < hrls.m_lifetimes.size(), "HRL index out of range - " << g << " with " << hrls);
++                    hrls.m_lifetimes.at(g.idx()) = lft;
++                    return ::HIR::Compare::Equal;
++                }
+             }
+             return lft.binding == g.binding
+                 ? ::HIR::Compare::Equal

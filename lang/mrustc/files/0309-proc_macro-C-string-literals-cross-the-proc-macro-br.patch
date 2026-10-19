@@ -1,0 +1,355 @@
+From 11590cfb69598667114a5ee9d2d75ecd6af56e84 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 23:45:32 +0000
+Subject: [PATCH 309/310] proc_macro: C string literals cross the proc-macro
+ bridge (`c"seed"`)
+
+openssl 0.10.79 (py-cryptography 48.0.0) pkey.rs:402:
+
+    #[corresponds(EVP_PKEY_get_params)]
+    #[cfg(ossl350)]
+    pub fn seed_into(&self, buf: &mut [u8]) -> Result<usize, ErrorStack> {
+        .. ffi::OSSL_PARAM_construct_octet_string(c"seed".as_ptr(), ..) ..
+
+    pkey.rs:402:19-40 BUG: src/expand/proc_macro.cpp:598: TODO: visit_token - TOK_CSTRING
+    thread 'main' panicked at :0:0:
+    Unexpected EOF
+
+An attribute macro's item is the AST printed and re-lexed, and the C string
+token that came out of that had no token class in the proc-macro protocol
+(nor did one in a function-like macro's input). libproc_macro already had
+LiteralValue::CString and Literal::c_string(), but a proc macro that gave
+one back panicked ("TODO: C string literal from a proc macro"), and
+TokenStream::from_str lexed `c"a"` as the identifier `c` and a string.
+
+- expand/proc_macro.cpp: bridge token class CString (14): the bytes of
+  the value, without the NUL, both ways (TokenSink::send_cstring for
+  the child's input and the token lists of `:pat`/`:ty`/`:item` fragments;
+  a suffix may follow it, as for the other string literals).
+- lib/libproc_macro: protocol Token::CString, serialisation both ways,
+  and from_str lexes `c"..."` and `cr"..."` (`\x` escapes are bytes,
+  `\u{..}` escapes and other characters UTF-8; a `c` or `cr` that starts no
+  string is still an identifier, `crate` included).
+- lib/libproc_macro, found on the way: from_str didn't step past the end of
+  a raw string (`r"a" x`: the closing `"` started a new string, "str eof"),
+  and in `r#"a""#` the second `"` wasn't looked at as the end.
+
+The compiler and libproc_macro must be updated together (an older
+libproc_macro panics on tag 14); proc-macro crates need rebuilding against
+the new libproc_macro.
+
+Assisted-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/lib/libproc_macro/src/lex.rs b/lib/libproc_macro/src/lex.rs
+index 0808c8b0..8e47031f 100644
+--- a/lib/libproc_macro/src/lex.rs
++++ b/lib/libproc_macro/src/lex.rs
+@@ -369,8 +369,9 @@ impl ::std::str::FromStr for TokenStream {
+             }
+             else
+             {
+-                // byte or raw string literals
+-                if c == 'b' || c == 'r' || c == '"' {
++                // byte, C or raw string literals (a `c` followed by anything but `"` or `r` starts an identifier; `cr`
++                // not followed by a string goes on as one in the raw string path, as `r` and `br` do)
++                if c == 'b' || c == 'r' || c == '"' || (c == 'c' && (it.next() == Some('"') || it.next() == Some('r'))) {
+                     let mut c = c;
+                     let is_byte = if c == 'b' {
+                             c = some_else!(it.consume() => { rv.push(Ident::new("b", crate::Span::call_site()).into()); break });
+@@ -378,11 +379,18 @@ impl ::std::str::FromStr for TokenStream {
+                         } else {
+                             false
+                         };
++                    // C string (`c"a"`, `cr"a"`): bytes, as a byte string's, without the terminating NUL
++                    let is_c = if !is_byte && c == 'c' {
++                            c = some_else!(it.consume() => { rv.push(Ident::new("c", crate::Span::call_site()).into()); break });
++                            true
++                        } else {
++                            false
++                        };
+ 
+                     if c == 'r'
+                     {
+                         // TODO: If this isn't a string, start parsing an ident instead.
+-                        let ident_str = if is_byte { "br" } else { "r" };
++                        let ident_str = if is_byte { "br" } else if is_c { "cr" } else { "r" };
+                         c = some_else!(it.consume() => { rv.push(Ident::new(ident_str.into(), crate::Span::call_site()).into()); break });
+                         let mut hashes = 0;
+                         while c == '#' {
+@@ -392,7 +400,7 @@ impl ::std::str::FromStr for TokenStream {
+ 
+                         if c != '"' {
+                             // Raw identifier: `r#type`
+-                            if !is_byte && hashes == 1 && (c.is_alphabetic() || c == '_') {
++                            if !is_byte && !is_c && hashes == 1 && (c.is_alphabetic() || c == '_') {
+                                 let s = get_ident(&mut it, String::new());
+                                 rv.push(Ident { is_raw: true, val: s, span: crate::Span::call_site() }.into());
+                                 continue 'outer;
+@@ -417,33 +425,34 @@ impl ::std::str::FromStr for TokenStream {
+                         {
+                             c = some_else!(it.consume() => return err("Rawstr eof"));
+                             if c == '"' {
++                                // The end when `req_hashes` `#`s follow; fewer are part of the string, and so is what
++                                // comes after them (only looked at, it may be the `"` that ends it: `r#"a""#`)
+                                 let mut hashes = 0;
+-                                while hashes < req_hashes {
+-                                    c = some_else!(it.consume() => return err("rawstr eof"));
+-                                    if c != '#' { break ; }
++                                while hashes < req_hashes && it.next() == Some('#') {
++                                    it.consume();
+                                     hashes += 1;
+                                 }
+-
+-                                if hashes != req_hashes {
+-                                    rawstr.push('"');
+-                                    for _ in 0 .. hashes {
+-                                        rawstr.push('#');
+-                                    }
+-                                    rawstr.push(c);
+-                                }
+-                                else {
++                                if hashes == req_hashes {
+                                     break ;
+                                 }
++                                rawstr.push('"');
++                                for _ in 0 .. hashes {
++                                    rawstr.push('#');
++                                }
+                             }
+                             else {
+                                 rawstr.push(c);
+                             }
+                         }
++                        // Past the closing `"` or `#` (the next token starts after it)
++                        it.consume();
+ 
+                         rv.push(Literal {
+                             span: crate::Span::call_site(),
+                             val: if is_byte {
+                                 crate::token_tree::LiteralValue::ByteString(rawstr.into_bytes())
++                            } else if is_c {
++                                crate::token_tree::LiteralValue::CString(rawstr.into_bytes())
+                             } else {
+                                 crate::token_tree::LiteralValue::String(rawstr)
+                             }
+@@ -492,7 +501,8 @@ impl ::std::str::FromStr for TokenStream {
+                                 break ;
+                             }
+                             else if c == '\\' {
+-                                let e = match some_else!(it.consume() => return err("str eof"))
++                                let esc = some_else!(it.consume() => return err("str eof"));
++                                let e = match esc
+                                     {
+                                     // A backslash at end-of-line eats the newline and the next line's leading whitespace
+                                     '\n' | '\r' => {
+@@ -513,11 +523,19 @@ impl ::std::str::FromStr for TokenStream {
+                                     }
+                                     bytes.push(e as u32 as u8);
+                                 }
++                                // In a C string `\xff` is the byte 0xFF, `\u{ff}` the character's UTF-8 encoding
++                                else if is_c && esc == 'x' {
++                                    bytes.push(e as u32 as u8);
++                                }
++                                else if is_c {
++                                    let mut buf = [0u8; 4];
++                                    bytes.extend_from_slice(e.encode_utf8(&mut buf).as_bytes());
++                                }
+                                 else {
+                                     s.push(e);
+                                 }
+                             }
+-                            else if is_byte {
++                            else if is_byte || is_c {
+                                 let mut buf = [0u8; 4];
+                                 bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                             }
+@@ -527,6 +545,8 @@ impl ::std::str::FromStr for TokenStream {
+                         }
+                         let val = if is_byte {
+                                 crate::token_tree::LiteralValue::ByteString(bytes)
++                            } else if is_c {
++                                crate::token_tree::LiteralValue::CString(bytes)
+                             } else {
+                                 crate::token_tree::LiteralValue::String(s)
+                             };
+@@ -792,4 +812,30 @@ mod tests {
+         assert_eq!(Literal::character('\\').to_string(), r"'\\'");
+         assert_eq!(Literal::byte_string(b"\\").to_string(), r#"b"\x5c""#);
+     }
++    #[test]
++    fn c_and_raw_strings()
++    {
++        // In a C string `\x` escapes are bytes, `\u{..}` and other characters UTF-8; `c`/`cr` not starting a
++        // string are identifiers. A raw string ends at the `"` followed by its hashes, and the next token after that.
++        let rv = TokenStream::from_str(r##"c"a\xff\u{e9}é" cr"x\y" cr#"q"r"# c crate cx r"a" r#"b""# br"c" x"##).expect("Failed to parse");
++        let cstr = |b: &[u8]| -> TokenTree { Literal::c_string(::std::ffi::CStr::from_bytes_with_nul(b).unwrap()).into() };
++        let mut it = rv.inner.into_iter();
++        assert_tt_matches!(it.next(), cstr(b"a\xff\xc3\xa9\xc3\xa9\0"));
++        assert_tt_matches!(it.next(), cstr(b"x\\y\0"));
++        assert_tt_matches!(it.next(), cstr(b"q\"r\0"));
++        assert_tt_matches!(it.next(), Ident::new("c", Span::call_site()).into());
++        assert_tt_matches!(it.next(), Ident::new("crate", Span::call_site()).into());
++        assert_tt_matches!(it.next(), Ident::new("cx", Span::call_site()).into());
++        assert_tt_matches!(it.next(), Literal::string("a").into());
++        assert_tt_matches!(it.next(), Literal::string("b\"").into());
++        assert_tt_matches!(it.next(), Literal::byte_string(b"c").into());
++        assert_tt_matches!(it.next(), Ident::new("x", Span::call_site()).into());
++        assert_tt_matches!(it.next());
++        // Printed C strings lex back to the same bytes
++        let lit = cstr(b"a\xff\xc3\xa9\"\\\x01{\0");
++        let back = TokenStream::from_str(&lit.to_string()).expect("Failed to parse a printed C string");
++        let mut it = back.inner.into_iter();
++        assert_tt_matches!(it.next(), lit);
++        assert_tt_matches!(it.next());
++    }
+ }
+diff --git a/lib/libproc_macro/src/protocol.rs b/lib/libproc_macro/src/protocol.rs
+index d1a2734c..adb6b57c 100644
+--- a/lib/libproc_macro/src/protocol.rs
++++ b/lib/libproc_macro/src/protocol.rs
+@@ -10,6 +10,8 @@ pub enum Token
+     Lifetime(String),
+     String(String),
+     ByteString(Vec<u8>),
++    /// A C string literal (`c"a"`): its bytes, without the terminating NUL
++    CString(Vec<u8>),
+     Char(char),
+     /// A byte literal (`b'a'`)
+     ByteChar(u8),
+@@ -103,6 +105,7 @@ impl<R: ::std::io::Read> Reader<R>
+             assert!(v < 256, "Protocol error: malformed byte literal {:#x}", v);
+             v as u8
+             }),
++        14 => Token::CString(self.get_byte_vec()),
+         _ => panic!("Unknown tag byte: {:#x}", hdr_b),
+         })
+     }
+@@ -213,6 +216,7 @@ impl<T: ::std::io::Write> Writer<T>
+             },
+         Token::Suffix(v) => { self.putb(12); self.put_bytes(v.as_bytes()); },
+         Token::ByteChar(v) => { self.putb(13); self.put_u128v(v as u128); },
++        Token::CString(v) => { self.putb(14); self.put_bytes(&v[..]); },
+         }
+     }
+     pub fn write_sym(&mut self, v: &[u8])
+diff --git a/lib/libproc_macro/src/serialisation.rs b/lib/libproc_macro/src/serialisation.rs
+index bb6440e2..0f0d4f51 100644
+--- a/lib/libproc_macro/src/serialisation.rs
++++ b/lib/libproc_macro/src/serialisation.rs
+@@ -74,6 +74,10 @@ pub fn recv_token_stream<R: ::std::io::Read>(reader: R) -> TokenStream
+                     span: crate::Span::call_site(),
+                     val: crate::token_tree::LiteralValue::ByteString(val)
+                     }.into(),
++                Token::CString(val) => Literal {
++                    span: crate::Span::call_site(),
++                    val: crate::token_tree::LiteralValue::CString(val)
++                    }.into(),
+                 Token::Char(ch) => Literal {
+                     span: crate::Span::call_site(),
+                     val: crate::token_tree::LiteralValue::CharLit(ch),
+@@ -179,7 +183,7 @@ pub fn send_token_stream<T: ::std::io::Write>(out_stream: T, ts: TokenStream)
+                     LiteralValue::UnsignedInt(v, sz) => Token::Unsigned(v, sz),
+                     LiteralValue::SignedInt(v, sz)   => Token::Signed(v, sz),
+                     LiteralValue::Float(v, sz)       => Token::Float(v, sz),
+-                    LiteralValue::CString(_) => panic!("TODO: C string literal from a proc macro"),
++                    LiteralValue::CString(v) => Token::CString(v),
+                     LiteralValue::Suffixed(..) => panic!("Nested literal suffix"),
+                     }
+                 }
+@@ -257,6 +261,24 @@ mod write_tests {
+     }
+ }
+ #[cfg(test)]
++mod literal_tests {
++    use crate::*;
++
++    #[test]
++    fn c_string()
++    {
++        // A C string goes as tag 14 and its bytes (no NUL), both ways (`c"seed"` in openssl's `#[corresponds]` items)
++        let lit = Literal::c_string(::std::ffi::CStr::from_bytes_with_nul(b"se\xffd\0").unwrap());
++        let ts: TokenStream = vec![TokenTree::from(lit), Literal::string("s").into()].into_iter().collect();
++        let mut out = Vec::new();
++        super::send_token_stream(&mut out, ts.clone());
++        assert_eq!(&out[..6], &[14, 4, b's', b'e', 0xff, b'd']);
++        let rv = super::recv_token_stream(&out[..]);
++        assert_eq!(rv.to_string(), ts.to_string());
++        assert!(rv.to_string().starts_with("c\"se\\xffd\""), "{}", rv);
++    }
++}
++#[cfg(test)]
+ mod read_tests {
+     use crate::*;
+ 
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index b09ececb..fb5f1a79 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -215,6 +215,7 @@ enum class TokenClass
+     SpanDef  = 11,
+     Suffix   = 12,  // Suffix of the preceding literal (see `Token::m_suffix`)
+     ByteChar = 13,  // v128, a byte literal (`b'a'`)
++    CString  = 14,  // String (bytes, no terminating NUL), a C string literal (`c"a"`)
+ };
+ enum class FragType
+ {
+@@ -241,6 +242,7 @@ struct TokenSink
+     virtual void send_lifetime(const char* val) = 0;
+     virtual void send_string(const ::std::string& s) = 0;
+     virtual void send_bytestring(const ::std::string& s) = 0;
++    virtual void send_cstring(const ::std::string& s) = 0;
+     virtual void send_suffix(const RcString& s) = 0;
+     virtual void send_char(uint32_t ch) = 0;
+     virtual void send_byte_char(uint8_t b) = 0;
+@@ -351,6 +353,10 @@ public:
+         this->send_u8(static_cast<uint8_t>(TokenClass::ByteString));
+         this->send_bytes(s.data(), s.size());
+     }
++    void send_cstring(const ::std::string& s) override {
++        this->send_u8(static_cast<uint8_t>(TokenClass::CString));
++        this->send_bytes(s.data(), s.size());
++    }
+     void send_suffix(const RcString& s) override {
+         if( s.size() > 0 ) {
+             this->send_u8(static_cast<uint8_t>(TokenClass::Suffix));
+@@ -594,8 +600,7 @@ namespace {
+             case TOK_FLOAT:     m_pmi.send_float(tok.datatype(), tok.floatval());   break;
+             case TOK_STRING:        m_pmi.send_string(tok.str());     m_pmi.send_suffix(tok.suffix());  break;
+             case TOK_BYTESTRING:    m_pmi.send_bytestring(tok.str()); m_pmi.send_suffix(tok.suffix());  break;
+-            case TOK_CSTRING:
+-                TODO(sp, "TOK_CSTRING");
++            case TOK_CSTRING:       m_pmi.send_cstring(tok.str());    m_pmi.send_suffix(tok.suffix());  break;
+ 
+             case TOK_HASH:      m_pmi.send_symbol("#"); break;
+             case TOK_UNDERSCORE:m_pmi.send_rword("_"); break;
+@@ -2076,6 +2081,9 @@ namespace {
+         void send_bytestring(const ::std::string& s) override {
+             out.push_back(Token(TOK_BYTESTRING, s, hygiene));
+         }
++        void send_cstring(const ::std::string& s) override {
++            out.push_back(Token(TOK_CSTRING, s, hygiene));
++        }
+         void send_suffix(const RcString& s) override {
+             if( s.size() > 0 ) {
+                 ASSERT_BUG(Span(), !out.empty(), "Literal suffix with no literal");
+@@ -2549,7 +2557,7 @@ Token ProcMacroInv::realGetToken() {
+     }
+     auto rv = this->realGetToken_();
+     // A string literal may be followed by its suffix (the stream always ends with an end marker, so there is a next byte)
+-    if( rv == TOK_STRING || rv == TOK_BYTESTRING ) {
++    if( rv == TOK_STRING || rv == TOK_BYTESTRING || rv == TOK_CSTRING ) {
+         uint8_t v = this->recv_u8();
+         if( static_cast<TokenClass>(v) == TokenClass::Suffix ) {
+             rv.set_suffix(RcString::new_interned(this->recv_bytes()));
+@@ -2627,6 +2635,10 @@ Token ProcMacroInv::realGetToken_() {
+         auto val = this->recv_bytes();
+         return Token(TOK_BYTESTRING, mv$(val), this->get_hygiene());
+         }
++    case TokenClass::CString: {
++        auto val = this->recv_bytes();
++        return Token(TOK_CSTRING, mv$(val), this->get_hygiene());
++        }
+     case TokenClass::CharLit: {
+         auto val = this->recv_v128u();
+         return Token(U128(val), CORETYPE_CHAR);

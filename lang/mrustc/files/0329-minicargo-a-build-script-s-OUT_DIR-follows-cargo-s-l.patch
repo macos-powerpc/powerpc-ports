@@ -1,0 +1,119 @@
+From 7d4f077ebdde34e8b2ac40dcffc408527f45260b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 05:25:56 +0000
+Subject: [PATCH] minicargo: a build script's OUT_DIR follows cargo's layout,
+ `<profile dir>/build/<package>-<version>/out`
+
+bat 0.26.1 (textproc/bat) failed to destroot:
+    Error: Failed to destroot bat: no files matched glob pattern
+      ".../work/bat-0.26.1/target/powerpc-apple-darwin/release/build/bat-*"
+Its Portfile installs the man page and shell completions that build/main.rs writes under
+OUT_DIR/assets from `[glob ${worksrcpath}/target/[cargo.rust_platform]/release/build/${name}-*]/out/assets/`,
+cargo's `<profile dir>/build/<package>-<hash>/out`. minicargo put OUT_DIR at
+`<host dir>/build_<package>-<version>/` (target/<triple>/release/host/build_bat-0_26_1/), so the
+glob matched nothing. Other Portfiles rely on the same layout.
+
+OUT_DIR is now `<profile dir>/build/<package>-<version>/out` (RunState::get_build_script_out_dir):
+in the target's profile directory as for a cargo target package, one directory per package since
+the script runs once. The script executable and its output file stay in the host directory. The
+directory chain is created with a new os_support::mkdir_p (also used for a job's log directory:
+a first cross build creates `<output dir>/host/` before the output dir exists), and a build script
+whose OUT_DIR is missing is run again, so a work directory from before this change (output file
+present, nothing at the new place) does not compile crates against an empty OUT_DIR.
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/tools/minicargo/build.cpp b/tools/minicargo/build.cpp
+index 240984b8..989dd0bc 100644
+--- a/tools/minicargo/build.cpp
++++ b/tools/minicargo/build.cpp
+@@ -125,8 +125,14 @@ struct RunState
+         return get_output_dir(true) / get_build_script_out(manifest) + "_run" EXESUF;
+     }
+     /// Get `OUT_DIR`: where a package's build script writes its generated sources.
++    /// cargo's layout, `<profile dir>/build/<package>-<hash>/out`, which Portfiles glob for generated assets: bat
++    /// 0.26.1 (build/main.rs writes the man page and completions under OUT_DIR/assets) installs them from
++    /// `[glob ${worksrcpath}/target/[cargo.rust_platform]/release/build/${name}-*]/out/assets/`, and the destroot
++    /// failed with "no files matched glob pattern .../release/build/bat-*" against the old
++    /// `<host dir>/build_<package>-<version>/`. One directory per package (the script runs once), in the target's
++    /// profile directory as for a cargo target package, not in the host directory the script executable lives in.
+     ::helpers::path get_build_script_out_dir(const PackageManifest& manifest) const {
+-        return get_output_dir(true) / get_build_script_out(manifest);
++        return get_output_dir(false) / "build" / (std::string(manifest.name().c_str()) + get_crate_suffix(manifest)) / "out";
+     }
+     /// Get the output file for a crate (e.g. libfoo.rlib, or foo.exe)
+     /// - `final_lib`: the C-consumable archive or dynamic library of a `crate-type = ["staticlib"/"cdylib", ..]`
+@@ -520,7 +526,11 @@ bool BuildList::build(BuildOptions opts, unsigned num_jobs, bool dry_run)
+                             bs_is_dirty |= this->handle_dep(job_bs_run->m_dependencies, output_ts, k);
+                         }
+                     });
+-                    bool bs_needs_run = bs_is_dirty || output_ts < script_ts;
++                    // The script's OUT_DIR has to exist as well: 0329 moved it (`<host dir>/build_<package>-<version>/`
++                    // -> `<profile dir>/build/<package>-<version>/out`), and a work directory from before has the output
++                    // file but nothing at the new place, which the output file's timestamp alone would never notice
++                    bool out_dir_missing = Timestamp::for_file(run_state.get_build_script_out_dir(p)) == Timestamp::infinite_past();
++                    bool bs_needs_run = bs_is_dirty || output_ts < script_ts || out_dir_missing;
+                     auto rv = bs_needs_run ? job_bs_run->name() : ::std::string();
+                     job_bs_run->m_is_dirty = bs_needs_run;
+                     this->add_job(std::move(job_bs_run), output_ts, bs_needs_run);
+@@ -1325,7 +1335,7 @@ RunnableJob Job_BuildTarget::start()
+ 
+     // Environment variables (rustc_env)
+     StringListKV    env;
+-    // Keyed on the build script's host-ness, not this crate's: a build script is always a host binary, and its OUT_DIR follows it.
++    // One OUT_DIR per package whichever of host/target this crate is built for: the build script runs once.
+     auto out_dir = parent.get_build_script_out_dir(m_manifest).to_absolute();
+     env.push_back("OUT_DIR", out_dir.str());
+     for(const auto& e : m_manifest.build_script_output().rustc_env) {
+@@ -1455,7 +1465,8 @@ RunnableJob Job_RunScript::start()
+     auto script_exe_abs = script_exe.to_absolute();
+ 
+     // - Run the script and put output in the right dir
+-    os_support::mkdir(out_dir);
++    // `build/<package>-<version>/out` under the profile directory, none of which need exist yet
++    os_support::mkdir_p(out_dir);
+     // Environment variables (key-value list)
+     StringListKV    env;
+     for(const auto& feat : m_manifest.active_features())
+diff --git a/tools/minicargo/os.cpp b/tools/minicargo/os.cpp
+index c2829587..aeb3500c 100644
+--- a/tools/minicargo/os.cpp
++++ b/tools/minicargo/os.cpp
+@@ -85,7 +85,7 @@ Process Process::spawn(
+     // Create logfile output directory (if the parent path is valid, i.e. the logile path isn't a single component)
+     if( logfile.is_valid() ) {
+         if( logfile.parent().is_valid() ) {
+-            mkdir(logfile.parent());
++            mkdir_p(logfile.parent());   // `<output dir>/host/` on a first cross build: the output dir may not exist either
+         }
+     }
+ 
+@@ -397,6 +397,14 @@ void set_console_colour(std::ostream& os, TerminalColour colour) {
+ #endif
+ };
+ 
++void mkdir_p(const helpers::path& p)
++{
++    auto parent = p.parent();
++    if( parent.is_valid() && parent.str() != p.str() ) {
++        mkdir_p(parent);
++    }
++    mkdir(p);
++}
+ void mkdir(const helpers::path& p)
+ {
+     #ifdef _WIN32
+diff --git a/tools/minicargo/os.hpp b/tools/minicargo/os.hpp
+index 8da52540..313d4988 100644
+--- a/tools/minicargo/os.hpp
++++ b/tools/minicargo/os.hpp
+@@ -44,6 +44,8 @@ enum class TerminalColour {
+ void set_console_colour(std::ostream& os, TerminalColour colour);
+ 
+ void mkdir(const helpers::path& path);
++    /// `mkdir -p`: every missing directory of the path
++    void mkdir_p(const helpers::path& p);
+ 
+ const helpers::path& get_mrustc_path();
+ 

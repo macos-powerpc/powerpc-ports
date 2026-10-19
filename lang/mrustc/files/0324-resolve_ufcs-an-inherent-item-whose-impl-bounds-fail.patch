@@ -1,0 +1,200 @@
+From ff9e5ee6da6dd88e6ea13682e62a593e7218aa63 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 18 Oct 2026 07:49:25 +0000
+Subject: [PATCH 324/324] resolve_ufcs: an inherent item whose impl bounds fail
+ for the type gives way to the traits in scope
+
+cryptography 48.0.0 src/rust/src/oid.rs:21 (after the previous fix):
+
+    error:0: Failed to find an impl of ::"pyo3"::impl_::pyclass::PyClass
+      for Result<ObjectIdentifier, CryptographyError>
+
+pyo3 0.28's probes (impl_/pyclass/probes.rs):
+
+    pub trait Probe { const VALUE: bool = false; }
+    pub struct IsPyClass<T>(PhantomData<T>);
+    impl<T> Probe for IsPyClass<T> {}
+    impl<T: PyClass> IsPyClass<T> { pub const VALUE: bool = true; }
+
+read as `IsPyClass::<T>::VALUE` under `use Probe as _;` in the `#[new]`
+wrapper (`tp_new_impl::<_, { IsPyClass::<#output>::VALUE }, ..>`). rustc
+takes an inherent candidate only when the impl's where clauses hold and
+otherwise searches the traits in scope, so a `Result<..>` return type
+reads the trait's `false`. "Resolve UFCS paths" took the inherent `VALUE`
+for any type the impl type matched, and typeck then failed `T: PyClass`.
+
+resolve_UfcsUnknown_inherent now skips an inherent impl whose trait
+bounds fail for the type (inherent_impl_bounds_hold: the impl parameters
+are captured from the matched type and each `T: Trait` bound is checked
+with StaticTraitResolve::find_impl; inference variables, parameters the
+type doesn't fix, bounds with associated type bindings or HRTBs and
+opaque projections are not decided and count as holding). The trait
+search then runs as before; when nothing else applies the skipped
+inherent item is taken after all, so its bound error from typeck stays
+(the same shape as the unstable-item fallback).
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_conv/resolve_ufcs.cpp b/src/hir_conv/resolve_ufcs.cpp
+index 66940728..eb68dae7 100644
+--- a/src/hir_conv/resolve_ufcs.cpp
++++ b/src/hir_conv/resolve_ufcs.cpp
+@@ -632,9 +632,118 @@ namespace resolve_ufcs {
+             return false;
+         }
+ 
++        /// Do an inherent impl's `where` bounds hold with `impl.m_type` matched against `type`? rustc takes an inherent
++        /// candidate only when they do and searches the traits in scope otherwise: pyo3 0.28's probes
++        /// (`impl<T: PyClass> IsPyClass<T> { pub const VALUE: bool = true; }` next to `impl<T> Probe for IsPyClass<T> {}`,
++        /// whose `VALUE` is `false`, read as `IsPyClass::<T>::VALUE` under `use Probe as _`) select by that rule.
++        /// Anything not decidable here (inference variables, impl parameters the type doesn't fix, bounds with associated
++        /// type bindings or HRTBs, opaque projections) counts as holding.
++        bool inherent_impl_bounds_hold(const Span& sp, const ::HIR::TypeImpl& impl, const ::HIR::TypeRef& type) const
++        {
++            if( !::std::any_of(impl.m_params.m_bounds.begin(), impl.m_params.m_bounds.end(), [](const ::HIR::GenericBound& b){ return b.is_TraitBound(); }) ) {
++                return true;
++            }
++            TRACE_FUNCTION_F("impl" << impl.m_params.fmt_args() << " " << impl.m_type << impl.m_params.fmt_bounds() << " for " << type);
++            auto is_undecidable = [](const ::HIR::TypeRef& t)->bool {
++                return t.data().is_Infer() || t.data().is_ErasedType()
++                    || (t.data().is_Path() && (t.data().as_Path().binding.is_Unbound() || t.data().as_Path().binding.is_Opaque()));
++                };
++            if( visit_ty_with(type, is_undecidable) ) {
++                DEBUG("- Not decidable (inference variable or opaque type in " << type << ")");
++                return true;
++            }
++            // Capture the impl parameters from the matched type
++            struct CaptureParams:
++                public ::HIR::MatchGenerics
++            {
++                Span    sp;
++                ::HIR::PathParams&  out;
++                ::std::vector<bool> set_tys;
++                ::std::vector<bool> set_vals;
++                CaptureParams(const Span& sp, const ::HIR::GenericParams& def, ::HIR::PathParams& out)
++                    : sp(sp), out(out)
++                {
++                    out.m_lifetimes.resize(def.m_lifetimes.size());
++                    out.m_types.resize(def.m_types.size());
++                    out.m_values.resize(def.m_values.size());
++                    set_tys.resize(def.m_types.size());
++                    set_vals.resize(def.m_values.size());
++                }
++                ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty, ::HIR::t_cb_resolve_type resolve_cb) override {
++                    if( g.group() != 0 || g.idx() >= out.m_types.size() ) {
++                        return ::HIR::Compare::Fuzzy;
++                    }
++                    if( !set_tys[g.idx()] ) {
++                        set_tys[g.idx()] = true;
++                        out.m_types[g.idx()] = ty.clone();
++                        return ::HIR::Compare::Equal;
++                    }
++                    return out.m_types[g.idx()].compare_with_placeholders(sp, ty, resolve_cb);
++                }
++                ::HIR::Compare match_val(const ::HIR::GenericRef& g, const ::HIR::ConstGeneric& v) override {
++                    if( g.group() != 0 || g.idx() >= out.m_values.size() ) {
++                        return ::HIR::Compare::Fuzzy;
++                    }
++                    if( !set_vals[g.idx()] ) {
++                        set_vals[g.idx()] = true;
++                        out.m_values[g.idx()] = v.clone();
++                        return ::HIR::Compare::Equal;
++                    }
++                    return out.m_values[g.idx()] == v ? ::HIR::Compare::Equal : ::HIR::Compare::Unequal;
++                }
++            };
++            ::HIR::PathParams   impl_params;
++            CaptureParams   cp(sp, impl.m_params, impl_params);
++            auto cb_ident = HIR::ResolvePlaceholdersNop();
++            if( impl.m_type.match_test_generics_fuzz(sp, type, cb_ident, cp) == ::HIR::Compare::Unequal ) {
++                DEBUG("- Type mismatch?");
++                return true;
++            }
++            if( ::std::find(cp.set_tys.begin(), cp.set_tys.end(), false) != cp.set_tys.end()
++             || ::std::find(cp.set_vals.begin(), cp.set_vals.end(), false) != cp.set_vals.end() ) {
++                DEBUG("- An impl parameter isn't fixed by the type");
++                return true;
++            }
++            auto ms = MonomorphStatePtr(&type, &impl_params, nullptr);
++            for(const auto& b : impl.m_params.m_bounds)
++            {
++                const auto* be = b.opt_TraitBound();
++                if( !be ) {
++                    continue;
++                }
++                if( (be->hrtbs && !be->hrtbs->is_empty()) || (be->trait.m_hrtbs && !be->trait.m_hrtbs->is_empty())
++                 || !be->trait.m_type_bounds.empty() || !be->trait.m_trait_bounds.empty() ) {
++                    DEBUG("- " << b << ": not decided here");
++                    continue;
++                }
++                auto b_ty = ms.monomorph_type(sp, be->type, /*allow_infer=*/true);
++                m_resolve.expand_associated_types(sp, b_ty);
++                auto b_tp = ms.monomorph_genericpath(sp, be->trait.m_path, /*allow_infer=*/true);
++                bool undecidable = visit_ty_with(b_ty, is_undecidable);
++                for(auto& t : b_tp.m_params.m_types) {
++                    m_resolve.expand_associated_types(sp, t);
++                    undecidable |= visit_ty_with(t, is_undecidable);
++                }
++                if( undecidable ) {
++                    DEBUG("- " << b_ty << ": " << b_tp << ": not decided here");
++                    continue;
++                }
++                // Trait arguments not yet filled to the trait's count (defaults): match any
++                const auto& trait = m_resolve.m_crate.get_trait_by_path(sp, b_tp.m_path);
++                const ::HIR::PathParams* tp = (b_tp.m_params.m_types.size() == trait.m_params.m_types.size() ? &b_tp.m_params : nullptr);
++                if( !m_resolve.find_impl(sp, b_tp.m_path, tp, b_ty, [](const auto&, bool)->bool { return true; }) ) {
++                    DEBUG("- " << b_ty << ": " << b_tp << " doesn't hold");
++                    return false;
++                }
++            }
++            return true;
++        }
++
+         /// - `out_skipped_unstable` (if set): skip an unstable method of a feature the crate hasn't enabled, and record that one was
+-        bool resolve_UfcsUnknown_inherent(const ::HIR::SimplePath& vis_path, const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd, bool* out_skipped_unstable = nullptr)
++        /// - `out_skipped_bounds` (if set): skip an inherent impl whose bounds don't hold for the type, and record that one was
++        bool resolve_UfcsUnknown_inherent(const ::HIR::SimplePath& vis_path, const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd, bool* out_skipped_unstable = nullptr, bool* out_skipped_bounds = nullptr)
+         {
++            static Span sp;
+             auto& e = pd.as_UfcsUnknown();
+             TRACE_FUNCTION_F(e.type);
+             return m_crate.find_type_impls(e.type, HIR::ResolvePlaceholdersNop(), [&](const auto& impl) {
+@@ -677,6 +786,14 @@ namespace resolve_ufcs {
+                 case ::HIR::Visitor::PathContext::TYPE:
+                     return false;
+                 }
++                // An inherent item whose impl bounds fail for this type isn't the candidate (the traits in scope are
++                // searched next); cryptography 48.0.0 oid.rs:21 via pyo3's `IsPyClass::<CryptographyResult<Self>>::VALUE`:
++                // "Failed to find an impl of PyClass for Result<ObjectIdentifier, CryptographyError>"
++                if( out_skipped_bounds && !inherent_impl_bounds_hold(sp, impl, e.type) ) {
++                    DEBUG("Impl bounds don't hold, skipped");
++                    *out_skipped_bounds = true;
++                    return false;
++                }
+ 
+                 auto new_data = ::HIR::Path::Data::make_UfcsInherent({ mv$(e.type), mv$(e.item), mv$(e.params)} );
+                 pd = mv$(new_data);
+@@ -884,7 +1001,8 @@ namespace resolve_ufcs {
+                 //   `TraitResolution::autoderef_find_method`), rustc takes one only if nothing else applies, so
+                 //   `str::as_str(s)` with shellexpand's `WstrExt` in scope is the trait's.
+                 bool skipped_unstable = false;
+-                if( this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data, &skipped_unstable) ) {
++                bool skipped_bounds = false;
++                if( this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data, &skipped_unstable, &skipped_bounds) ) {
+                     assert(!p.m_data.is_UfcsUnknown());
+                     return ;
+                 }
+@@ -996,8 +1114,10 @@ namespace resolve_ufcs {
+                     }
+                 }
+ 
+-                if( skipped_unstable && this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data) ) {
+-                    DEBUG("Only an unstable inherent item applies, p = " << p);
++                // Nothing else applies: take the skipped inherent item after all (an impl whose bounds fail then gets the
++                // bound error from typeck, as before)
++                if( (skipped_unstable || skipped_bounds) && this->resolve_UfcsUnknown_inherent(m_cur_mod_path, p, pc, p.m_data) ) {
++                    DEBUG("Only an " << (skipped_bounds ? "inherent item whose impl bounds fail" : "unstable inherent item") << " applies, p = " << p);
+                     assert(!p.m_data.is_UfcsUnknown());
+                     return ;
+                 }

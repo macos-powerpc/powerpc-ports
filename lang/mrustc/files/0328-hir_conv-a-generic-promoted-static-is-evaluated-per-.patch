@@ -1,0 +1,126 @@
+From 3fb2434f1694ced21e7156dc1601d005d49e5783 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 04:37:28 +0000
+Subject: [PATCH] hir_conv: a generic promoted static is evaluated per instance
+ when read through in const evaluation
+
+pyo3 0.28.3 (cryptography-rust 48.0.0, py314-cryptography) src/impl_/pyclass/doc.rs:28:
+    impl<ClassT: PyClass + PyClassNewTextSignature> PyClassDocGenerator<ClassT, true> {
+        pub const DOC_PIECES: &'static [&'static [u8]] = &[<ClassT as PyClass>::NAME.as_bytes(), ..];
+    }
+The borrowed array is promoted to a GENERIC static `pyo3::lifted#C_0<Self, ClassT>`
+(static_borrow_constants.cpp), which has MIR but no value of its own. `#[pyclass]` in the
+downstream crate evaluates `combined_len(PyClassDocGenerator::<Type_Tlv, true>::DOC_PIECES)`
+(impl_/concat.rs:5), which indexes through the instance `lifted#C_0<.., Type_Tlv>`:
+    <null> BUG: ASSERT FAIL: src/hir_conv/constant_evaluation.cpp:573:ofs <= this->len && ofs+len <= this->len: ValueRef::slice: 0+8 out of range (0)
+
+Cause: the evaluator's static lookup (get_staticref) knew two kinds of static: "generated"
+(use m_value_res) and not yet generated (evaluate once, store as THE value). A generic static
+from an rlib is deserialised as generated with an EMPTY literal (`m_save_literal` set,
+nothing evaluated), so a read through it saw a zero-length allocation; in the defining crate
+the first instance's value became the static's value and every later instance read it (kit:
+`Gen::<Local, true>::PIECES` read as `Gen::<Local2, true>`'s, silently).
+
+Fix: a generic static is evaluated per instance with its path's parameters and cached in
+`m_monomorph_cache`, exactly as a generic `const` is in get_const (and as
+trans/monomorphise.cpp does for codegen). trans then reuses the cached instance instead of
+evaluating again, and enumerate.cpp follows the cached value's relocations so the statics
+it borrows are emitted.
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_conv/constant_evaluation.cpp b/src/hir_conv/constant_evaluation.cpp
+index 388dddd1..59c894c8 100644
+--- a/src/hir_conv/constant_evaluation.cpp
++++ b/src/hir_conv/constant_evaluation.cpp
+@@ -1148,6 +1148,42 @@ namespace MIR { namespace eval {
+             {
+                 const auto& s = *ent.as_Static();
+ 
++                // A generic static: a borrow promoted out of a generic item (`impl<T: Named> Gen<T> { const PIECES: &[&[u8]]
++                // = &[T::NAME, ..]; }` -> `lifted#C_N<Self, T>`, static_borrow_constants.cpp) has no value of its own, only
++                // MIR: each instance is evaluated with its path's parameters and cached, as a generic `const` is in
++                // `get_const` and as trans/monomorphise.cpp does for codegen. The rlib loader marks such a static
++                // "generated" with an EMPTY literal (`m_save_literal` set, nothing evaluated), which read as a zero-length
++                // allocation: pyo3 0.28.3 `PyClassDocGenerator<ClassT, true>::DOC_PIECES` indexed by `combined_len` from
++                // cryptography-rust 48.0.0 = "ValueRef::slice: 0+8 out of range (0)"
++                if( s.m_params.is_generic() )
++                {
++                    auto mono_ty = root_resolve.monomorph_expand(state.sp, s.m_type, const_ms);
++                    auto it = s.m_monomorph_cache.find(p);
++                    if( it == s.m_monomorph_cache.end() )
++                    {
++                        auto& item = const_cast<::HIR::Static&>(s);
++                        MIR_ASSERT(state, item.m_value || item.m_value.m_mir, "Generic static " << p << " has no value");
++                        MIR_ASSERT(state, item.m_value.m_state, "Generic static " << p << " has no expression state");
++                        // Challenge: Adding items to the module might invalidate an iterator.
++                        ::HIR::ItemPath mod_ip { item.m_value.m_state->m_mod_path };
++                        auto nvs = NewvalState(item.m_value.m_state->m_module, mod_ip, FMT("static" << &item << "#"));
++                        auto eval = ::HIR::Evaluator(item.m_value.span(), root_resolve.m_crate, nvs);
++                        eval.resolve.set_both_generics_raw(impl_params_def, &item.m_params);
++                        DEBUG("- Evaluate monomorphed " << p);
++                        DEBUG("> const_ms=" << const_ms);
++                        auto val = eval.evaluate_constant(::HIR::ItemPath(p), item.m_value, mono_ty.clone(), std::move(const_ms));
++                        it = item.m_monomorph_cache.insert(std::make_pair(p.clone(), std::move(val))).first;
++                        DEBUG(p << " = " << it->second);
++                    }
++                    else {
++                        DEBUG("Cached generic static " << p);
++                    }
++                    if(out_ty) {
++                        *out_ty = std::move(mono_ty);
++                    }
++                    return StaticRefPtr::allocate(std::move(p), &it->second);
++                }
++
+                 if( !s.m_value_generated )
+                 {
+                     // If there's no MIR and no HIR then this is an external static (which can only be borrowed)
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index 9e8b8843..ffe59b46 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -1889,9 +1889,24 @@ void Trans_Enumerate_FillFrom_PathMono(EnumState& state, ::HIR::Path path_mono)
+         state.enum_fcn(mv$(path_mono), *e, mv$(sub_pp));
+         }
+     TU_ARMA(Static, e) {
++        // An instance of a generic static whose value const-evaluation already produced (reading through it, 0328) is
++        // emitted from that cached value (trans/monomorphise.cpp does not evaluate it again): the statics its
++        // relocations name have to be enumerated from it
++        const EncodedLiteral* cached = nullptr;
++        if( e->m_params.is_generic() )
++        {
++            auto it = e->m_monomorph_cache.find(path_mono);
++            if( it != e->m_monomorph_cache.end() )
++                cached = &it->second;
++        }
+         if( auto* ptr = state.rv.add_static(mv$(path_mono)) )
+         {
+             Trans_Enumerate_FillFrom_Static(state, *e, *ptr, mv$(sub_pp));
++            if( cached )
++            {
++                DEBUG("Generic static instance evaluated by consteval");
++                Trans_Enumerate_FillFrom_Literal(state, *cached, ptr->pp);
++            }
+         }
+         }
+     TU_ARMA(Constant, e) {
+diff --git a/src/trans/monomorphise.cpp b/src/trans/monomorphise.cpp
+index be0d221b..d5b3cb0d 100644
+--- a/src/trans/monomorphise.cpp
++++ b/src/trans/monomorphise.cpp
+@@ -199,6 +199,13 @@ void Trans_Monomorphise_List(const ::HIR::Crate& crate, TransList& list)
+         }
+ 
+         TRACE_FUNCTION_FR("STATIC " << path, "STATIC " << path);
++        // Already evaluated by const-evaluation (a value read through in a constant, 0328); the statics that value
++        // borrows were enumerated from it, a fresh evaluation here would create new ones that nothing enumerated
++        if( s.m_monomorph_cache.count(path) )
++        {
++            DEBUG("Evaluated by consteval");
++            continue ;
++        }
+         auto ty = pp.monomorph(resolve, s.m_type);
+         // 1. Evaluate the constant
+         auto eval = ::HIR::Evaluator { pp.sp, crate, nvs };

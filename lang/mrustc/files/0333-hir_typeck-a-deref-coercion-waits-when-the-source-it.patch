@@ -1,0 +1,102 @@
+From 50762a0f9dcbababd3c07957aec24e5ed8d27014 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 10:24:05 +0000
+Subject: [PATCH] hir_typeck: a deref coercion waits when the source itself
+ also fits the destination through an ivar
+
+cryptography-rust 48.0.0 (py314-cryptography) src/pkcs12.rs:276, `#[derive(pyo3::FromPyObject)] enum
+CertificateOrPKCS12Certificate { Certificate(Py<Certificate>), PKCS12Certificate(Py<PKCS12Certificate>) }`
+(after 0332):
+    pkcs12.rs:276:10-30 error:0: Cannot find an impl of ::core::ops::deref::Deref for
+    ::pyo3::instance::Bound<'_, ::pyo3::types::any::PyAny>
+
+pyo3-macros-backend 0.28.3 frompyobject.rs emits
+    fn extract(obj: Borrowed<'_, 'py, PyAny>) -> Result<Self, PyErr> {
+        let obj: &Bound<'_, _> = &*obj;
+        .. || -> PyResult<Self> { extract_tuple_struct_field(obj, "Certificate", 0).map(..) }() ..
+The `_` is left to the projection rule `<Borrowed<PyAny> as Deref>::Target`, and a pass checks coercions
+before associated types, so the coercion of `obj` to the parameter's `&Bound<'py, PyAny>` ran with
+`Bound<'_, _>` against `Bound<'py, PyAny>`. check_unsize_tys's deref search accepted `impl<T:
+DerefToPyAny> Deref for Bound<T>` with the bound undecided for `_` and committed the deref to its
+Target `Bound<PyAny>`; `_` then resolved to PyAny, and the validation pass found no Deref for
+`Bound<PyAny>` (pyo3 leaves it out on purpose: it would deref into itself). rustc unifies the pointees
+at the shallowest autoderef level first, so `_ = PyAny` and nothing is dereferenced.
+
+Fix: in the deref-coercion loop, a level that fits while the source itself fits too (`first_unifiable
+== 0`: not equal, so through an ivar) returns Unknown instead of committing the deref: deciding would be
+a guess either way (an equality may contradict a deferred projection whose `_` turns out to be a
+DerefToPyAny type and needs the deref; the deref may rest on an impl the ivar's bounds rule out). The
+coercion is rechecked once the ivar is known (equal, or a real deref), and one nothing else decides is
+equated by the final "Coercion consume" stage, rustc's unification. The level's equate_types now
+happens only when the level is chosen (it was done before the choice in the fuzzy-same-constructor
+case).
+
+Assisted-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index e5124083..45c45c4f 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -4567,13 +4567,12 @@ namespace {
+                 {
+                     lit_p = &context.m_ivars.get_type(lit_p->data().as_Borrow().inner);
+                 }
++                // Does this level fit the destination? (equated once the level is chosen)
++                bool equate_level = false;
+                 if( TU_TEST1(lit_p->data(), Infer, .is_lit()) && first_unifiable == count )
+                 {
+                     DEBUG("Literal level fits - " << dst << " == " << out_ty);
+-                    if( context_mut )
+-                    {
+-                        context_mut->equate_types(sp, dst, out_ty);
+-                    }
++                    equate_level = true;
+                 }
+                 // Types aren't equal
+                 else if( context.m_ivars.types_equal(dst, out_ty) == false )
+@@ -4588,10 +4587,7 @@ namespace {
+ 
+                     if( dst.data().is_Slice() )
+                     {
+-                        if(context_mut)
+-                        {
+-                            context_mut->equate_types(sp, dst, out_ty);
+-                        }
++                        equate_level = true;
+                     }
+                     else if( dst.data().is_Borrow() )
+                     {
+@@ -4605,13 +4601,28 @@ namespace {
+                             continue ;
+                         }
+                         DEBUG("Same tag and fuzzy match - assuming " << dst << " == " << out_ty);
+-                        if( context_mut )
+-                        {
+-                            context_mut->equate_types(sp, dst, out_ty);
+-                        }
++                        equate_level = true;
+                     }
+                 }
+ 
++                // This level fits, but so does the source itself (through an ivar, the types are not equal): rustc
++                // unifies at the shallowest level and never dereferences here, and which it is depends on the ivar.
++                // Deciding now would be a guess either way: an equality may contradict a deferred projection (`&Bound<'_, _>`
++                // from `&*borrowed` to `&Bound<PyAny>` with `_` = PyList needs the deref), a deref through an impl whose
++                // bounds the ivar leaves undecided may be no impl at all (pyo3 0.28's FromPyObject derive for enums,
++                // cryptography-rust 48.0.0 pkcs12.rs:276: `let obj: &Bound<'_, _> = &*obj;` then `obj` to `&Bound<PyAny>`
++                // via `impl<T: DerefToPyAny> Deref for Bound<T>`; `Bound<PyAny>` has no Deref, validation rejected it).
++                // Wait for the ivar; a coercion nothing else decides is equated by the final "Coercion consume".
++                if( first_unifiable == 0 )
++                {
++                    DEBUG("Source fits the destination too (through an ivar), defer");
++                    return CoerceResult::Unknown;
++                }
++                if( equate_level && context_mut )
++                {
++                    context_mut->equate_types(sp, dst, out_ty);
++                }
++
+                 if( context_mut && node_ptr_ptr )
+                 {
+                     auto& node_ptr = *node_ptr_ptr;

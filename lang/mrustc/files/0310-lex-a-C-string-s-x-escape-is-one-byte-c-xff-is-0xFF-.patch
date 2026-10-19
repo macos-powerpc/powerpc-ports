@@ -1,0 +1,135 @@
+From 7c8e913566fc66fe51292c887700fd503c7e4d1b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 17 Oct 2026 23:45:42 +0000
+Subject: [PATCH 310/310] lex: a C string's `\x` escape is one byte (`c"\xff"`
+ is 0xFF, not U+00FF)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Found while adding C strings to the proc-macro bridge (0309): the lexer
+added every escape of a C string literal as a character, so `c"\xff"`
+became U+00FF's UTF-8 encoding c3 bf, and the C string held two wrong
+bytes (rustc: a `\x` escape in a C string is any byte 01-ff; `\u{..}` is
+the character's UTF-8 encoding).
+
+- parse/lex.cpp: a `\x` escape in a C string adds the byte itself; the
+  value is bytes, as for byte strings.
+- The two printers of C strings read the value as text: Token::to_str
+  (stringify!, the text proc macros and re-lexing get) wrote bytes >= 0x80
+  as they are, ExprNode_CString in the AST dump used FmtEscaped, which
+  decodes UTF-8 and drops stray bytes. Both use the new FmtCStringBody
+  (parse/token.hpp): valid UTF-8 sequences as written, other bytes as
+  `\xNN`.
+
+Assisted-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index be864000..878553dc 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -628,7 +628,7 @@ public:
+     }
+     virtual void visit(AST::ExprNode_CString& n) override {
+         m_expr_root = false;
+-        m_os << "c\"" << FmtEscaped(n.m_value) << "\"";
++        m_os << "c\"" << FmtCStringBody(n.m_value) << "\"";
+     }
+ 
+     virtual void visit(AST::ExprNode_StructLiteral& n) override {
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index 08ded116..5f6d050f 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -910,8 +910,17 @@ Token Lexer::getTokenInt_Identifier(Codepoint leader, Codepoint leader2, bool pa
+             str = "";
+             while( (ch = this->getc()) != '"' ) {
+                 if( ch == '\\' ) {
++                    // The value is bytes: a `\x` escape is one byte (`c"\xff"` is 0xFF, not U+00FF), `\u{..}` the
++                    // character's UTF-8 encoding
++                    bool is_byte_escape = (this->getc() == 'x');
++                    this->ungetc();
+                     auto v = this->parseEscape('"');
+-                    if( v != ~0u ) {
++                    if( v == ~0u ) {
++                    }
++                    else if( is_byte_escape ) {
++                        str += static_cast<char>(v);
++                    }
++                    else {
+                         str += Codepoint(v);
+                     }
+                 }
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 7b8e2186..711af1bf 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -381,6 +381,42 @@ struct EscapedByteString {
+     }
+ };
+ 
++::std::ostream& operator<<(::std::ostream& os, const FmtCStringBody& x)
++{
++    static const char HEX[] = "0123456789abcdef";
++    const auto& s = x.s;
++    for(size_t i = 0; i < s.size(); )
++    {
++        unsigned char b = s[i];
++        switch(b)
++        {
++        case '"':   os << "\\\"";   i ++;   continue;
++        case '\\':  os << "\\\\";   i ++;   continue;
++        case '\n':  os << "\\n";    i ++;   continue;
++        }
++        if( ' ' <= b && b < 0x7F ) {
++            os << b;
++            i ++;
++            continue;
++        }
++        // A whole UTF-8 sequence (lead byte, continuation bytes, no overlong 2-byte form) is written as-is
++        size_t len = (b >= 0xC2 && b < 0xE0) ? 2 : (b >= 0xE0 && b < 0xF0) ? 3 : (b >= 0xF0 && b < 0xF5) ? 4 : 0;
++        bool valid = len > 0 && i + len <= s.size();
++        for(size_t j = 1; valid && j < len; j ++) {
++            valid = (static_cast<unsigned char>(s[i+j]) & 0xC0) == 0x80;
++        }
++        if( valid ) {
++            os.write(s.data() + i, len);
++            i += len;
++        }
++        else {
++            os << "\\x" << HEX[b >> 4] << HEX[b & 0xF];
++            i ++;
++        }
++    }
++    return os;
++}
++
+ ::std::string Token::to_str() const
+ {
+     ::std::stringstream ss;
+@@ -487,7 +523,7 @@ struct EscapedByteString {
+     // No hygiene marker (`"x"/*1*/`, and `/**/` for none): this is the `stringify!` text, re-lexed at run time by proc
+     // macros and shown in panic messages (the debug form is `operator<<`)
+     case TOK_STRING:    return FMT("\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix);
+-    case TOK_CSTRING:   return FMT("c\"" << EscapedString(m_data.as_String()) << "\"" << m_suffix);
++    case TOK_CSTRING:   return FMT("c\"" << FmtCStringBody(m_data.as_String()) << "\"" << m_suffix);
+     case TOK_BYTESTRING:return FMT("b\"" << EscapedByteString(m_data.as_String()) << "\"" << m_suffix);
+     case TOK_HASH:  return "#";
+     case TOK_UNDERSCORE:return "_";
+diff --git a/src/parse/token.hpp b/src/parse/token.hpp
+index c38824c7..634c6c10 100644
+--- a/src/parse/token.hpp
++++ b/src/parse/token.hpp
+@@ -206,3 +206,11 @@ public:
+ };
+ extern ::std::ostream&  operator<<(::std::ostream& os, const Token& tok);
+ 
++/// Body of a C string literal (`c"..."`, between the quotes) holding the given bytes: valid UTF-8 as written, other
++/// bytes as `\xNN` (`c"\xff"` is the byte 0xFF). The text is re-lexed (`stringify!`, proc macro input).
++struct FmtCStringBody {
++    const ::std::string& s;
++    FmtCStringBody(const ::std::string& s): s(s) {}
++};
++extern ::std::ostream&  operator<<(::std::ostream& os, const FmtCStringBody& x);
++
