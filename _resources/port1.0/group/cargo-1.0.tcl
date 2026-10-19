@@ -27,8 +27,10 @@ if {${os.arch} eq "powerpc"} {
 
     default build.cmd           {MRUSTC_TARGET_VER=${rustc_target_ver} ${cargo.bin} \.}
     default build.target        {}
-    default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs}}
-    default build.args          {--vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
+    # Keep the vendor and output directories out of build.args: a Portfile that sets `build.args --features=..` (websocat)
+    # instead of appending would otherwise drop them (minicargo then finds no crate at all)
+    default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs} --vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
+    default build.args          {}
 } else {
     PortGroup                   rust 1.0
 
