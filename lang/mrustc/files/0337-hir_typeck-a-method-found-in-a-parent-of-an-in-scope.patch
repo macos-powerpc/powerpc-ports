@@ -1,0 +1,90 @@
+From 67f553157f14bb62e02165e18f5595513198dce6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 14:17:40 +0000
+Subject: [PATCH] hir_typeck: a method found in a parent of an in-scope trait
+ is attributed to the parent, not to the trait in scope
+
+futures-lite@2.3.0 (meli) src/io.rs:813 `self.consume(nread)` in BufReader's `poll_read(mut self: Pin<&mut Self>, ..)`:
+"warn:0: Spare rule - _CallMethod {Pin<&mut BufReader<R>>}.consume({usize}) -> _" then "BUG: expr_cs.cpp:8725: Spare
+rules left after typecheck stabilised". Two in-scope traits offer `consume`: futures_io's `AsyncBufRead::consume(self:
+Pin<&mut Self>)` and futures-lite's own extension trait `AsyncBufReadExt::consume(&mut self) where Self: Unpin`
+(io.rs:1598, defined in the same module as BufReader, so in scope there). For the extension trait, find_method's
+in-scope section skipped its `consume` (the receiver doesn't fit), found `consume` in the PARENT trait AsyncBufRead
+(trait_contains_method walks the parents and returns the parent's path), but then searched impls of, and named, the
+trait in scope: `<BufReader<R> as AsyncBufReadExt>::consume` next to the real `<BufReader<R> as AsyncBufRead>::consume`
+from the parent itself. Two different traits = "Multiple options, deferring", on every revisit. rustc picks the by-value
+`AsyncBufRead::consume` at autoderef level 0 (the `&mut self` one needs an autoref).
+
+helpers.cpp find_method, in-scope traits: the impl search and the resulting path use the trait that declares the method
+(`final_trait_path`, as the current-trait, bound and erased-type sections already do). The in-scope trait's own
+parameters are its ivared parameters from the start, so a parent's arguments are monomorphised from them
+(`BorrowMut<B>: Borrow<B>`; they used to come from an empty parameter list), with `Self` replaced by the receiver's type.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index bd57c125..680f3aa7 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -5774,34 +5774,40 @@ bool TraitResolution::find_method(const Span& sp,
+         if( trait_ref.first == nullptr )
+             break;
+ 
++        // The trait's own parameters are the caller's ivars; a parent's arguments are monomorphised from them
++        // (`BorrowMut<B>: Borrow<B>` in scope, `.borrow()`)
++        ::HIR::GenericPath  scope_trait_path( *trait_ref.first, get_ivared_params(trait_ref.second->m_params) );
+         ::HIR::GenericPath final_trait_path;
+         const ::HIR::Function* fcn_ptr;
+-        if( !(fcn_ptr = this->trait_contains_method(sp, *trait_ref.first, *trait_ref.second, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits)) )
++        if( !(fcn_ptr = this->trait_contains_method(sp, scope_trait_path, *trait_ref.second, ::HIR::TypeRef::new_self(), method_name,  final_trait_path, receiver_fits)) )
+             continue ;
+         DEBUG("- Found trait " << final_trait_path << " (in scope)");
+ 
+         if( const auto* self_ty_p = check_method_receiver(sp, *fcn_ptr, ty, access) )
+         {
+             const auto& self_ty = *self_ty_p;
+-            DEBUG("Search for impl of " << *trait_ref.first << " for " << self_ty);
+-
+-            // Use the set of ivars we were given to populate the trait parameters
+-            ::HIR::PathParams   trait_params = get_ivared_params(trait_ref.second->m_params);
+-
+-            // TODO: Re-monomorphise the trait path!
++            // The method can come from a PARENT of the trait in scope (`AsyncBufReadExt::consume(&mut self)` skipped for
++            // the receiver, `AsyncBufRead::consume(self: Pin<&mut Self>)` found): the impl search and the path name
++            // the trait that declares it. futures-lite 2.3.0 io.rs:813 `self.consume(nread)` got
++            // `<BufReader<R> as AsyncBufReadExt>::consume` next to `<BufReader<R> as AsyncBufRead>::consume`: two
++            // traits, deferred for good ("Spare rule - _CallMethod").
++            const auto& found_trait_path = final_trait_path.m_path;
++            // `Self` in a parent's arguments (`Ord: PartialOrd<Self>`) is the receiver's type
++            ::HIR::PathParams   trait_params = MonomorphStatePtr(&self_ty, nullptr, nullptr).monomorph_path_params(sp, final_trait_path.m_params, true);
++            DEBUG("Search for impl of " << found_trait_path << trait_params << " for " << self_ty);
+ 
+             bool magic_found = false;
+             bool crate_impl_found = false;
+             auto impl_cmp = ::HIR::Compare::Unequal;
+ 
+-            crate_impl_found = find_trait_impls_magic(sp, *trait_ref.first, trait_params, self_ty,  [&](auto impl, auto cmp) {
++            crate_impl_found = find_trait_impls_magic(sp, found_trait_path, trait_params, self_ty,  [&](auto impl, auto cmp) {
+                 impl_cmp = ::HIR::Compare::Equal;
+                 return true;
+                 });
+ 
+             // NOTE: This just detects the presence of a trait impl, not the specifics
+             try {
+-                find_trait_impls_crate(sp, *trait_ref.first, &trait_params, self_ty,  [&](auto impl, auto cmp) {
++                find_trait_impls_crate(sp, found_trait_path, &trait_params, self_ty,  [&](auto impl, auto cmp) {
+                     DEBUG("[find_method] " << impl << ", cmp = " << cmp);
+                     magic_found = true;
+                     crate_impl_found = true;
+@@ -5818,8 +5824,8 @@ bool TraitResolution::find_method(const Span& sp,
+             }
+             if( crate_impl_found ) {
+                 defer_if_only_fuzzy(impl_cmp, self_ty);
+-                DEBUG("Found trait impl " << *trait_ref.first << trait_params << " for " << self_ty << " ("<<m_ivars.fmt_type(self_ty)<<")");
+-                possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty.clone(), ::HIR::GenericPath( *trait_ref.first, mv$(trait_params) ), method_name, {}) ));
++                DEBUG("Found trait impl " << found_trait_path << trait_params << " for " << self_ty << " ("<<m_ivars.fmt_type(self_ty)<<")");
++                possibilities.push_back(::std::make_pair( borrow_type, ::HIR::Path(self_ty.clone(), ::HIR::GenericPath( found_trait_path, mv$(trait_params) ), method_name, {}) ));
+                 DEBUG("++ " << possibilities.back());
+                 rv = true;
+             }

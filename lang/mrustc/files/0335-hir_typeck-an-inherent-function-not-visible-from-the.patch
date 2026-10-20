@@ -1,0 +1,99 @@
+From 458248d142c50b975d48326838fa960661c4f8bb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 13:29:56 +0000
+Subject: [PATCH] hir_typeck: an inherent function not visible from the calling
+ module is no candidate for a `Type::f` path
+
+crc@3.4.0 (localsend-cli 1.18.2) src/crc128.rs:39 `Digest::new(self, value)`: "warn:0: Spare rule - terminate called
+after throwing an instance of 'char const*'". crc has one `impl Digest<'a, uN, Table<L>>` per width module (five),
+each with a private `const fn new`. rustc's probe drops items that aren't accessible from the calling module before it
+looks for ambiguity, so the path means crc128's own `new`. visit_call_populate_cache_UfcsInherent collected all five
+impls for `Digest<_, _, _>` (method lookup and the UFCS resolver already filter by visibility), the bounds selector
+(0330) saw five applicable impls and deferred the call, and since the call's result ivar is tied to the signature only
+once an impl is picked, no revisit could ever resolve it: a spare rule. Printing that warning then threw:
+ExprVisitor_Print::no_revisit throws a bare `const char*` for node kinds it assumes are never revisited, but
+an ambiguous _CallPath is revisited since 02ad4c5b, so the diagnostic ended in `terminate`.
+
+- expr_cs__enum.cpp: impls whose function isn't visible from `m_vis_path` are set aside, used only when no visible impl
+  has the function (privacy isn't enforced here).
+- expr_cs.cpp: the printer prints a _CallPath (path and argument types); other never-revisited kinds print their type
+  name instead of throwing out of a diagnostic.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 45c45c4f..946b4460 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -10,6 +10,7 @@
+ #include <hir/hir.hpp>
+ #include <hir/visitor.hpp>
+ #include <algorithm>    // std::find_if
++#include <typeinfo>     // no_revisit
+ 
+ #include <hir_typeck/static.hpp>
+ #include "helpers.hpp"
+@@ -2037,7 +2038,11 @@ namespace {
+             no_revisit(node);
+         }
+         void visit(::HIR::ExprNode_CallPath& node) override {
+-            no_revisit(node);
++            // An ambiguous inherent path is revisited (02ad4c5b), so it can be left as a spare rule
++            m_os << "_CallPath " << node.m_path << "(";
++            for(const auto& arg : node.m_args)
++                m_os << "{" << fmt_res_ty(*arg) << "}, ";
++            m_os << ")";
+         }
+         void visit(::HIR::ExprNode_CallValue& node) override {
+             m_os << "_CallValue {" << fmt_res_ty(*node.m_value) << "}(";
+@@ -2101,7 +2106,9 @@ namespace {
+             return context.m_ivars.fmt_type(n.m_res_type);
+         }
+         void no_revisit(::HIR::ExprNode& n) {
+-            throw "";
++            // A node kind that is never revisited: name it rather than throw out of the diagnostic (the "Spare rule"
++            // warning's formatter runs this, and a thrown `const char*` reached `terminate` with the message cut off)
++            m_os << "_" << typeid(n).name() << " (never revisited)";
+         }
+     }; // class ExprVisitor_Print
+ }
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index aac7165c..0eec828e 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -455,15 +455,32 @@ namespace typecheck
+ 
+         const ::HIR::TypeImpl* impl_ptr = nullptr;
+         // Detect multiple applicable methods and get the caller to try again later if there are multiple
++        // - An impl whose function isn't visible from here is no candidate (as in method lookup and the UFCS
++        //   resolver; rustc's probe drops inaccessible items before it looks for ambiguity). crc 3.4.0 has five
++        //   `impl Digest<'a, uN, Table<L>>` blocks, each with a private `const fn new`, and `Digest::new(self, value)`
++        //   in crc128.rs can only mean its own module's: with all five matching `Digest<_, _, _>` the call was deferred
++        //   for good (the result ivar is tied to the signature only once an impl is picked) and ended as a spare rule.
+         ::std::vector<const ::HIR::TypeImpl*>   candidates;
++        ::std::vector<const ::HIR::TypeImpl*>   hidden_candidates;
+         context.m_crate.find_type_impls(e.type, context.m_ivars.callback_resolve_infer(),
+             [&](const auto& impl) {
+                 DEBUG("- impl" << impl.m_params.fmt_args() << " " << impl.m_type);
+-                if( impl.m_methods.find(e.item) != impl.m_methods.end() ) {
+-                    candidates.push_back(&impl);
++                auto it = impl.m_methods.find(e.item);
++                if( it != impl.m_methods.end() ) {
++                    if( it->second.publicity.is_visible(context.m_resolve.m_vis_path) ) {
++                        candidates.push_back(&impl);
++                    }
++                    else {
++                        DEBUG("  (not visible from " << context.m_resolve.m_vis_path << ")");
++                        hidden_candidates.push_back(&impl);
++                    }
+                 }
+                 return false;
+             });
++        if( candidates.empty() ) {
++            // Only inaccessible impls have the function: privacy isn't enforced here, so they stay candidates as before
++            candidates = ::std::move(hidden_candidates);
++        }
+         if( candidates.empty() ) {
+             ERROR(sp, E0000, "Failed to locate function " << path);
+         }

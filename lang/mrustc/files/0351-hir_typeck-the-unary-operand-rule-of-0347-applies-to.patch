@@ -1,0 +1,128 @@
+From 24d7eaeef33a7c254d2b5a2f1cc7b226d1d12b34 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Tue, 20 Oct 2026 01:40:06 +0000
+Subject: [PATCH] hir_typeck: the unary operand rule of 0347 applies to
+ match/block operands only, in a late stage
+
+tokio 1.53.1 src/fs/read_dir.rs:106 (tombi 1.8.4, feature `fs`):
+    let (buf, _, ref remain) = data.as_mut().unwrap();
+    .. else if !remain { .. }
+= "Type mismatch between bool and &bool" since 0347 (C198). A `ref` binding under the `&mut` default binding mode is
+`&bool` (editions before 2024) and `!remain` goes through `Not for &bool`. 0347's revisit equated an unknown operand
+with a primitive result type as soon as the greedy revisit stage reached the node; in that stage the nodes (`as_mut`,
+`unwrap`, the `!`) run before the pattern callbacks, so `remain` was still an ivar when it got `bool`, and the
+match-ergonomics revisit then produced `&bool`.
+
+rustc's expectation only coerces the arms of a match (`?`, `if`) or the tail of a block to the expected type; any other
+operand has the type it has, whenever it arrives. The rule is restricted to those operand kinds (the revisit is only
+registered for them) and runs in its own stage of the typeck main loop: after the definitive stages and the
+Backwards/Assume guesses, before the stage that picks `!` for an ivar whose only source diverges. The fallback revisit
+stage is too late: the `?` match of pydantic_core's `if !obj.call(..)?.extract()? {..}` got `!` there.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 9af8e6da..d03f174f 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -203,21 +203,26 @@ namespace {
+             const auto& sp = node.span();
+             const auto& res_ty = this->context.get_type(node.m_res_type);
+             const auto& val_ty = this->context.get_type(node.m_value->m_res_type);
+-            TRACE_FUNCTION_F(::HIR::ExprNode_UniOp::opname(node.m_op) << " {" << val_ty << "} -> " << res_ty);
++            TRACE_FUNCTION_F(::HIR::ExprNode_UniOp::opname(node.m_op) << " {" << val_ty << "} -> " << res_ty << (m_is_fallback ? " (fallback)" : ""));
+             // rustc checks the operand of `!`/`-` with the expression's own expectation (the builtin operators keep
+             // their type), so `if !obj.call(..)?.extract()? {..}` makes `extract` return `bool`: the `?` match's
+             // value arm is coerced to it (pydantic_core 2.46.5 validators/decimal.rs:148; the other arm is a `return`,
+-            // so the type variable had nothing but the never-type fallback, `!` from the 2024 edition). An unknown
+-            // operand takes a primitive result type; a known one is the `Not`/`Neg` rule's business.
++            // so the type variable had nothing but the never-type fallback, `!` from the 2024 edition). The
++            // expectation only coerces the arms of a match or the tail of a block: any other operand has the type it
++            // has (a `ref` binding under the `&mut` default binding mode is `&bool`, and `!` goes through `Not for
++            // &bool`: tokio 1.53.1 fs/read_dir.rs:105), and that type may only arrive from a later revisit (match
++            // ergonomics, after the method calls resolve), so the equate waits for the dedicated stage of the main
++            // loop (after the definitive stages and the first guesses, before the never-type pick). A known operand
++            // is the `Not`/`Neg` rule's business.
+             if( !val_ty.data().is_Infer() ) {
+                 this->m_completed = true;
+             }
+-            else if( res_ty.data().is_Primitive() ) {
++            else if( this->m_is_fallback && res_ty.data().is_Primitive() && uniop_operand_takes_expectation(node) ) {
+                 this->context.equate_types(sp, val_ty, res_ty);
+                 this->m_completed = true;
+             }
+             else {
+-                // Neither side known yet
++                // Neither side known yet (or not the fallback stage)
+             }
+         }
+         void visit(::HIR::ExprNode_Borrow& node) override {
+@@ -8538,6 +8543,33 @@ void Typecheck_Code_CS(const typeck::ModuleState& ms, t_args& args, const ::HIR:
+             }
+         }
+ 
++        // The operand of a unary `!`/`-` takes a primitive result type (rustc's expectation coerces the arms of
++        // a match or the tail of a block to it, see the UniOp revisit) once the definitive stages and the guesses above
++        // left it unknown: before the stage below picks `!` for an ivar whose only known source diverges (the `return`
++        // arm of a `?` match, pydantic_core 2.46.5 validators/decimal.rs:148 `if !obj.call(..)?.extract()? {..}`).
++        if( !context.m_ivars.peek_changed() )
++        {
++            DEBUG("--- Node revisits (unary operand expectation)");
++            for( auto it = context.to_visit.begin(); it != context.to_visit.end(); )
++            {
++                ::HIR::ExprNode& node = **it;
++                if( !dynamic_cast<::HIR::ExprNode_UniOp*>(&node) ) {
++                    ++ it;
++                    continue;
++                }
++                ExprVisitor_Revisit visitor { context, /*fallback=*/true };
++                DEBUG("> " << &node << " " << typeid(node).name() << " -> " << context.m_ivars.fmt_type(node.m_res_type));
++                node.visit( visitor );
++                if( visitor.node_completed() ) {
++                    DEBUG("- Completed " << &node << " - " << typeid(node).name());
++                    it = context.to_visit.erase(it);
++                }
++                else {
++                    ++ it;
++                }
++            }
++        }
++
+         // If nothing has changed, run check_ivar_poss again but ignoring the 'disable' flag
+ #if 1
+         if( !context.m_ivars.peek_changed() )
+diff --git a/src/hir_typeck/expr_cs.hpp b/src/hir_typeck/expr_cs.hpp
+index 35c84ba5..e448a3c4 100644
+--- a/src/hir_typeck/expr_cs.hpp
++++ b/src/hir_typeck/expr_cs.hpp
+@@ -13,6 +13,14 @@
+ #include <span.hpp>
+ #include "helpers.hpp"
+ 
++/// Whether rustc's expectation types the operand of a unary `!`/`-`: it coerces the arms of a match (`?`, `if`)
++/// or the tail of a block to the expected type; any other operand keeps its own type (see the UniOp revisit)
++static inline bool uniop_operand_takes_expectation(const ::HIR::ExprNode_UniOp& node)
++{
++    const auto* v = node.m_value.get();
++    return dynamic_cast<const ::HIR::ExprNode_Match*>(v) || dynamic_cast<const ::HIR::ExprNode_Block*>(v);
++}
++
+ // PLAN: Build up a set of conditions that are easier to solve
+ struct Context
+ {
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index bfc66b7f..553b869f 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -1223,8 +1223,8 @@ namespace typecheck
+             const auto& op_trait = this->context.m_crate.get_lang_item_path(node.span(), item_name);
+             this->context.equate_types_assoc(node.span(), node.m_res_type,  op_trait, ::HIR::PathParams {}, node.m_value->m_res_type.clone(), "Output", {}, true);
+             node.m_value->visit( *this );
+-            // An unknown operand can take the result type (see the revisit)
+-            if( this->context.get_type(node.m_value->m_res_type).data().is_Infer() ) {
++            // An unknown match/block operand can take the result type (see the revisit)
++            if( uniop_operand_takes_expectation(node) && this->context.get_type(node.m_value->m_res_type).data().is_Infer() ) {
+                 this->context.add_revisit(node);
+             }
+         }

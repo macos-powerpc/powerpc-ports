@@ -1,0 +1,588 @@
+From 514039150fcadfd15685565ca47f56427decf242 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 15:10:39 +0000
+Subject: [PATCH] expand: `stringify!` of a forwarded fragment prints no
+ binding/hygiene comments, a block fragment survives whole
+
+libz-ng-sys@1.1.28 / libz-sys@1.1.28 (hck 0.11.6 via flate2 1.1.9, zlib-ng): "Undefined symbols for architecture ppc:
+_zng_, referenced from: ...flate2...ffi::c::Inflate::decompress_inner" (ld's suggestions: _zng_inflate,
+_zng_inflateEnd, ...). Every zlib import is declared `#[link_name = zng_prefix!(inflate)] pub fn inflate(..);` with
+`macro_rules! zng_prefix { ($name:expr) => { concat!("zng_", stringify!($name)) } }` (`stringify!($name)` alone
+without cfg(zng)). `stringify!` printed the `expr` fragment through DumpAST_Node, whose path printer is the debug one:
+the link name was `zng_/*1*/inflate/*?*/` (hygiene + binding comments). GNU as strips the comments, so Linux links
+worked; Apple's assembler takes `_zng_`. 0304 had kept these comments as "harmless to the lexer", which holds for
+proc-macro input but not for a string used as data (link names, export names, assert messages).
+
+ast/dump.cpp: RustPrinter has a debug flag, on only for Dump_Rust. Off (DumpAST_Node/DumpAST_Pattern: stringify!,
+proc-macro input, re-captured fragments, all of which re-lex the text or use it as data) it prints paths and types
+without comments, names without hygiene, no binding slots, labels by name, and named pattern values through the same
+path printer. ast/path.cpp: Path::print_pretty without is_debug also prints the generic arguments (types, lifetimes,
+associated type bindings) and a qualified path's type and trait without comments (they always went through the debug
+operator<<); the debug output is unchanged. expand/stringify.cpp: the strip of a leading `{..}` (from hygiene printed
+in braces, `/*..*/` since upstream 102b9e3e, 2024-02) cut a `$b:block` fragment down to its last line (`\n}`).
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index 878553dc..3d51ab9a 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -27,11 +27,17 @@ class RustPrinter:
+     ::std::ostream& m_os;
+     int m_indent_level;
+     bool m_expr_root;   //!< used to allow 'if' and 'match' to behave differently as standalone exprs
++    /// The annotated dump (`Dump_Rust`): paths carry their bindings and hygiene, pattern bindings their slots, all in
++    /// comments. Off for the source form (`DumpAST_Node`/`DumpAST_Pattern`), whose text is re-lexed (proc-macro input,
++    /// re-captured fragments) or is data: `stringify!` of a forwarded fragment, e.g. a `#[link_name]` (libz-ng-sys
++    /// `concat!("zng_", stringify!($name))` with `$name:expr` gave `zng_/*1*/inflate/*?*/`).
++    bool m_is_debug;
+ public:
+-    RustPrinter(::std::ostream& os):
++    RustPrinter(::std::ostream& os, bool is_debug):
+         m_os(os),
+         m_indent_level(0),
+-        m_expr_root(false)
++        m_expr_root(false),
++        m_is_debug(is_debug)
+     {}
+ 
+     void handle_module(const AST::Module& mod);
+@@ -54,7 +60,9 @@ public:
+             break;
+         }
+         if( n.m_label.name != RcString() ) {
+-            m_os << "'" << n.m_label << ": ";
++            m_os << "'";
++            print_ident(n.m_label);
++            m_os << ": ";
+         }
+         m_os << "{";
+         inc_indent();
+@@ -118,7 +126,8 @@ public:
+     }
+     virtual void visit(AST::ExprNode_Macro& n) override {
+         m_expr_root = false;
+-        m_os << n.m_path << "!";
++        print_path(n.m_path);
++        m_os << "!";
+         if( n.m_ident != "" ) {
+             m_os << " ";
+             m_os << n.m_ident;
+@@ -204,7 +213,9 @@ public:
+         case AST::ExprNode_Flow::YEET:      m_os << "do yeet ";  break;
+         }
+         if( n.m_target.name != "" ) {
+-            m_os << "'" << n.m_target << " ";
++            m_os << "'";
++            print_ident(n.m_target);
++            m_os << " ";
+         }
+         AST::NodeVisitor::visit(n.m_value);
+     }
+@@ -256,7 +267,7 @@ public:
+     }
+     virtual void visit(AST::ExprNode_CallPath& n) override {
+         m_expr_root = false;
+-        m_os << n.m_path;
++        print_path(n.m_path);
+         m_os << "(";
+         bool is_first = true;
+         for( auto& arg : n.m_args )
+@@ -277,7 +288,12 @@ public:
+             , AST::ExprNode_Cast, AST::ExprNode_BinOp, AST::ExprNode_Assign
+             , AST::ExprNode_Match, AST::ExprNode_If, AST::ExprNode_Match
+             );
+-        m_os << "." << n.m_method;
++        m_os << ".";
++        if( m_is_debug )
++            m_os << n.m_method;
++        else
++            // The turbofish as for any other path
++            AST::Path::new_relative(Ident::Hygiene(), { n.m_method }).print_pretty(m_os, false, false);
+         m_os << "(";
+         bool is_first = true;
+         for( auto& arg : n.m_args )
+@@ -313,7 +329,9 @@ public:
+         m_expr_root = false;
+ 
+         if( n.m_label.name != "" ) {
+-            m_os << "'" << n.m_label << ": ";
++            m_os << "'";
++            print_ident(n.m_label);
++            m_os << ": ";
+         }
+ 
+         m_os << "loop";
+@@ -333,7 +351,9 @@ public:
+         m_expr_root = false;
+ 
+         if( n.m_label.name != "" ) {
+-            m_os << "'" << n.m_label << ": ";
++            m_os << "'";
++            print_ident(n.m_label);
++            m_os << ": ";
+         }
+         m_os << "for ";
+         print_pattern(n.m_pattern, true);
+@@ -368,7 +388,9 @@ public:
+         m_expr_root = false;
+ 
+         if( n.m_label.name != "" ) {
+-            m_os << "'" << n.m_label << ": ";
++            m_os << "'";
++            print_ident(n.m_label);
++            m_os << ": ";
+         }
+ 
+         m_os << "while ";
+@@ -633,7 +655,8 @@ public:
+ 
+     virtual void visit(AST::ExprNode_StructLiteral& n) override {
+         m_expr_root = false;
+-        m_os << n.m_path << " {\n";
++        print_path(n.m_path);
++        m_os << " {\n";
+         inc_indent();
+         for( auto& i : n.m_values )
+         {
+@@ -653,7 +676,8 @@ public:
+     }
+     virtual void visit(AST::ExprNode_StructLiteralPattern& n) override {
+         m_expr_root = false;
+-        m_os << n.m_path << " {\n";
++        print_path(n.m_path);
++        m_os << " {\n";
+         inc_indent();
+         for( auto& i : n.m_values )
+         {
+@@ -696,7 +720,7 @@ public:
+     }
+     virtual void visit(AST::ExprNode_NamedValue& n) override {
+         m_expr_root = false;
+-        m_os << n.m_path;
++        print_path(n.m_path);
+     }
+     virtual void visit(AST::ExprNode_Field& n) override {
+         m_expr_root = false;
+@@ -728,13 +752,15 @@ public:
+         m_expr_root = false;
+         m_os << "(";
+         AST::NodeVisitor::visit(n.m_value);
+-        m_os << ") as " << n.m_type;
++        m_os << ") as ";
++        print_type(n.m_type);
+     }
+     virtual void visit(AST::ExprNode_TypeAnnotation& n) override {
+         m_expr_root = false;
+         m_os << "(";
+         AST::NodeVisitor::visit(n.m_value);
+-        m_os << ") : " << n.m_type;
++        m_os << ") : ";
++        print_type(n.m_type);
+     }
+     virtual void visit(AST::ExprNode_BinOp& n) override {
+         m_expr_root = false;
+@@ -829,6 +855,21 @@ public:
+     void print_pattern(const AST::Pattern& p, bool is_refutable);
+ private:
+     void print_type(const TypeRef& t);
++    void print_path(const AST::Path& p) {
++        p.print_pretty(m_os, false, m_is_debug);
++    }
++    void print_pattern_value(const AST::Pattern::Value& v) {
++        if( const auto* p = v.opt_Named() )
++            print_path(*p);
++        else
++            m_os << v;
++    }
++    void print_ident(const Ident& i) {
++        if( m_is_debug )
++            m_os << i;
++        else
++            m_os << i.name;
++    }
+ 
+     void inc_indent();
+     RepeatLitStr indent();
+@@ -869,7 +910,7 @@ void RustPrinter::handle_module(const AST::Module& mod)
+         {
+             if( &ent != &i_data.entries.front() )
+                 m_os << ", ";
+-            m_os << ent.path;
++            print_path(ent.path);
+             if( ent.name == "" ) {
+                 m_os << "::*";
+             }
+@@ -1201,7 +1242,9 @@ void RustPrinter::print_pattern(const AST::Pattern& p, bool is_refutable)
+             m_os << "ref mut ";
+             break;
+         }
+-        m_os << pb.m_name << "/*" << pb.m_slot << "*/";
++        print_ident(pb.m_name);
++        if( m_is_debug )
++            m_os << "/*" << pb.m_slot << "*/";
+         // If binding is irrefutable, and would be binding against a wildcard, just emit the name
+         if( !is_refutable && p.bindings().size() == 1 && p.data().is_Any() )
+         {
+@@ -1214,7 +1257,9 @@ void RustPrinter::print_pattern(const AST::Pattern& p, bool is_refutable)
+         m_os << "_";
+         ),
+     (MaybeBind,
+-        m_os << v.name << " /*?*/";
++        print_ident(v.name);
++        if( m_is_debug )
++            m_os << " /*?*/";
+         ),
+     (Macro,
+         m_os << *v.inv;
+@@ -1236,22 +1281,27 @@ void RustPrinter::print_pattern(const AST::Pattern& p, bool is_refutable)
+         m_os << ")";
+         }),
+     (Value,
+-        m_os << v.start;
++        print_pattern_value(v.start);
+         if( ! v.end.is_Invalid() ) {
+-            m_os << " ..= " << v.end;
++            m_os << " ..= ";
++            print_pattern_value(v.end);
+         }
+         ),
+     (ValueLeftInc,
+-        m_os << v.start << " .. " << v.end;
++        print_pattern_value(v.start);
++        m_os << " .. ";
++        print_pattern_value(v.end);
+         ),
+     (StructTuple,
+-        m_os << v.path << "(";
++        print_path(v.path);
++        m_os << "(";
+         this->print_pattern_tuple(v.tup_pat, is_refutable);
+         m_os << ")";
+         ),
+     (Struct, {
+         const auto& v = p.data().as_Struct();
+-        m_os << v.path << "{";
++        print_path(v.path);
++        m_os << "{";
+         for(const auto& sp : v.sub_patterns) {
+             m_os << sp.name << ": ";
+             print_pattern(sp.pat, is_refutable);
+@@ -1299,7 +1349,9 @@ void RustPrinter::print_pattern(const AST::Pattern& p, bool is_refutable)
+                 m_os << "ref mut ";
+                 break;
+             }
+-            m_os << b.m_name << "/*"<<b.m_slot<<"*/";
++            print_ident(b.m_name);
++            if( m_is_debug )
++                m_os << "/*"<<b.m_slot<<"*/";
+         }
+         m_os << "..";
+         needs_comma = true;
+@@ -1328,7 +1380,7 @@ void RustPrinter::print_pattern(const AST::Pattern& p, bool is_refutable)
+ 
+ void RustPrinter::print_type(const TypeRef& t)
+ {
+-    m_os << t;
++    t.print(m_os, m_is_debug);
+ }
+ 
+ void RustPrinter::handle_struct(const AST::Struct& s)
+@@ -1344,7 +1396,9 @@ void RustPrinter::handle_struct(const AST::Struct& s)
+     (Tuple,
+         m_os << "(";
+         for( const auto& i : e.ents ) {
+-            m_os << i.m_vis << i.m_type << ", ";
++            m_os << i.m_vis;
++            print_type(i.m_type);
++            m_os << ", ";
+         }
+         m_os << ")\n";
+         print_bounds(s.params());
+@@ -1420,7 +1474,8 @@ void RustPrinter::handle_trait(const AST::Trait& s)
+             c = '+';
+         }
+         for(const auto& t : s.supertraits()) {
+-            m_os << " " << c << " " << t.ent.hrbs << *t.ent.path;
++            m_os << " " << c << " " << t.ent.hrbs;
++            print_path(*t.ent.path);
+             c = '+';
+         }
+     }
+@@ -1513,16 +1568,16 @@ void RustPrinter::dec_indent()
+ void Dump_Rust(const char *filename, const AST::Crate& crate)
+ {
+     ::std::ofstream os(filename);
+-    RustPrinter printer(os);
++    RustPrinter printer(os, /*is_debug=*/true);
+     printer.handle_module(crate.root_module());
+ }
+ void DumpAST_Node(::std::ostream& os, const AST::ExprNode& node)
+ {
+-    RustPrinter printer(os);
++    RustPrinter printer(os, /*is_debug=*/false);
+     const_cast<AST::ExprNode&>( node ).visit(printer);
+ }
+ void DumpAST_Pattern(::std::ostream& os, const AST::Pattern& pat)
+ {
+-    RustPrinter printer(os);
++    RustPrinter printer(os, /*is_debug=*/false);
+     printer.print_pattern(pat, true);
+ }
+diff --git a/src/ast/path.cpp b/src/ast/path.cpp
+index 504caeba..158e8ae6 100644
+--- a/src/ast/path.cpp
++++ b/src/ast/path.cpp
+@@ -109,28 +109,88 @@ PathBinding_Macro PathBinding_Macro::clone() const
+     throw "BUG: Fell off the end of PathBinding_Macro::clone";
+ }
+ 
+-::std::ostream& operator<<(::std::ostream& os, const PathParams& x)
+-{
+-    if( x.m_is_paren ) {
+-        auto& t = x.m_entries.at(0).as_Type();
+-        os << t;    // Should be a tuple
+-        auto& rv = x.m_entries.at(1).as_AssociatedTyEqual();
+-        os << "->";
+-        os << rv.second;
+-        return os;
++namespace {
++    // Generic arguments for `Path::print_pretty`: without `is_debug` they print as Rust source, with no binding or
++    // hygiene comments in the argument types. That text is data for `stringify!` of a forwarded fragment: libz-sys /
++    // libz-ng-sys 1.1.28 `#[link_name = concat!("zng_", stringify!($name))]` with `$name:expr` named the symbol
++    // `zng_/*1*/inflate/*?*/`, which Apple's assembler reads as `_zng_` (hck 0.11.6 via flate2).
++    void print_lifetime(::std::ostream& os, const LifetimeRef& lr, bool is_debug)
++    {
++        if( is_debug ) {
++            os << lr;
++        }
++        else if( lr.binding() == LifetimeRef::BINDING_STATIC ) {
++            os << "'static";
++        }
++        else if( lr.binding() == LifetimeRef::BINDING_INFER || lr.binding() == LifetimeRef::BINDING_UNSPECIFIED ) {
++            os << "'_";
++        }
++        else {
++            os << "'" << lr.name().name;
++        }
+     }
+-    bool needs_comma = false;
+-    os << (x.m_is_paren ? "(" : "<");
+-    for(const auto& e : x.m_entries)
++    void print_param_ent(::std::ostream& os, const PathParamEnt& e, bool is_debug)
++    {
++        TU_MATCH_HDRA( (e), {)
++        TU_ARMA(Null, _) {
++            os << "/*removed*/";
++            }
++        TU_ARMA(Lifetime, v) {
++            print_lifetime(os, v, is_debug);
++            }
++        TU_ARMA(Type, v) {
++            v.print(os, is_debug);
++            }
++        TU_ARMA(Value, v) {
++            v->print(os);
++            }
++        TU_ARMA(AssociatedTyEqual, v) {
++            os << v.first << "=";
++            v.second.print(os, is_debug);
++            }
++        TU_ARMA(AssociatedTyBound, v) {
++            os << v.first << ": " << v.second;
++            }
++        }
++    }
++    void print_params(::std::ostream& os, const PathParams& x, bool is_debug)
+     {
+-        if(e.is_Null())
+-            continue;
+-        if(needs_comma) os << ", ";
+-        needs_comma = true;
++        if( x.m_is_paren ) {
++            auto& t = x.m_entries.at(0).as_Type();
++            t.print(os, is_debug);    // Should be a tuple
++            auto& rv = x.m_entries.at(1).as_AssociatedTyEqual();
++            os << "->";
++            rv.second.print(os, is_debug);
++            return ;
++        }
++        bool needs_comma = false;
++        os << (x.m_is_paren ? "(" : "<");
++        for(const auto& e : x.m_entries)
++        {
++            if(e.is_Null())
++                continue;
++            if(needs_comma) os << ", ";
++            needs_comma = true;
+ 
+-        e.fmt(os);
++            print_param_ent(os, e, is_debug);
++        }
++        os << (x.m_is_paren ? ")" : ">");
+     }
+-    os << (x.m_is_paren ? ")" : ">");
++    void print_node(::std::ostream& os, const PathNode& n, bool is_type_context, bool is_debug)
++    {
++        os << n.name();
++        if( ! n.args().is_empty() )
++        {
++            if( ! is_type_context )
++                os << "::";
++            print_params(os, n.args(), is_debug);
++        }
++    }
++}
++
++::std::ostream& operator<<(::std::ostream& os, const PathParams& x)
++{
++    print_params(os, x, true);
+     return os;
+ }
+ PathParams::PathParams(const PathParams& x)
+@@ -202,26 +262,7 @@ Ordering PathParamEnt::ord(const PathParamEnt& x) const
+ }
+ void PathParamEnt::fmt(::std::ostream& os) const
+ {
+-    TU_MATCH_HDRA( (*this), {)
+-    TU_ARMA(Null, _) {
+-        os << "/*removed*/";
+-        }
+-    TU_ARMA(Lifetime, v) {
+-        os << v;
+-        }
+-    TU_ARMA(Type, v) {
+-        os << v;
+-        }
+-    TU_ARMA(Value, v) {
+-        v->print(os);
+-        }
+-    TU_ARMA(AssociatedTyEqual, v) {
+-        os << v.first << "=" << v.second;
+-        }
+-    TU_ARMA(AssociatedTyBound, v) {
+-        os << v.first << ": " << v.second;
+-        }
+-    }
++    print_param_ent(os, *this, true);
+ }
+ 
+ // --- AST::PathNode
+@@ -241,13 +282,7 @@ Ordering PathNode::ord(const PathNode& x) const
+ }
+ void PathNode::print_pretty(::std::ostream& os, bool is_type_context) const
+ {
+-    os << m_name;
+-    if( ! m_params.is_empty() )
+-    {
+-        if( ! is_type_context )
+-            os << "::";
+-        os << m_params;
+-    }
++    print_node(os, *this, is_type_context, true);
+ }
+ ::std::ostream& operator<<(::std::ostream& os, const PathNode& pn) {
+     pn.print_pretty(os, false);
+@@ -415,7 +450,7 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
+             if( &n != &ent.nodes[0] ) {
+                 os << "::";
+             }
+-            n.print_pretty(os, is_type_context);
++            print_node(os, n, is_type_context, is_debug);
+         }
+         }
+     TU_ARMA(Self, ent) {
+@@ -423,7 +458,7 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
+         for(const auto& n : ent.nodes)
+         {
+             os << "::";
+-            n.print_pretty(os, is_type_context);
++            print_node(os, n, is_type_context, is_debug);
+         }
+         }
+     TU_ARMA(Super, ent) {
+@@ -436,7 +471,7 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
+         for(const auto& n : ent.nodes)
+         {
+             os << "::";
+-            n.print_pretty(os, is_type_context);
++            print_node(os, n, is_type_context, is_debug);
+         }
+         }
+     TU_ARMA(Absolute, ent) {
+@@ -453,27 +488,26 @@ void Path::print_pretty(::std::ostream& os, bool is_type_context, bool is_debug)
+         for(const auto& n : ent.nodes)
+         {
+             os << "::";
+-            n.print_pretty(os, is_type_context);
++            print_node(os, n, is_type_context, is_debug);
+         }
+         }
+     TU_ARMA(UFCS, ent) {
+         //os << "/*ufcs*/";
++        os << "<";
++        ent.type->print(os, is_debug);
+         if( ent.trait ) {
+-            os << "<" << *ent.type << " as ";
++            os << " as ";
+             if( ent.trait->m_class.is_Invalid() ) {
+                 os << "_";
+             }
+             else {
+-                os << *ent.trait;
++                ent.trait->print_pretty(os, false, is_debug);
+             }
+-            os << ">";
+-        }
+-        else {
+-            os << "<" << *ent.type << ">";
+         }
++        os << ">";
+         for(const auto& n : ent.nodes) {
+             os << "::";
+-            n.print_pretty(os, is_type_context);
++            print_node(os, n, is_type_context, is_debug);
+         }
+         }
+     }
+diff --git a/src/expand/stringify.cpp b/src/expand/stringify.cpp
+index f0e11854..6d8f7b7c 100644
+--- a/src/expand/stringify.cpp
++++ b/src/expand/stringify.cpp
+@@ -38,18 +38,13 @@ namespace {
+                 }
+                 stringify_tt(rv, sp, a.data());
+                 break; }
+-            default: {
+-                auto v = tok.to_str();
+-                const char* s = v.c_str();
+-                // Very hacky strip of hygine information (e.g. from paths)
+-                if( s[0] == '{' && s[1] ) {
+-                    while( *s != '}' && *s )
+-                        s ++;
+-                    assert(*s);
+-                    s ++;
+-                }
+-                rv += s;
+-                break; }
++            // Fragments print as source with no binding/hygiene comments (DumpAST_Node's source form): the text can be
++            // data, e.g. a link name (libz-ng-sys `concat!("zng_", stringify!($name))`). The strip of a leading
++            // `{..}` that was here dated from hygiene printed in braces (now `/*..*/`) and cut a `$b:block` fragment
++            // down to its last line.
++            default:
++                rv += tok.to_str();
++                break;
+             }
+         }
+     }
+@@ -63,9 +58,6 @@ class CExpander:
+         ::std::string rv;
+         stringify_tt(rv, sp, tt);
+ 
+-        // TODO: Strip out any `{...}` sequences that aren't from nested
+-        // strings.
+-
+         return box$( TTStreamO(sp, ParseState(), TokenTree(Token(TOK_STRING, mv$(rv), {}))) );
+     }
+ };

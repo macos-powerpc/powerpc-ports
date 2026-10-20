@@ -1,0 +1,121 @@
+From 5815f14be38d2ea1c16e8a6faf8fa466507973fd Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 17:42:05 +0000
+Subject: [PATCH] resolve: from 2018 the implicit `extern crate std`/`core` is
+ not nameable by a path, a glob import of `std` wins
+
+pyo3 0.28.3 (py314-pydantic_core 2.46.5) src/conversions/num_bigint.rs:52-55 `use crate::{conversion::IntoPyObject,
+std::num::nb_index, ..}`: "Unable to resolve `use` target crate::std::num::nb_index". pyo3's conversions/mod.rs has
+`pub(crate) mod std;` and lib.rs `pub use crate::conversions::*;`, so the root gets `std` = that module by a glob.
+rustc injects `extern crate std;` (`core` for #![no_std]) with def-site hygiene from 2018: no path (`crate::std`,
+`self::std`, a glob of the root) names it, it only provides `#[macro_use]` and the extern prelude. mrustc's injected
+item was an ordinary private root item, which beats a glob import, so `crate::std` was libstd. Not a regression.
+
+expand/mod.cpp: the injected item carries a `#std_injection` marker attribute (no source attribute can spell it).
+resolve: from 2018 the index leaves it out of the root module and `use` resolution skips it (the item scan of
+Resolve_Use_GetBinding__mod and the local-shadow check of the extern prelude). It still feeds `#[macro_use]` and the
+extern prelude (g_implicit_crates, filled from the item during expansion), so `std::..` / `use std::..` resolve as
+before. 2015 is unchanged (rustc's item is nameable there too). Rust 1.90's library sources (rust-src) and the mrustc
+1.90 source patch have no `crate::core`/`self::core`/`crate::std` path, so libstd/liballoc are unaffected; a 2018+
+crate that wrote `crate::std::..` without such an item is now rejected, as by rustc (E0432).
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 0b34b556..942ae5e8 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -2713,6 +2713,12 @@ void Expand(::AST::Crate& crate)
+         AST::AttributeName  name;
+         name.elems.push_back("macro_use");
+         attrs.push_back( AST::Attribute(Span(), mv$(name), {}) );
++        // The injected item has def-site hygiene in rustc: from 2018 no path names it (`crate::std`, `self::std`), only
++        // its `#[macro_use]` and the extern prelude entry count (resolve skips items with this marker, which no source
++        // attribute can spell)
++        AST::AttributeName  marker;
++        marker.elems.push_back("#std_injection");
++        attrs.push_back( AST::Attribute(Span(), mv$(marker), {}) );
+         // NOTE: For `macro_use` we want to import this first, but for item lookup, we want it to be last.
+         // - Solution, add to the end - but pre-visit the attributes
+         crate.m_root_module.m_items.push_back(
+diff --git a/src/resolve/index.cpp b/src/resolve/index.cpp
+index 5424f5e0..cca3713e 100644
+--- a/src/resolve/index.cpp
++++ b/src/resolve/index.cpp
+@@ -123,6 +123,16 @@ void _add_item_value(const Span& sp, AST::Module& mod, const RcString& name, con
+     _add_item(sp, mod, IndexName::Value, name, vis, mv$(ir), error_on_collision);
+ }
+ 
++namespace {
++    /// The implicit `extern crate std;` (`core` for `#![no_std]`) at the root: from 2018 no path can name it, as its
++    /// rustc counterpart has def-site hygiene (pyo3 0.28.3: `pub use crate::conversions::*;` brings
++    /// `conversions::std` to the root, and `use crate::std::num::nb_index` means that module)
++    bool is_hidden_std_injection(const AST::Crate& crate, const AST::Named<AST::Item>& item)
++    {
++        return crate.m_edition >= AST::Edition::Rust2018 && item.data.is_Crate() && item.attrs.has("#std_injection");
++    }
++}
++
+ void Resolve_Index_Module_Base(const AST::Crate& crate, AST::Module& mod)
+ {
+     TRACE_FUNCTION_F("mod = " << mod.path());
+@@ -162,7 +172,11 @@ void Resolve_Index_Module_Base(const AST::Crate& crate, AST::Module& mod)
+             _add_item(i->span, mod, IndexName::Namespace, i->name, i->vis,  mv$(p));
+             }
+         TU_ARMA(Crate, e) {
+-            if( e.name != "" )
++            if( is_hidden_std_injection(crate, *i) )
++            {
++                DEBUG("Implicit `extern crate " << i->name << "`: not nameable from 2018");
++            }
++            else if( e.name != "" )
+             {
+                 ASSERT_BUG(i->span, crate.m_extern_crates.count(e.name) > 0, "Referenced crate '" << e.name << "' isn't loaded for `extern crate`");
+                 p.m_bindings.type.set( ap, ::AST::PathBinding_Type::make_Crate({ &crate.m_extern_crates.at(e.name) }) );
+@@ -171,7 +185,8 @@ void Resolve_Index_Module_Base(const AST::Crate& crate, AST::Module& mod)
+             {
+                 p.m_bindings.type.set( ap, ::AST::PathBinding_Type::make_Module({ &crate.m_root_module }) );
+             }
+-            _add_item(i->span, mod, IndexName::Namespace, i->name, i->vis,  mv$(p));
++            if( !is_hidden_std_injection(crate, *i) )
++                _add_item(i->span, mod, IndexName::Namespace, i->name, i->vis,  mv$(p));
+             }
+         TU_ARMA(Enum, e) {
+             p.m_bindings.type.set( ap, ::AST::PathBinding_Type::make_Enum({&e}) );
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index 40f021e5..64792a35 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -94,6 +94,13 @@ static const AST::Module* Resolve_Use_WalkToModule(const AST::Crate& crate, cons
+     return cur_mod;
+ }
+ 
++// The implicit `extern crate std;` (`core` for `#![no_std]`) at the root: from 2018 no path can name it (def-site
++// hygiene in rustc), it only feeds `#[macro_use]` and the extern prelude (see is_hidden_std_injection in index.cpp)
++static bool Resolve_Use_IsHiddenStdInjection(const AST::Crate& crate, const AST::Named<AST::Item>& item)
++{
++    return crate.m_edition >= AST::Edition::Rust2018 && item.data.is_Crate() && item.attrs.has("#std_injection");
++}
++
+ // Does the module containing this `use` have a local type-namespace item with this name? Such an item shadows
+ // the extern prelude (2018+) and the builtin types.
+ // Conservative: if the walk fails for any reason, say no.
+@@ -104,7 +111,7 @@ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AS
+     if( cur_mod )
+     {
+         for(const auto& item : cur_mod->m_items) {
+-            if( item->name != name )
++            if( item->name != name || Resolve_Use_IsHiddenStdInjection(crate, *item) )
+                 continue;
+             TU_MATCH_HDRA( (item->data), {)
+             default:
+@@ -577,6 +584,8 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+         const auto& item = *ip;
+         if( item.data.is_None() )
+             continue ;
++        if( Resolve_Use_IsHiddenStdInjection(crate, item) )
++            continue ;
+ 
+         if( item.name == des_item_name ) {
+             auto p = mod.path() + item.name;

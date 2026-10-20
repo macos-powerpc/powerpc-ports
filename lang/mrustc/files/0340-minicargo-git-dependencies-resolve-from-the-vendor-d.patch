@@ -1,0 +1,481 @@
+From e668a6baed8d78e73902e4a1a41529bc327e0d85 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 15:25:32 +0000
+Subject: [PATCH] minicargo: git dependencies resolve from the vendor
+ directory, packages anywhere in a git checkout count
+
+gdrive 3.9.1 (gdrive3) Cargo.toml:14 `google-drive3 = { git = "https://github.com/prasmussen/google-apis-rs", branch =
+"resumable-fix" }`: "EXCEPTION: TODO: Cargo.toml:14: Support git dependencies". minicargo fetches nothing: the
+PortGroup's cargo.crates_github extracts GitHub's archive of the commit (the WHOLE repository) into the vendor
+directory as `<repo>-<rev>/` and writes `.cargo-checksum.json` with `"package": null`.
+
+manifest: `git`/`branch`/`tag`/`rev` of a dependency are accepted; the URL is kept (has_git() was a `false` stub) and
+the dependency loads from the repository like a registry one, with any version when it names none (`version`, if
+given, still applies; a dependency with neither version nor path used to be "No source"). In `[patch.<source>]`, git
+keys are ignored (the vendored checkout is used) and a `path` patch applies for a git source as for crates-io (it was
+ignored).
+
+repository: a vendor entry marked `"package": null` (as the PortGroup and `cargo vendor` write it for git sources), or
+whose root manifest has no `[package]` (a bare workspace), is a git checkout: every package in its tree is recorded, as
+cargo's git source finds them (no hidden directories, no `target` of a package, depth limit 16). google-drive3 is
+`google-apis-rs-<rev>/gen/drive3`; the repository root is a `[workspace]` that excludes `gen`. A package in a checkout
+inherits (`version.workspace = true`, `edition.workspace`, `x = { workspace = true }`) from the nearest manifest with
+`[workspace]` keys above it in the checkout, not from the project's workspace: when loaded by name and as a path
+dependency, and its inherited version is what a `version` requirement is matched against. A registry copy of the same
+name and version wins over one inside a checkout; a registry crate's nested packages (`fuzz/`) still don't count. The
+top-level scan skips `.` and `..` (`<vendor>/../Cargo.toml` was read as a vendored package).
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index 7e81b690..1d1a5039 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -17,6 +17,14 @@
+ #include "cfg.hpp"
+ #include "os.hpp"   // list_directory
+ 
++namespace {
++    /// The keys of a git dependency (`git`, `branch`, `tag`, `rev`): minicargo fetches nothing, the checkout is expected in
++    /// the vendor directory and the dependency resolves from there by name (see Repository::load_vendored)
++    bool is_git_dependency_key(const ::std::string& key) {
++        return key == "git" || key == "branch" || key == "tag" || key == "rev";
++    }
++}
++
+ // TODO: Extract this from the target at runtime (by invoking the compiler on the passed target)
+ #ifdef _WIN32
+ # define TARGET_NAME    "i586-windows-msvc"
+@@ -151,17 +159,17 @@ WorkspaceManifest WorkspaceManifest::load_from_toml(const ::helpers::path& works
+                     eh.error(key_val.path, ": Incorrect type ", key_val.value);
+                     continue ;
+                 }
+-                if( repo_name == "crates-io" )
+-                {
+-                    // Kinda hacky to do overrides in the repository, but it works
+-                    auto p = workspace_manifest_path.parent() / key_val.value.as_string();
+-                    DEBUG("Override " << package_name << " = path " << p);
+-                    rv.m_patches.emplace( package_name, std::move(p) );
+-                }
+-                else
+-                {
+-                    DEBUG("TODO: Handle patching other types of dependencies");
+-                }
++                // `crates-io` or a git source (`[patch."https://github.com/.."]`): git dependencies resolve from the same
++                // repository as registry ones
++                // Kinda hacky to do overrides in the repository, but it works
++                auto p = workspace_manifest_path.parent() / key_val.value.as_string();
++                DEBUG("Override " << package_name << " (" << repo_name << ") = path " << p);
++                rv.m_patches.emplace( package_name, std::move(p) );
++            }
++            else if( is_git_dependency_key(key_val.path[3]) )
++            {
++                // `[patch.crates-io] x = { git = ".." }`: the checkout is in the vendor directory, found by name
++                DEBUG("Patch " << package_name << ": " << key_val.path[3] << " = " << key_val.value << " (resolved from the vendor directory)");
+             }
+             else
+             {
+@@ -867,14 +875,16 @@ void PackageManifest::fill_from_kv(ErrorHandler& eh, const WorkspaceManifest* wm
+                     if( key_val.value.m_type != TomlValue::Type::String ) {
+                         eh.error(key_val.path, ": Incorrect type ", key_val.value);
+                     }
+-                    else if( repo_name == "crates-io" ) {
++                    else {
++                        // `crates-io` or a git source: git dependencies resolve from the same repository
+                         auto p = m_manifest_dir / key_val.value.as_string();
+-                        DEBUG("Override " << package_name << " = path " << p);
++                        DEBUG("Override " << package_name << " (" << repo_name << ") = path " << p);
+                         rv.m_patches.emplace( package_name, ::std::move(p) );
+                     }
+-                    else {
+-                        DEBUG("TODO: Handle patching other types of dependencies");
+-                    }
++                }
++                else if( key_val.path.size() == 4 && is_git_dependency_key(key_val.path[3]) ) {
++                    // `[patch.crates-io] x = { git = ".." }`: the checkout is in the vendor directory, found by name
++                    DEBUG("Patch " << package_name << ": " << key_val.path[3] << " = " << key_val.value << " (resolved from the vendor directory)");
+                 }
+                 else {
+                     eh.todo("Support non-path repository patches");
+@@ -1208,15 +1218,15 @@ void PackageRef::fill_from_kv(
+                 this->m_path = base_dir / key_val.value.as_string();
+             }
+         }
+-        else if( attr == "git" )
++        else if( is_git_dependency_key(attr) )
+         {
+-            // Load from git repo.
+-            eh.todo("Support git dependencies");
+-        }
+-        else if( attr == "branch" )
+-        {
+-            // Specify git branch
+-            eh.todo("Support git dependencies (branch)");
++            // A git dependency resolves by name like a registry one (`version`, if given, still applies)
++            // - gdrive 3.9.1 `google-drive3 = { git = "https://github.com/..", branch = "resumable-fix" }`
++            assert(key_val.path.size() == base_idx+1);
++            DEBUG("Dependency `" << this->m_name << "`: " << attr << " = " << key_val.value << " (resolved from the vendor directory)");
++            if( attr == "git" ) {
++                this->m_git = key_val.value.as_string();
++            }
+         }
+         else if( attr == "version" )
+         {
+@@ -1681,15 +1691,11 @@ std::shared_ptr<PackageManifest> PackageRef::load_manifest_raw(Repository& repo,
+     // If the path isn't set, check for:
+     // - Git (checkout and use)
+     // - Version and repository (check vendored, check cache, download into cache)
+-    if( this->has_git() )
++    // A git dependency comes from the vendor directory too (the checkout, see Repository::load_vendored), with any
++    // version when it names none
++    if( !this->get_version().m_bounds.empty() || this->has_git() )
+     {
+-        DEBUG("Load dependency " << this->name() << " from git");
+-        throw ::std::runtime_error("TODO: PackageRef::load_manifest_raw - Git");
+-    }
+-
+-    if( !this->get_version().m_bounds.empty() )
+-    {
+-        DEBUG("Load dependency " << this->name() << " from repo");
++        DEBUG("Load dependency " << this->name() << " from repo" << (this->has_git() ? " (git)" : ""));
+         auto rv = repo.find(this->name(), this->get_version(), filter_cb);
+         if( rv ) {
+             return rv;
+@@ -1780,6 +1786,9 @@ std::ostream& operator<<(std::ostream& os, const PackageRef& pr)
+     if(pr.has_path()) {
+         os << " path='" << pr.m_path << "'";
+     }
++    if(pr.has_git()) {
++        os << " git='" << pr.m_git << "'";
++    }
+     os << " }";
+     //::std::string   m_name;
+     //PackageVersionSpec  m_version;
+diff --git a/tools/minicargo/manifest.h b/tools/minicargo/manifest.h
+index 76c688a4..5ebd19ef 100644
+--- a/tools/minicargo/manifest.h
++++ b/tools/minicargo/manifest.h
+@@ -191,6 +191,8 @@ class PackageRef
+     bool m_optional = false;
+     bool m_public = false;
+     ::std::string   m_path;
++    /// A git dependency's repository URL: nothing is fetched, it resolves from the vendor directory by name
++    ::std::string   m_git;
+ 
+     // Features requested by this reference
+     bool    m_use_default_features = true;
+@@ -222,7 +224,7 @@ public:
+ 
+     const bool has_path() const { return m_path != ""; }
+     const ::std::string& path() const { return m_path; }
+-    const bool has_git() const { return false; }
++    const bool has_git() const { return m_git != ""; }
+ 
+     const PackageManifest& get_package() const {
+         if(!m_manifest) throw ::std::runtime_error("Manifest not loaded for package " + m_name);
+diff --git a/tools/minicargo/repository.cpp b/tools/minicargo/repository.cpp
+index cddb3e97..fe56690f 100644
+--- a/tools/minicargo/repository.cpp
++++ b/tools/minicargo/repository.cpp
+@@ -14,75 +14,156 @@
+ # include <dirent.h>
+ #endif
+ #include "toml.h"
++#include "os.hpp"   // list_directory
++#include <cstring>
++#include <cctype>
++#include <iterator>
++#include <functional>
+ 
+ void Repository::load_cache(const ::helpers::path& path)
+ {
+     throw ::std::runtime_error("TODO: Repository::load_cache");
+ }
+-void Repository::load_vendored(const ::helpers::path& path)
+-{
+-    // Enumerate folders in this folder, try to open Cargo.toml files
+-    // Extract package name and version from each manifest
+-    #if _WIN32
+-    WIN32_FIND_DATA find_data;
+-    HANDLE find_handle = FindFirstFile( (path / "*").str().c_str(), &find_data );
+-    if( find_handle == INVALID_HANDLE_VALUE )
+-        throw ::std::runtime_error(::format( "Unable to open vendor directory '", path, "'" ));
+-    do
+-    {
+-        auto manifest_path = path / find_data.cFileName / "Cargo.toml";
+-    #else
+-    auto* dp = opendir(path.str().c_str());
+-    if( dp == nullptr )
+-        throw ::std::runtime_error(::format( "Unable to open vendor directory '", path, "'" ));
+-    while( const auto* dent = readdir(dp) )
++namespace {
++    struct ManifestInfo {
++        bool    exists = false;
++        /// Empty when the manifest has no `[package]` (e.g. a bare `[workspace]`)
++        ::std::string   name;
++        PackageVersion  version;
++        /// `version.workspace = true`
++        bool    version_from_workspace = false;
++        /// Has `[workspace.*]` keys (what a member could inherit)
++        bool    has_workspace = false;
++    };
++    ManifestInfo read_manifest_info(const ::helpers::path& manifest_path)
+     {
+-        auto manifest_path = path / dent->d_name / "Cargo.toml";
+-    #endif
+-
++        ManifestInfo    rv;
+         if( ! ::std::ifstream(manifest_path.str()).good() )
+-            continue ;
+-        //DEBUG("Opening manifest " << manifest_path);
+-
+-        // Scan the manifiest until both the name and version are set
+-        bool name_set = false;
+-        ::std::string   name;
+-        bool ver_set = false;
+-        PackageVersion  ver;
+-
++            return rv;
++        rv.exists = true;
+         TomlFile toml_file(manifest_path);
+         for(auto key_val : toml_file)
+         {
++            if( key_val.path.size() >= 2 && key_val.path[0] == "workspace" ) {
++                rv.has_workspace = true;
++            }
++            if( key_val.path.size() == 3 && key_val.path[0] == "package" && key_val.path[1] == "version" && key_val.path[2] == "workspace" ) {
++                rv.version_from_workspace = key_val.value.as_bool();
++            }
+             if(key_val.path.size() != 2)
+                 continue ;
+             if(key_val.path[0] == "package") {
+                 if( key_val.path[1] == "name" ) {
+-                    //assert( !name_set );
+-                    name = key_val.value.as_string();
+-                    name_set = true;
+-                    if( name_set && ver_set )
+-                        break;
++                    rv.name = key_val.value.as_string();
+                 }
+                 else if( key_val.path[1] == "version" ) {
+-                    //assert( !ver_set );
+-                    ver = PackageVersion::from_string(key_val.value.as_string());
+-                    ver_set = true;
+-                    if( name_set && ver_set )
+-                        break;
++                    rv.version = PackageVersion::from_string(key_val.value.as_string());
+                 }
+                 else
+                     ;
+             }
+         }
++        return rv;
++    }
++    /// A git checkout: `.cargo-checksum.json` says `"package": null` (no registry checksum), as the PortGroup writes it
++    /// for a crate from GitHub and `cargo vendor` for a git source
++    bool is_git_checkout(const ::helpers::path& dir)
++    {
++        ::std::ifstream is( (dir / ".cargo-checksum.json").str() );
++        if( !is.good() )
++            return false;
++        ::std::string s { ::std::istreambuf_iterator<char>(is), ::std::istreambuf_iterator<char>() };
++        auto pos = s.find("\"package\"");
++        if( pos == ::std::string::npos )
++            return false;
++        pos += 9;
++        while( pos < s.size() && (isspace(s[pos]) || s[pos] == ':') )
++            pos ++;
++        return s.compare(pos, 4, "null") == 0;
++    }
++}
+ 
+-        DEBUG("Vendored package '" << name << "' v" << ver);
+-        if(name == "")
+-            continue ;
++const WorkspaceManifest* Repository::workspace_for(const ::std::string& workspace_path)
++{
++    if( workspace_path == "" )
++        return m_workspace_manifest;
++    auto it = m_checkout_workspaces.find(workspace_path);
++    if( it == m_checkout_workspaces.end() )
++    {
++        DEBUG("Loading the workspace of a git checkout: " << workspace_path);
++        ::std::unique_ptr<WorkspaceManifest> wm ( new WorkspaceManifest(WorkspaceManifest::load_from_toml(workspace_path)) );
++        it = m_checkout_workspaces.insert(::std::make_pair(workspace_path, ::std::move(wm))).first;
++    }
++    return it->second.get();
++}
++
++void Repository::load_vendored(const ::helpers::path& path)
++{
++    // Records the package of a manifest. `workspace_path`: the `[workspace]` manifest a package inside a git checkout
++    // inherits from (its version too, when it says `version.workspace = true`)
++    auto add_package = [&](const ManifestInfo& info, const ::helpers::path& manifest_path, const ::std::string& workspace_path, bool is_nested) {
++        auto ver = info.version;
++        if( info.version_from_workspace && workspace_path != "" ) {
++            const auto* wm = workspace_for(workspace_path);
++            if( wm->has_package_version() )
++                ver = wm->package_version();
++        }
++        DEBUG("Vendored package '" << info.name << "' v" << ver << (is_nested ? " (in a git checkout)" : ""));
++        if( is_nested ) {
++            // A registry copy of the same package and version wins: a repository can carry copies of its dependencies
++            auto itp = m_cache.equal_range(info.name);
++            for(auto i = itp.first; i != itp.second; ++i) {
++                if( i->second.version == ver ) {
++                    DEBUG("- already have " << info.name << " v" << ver << " at " << i->second.manifest_path);
++                    return ;
++                }
++            }
++        }
+ 
+         Entry   cache_ent;
+         cache_ent.manifest_path = manifest_path;
+         cache_ent.version = ver;
+-        m_cache.insert(::std::make_pair( name, ::std::move(cache_ent) ));
++        cache_ent.workspace_path = workspace_path;
++        m_cache.insert(::std::make_pair( info.name, ::std::move(cache_ent) ));
++        if( workspace_path != "" ) {
++            m_checkout_package_workspaces[manifest_path.to_absolute().normalise().str()] = workspace_path;
++        }
++    };
++
++    // Enumerate folders in this folder, try to open Cargo.toml files
++    // Extract package name and version from each manifest
++    // - Git checkouts to walk afterwards, with the workspace of their root (if any)
++    ::std::vector<::std::pair<::helpers::path, ::std::string>>  checkouts;
++    #if _WIN32
++    WIN32_FIND_DATA find_data;
++    HANDLE find_handle = FindFirstFile( (path / "*").str().c_str(), &find_data );
++    if( find_handle == INVALID_HANDLE_VALUE )
++        throw ::std::runtime_error(::format( "Unable to open vendor directory '", path, "'" ));
++    do
++    {
++        if( ::std::strcmp(find_data.cFileName, ".") == 0 || ::std::strcmp(find_data.cFileName, "..") == 0 )
++            continue ;
++        auto dir = path / find_data.cFileName;
++    #else
++    auto* dp = opendir(path.str().c_str());
++    if( dp == nullptr )
++        throw ::std::runtime_error(::format( "Unable to open vendor directory '", path, "'" ));
++    while( const auto* dent = readdir(dp) )
++    {
++        if( dent->d_name[0] == '.' && (dent->d_name[1] == '\0' || (dent->d_name[1] == '.' && dent->d_name[2] == '\0')) )
++            continue ;
++        auto dir = path / dent->d_name;
++    #endif
++        auto manifest_path = dir / "Cargo.toml";
++        auto info = read_manifest_info(manifest_path);
++        // A git checkout holds the whole repository (the PortGroup extracts GitHub's archive of the commit), its packages
++        // can be anywhere in it: so can a directory whose manifest is a bare `[workspace]`
++        bool is_checkout = is_git_checkout(dir) || (info.exists && info.name == "");
++        ::std::string workspace_path = (is_checkout && info.has_workspace) ? manifest_path.to_absolute().normalise().str() : ::std::string();
++        if( info.name != "" )
++            add_package(info, manifest_path, workspace_path, false);
++        if( is_checkout )
++            checkouts.push_back(::std::make_pair(dir, workspace_path));
+ 
+     #ifndef _WIN32
+     }
+@@ -91,6 +172,33 @@ void Repository::load_vendored(const ::helpers::path& path)
+     } while( FindNextFile(find_handle, &find_data) );
+     FindClose(find_handle);
+     #endif
++
++    // Every package of a git checkout, found as cargo's git source finds them (read_packages): the whole tree except
++    // hidden directories and a package's `target`; each inherits from the nearest `[workspace]` above it
++    // - gdrive 3.9.1: google-drive3 is `google-apis-rs-<rev>/gen/drive3`, the repository root is a `[workspace]` that
++    //   excludes `gen`, and its `google-apis-common` (a path dependency of google-drive3) is a top-level directory
++    ::std::function<void(const ::helpers::path&, const ::std::string&, unsigned)> walk_checkout = [&](const ::helpers::path& dir, const ::std::string& workspace_path, unsigned depth) {
++        bool dir_is_package = ::std::ifstream((dir / "Cargo.toml").str()).good();
++        os_support::list_directory(dir, [&](const char* name) {
++            if( name[0] == '.' )
++                return ;
++            if( dir_is_package && ::std::strcmp(name, "target") == 0 )
++                return ;
++            auto sub = dir / name;
++            auto manifest_path = sub / "Cargo.toml";
++            auto info = read_manifest_info(manifest_path);
++            const auto& sub_workspace = info.has_workspace ? manifest_path.to_absolute().normalise().str() : workspace_path;
++            if( info.name != "" )
++                add_package(info, manifest_path, sub_workspace, true);
++            if( depth < 16 )
++                walk_checkout(sub, sub_workspace, depth + 1);
++            });
++        };
++    for(const auto& c : checkouts)
++    {
++        DEBUG("Git checkout " << c.first << (c.second != "" ? " (workspace)" : ""));
++        walk_checkout(c.first, c.second, 1);
++    }
+     DEBUG("Loaded " << m_cache.size() << " vendored packages");
+ }
+ 
+@@ -104,7 +212,12 @@ void Repository::load_vendored(const ::helpers::path& path)
+     auto it = m_path_cache.find(path);
+     if(it == m_path_cache.end())
+     {
+-        ::std::shared_ptr<PackageManifest> rv ( new PackageManifest(PackageManifest::load_from_toml(path, m_workspace_manifest)) );
++        // A path dependency inside a git checkout inherits from the checkout's workspace
++        const auto* wm = m_workspace_manifest;
++        auto ws_it = m_checkout_package_workspaces.find(path.to_absolute().normalise().str());
++        if( ws_it != m_checkout_package_workspaces.end() )
++            wm = workspace_for(ws_it->second);
++        ::std::shared_ptr<PackageManifest> rv ( new PackageManifest(PackageManifest::load_from_toml(path, wm)) );
+ 
+         m_path_cache.insert( ::std::make_pair(::std::move(path), rv) );
+ 
+@@ -190,7 +303,7 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
+             }
+             try
+             {
+-                best->loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(best->manifest_path, m_workspace_manifest)) );
++                best->loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(best->manifest_path, workspace_for(best->workspace_path))) );
+             }
+             catch(const ::std::exception& e)
+             {
+@@ -221,7 +334,7 @@ void Repository::add_patch_path(const std::string& package_name, ::helpers::path
+                 }
+                 try
+                 {
+-                    i->second.loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(i->second.manifest_path, m_workspace_manifest)) );
++                    i->second.loaded_manifest = ::std::shared_ptr<PackageManifest>( new PackageManifest(PackageManifest::load_from_toml(i->second.manifest_path, workspace_for(i->second.workspace_path))) );
+                 }
+                 catch(const ::std::exception& e)
+                 {
+diff --git a/tools/minicargo/repository.h b/tools/minicargo/repository.h
+index 538d5e81..24baf39d 100644
+--- a/tools/minicargo/repository.h
++++ b/tools/minicargo/repository.h
+@@ -9,6 +9,7 @@
+ 
+ #include <string>
+ #include <map>
++#include <memory>
+ #include "helpers.h"
+ #include "manifest.h"
+ 
+@@ -20,6 +21,9 @@ class Repository
+         ::std::string   manifest_path;
+         /// Package version
+         PackageVersion  version;
++        /// A package inside a git checkout: the `[workspace]` manifest it inherits from (`version.workspace = true`,
++        /// `x = { workspace = true }`); empty = the project's workspace
++        ::std::string   workspace_path;
+         /// (Cached) loaded manifest
+         ::std::shared_ptr<PackageManifest>  loaded_manifest;
+     };
+@@ -28,6 +32,12 @@ class Repository
+     // path => manifest
+     ::std::map<::std::string, ::std::shared_ptr<PackageManifest>>   m_path_cache;
+     const WorkspaceManifest*    m_workspace_manifest = nullptr;
++    /// Workspaces of git checkouts, by manifest path (loaded on first use)
++    ::std::map<::std::string, ::std::unique_ptr<WorkspaceManifest>>   m_checkout_workspaces;
++    /// Absolute manifest path of each package inside a git checkout => its workspace manifest (for path dependencies)
++    ::std::map<::std::string, ::std::string>   m_checkout_package_workspaces;
++
++    const WorkspaceManifest* workspace_for(const ::std::string& workspace_path);
+ public:
+     void load_cache(const ::helpers::path& path);
+     void load_vendored(const ::helpers::path& path);

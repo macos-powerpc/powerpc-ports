@@ -1,0 +1,511 @@
+From 7092a6bc3f32c9f229f72b2911fc95d723b7f0ef Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 19 Oct 2026 20:18:56 +0000
+Subject: [PATCH 344/345] proc_macro: one child per proc-macro executable
+ serves every invocation of the expand pass
+
+py314-pydantic_core 2.46.5 src/serializers/type_serializers/bytes.rs:26:17: `BytesSerializer { .. }.into()` into
+`Arc<CombinedSerializer>` = "Failed to find an impl of From<BytesSerializer> for CombinedSerializer" (next would be the
+missing `impl TypeSerializer for CombinedSerializer`). enum_dispatch 0.3.13 links `#[enum_dispatch] pub enum
+CombinedSerializer` (src/serializers/shared.rs:52, from `combined_serializer!` at :88) and
+`#[enum_dispatch(CombinedSerializer)] trait TypeSerializer` (:398) through process globals (src/cache.rs: TRAIT_DEFS,
+ENUM_DEFS, DEFERRED_LINKS) and emits the `From` impls and the trait impl from whichever invocation finds both halves.
+rustc loads a proc-macro crate once per crate compilation, so the cache survives; mrustc spawned a child per
+invocation, so neither half saw the other and nothing was emitted. Not a regression: it has always been so.
+
+lib/libproc_macro `main`: with `MRUSTC_PROC_MACRO_SERVER=1` in the environment (and no input file) the process keeps
+going after an invocation's output: it writes a "more" byte, reads the next request from stdin (a v128 length and the
+macro name; EOF = exit), resets the span table (the compiler numbers definitions from 0 in every invocation) and
+serves it. Macros' own globals persist, as under rustc. Without the variable (an older compiler) it serves one
+invocation as before.
+
+expand/proc_macro.cpp: a pool of idle children keyed by executable path, one child each. Once the output's end marker
+has been read, one more byte decides: the "more" byte = the child goes to the pool, and the next invocation of its
+executable sends the macro name as the request instead of spawning; EOF = a one-shot child (a plugin built against the
+previous libproc_macro, every fakepm.py kit, `MRUSTC_PROC_MACRO_SERVER=0` in the compiler's environment) is reaped as
+before. So a new compiler works with old plugins and vice versa. The compiler's pipe ends are close-on-exec: a later
+child would otherwise hold the write end of a pooled child's stdin and that child would never see EOF. The pool is
+closed at the end of `Expand()` (the children exit on EOF, then are waited for), before the memory-heavy passes; the
+destructor closes its pipes before waiting, so a child still writing after an error gets EPIPE instead of blocking.
+Windows stays one-shot. The `MRUSTC_DUMP_PROCMACRO` dumps hold one invocation's input as before (the request bypasses
+them). Big crates also save a process spawn per invocation.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/lib/libproc_macro/src/lib.rs b/lib/libproc_macro/src/lib.rs
+index 1876b3d0..43800d02 100644
+--- a/lib/libproc_macro/src/lib.rs
++++ b/lib/libproc_macro/src/lib.rs
+@@ -161,6 +161,9 @@ pub struct MacroDesc
+ }
+ 
+ static mut IS_AVAILABLE: bool = false;
++/// What a child in server mode writes after an invocation's output: it waits for the next request
++const MORE_MARKER: u8 = 1;
++
+ #[doc(hidden)]
+ pub fn main(macros: &[MacroDesc])
+ {
+@@ -172,9 +175,53 @@ pub fn main(macros: &[MacroDesc])
+ 
+     let mut args = ::std::env::args();
+     let _ = args.next().expect("Should have an executable name");
+-    let mac_name = args.next().expect("Was not passed a macro name");
++    let mut mac_name = args.next().expect("Was not passed a macro name");
+     let input_path = args.next();
+-    //eprintln!("Searching for macro {}\r", mac_name);
++    // Server mode (the compiler sets `MRUSTC_PROC_MACRO_SERVER=1` for its children): after an invocation's output comes
++    // `MORE_MARKER`, then the next request is read from stdin (a macro name, see `read_request`; EOF = done). One
++    // process then serves every invocation of a crate compilation, and a macro's own globals (enum_dispatch's cache of
++    // enums and traits) persist between them as they do under rustc, which loads a proc-macro crate once per
++    // compilation. Without the variable (an older compiler) the process serves one invocation; so does an input file
++    // (debugging).
++    let server_mode = input_path.is_none()
++        && ::std::env::var_os("MRUSTC_PROC_MACRO_SERVER").map_or(false, |v| v == "1");
++    let mut stdin_raw;
++    let mut fp_raw;
++    let stdin = if let Some(p) = input_path {
++            fp_raw = ::std::fs::File::open(p).unwrap();
++            &mut fp_raw as &mut /*dyn */::std::io::Read
++        }
++        else {
++            stdin_raw = ::std::io::stdin().lock();
++            &mut stdin_raw
++        };
++    loop
++    {
++        // The compiler numbers its span definitions from 0 in every invocation
++        Span::reset_definitions();
++        run_macro(macros, &mac_name, stdin);
++        if !server_mode {
++            return ;
++        }
++        {
++            use std::io::Write;
++            ::std::io::stdout().write(&[MORE_MARKER]).expect("Stdout write error?");
++            ::std::io::stdout().flush().expect("Stdout write error?");
++        }
++        mac_name = match read_request(stdin)
++            {
++            Some(n) => n,
++            None => {
++                note!("Done (no more requests)");
++                return
++                },
++            };
++    }
++}
++
++/// Serve one invocation of `mac_name`: the ready byte, the input stream(s), the output stream
++fn run_macro(macros: &[MacroDesc], mac_name: &str, stdin: &mut /*dyn */::std::io::Read)
++{
+     for m in macros
+     {
+         if m.name == mac_name {
+@@ -182,17 +229,7 @@ pub fn main(macros: &[MacroDesc])
+             ::std::io::stdout().write(&[0]).expect("Stdout write error?");
+             ::std::io::stdout().flush().expect("Stdout write error?");
+             debug!("Waiting for input\r");
+-            let mut stdin_raw;
+-            let mut fp_raw;
+-            let stdin = if let Some(p) = input_path {
+-                    fp_raw = ::std::fs::File::open(p).unwrap();
+-                    &mut fp_raw as &mut /*dyn */::std::io::Read
+-                }
+-                else {
+-                    stdin_raw = ::std::io::stdin().lock();
+-                    &mut stdin_raw
+-                };
+-            let input = crate::serialisation::recv_token_stream(stdin);
++            let input = crate::serialisation::recv_token_stream(&mut *stdin);
+             debug!("INPUT = `{}`\r", input);
+             let output = match m.handler
+                 {
+@@ -201,7 +238,7 @@ pub fn main(macros: &[MacroDesc])
+                     (h)(input)
+                     },
+                 MacroType::Attribute(h) => {
+-                    let input_body = crate::serialisation::recv_token_stream(stdin);
++                    let input_body = crate::serialisation::recv_token_stream(&mut *stdin);
+                     debug!("INPUT BODY = `{}`\r", input_body);
+                     Span::freeze_definitions();
+                     (h)(input, input_body)
+@@ -218,6 +255,34 @@ pub fn main(macros: &[MacroDesc])
+     panic!("Unknown macro name '{}'", mac_name);
+ }
+ 
++/// The next request in server mode: a macro name as a v128 length and its bytes. `None` at EOF: the compiler has
++/// closed the pipe, there is nothing more to do
++fn read_request(stdin: &mut /*dyn */::std::io::Read) -> Option<String>
++{
++    use std::io::Read;
++    let mut len = 0usize;
++    let mut ofs = 0;
++    loop
++    {
++        let mut b = [0u8];
++        match stdin.read(&mut b)
++        {
++        Ok(1) => {},
++        Ok(0) if ofs == 0 => return None,
++        Ok(_) => panic!("Unexpected EOF in a proc macro request"),
++        Err(e) => panic!("Error reading from stdin - {}", e),
++        }
++        len |= ((b[0] & 0x7F) as usize) << ofs;
++        if b[0] < 128 {
++            break;
++        }
++        ofs += 7;
++    }
++    let mut buf = vec![0u8; len];
++    stdin.read_exact(&mut buf).expect("Error reading a proc macro request");
++    Some(String::from_utf8(buf).expect("Invalid UTF-8 macro name from compiler"))
++}
++
+ pub fn is_available() -> bool {
+     // SAFE: Reading from a value only ever written in single-threaded code
+     unsafe { IS_AVAILABLE }
+diff --git a/lib/libproc_macro/src/span.rs b/lib/libproc_macro/src/span.rs
+index 7f55c573..400528e4 100644
+--- a/lib/libproc_macro/src/span.rs
++++ b/lib/libproc_macro/src/span.rs
+@@ -26,6 +26,13 @@ impl Span
+     pub(crate) fn freeze_definitions() {
+         unsafe { SPANS_COMPLETE = true; }
+     }
++    /// Forget a previous invocation's definitions (server mode, see `main`): the compiler numbers them from 0 again
++    pub(crate) fn reset_definitions() {
++        unsafe {
++            SPANS.clear();
++            SPANS_COMPLETE = false;
++        }
++    }
+     pub(crate) fn from_raw(idx: usize) -> Self {
+         Span(idx)
+     }
+
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 942ae5e8..a4cb3ebe 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -2759,6 +2759,8 @@ void Expand(::AST::Crate& crate)
+     es.mode = ExpandMode::Final;
+     Expand_Mod(es, ::AST::AbsolutePath(), crate.m_root_module);
+     ASSERT_BUG(Span(), !es.has_missing, "Expand too too many attempts");
++    // The proc-macro children kept for this pass (proc_macro.cpp) have served their last invocation
++    ProcMacro_ClosePool();
+ 
+     //Expand_Attrs(es, crate.m_attrs, AttrStage::Post,  [&](const Span& sp, const auto& d, const auto& a){ d.handle(sp, a, crate); });
+ 
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index e8f47f33..a5f3465f 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -17,6 +17,7 @@
+ #include <parse/lex.hpp>
+ #include <parse/ttstream.hpp>
+ #include <unordered_set>
++#include <map>
+ #ifdef _WIN32
+ # define NOMINMAX
+ # define NOGDI  // Don't include GDI functions (defines some macros that collide with mrustc ones)
+@@ -26,6 +27,7 @@
+ # endif
+ #else
+ # include <unistd.h>    // read/write/pipe
++# include <fcntl.h>     // FD_CLOEXEC
+ # include <spawn.h>
+ # include <sys/wait.h>
+ #endif
+@@ -292,6 +294,7 @@ struct ProcMacroInv:
+     } handles;
+     bool    m_eof_hit = false;
+     int     m_pending_class = -1;   // Class byte read while looking for a literal suffix
++    ::std::string   m_executable;   // Key of the pool of server-mode children (POSIX, see `release_child`)
+ 
+ public:
+     ProcMacroInv(const Span& sp, AST::Edition edition, const char* executable, const ::HIR::ProcMacro& proc_macro_desc);
+@@ -302,6 +305,8 @@ public:
+     ~ProcMacroInv();
+ 
+     bool check_good();
++    void release_child();
++    void send_request_name(const char* name);
+     void send_done() {
+         this->send_u8(static_cast<uint8_t>(TokenClass::EndOfStream));
+         m_dump_file_out.flush();
+@@ -2279,12 +2284,70 @@ namespace {
+         });
+ }
+ 
++#ifndef _WIN32
++namespace {
++    /// Set to `1` for the children (see below); `0` in the compiler's own environment keeps every child one-shot
++    const char PROC_MACRO_SERVER_VAR[] = "MRUSTC_PROC_MACRO_SERVER";
++    /// What a server-mode child writes after its output (lib/libproc_macro/src/lib.rs `MORE_MARKER`)
++    const uint8_t PROC_MACRO_MORE_MARKER = 1;
++
++    /// An idle proc-macro child in server mode: a child built against a libproc_macro that knows
++    /// `MRUSTC_PROC_MACRO_SERVER=1` keeps serving invocations after its first (the next request is a macro name on its
++    /// stdin), so one process per executable serves the whole expand pass. That is rustc's model (a proc-macro crate is
++    /// loaded once per crate compilation) and the one proc macros rely on for state between invocations: enum_dispatch
++    /// links `#[enum_dispatch] enum` and `#[enum_dispatch(Enum)] trait` through process globals and emits the impls
++    /// from whichever invocation runs second. It also saves a process spawn per invocation.
++    struct PooledChild
++    {
++        pid_t   pid;
++        int     child_stdin;
++        int     child_stdout;
++    };
++    /// Executable path -> its idle child (at most one per executable, so state lives in a single process)
++    ::std::map<::std::string, PooledChild>  g_proc_macro_pool;
++
++    bool proc_macro_pool_enabled()
++    {
++        static int  enabled = -1;
++        if( enabled < 0 ) {
++            const char* v = getenv(PROC_MACRO_SERVER_VAR);
++            enabled = (v && ::std::strcmp(v, "0") == 0) ? 0 : 1;
++            if( !enabled ) {
++                DEBUG("Proc-macro children stay one-shot (" << PROC_MACRO_SERVER_VAR << "=0)");
++            }
++        }
++        return enabled != 0;
++    }
++    /// EOF where the child waits for its next request: it exits
++    void close_pooled_child(const PooledChild& c)
++    {
++        close(c.child_stdin);
++        close(c.child_stdout);
++        int status;
++        waitpid(c.pid, &status, 0);
++    }
++}
++#endif
++/// End of the expand pass: the pooled children have served their last invocation
++void ProcMacro_ClosePool()
++{
++#ifndef _WIN32
++    for(const auto& e : g_proc_macro_pool)
++    {
++        DEBUG("Closing child " << e.second.pid << " of " << e.first);
++        close_pooled_child(e.second);
++    }
++    g_proc_macro_pool.clear();
++#endif
++}
++
+ ProcMacroInv::ProcMacroInv(const Span& sp, AST::Edition edition, const char* executable, const ::HIR::ProcMacro& proc_macro_desc):
+     TokenStream(ParseState()),
+     m_parent_span(sp),
+     m_this_span( Span( m_parent_span, proc_macro_desc.path.crate_name(), proc_macro_desc.name ) ),
+     m_proc_macro_desc(proc_macro_desc),
+-    m_edition(edition)
++    m_edition(edition),
++    m_executable(executable)
+ {
+     if( getenv("MRUSTC_DUMP_PROCMACRO") && getenv("MRUSTC_DUMP_PROCMACRO")[0] )
+     {
+@@ -2357,41 +2420,72 @@ ProcMacroInv::ProcMacroInv(const Span& sp, AST::Edition edition, const char* exe
+     CloseHandle(stdout_write);
+     CloseHandle(piProcInfo.hThread);
+ #else
+-     int    stdin_pipes[2];
+-    if( pipe(stdin_pipes) != 0 )
++    auto pooled = g_proc_macro_pool.find(m_executable);
++    if( pooled != g_proc_macro_pool.end() )
+     {
+-        BUG(sp, "Unable to create stdin pipe pair for proc macro, " << strerror(errno));
++        // An idle server-mode child of this executable (see `release_child`): the macro name is its next request
++        this->handles.child_pid = pooled->second.pid;
++        this->handles.child_stdin = pooled->second.child_stdin;
++        this->handles.child_stdout = pooled->second.child_stdout;
++        g_proc_macro_pool.erase(pooled);
++        DEBUG("Child " << this->handles.child_pid << " serves " << executable << " " << proc_macro_desc.name);
++        this->send_request_name(proc_macro_desc.name.c_str());
+     }
+-    this->handles.child_stdin = stdin_pipes[1]; // Write end
+-     int    stdout_pipes[2];
+-    if( pipe(stdout_pipes) != 0)
+-    {
+-        BUG(sp, "Unable to create stdout pipe pair for proc macro, " << strerror(errno));
+-    }
+-    this->handles.child_stdout = stdout_pipes[0]; // Read end
+-
+-    posix_spawn_file_actions_t  file_actions;
+-    posix_spawn_file_actions_init(&file_actions);
+-    posix_spawn_file_actions_adddup2(&file_actions, stdin_pipes[0], 0);
+-    posix_spawn_file_actions_adddup2(&file_actions, stdout_pipes[1], 1);
+-    posix_spawn_file_actions_addclose(&file_actions, stdin_pipes[0]);
+-    posix_spawn_file_actions_addclose(&file_actions, stdin_pipes[1]);
+-    posix_spawn_file_actions_addclose(&file_actions, stdout_pipes[0]);
+-    posix_spawn_file_actions_addclose(&file_actions, stdout_pipes[1]);
+-
+-    char*   argv[3] = { const_cast<char*>(executable), const_cast<char*>(proc_macro_desc.name.c_str()), nullptr };
+-    DEBUG(argv[0] << " " << argv[1]);
+-    //char*   envp[] = { nullptr };
+-    int rv = posix_spawn(&this->handles.child_pid, executable, &file_actions, nullptr, argv, environ);
+-    if( rv != 0 )
++    else
+     {
+-        BUG(sp, "Error in posix_spawn - " << rv << " - can't start `" << executable << "`");
+-    }
++         int    stdin_pipes[2];
++        if( pipe(stdin_pipes) != 0 )
++        {
++            BUG(sp, "Unable to create stdin pipe pair for proc macro, " << strerror(errno));
++        }
++        this->handles.child_stdin = stdin_pipes[1]; // Write end
++         int    stdout_pipes[2];
++        if( pipe(stdout_pipes) != 0)
++        {
++            BUG(sp, "Unable to create stdout pipe pair for proc macro, " << strerror(errno));
++        }
++        this->handles.child_stdout = stdout_pipes[0]; // Read end
++        // Our ends must not leak into later children: a pooled child sees EOF on its stdin only once nobody else holds
++        // the write end (`pipe2`/O_CLOEXEC isn't on every target)
++        fcntl(this->handles.child_stdin, F_SETFD, FD_CLOEXEC);
++        fcntl(this->handles.child_stdout, F_SETFD, FD_CLOEXEC);
++
++        posix_spawn_file_actions_t  file_actions;
++        posix_spawn_file_actions_init(&file_actions);
++        posix_spawn_file_actions_adddup2(&file_actions, stdin_pipes[0], 0);
++        posix_spawn_file_actions_adddup2(&file_actions, stdout_pipes[1], 1);
++        posix_spawn_file_actions_addclose(&file_actions, stdin_pipes[0]);
++        posix_spawn_file_actions_addclose(&file_actions, stdin_pipes[1]);
++        posix_spawn_file_actions_addclose(&file_actions, stdout_pipes[0]);
++        posix_spawn_file_actions_addclose(&file_actions, stdout_pipes[1]);
++
++        char*   argv[3] = { const_cast<char*>(executable), const_cast<char*>(proc_macro_desc.name.c_str()), nullptr };
++        DEBUG(argv[0] << " " << argv[1]);
++        // `MRUSTC_PROC_MACRO_SERVER=1`: a child that understands it (lib/libproc_macro `main`) keeps serving requests
++        // after its output, see `release_child`; one that doesn't exits after its output as before. Not set when the
++        // compiler's own environment has it as `0`.
++        ::std::vector<char*>    envp;
++        for(char** e = environ; *e; e++)
++        {
++            if( ::std::strncmp(*e, PROC_MACRO_SERVER_VAR, sizeof(PROC_MACRO_SERVER_VAR)-1) == 0 && (*e)[sizeof(PROC_MACRO_SERVER_VAR)-1] == '=' )
++                continue ;
++            envp.push_back(*e);
++        }
++        static char server_var[] = "MRUSTC_PROC_MACRO_SERVER=1";
++        if( proc_macro_pool_enabled() )
++            envp.push_back(server_var);
++        envp.push_back(nullptr);
++        int rv = posix_spawn(&this->handles.child_pid, executable, &file_actions, nullptr, argv, envp.data());
++        if( rv != 0 )
++        {
++            BUG(sp, "Error in posix_spawn - " << rv << " - can't start `" << executable << "`");
++        }
+ 
+-    posix_spawn_file_actions_destroy(&file_actions);
+-    // Close the ends we don't care about.
+-    close(stdin_pipes[0]);
+-    close(stdout_pipes[1]);
++        posix_spawn_file_actions_destroy(&file_actions);
++        // Close the ends we don't care about.
++        close(stdin_pipes[0]);
++        close(stdout_pipes[1]);
++    }
+ #endif
+ 
+     // Invocation span is #1 (#0 is always empty/undefined)
+@@ -2455,11 +2549,73 @@ ProcMacroInv::~ProcMacroInv()
+     if( this->handles.child_pid != 0 )
+     {
+         DEBUG("Waiting for child " << this->handles.child_pid << " to terminate");
+-        int status;
+-        waitpid(this->handles.child_pid, &status, 0);
++        // Closed first: a child still writing (its output not consumed after an error) gets EPIPE and exits instead
++        // of blocking on a full pipe
+         close(this->handles.child_stdout);
+         close(this->handles.child_stdin);
++        int status;
++        waitpid(this->handles.child_pid, &status, 0);
++    }
++#endif
++}
++/// Called once the output's end marker has been read. A server-mode child (lib/libproc_macro/src/lib.rs `main`) then
++/// writes `PROC_MACRO_MORE_MARKER` and waits for its next request on stdin, so it goes to the pool for the next
++/// invocation of its executable; a one-shot child (an older libproc_macro, `MRUSTC_PROC_MACRO_SERVER=0`, every
++/// Windows child) closes its stdout instead and the destructor reaps it.
++void ProcMacroInv::release_child()
++{
++#ifndef _WIN32
++    if( this->handles.child_pid == 0 )
++        return ;
++    uint8_t v = 0;
++    ssize_t n;
++    do {
++        n = read(this->handles.child_stdout, &v, 1);
++    } while( n < 0 && errno == EINTR );
++    if( n == 0 ) {
++        DEBUG("Child " << this->handles.child_pid << " is one-shot");
++        return ;
++    }
++    if( n < 0 ) {
++        BUG(this->m_parent_span, "Error while reading from child process, " << strerror(errno));
++    }
++    if( v != PROC_MACRO_MORE_MARKER ) {
++        BUG(this->m_this_span, "Unexpected byte " << static_cast<int>(v) << " from the child process after its output");
++    }
++    PooledChild c = { this->handles.child_pid, this->handles.child_stdin, this->handles.child_stdout };
++    this->handles.child_pid = 0;
++    this->handles.child_stdin = -1;
++    this->handles.child_stdout = -1;
++    if( g_proc_macro_pool.count(m_executable) ) {
++        // A second child of the executable (an invocation nested in the reading of another's output): keep one, so
++        // state stays in a single process
++        DEBUG("Closing the extra child " << c.pid << " of " << m_executable);
++        close_pooled_child(c);
+     }
++    else {
++        DEBUG("Child " << c.pid << " of " << m_executable << " waits for the next invocation");
++        g_proc_macro_pool.insert(::std::make_pair(m_executable, c));
++    }
++#endif
++}
++void ProcMacroInv::send_request_name(const char* name)
++{
++#ifdef _WIN32
++    BUG(m_parent_span, "Proc macro children aren't pooled on Windows");
++#else
++    // Straight to the pipe: the `MRUSTC_DUMP_PROCMACRO` dump holds one invocation's input, which a child replays
++    // from a file (one-shot), not the pool's requests
++    ::std::vector<uint8_t>  buf;
++    size_t len = ::std::strlen(name);
++    uint64_t v = len;
++    while( v >= 128 ) {
++        buf.push_back( static_cast<uint8_t>(v & 0x7F) | 0x80 );
++        v >>= 7;
++    }
++    buf.push_back( static_cast<uint8_t>(v) );
++    buf.insert(buf.end(), name, name + len);
++    if( write(this->handles.child_stdin, buf.data(), buf.size()) != static_cast<ssize_t>(buf.size()) )
++        BUG(m_parent_span, "Error writing to child, " << strerror(errno));
+ #endif
+ }
+ bool ProcMacroInv::check_good()
+@@ -2657,6 +2813,7 @@ Token ProcMacroInv::realGetToken_() {
+         auto val = this->recv_bytes();
+         if( val == "" ) {
+             m_eof_hit = true;
++            this->release_child();
+             return Token(TOK_EOF);
+         }
+         auto t = Lex_FindOperator(val);
+diff --git a/src/expand/proc_macro.hpp b/src/expand/proc_macro.hpp
+index 5cdea559..402544a3 100644
+--- a/src/expand/proc_macro.hpp
++++ b/src/expand/proc_macro.hpp
+@@ -29,6 +29,9 @@ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(
+ // Function-like macros
+ extern ::std::unique_ptr<TokenStream> ProcMacro_Invoke(const Span& sp, const ::AST::Crate& crate, const ::std::vector<RcString>& mac_path, const TokenTree& tt);
+ 
++// End of the expand pass: close the proc-macro children kept to serve every invocation of their executable
++extern void ProcMacro_ClosePool();
++
+ // Tokens of a pattern/item as a proc macro would receive them, every identifier with `hygiene` (an interpolated
+ // `:pat`/`:item` fragment written back into an exported `macro_rules!` body)
+ extern ::std::vector<Token> ProcMacro_PatternTokens(const Span& sp, const AST::Pattern& pat, const Ident::Hygiene& hygiene);
