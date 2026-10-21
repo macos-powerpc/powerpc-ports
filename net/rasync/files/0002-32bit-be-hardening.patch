@@ -1,0 +1,248 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a74aaa7..0ec87f8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,6 +70,11 @@ endif()
+ 
+ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+ 
++# ── 32-bit POSIX: 64-bit file offsets ─────────────────────────
++if(NOT WIN32 AND NOT ANDROID AND CMAKE_SIZEOF_VOID_P EQUAL 4)
++    add_compile_definitions(_FILE_OFFSET_BITS=64)
++endif()
++
+ option(RASYNC_BUILD_TESTS "Build the rasync test suite" ON)
+ option(RASYNC_USE_SYSTEM_LIBRATS
+     "Link an installed librats (find_package(rats)) instead of building src/librats" OFF)
+@@ -118,6 +133,21 @@ target_include_directories(rasync_core PUBLIC src/rasync ${PROJECT_BINARY_DIR}/g
+ # librats gives us SHA-256 + portable filesystem helpers; nothing more.
+ target_link_libraries(rasync_core PUBLIC rats::rats)
+ 
++# rasync's transfer ids and counters are 8-byte std::atomics, which 32-bit
++# targets without native 64-bit atomics (ppc, mips, older arm) lower to
++# __atomic_*_8 calls in libatomic. librats runs the same probe and usually passes
++# -latomic along, but these references are rasync's own.
++include(CheckCXXSourceCompiles)
++check_cxx_source_compiles("
++#include <atomic>
++#include <cstdint>
++std::atomic<uint64_t> x;
++int main() { x.fetch_add(1); x.store(2); return (int)x.load(); }
++" RASYNC_HAVE_BUILTIN_ATOMIC64)
++if(NOT RASYNC_HAVE_BUILTIN_ATOMIC64)
++    target_link_libraries(rasync_core PUBLIC atomic)
++endif()
++
+ # ── rasync_net: the sync protocol + session, built on librats' Node ──────────
+ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/rasync/net/sync_session.cpp)
+ add_library(rasync_net STATIC
+diff --git a/README.md b/README.md
+index 5aa6f7c..a0d0a26 100644
+--- a/README.md
++++ b/README.md
+@@ -514,8 +514,9 @@ What follows from treating a link as the real thing:
+   state pass reads metadata only and is cheap; a folder in the middle of a large
+   import delays its neighbours' next scan by its own scan time.
+ - **Large single files & delta.** Delta reconstruction reads the sender's file into
+-  memory to run the scan; files above `256 MiB` fall back to whole-file streaming
+-  (always bounded memory). Everything else streams in fixed windows.
++  memory to run the scan; files above `256 MiB` (`64 MiB` in a 32-bit build) fall
++  back to whole-file streaming (always bounded memory). Everything else streams in
++  fixed windows.
+ - **Regular files only.** A symlink — and on Windows a directory junction — is
+   skipped unless `--follow-symlinks` is given, in which case it is synced as the
+   file or directory it points at; a link itself is never reproduced on the peer,
+diff --git a/src/rasync/core/delta.cpp b/src/rasync/core/delta.cpp
+index 986f4a5..6b8356a 100644
+--- a/src/rasync/core/delta.cpp
++++ b/src/rasync/core/delta.cpp
+@@ -81,7 +81,9 @@ std::optional<Signature> Signature::decode(BinaryReader& r) {
+     s.block_size = r.u32();
+     s.file_size  = r.u64();
+     uint32_t n   = r.u32();
+-    if (!r.ok() || r.remaining() < static_cast<size_t>(n) * 20) return std::nullopt;
++    // Divided, not multiplied: n * 20 wraps a 32-bit size_t, and the bogus count
++    // would then pass this check and size the reserve below.
++    if (!r.ok() || n > r.remaining() / 20) return std::nullopt;
+     s.blocks.reserve(n);
+     for (uint32_t i = 0; i < n; ++i) {
+         BlockSig b;
+diff --git a/src/rasync/core/manifest.cpp b/src/rasync/core/manifest.cpp
+index e7e99b4..30a1941 100644
+--- a/src/rasync/core/manifest.cpp
++++ b/src/rasync/core/manifest.cpp
+@@ -108,7 +108,8 @@ std::optional<ManifestPatch> ManifestPatch::decode(BinaryReader& r) {
+     uint32_t n_set = r.u32();
+     // Bound the count by what the buffer could possibly hold before reserving, so
+     // a bogus header can't make us allocate for entries that aren't there.
+-    if (!r.ok() || r.remaining() < static_cast<size_t>(n_set) * kMinEntryBytes)
++    // Divided, not multiplied: the product wraps a 32-bit size_t.
++    if (!r.ok() || n_set > r.remaining() / kMinEntryBytes)
+         return std::nullopt;
+     p.set.reserve(n_set);
+     for (uint32_t i = 0; i < n_set; ++i) {
+@@ -119,7 +120,7 @@ std::optional<ManifestPatch> ManifestPatch::decode(BinaryReader& r) {
+     }
+ 
+     uint32_t n_del = r.u32();
+-    if (!r.ok() || r.remaining() < static_cast<size_t>(n_del) * 2) return std::nullopt;
++    if (!r.ok() || n_del > r.remaining() / 2) return std::nullopt;
+     p.removed.reserve(n_del);
+     for (uint32_t i = 0; i < n_del; ++i) {
+         std::string path = r.str16();
+diff --git a/src/rasync/net/sync_service.h b/src/rasync/net/sync_service.h
+index e894ee6..16200cf 100644
+--- a/src/rasync/net/sync_service.h
++++ b/src/rasync/net/sync_service.h
+@@ -92,7 +92,11 @@ struct SyncConfig {
+     uint32_t block_size       = kDefaultBlockSize;
+     uint32_t chunk_size       = 64 * 1024;                  ///< whole-file / literal chunk payload
+     uint64_t window_bytes     = 4ull * 1024 * 1024;         ///< max un-acked bytes in flight
+-    uint64_t delta_max_bytes  = 256ull * 1024 * 1024;       ///< above this, skip delta (bounded memory)
++    /// Above this, skip delta (bounded memory). Serving a delta holds the file and
++    /// its literal runs at once — up to twice this, per session sending — which
++    /// a 32-bit address space only has room for at a lower ceiling. Peers need not
++    /// agree: each side falls back to whole-file past its own limit.
++    uint64_t delta_max_bytes  = (sizeof(void*) >= 8 ? 256ull : 64ull) * 1024 * 1024;
+ 
+     /// How many pulls may be requested at once. Requests are not free: each one
+     /// carries an rsync signature (~1% of the file) and parks it on the peer's
+diff --git a/src/rasync/net/sync_session.cpp b/src/rasync/net/sync_session.cpp
+index 99e26a2..cfc18db 100644
+--- a/src/rasync/net/sync_session.cpp
++++ b/src/rasync/net/sync_session.cpp
+@@ -10,6 +10,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <filesystem>
++#include <limits>
+ #include <thread>
+ #include <vector>
+ 
+@@ -64,8 +65,17 @@ std::string describe_conflict(uint8_t raw) {
+ 
+ void set_mtime(const std::string& path, int64_t mtime) {
+     utimbuf_t t{};
+-    t.actime = static_cast<decltype(t.actime)>(mtime);
+-    t.modtime = static_cast<decltype(t.modtime)>(mtime);
++    // time_t is still 32 bits on 32-bit Darwin and on 32-bit glibc before 2.34.
++    // Clamp an mtime it cannot hold rather than let the cast wrap 2040 into 1901,
++    // which `--conflict newer` would read as the oldest version there is. The
++    // limits are parenthesized for the same reason std::min is spelled out in
++    // send_gate.cpp: <windows.h> defines `min` and `max` as macros.
++    using time_type = decltype(t.modtime);
++    const auto clamped = static_cast<time_type>(
++        std::clamp<int64_t>(mtime, (std::numeric_limits<time_type>::min)(),
++                            (std::numeric_limits<time_type>::max)()));
++    t.actime = clamped;
++    t.modtime = clamped;
+     RASYNC_UTIME(path.c_str(), &t);
+ }
+ 
+diff --git a/tests/test_delta.cpp b/tests/test_delta.cpp
+index 74fb653..11a71a9 100644
+--- a/tests/test_delta.cpp
++++ b/tests/test_delta.cpp
+@@ -101,6 +101,17 @@ TEST(Delta, SignatureEncodeDecode) {
+     }
+ }
+ 
++// n * 20 bytes per block wraps a 32-bit size_t to 4, which the padding covers: a
++// bound check that multiplies passes this and the reserve() behind it throws.
++TEST(Delta, SignatureDecodeRejectsACountThatWrapsA32BitSize) {
++    BinaryWriter w;
++    w.u32(2048);
++    w.u64(0);
++    w.u32(0x0CCCCCCDu);                 // * 20 = 2^32 + 4
++    for (int i = 0; i < 8; ++i) w.u8(0);
++    EXPECT_FALSE(Signature::decode(w.take()).has_value());
++}
++
+ TEST(Delta, WeakChecksumRolls) {
+     // The incremental roll must equal a fresh checksum of the shifted window.
+     auto data = test::random_bytes(100, 77);
+diff --git a/tests/test_manifest.cpp b/tests/test_manifest.cpp
+index 83688c3..31c329f 100644
+--- a/tests/test_manifest.cpp
++++ b/tests/test_manifest.cpp
+@@ -187,3 +187,19 @@ TEST(ManifestPatch, DecodeRejectsMalformed) {
+     w.str16("");
+     EXPECT_FALSE(ManifestPatch::decode(w.take()).has_value());
+ }
++
++// Counts picked so that count * entry-size wraps a 32-bit size_t to a few bytes —
++// which a few bytes of padding then satisfy. A bound check that multiplies lets
++// these through to a reserve() that throws; on 64-bit they were always refused.
++TEST(ManifestPatch, DecodeRejectsCountsThatWrapA32BitSize) {
++    BinaryWriter set;
++    set.u32(79536432u);                 // * 54 bytes per entry = 2^32 + 32
++    for (int i = 0; i < 40; ++i) set.u8(0);
++    EXPECT_FALSE(ManifestPatch::decode(set.take()).has_value());
++
++    BinaryWriter del;
++    del.u32(0);
++    del.u32(0x80000002u);               // * 2 bytes per path = 2^32 + 4
++    for (int i = 0; i < 8; ++i) del.u8(0);
++    EXPECT_FALSE(ManifestPatch::decode(del.take()).has_value());
++}
+diff --git a/tests/test_protocol.cpp b/tests/test_protocol.cpp
+index 56c2268..55b004c 100644
+--- a/tests/test_protocol.cpp
++++ b/tests/test_protocol.cpp
+@@ -175,6 +175,56 @@ TEST(Protocol, RequestWithSignatureRoundTrip) {
+     EXPECT_EQ(back->blocks.size(), sig.blocks.size());
+ }
+ 
++// ── pinned bytes ─────────────────────────────────────────────────────────────
++// The integration suite runs both peers in one process, so on a big-endian host
++// it shows BE talking to BE — never to the little-endian machines most peers are.
++// Exact bytes do: these were captured on x86-64, and a host that lays out any
++// field differently, or whose SHA-256 disagrees, fails here.
++
++TEST(ProtocolBytes, FolderTagIsPinned) {
++    EXPECT_EQ(proto::folder_tag("docs"), 0x84867af5u);
++}
++
++TEST(ProtocolBytes, ManifestPatchIsPinned) {
++    FileMeta m;
++    m.size  = 0x0102030405060708ull;
++    m.mtime = -2;
++    m.mode  = FileMeta::kExecutable;
++    for (size_t i = 0; i < m.hash.size(); ++i) m.hash[i] = static_cast<uint8_t>(i);
++    ManifestPatch p;
++    p.set.emplace_back("a/b", m);
++    p.removed.push_back("gone");
++
++    const Bytes want = {
++        0, 0, 0, 1,                                      // entries set
++        0, 3, 'a', '/', 'b',                             // path
++        1, 2, 3, 4, 5, 6, 7, 8,                          // size
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,  // mtime -2
++        0, 0, 0, 1,                                      // mode
++        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,  // hash
++        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
++        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
++        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
++        0, 0, 0, 1,                                      // paths removed
++        0, 4, 'g', 'o', 'n', 'e',
++    };
++    EXPECT_EQ(p.encode(), want);
++}
++
++TEST(ProtocolBytes, SignatureIsPinned) {
++    const uint8_t abc[] = {'a', 'b', 'c'};
++    const Signature sig = signature_of(abc, sizeof(abc), 2048);
++    const Bytes want = {
++        0, 0, 0x08, 0,                                   // block size
++        0, 0, 0, 0, 0, 0, 0, 3,                          // file size
++        0, 0, 0, 1,                                      // blocks
++        0x02, 0x4a, 0x01, 0x26,                          // weak: b = 586, a = 294
++        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,  // SHA-256("abc"), first 16
++        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
++    };
++    EXPECT_EQ(sig.encode(), want);
++}
++
+ /// The header is fixed width, so a router can read the tag off any message
+ /// without knowing what the opcode behind it means.
+ TEST(Protocol, HeaderWidthMatchesWhatEveryMessageWrites) {
