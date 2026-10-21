@@ -1,0 +1,156 @@
+libcxxabi: export the fundamental type typeinfos which GCC emits
+
+On Apple platforms libc++abi hides everything but the symbols named in
+lib/*.exp. lib/fundamental-types.exp lists the typeinfos and typeinfo
+names of the fundamental types as Clang emits them; GCC emits a
+different, target-dependent set:
+
+ - it has no _Float16 (Dh/DF16_), e.g. on PowerPC;
+ - __int128 (n, o) exists on 64-bit targets only;
+ - it adds _Float32, _Float64, _Float32x (DF32_, DF64_, DF32x) and,
+   where the target has them, _Float128, _Float64x, bfloat16 and the
+   decimal floating-point types;
+ - the IBM 128-bit long double of PowerPC is mangled g instead of e.
+
+ld64 treats an exported symbol which does not exist as an undefined
+reference ("typeinfo for __int128", referenced from:
+-exported_symbol[s_list] command line option), and a typeinfo which is
+not exported is unusable by programs, since they reference the copy in
+the ABI library. So when building with GCC, generate the list at
+configure time from the symbols of a probe translation unit which, like
+private_typeinfo.cpp, defines the destructor of
+__cxxabiv1::__fundamental_type_info and therefore gets the typeinfo of
+every fundamental type emitted into it. The upstream list is kept as a
+fallback if the probe fails.
+
+diff --git a/libcxxabi/cmake/Modules/FundamentalTypesExportList.cmake b/libcxxabi/cmake/Modules/FundamentalTypesExportList.cmake
+new file mode 100644
+--- /dev/null
++++ b/libcxxabi/cmake/Modules/FundamentalTypesExportList.cmake
+@@ -0,0 +1,104 @@
++# Produce an ld64 exported-symbols list of the typeinfo symbols which the C++
++# compiler emits for the fundamental types.
++#
++# lib/fundamental-types.exp lists the typeinfo symbols that Clang emits for
++# the fundamental types. GCC emits a different, target-dependent set: it has
++# no _Float16/__fp16, provides __int128 only on 64-bit targets, adds
++# _Float32/_Float64/_Float32x (and more where the target supports them), and
++# mangles the IBM 128-bit long double of PowerPC as 'g' instead of 'e'.
++# ld64 fails on an exported symbol that does not exist, and a typeinfo which
++# is not exported is unusable by programs, which reference the copy in the
++# ABI library. So ask the compiler: just like the ABI library itself, a
++# translation unit which defines the destructor of
++# __cxxabiv1::__fundamental_type_info gets the typeinfo of every fundamental
++# type emitted into it.
++#
++# generate_fundamental_types_exp(<output-variable> <fallback-file>)
++#   sets <output-variable> to the path of the generated list, or to
++#   <fallback-file> if the list could not be generated.
++function(generate_fundamental_types_exp outvar fallback)
++  set(probe_dir "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/fundamental-types-probe")
++  file(MAKE_DIRECTORY "${probe_dir}")
++  # Self-contained on purpose: the probe must not depend on any standard
++  # library headers (the ABI library is built with -nostdinc++).
++  file(WRITE "${probe_dir}/probe.cpp" "\
++namespace std {
++class type_info {
++public:
++  virtual ~type_info();
++protected:
++  const char* __type_name;
++};
++} // namespace std
++namespace __cxxabiv1 {
++class __fundamental_type_info : public std::type_info {
++public:
++  ~__fundamental_type_info() override;
++};
++__fundamental_type_info::~__fundamental_type_info() {}
++} // namespace __cxxabiv1
++")
++
++  # Only compile; the probe cannot be linked without an ABI library.
++  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
++  try_compile(probe_compiled "${probe_dir}/build" "${probe_dir}/probe.cpp"
++              CXX_STANDARD 23
++              COPY_FILE "${probe_dir}/probe.a"
++              OUTPUT_VARIABLE probe_output)
++  if (NOT probe_compiled)
++    message(WARNING "Could not compile the fundamental types probe, using ${fallback}:\n${probe_output}")
++    set(${outvar} "${fallback}" PARENT_SCOPE)
++    return()
++  endif()
++
++  if (NOT CMAKE_NM)
++    find_program(FUNDAMENTAL_TYPES_PROBE_NM nm)
++    set(CMAKE_NM "${FUNDAMENTAL_TYPES_PROBE_NM}")
++  endif()
++  execute_process(COMMAND "${CMAKE_NM}" -g "${probe_dir}/probe.a"
++                  OUTPUT_VARIABLE nm_output
++                  ERROR_VARIABLE nm_error
++                  RESULT_VARIABLE nm_result)
++  if (NOT nm_result EQUAL 0)
++    message(WARNING "Could not list the symbols of the fundamental types probe, using ${fallback}:\n${nm_error}")
++    set(${outvar} "${fallback}" PARENT_SCOPE)
++    return()
++  endif()
++
++  # Keep the defined symbols (undefined ones have no address) of typeinfos
++  # and typeinfo names of fundamental types: a builtin type code (one letter,
++  # D..., or a vendor extended type u<n>...), optionally behind P or PK.
++  set(symbols)
++  string(REPLACE ";" "" nm_output "${nm_output}")
++  string(REPLACE "\n" ";" nm_lines "${nm_output}")
++  foreach (line IN LISTS nm_lines)
++    string(STRIP "${line}" line)
++    if (line MATCHES "^[0-9a-fA-F]+ +[A-TV-Za-z] +(_?_ZT[IS](PK?)?([a-zA-Z]|D[A-Za-z0-9_]+|u[0-9]+[A-Za-z0-9_]+))$")
++      list(APPEND symbols "${CMAKE_MATCH_1}")
++    endif()
++  endforeach()
++  list(SORT symbols)
++  list(REMOVE_DUPLICATES symbols)
++  if (NOT "_ZTIi" IN_LIST symbols AND NOT "__ZTIi" IN_LIST symbols)
++    message(WARNING "The fundamental types probe did not produce the typeinfo of int, using ${fallback}:\n${nm_output}")
++    set(${outvar} "${fallback}" PARENT_SCOPE)
++    return()
++  endif()
++
++  set(content "# Typeinfos and typeinfo names of the fundamental types as emitted by\n")
++  string(APPEND content "# ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} for this target; generated at configure time.\n")
++  foreach (symbol IN LISTS symbols)
++    string(APPEND content "${symbol}\n")
++  endforeach()
++  set(output "${CMAKE_CURRENT_BINARY_DIR}/fundamental-types.exp")
++  set(old_content "")
++  if (EXISTS "${output}")
++    file(READ "${output}" old_content)
++  endif()
++  if (NOT content STREQUAL old_content)
++    file(WRITE "${output}" "${content}")
++  endif()
++  list(LENGTH symbols count)
++  message(STATUS "Fundamental types export list: ${count} symbols emitted by the compiler (${output})")
++  set(${outvar} "${output}" PARENT_SCOPE)
++endfunction()
+
+diff --git a/libcxxabi/src/CMakeLists.txt b/libcxxabi/src/CMakeLists.txt
+--- a/libcxxabi/src/CMakeLists.txt
++++ b/libcxxabi/src/CMakeLists.txt
+@@ -267,7 +267,16 @@
+ 
+   export_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/symbols-not-reexported.exp")
+   reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/cxxabiv1.exp")
+-  reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/fundamental-types.exp")
++  # lib/fundamental-types.exp lists the typeinfos which Clang emits for the
++  # fundamental types. GCC emits a different, target-dependent set (see
++  # FundamentalTypesExportList.cmake), and ld64 rejects a list which names
++  # symbols that do not exist, so derive the list from the compiler.
++  set(LIBCXXABI_FUNDAMENTAL_TYPES_EXP "${CMAKE_CURRENT_SOURCE_DIR}/../lib/fundamental-types.exp")
++  if (APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++    include(FundamentalTypesExportList)
++    generate_fundamental_types_exp(LIBCXXABI_FUNDAMENTAL_TYPES_EXP "${LIBCXXABI_FUNDAMENTAL_TYPES_EXP}")
++  endif()
++  reexport_symbols("${LIBCXXABI_FUNDAMENTAL_TYPES_EXP}")
+   reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/itanium-base.exp")
+   reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/std-misc.exp")
+ 

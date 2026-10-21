@@ -1,0 +1,90 @@
+libc++abi: keep the thread_local destructor list in the TLS key, not in a thread_local
+
+The fallback implementation of __cxa_thread_atexit() (used when the C
+library has no __cxa_thread_atexit_impl(), i.e. always on Darwin) keeps
+the per-thread list of destructors in a __thread variable and only uses
+its std::__libcpp_tls_key as a trigger to run them at thread exit.
+
+With GCC's emulated TLS this does not work: libgcc's emutls releases a
+thread's TLS storage from a pthread key destructor of its own, and that
+key is created at the first TLS access in the process, i.e. before the
+key of __cxa_thread_atexit(), which is only created from a TLS wrapper
+after the first thread_local has been constructed. Key destructors run
+in creation order, so at thread exit the emutls storage is freed first
+and the list reads as empty: no thread_local destructor runs on any
+thread but the main one.
+
+Keep the list as the value of the key instead, as libstdc++ does, so the
+key destructor is handed the list directly and nothing depends on TLS
+during thread teardown. Destructors registered while the list runs (a
+thread_local first used by another one's destructor) are run next, as
+before.
+
+diff --git a/libcxxabi/src/cxa_thread_atexit.cpp b/libcxxabi/src/cxa_thread_atexit.cpp
+--- a/libcxxabi/src/cxa_thread_atexit.cpp
++++ b/libcxxabi/src/cxa_thread_atexit.cpp
+@@ -68,21 +68,26 @@
+     DtorList* next;
+   };
+ 
+-  // The linked list of thread-local destructors to run
+-  __thread DtorList* dtors = nullptr;
+-  // True if the destructors are currently scheduled to run on this thread
+-  __thread bool dtors_alive = false;
+-  // Used to trigger destructors on thread exit; value is ignored
++  // The linked list of thread-local destructors to run is the value of this
++  // key, so that the key's destructor receives it at thread exit, as in
++  // libstdc++. It must not live in a thread_local: with GCC's emulated TLS
++  // (libgcc's emutls) the thread-local storage of a thread is released by a
++  // key destructor of its own, which is created earlier and therefore runs
++  // earlier, after which thread_locals read as freshly zero-initialized.
+   std::__libcpp_tls_key dtors_key;
+ 
+-  void run_dtors(void*) {
+-    while (auto head = dtors) {
+-      dtors = head->next;
++  void run_dtors(void* p) {
++    // The key's destructor is given the list after the key was reset; put it
++    // back so that destructors registered while running (a thread_local first
++    // used by another one's destructor) are seen and run next, newest first.
++    if (p != nullptr) {
++      std::__libcpp_tls_set(dtors_key, p);
++    }
++    while (auto head = static_cast<DtorList*>(std::__libcpp_tls_get(dtors_key))) {
++      std::__libcpp_tls_set(dtors_key, head->next);
+       head->dtor(head->obj);
+       ::free(head);
+     }
+-
+-    dtors_alive = false;
+   }
+ 
+   struct DtorsManager {
+@@ -130,13 +135,6 @@
+       // one-time initialization and __cxa_atexit() for destruction)
+       static DtorsManager manager;
+ 
+-      if (!dtors_alive) {
+-        if (std::__libcpp_tls_set(dtors_key, &dtors_key) != 0) {
+-          return -1;
+-        }
+-        dtors_alive = true;
+-      }
+-
+       auto head = static_cast<DtorList*>(::malloc(sizeof(DtorList)));
+       if (!head) {
+         return -1;
+@@ -144,8 +142,11 @@
+ 
+       head->dtor = dtor;
+       head->obj = obj;
+-      head->next = dtors;
+-      dtors = head;
++      head->next = static_cast<DtorList*>(std::__libcpp_tls_get(dtors_key));
++      if (std::__libcpp_tls_set(dtors_key, head) != 0) {
++        ::free(head);
++        return -1;
++      }
+ 
+       return 0;
+     }

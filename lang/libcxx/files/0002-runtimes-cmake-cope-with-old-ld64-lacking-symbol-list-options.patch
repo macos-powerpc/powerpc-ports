@@ -1,0 +1,226 @@
+runtimes cmake: cope with ld64 versions lacking the symbol-list options
+
+ld64 before version 127 (Xcode 4.x) -- e.g. ld64-97.17, the newest Apple
+linker for PowerPC -- does not understand -reexported_symbols_list,
+-force_symbols_weak_list and -force_symbols_not_weak_list, which libc++ and
+libc++abi now use unconditionally on Apple platforms. Later linkers (e.g.
+the ld64 of darwin-xtools) know the options, but reject
+-reexported_symbols_list for deployment targets before macOS 10.7, where
+dyld learned to re-export individual symbols ("ld: targeted OS version does
+not support -reexported_symbols_list").
+
+Detect the ld64 version used by the compiler driver and the deployment
+target (new module runtimes/cmake/Modules/DarwinLinkerFeatures.cmake,
+overridable with -DRUNTIMES_DARWIN_LD64_VERSION=... and
+-DRUNTIMES_DARWIN_DEPLOYMENT_TARGET=...). With an old linker, skip the
+weak/not weak lists; whenever -reexported_symbols_list cannot be used, make
+libc++ re-export libc++abi wholesale with -reexport_library, as libc++ did
+before -reexported_symbols_list existed.
+
+With -reexport_library the order on the command line matters: ld64 keys
+dylibs by install name and takes the load command (LC_REEXPORT_DYLIB vs.
+LC_LOAD_DYLIB) from the first mention, so libc++ has to link the re-export
+before the plain libc++abi library (HandleLibCXXABI.cmake).
+
+diff --git a/libcxx/cmake/Modules/HandleLibCXXABI.cmake b/libcxx/cmake/Modules/HandleLibCXXABI.cmake
+--- a/libcxx/cmake/Modules/HandleLibCXXABI.cmake
++++ b/libcxx/cmake/Modules/HandleLibCXXABI.cmake
+@@ -123,12 +123,14 @@
+ 
+   if (TARGET cxxabi_shared)
+     add_library(libcxx-abi-shared INTERFACE)
+-    target_link_libraries(libcxx-abi-shared INTERFACE cxxabi_shared)
+ 
+     # When using the in-tree libc++abi as an ABI library, libc++ re-exports the
+     # libc++abi symbols (on platforms where it can) because libc++abi is only an
+-    # implementation detail of libc++.
+-    target_link_libraries(libcxx-abi-shared INTERFACE cxxabi-reexports)
++    # implementation detail of libc++. The re-exports come before the library
++    # itself: when they are done with -reexport_library (old ld64 or old
++    # deployment targets, see DarwinLinkerFeatures.cmake), ld64 takes the load
++    # command of a dylib from its first mention on the command line.
++    target_link_libraries(libcxx-abi-shared INTERFACE cxxabi-reexports cxxabi_shared)
+ 
+     # Populate the OUTPUT_NAME property of libcxx-abi-shared because that is used when
+     # generating a linker script.
+
+diff --git a/libcxx/cmake/config-ix.cmake b/libcxx/cmake/config-ix.cmake
+--- a/libcxx/cmake/config-ix.cmake
++++ b/libcxx/cmake/config-ix.cmake
+@@ -131,3 +131,9 @@
+   check_library_exists(rt clock_gettime "" LIBCXX_HAS_RT_LIB)
+   check_library_exists(atomic __atomic_fetch_add_8 "" LIBCXX_HAS_ATOMIC_LIB)
+ endif()
++
++# Figure out which symbol-list options the Darwin linker understands; old ld64
++# versions (as found on PowerPC Macs) lack several of them.
++if (APPLE)
++  include(DarwinLinkerFeatures)
++endif()
+
+diff --git a/libcxx/src/CMakeLists.txt b/libcxx/src/CMakeLists.txt
+--- a/libcxx/src/CMakeLists.txt
++++ b/libcxx/src/CMakeLists.txt
+@@ -210,8 +210,10 @@
+ 
+   # Maybe force some symbols to be weak, not weak or not exported.
+   # TODO: This shouldn't depend on the platform, and ideally it should be done in the sources.
++  # Old ld64 versions do not understand these options (see DarwinLinkerFeatures.cmake).
+   if (APPLE AND LIBCXX_CXX_ABI MATCHES "libcxxabi$"
+-            AND NOT LIBCXX_STATICALLY_LINK_ABI_IN_SHARED_LIBRARY)
++            AND NOT LIBCXX_STATICALLY_LINK_ABI_IN_SHARED_LIBRARY
++            AND RUNTIMES_DARWIN_LD64_SUPPORTS_SYMBOL_LISTS)
+     target_link_libraries(cxx_shared PRIVATE
+       "-Wl,-force_symbols_not_weak_list,${CMAKE_CURRENT_SOURCE_DIR}/../lib/notweak.exp"
+       "-Wl,-force_symbols_weak_list,${CMAKE_CURRENT_SOURCE_DIR}/../lib/weak.exp")
+
+diff --git a/libcxxabi/cmake/config-ix.cmake b/libcxxabi/cmake/config-ix.cmake
+--- a/libcxxabi/cmake/config-ix.cmake
++++ b/libcxxabi/cmake/config-ix.cmake
+@@ -111,3 +111,9 @@
+   check_library_exists(c __cxa_thread_atexit_impl ""
+     LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL)
+ endif()
++
++# Figure out which symbol-list options the Darwin linker understands; old ld64
++# versions (as found on PowerPC Macs) lack several of them.
++if (APPLE)
++  include(DarwinLinkerFeatures)
++endif()
+
+diff --git a/libcxxabi/src/CMakeLists.txt b/libcxxabi/src/CMakeLists.txt
+--- a/libcxxabi/src/CMakeLists.txt
++++ b/libcxxabi/src/CMakeLists.txt
+@@ -250,12 +250,21 @@
+ 
+   function(reexport_symbols file)
+     export_symbols("${file}")
+-    # -reexported_symbols_list is only available on Apple platforms
+-    if (APPLE)
++    # -reexported_symbols_list is only available on Apple platforms, and only
++    # with ld64 >= 127 and a deployment target >= 10.7 (see
++    # DarwinLinkerFeatures.cmake).
++    if (APPLE AND RUNTIMES_DARWIN_LD64_SUPPORTS_REEXPORTED_SYMBOLS_LIST)
+       target_link_libraries(cxxabi-reexports INTERFACE "-Wl,-reexported_symbols_list,${file}")
+     endif()
+   endfunction()
+ 
++  if (APPLE AND NOT RUNTIMES_DARWIN_LD64_SUPPORTS_REEXPORTED_SYMBOLS_LIST)
++    # Without -reexported_symbols_list a subset of the symbols of a library
++    # cannot be re-exported, so make libc++ re-export all of libc++abi
++    # instead, as was done before that option existed.
++    target_link_libraries(cxxabi-reexports INTERFACE "-Wl,-reexport_library,$<TARGET_FILE:cxxabi_shared>")
++  endif()
++
+   export_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/symbols-not-reexported.exp")
+   reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/cxxabiv1.exp")
+   reexport_symbols("${CMAKE_CURRENT_SOURCE_DIR}/../lib/fundamental-types.exp")
+
+diff --git a/runtimes/cmake/Modules/DarwinLinkerFeatures.cmake b/runtimes/cmake/Modules/DarwinLinkerFeatures.cmake
+new file mode 100644
+--- /dev/null
++++ b/runtimes/cmake/Modules/DarwinLinkerFeatures.cmake
+@@ -0,0 +1,103 @@
++# Detect the version of the Darwin linker (ld64) used by the C++ compiler
++# driver and the deployment target of the build, and derive which symbol-list
++# options can be used.
++#
++# ld64 before version 127 (Xcode 4.x) -- for instance ld64-97.17, the newest
++# Apple linker for PowerPC Macs -- does not know -reexported_symbols_list,
++# -force_symbols_weak_list and -force_symbols_not_weak_list. Later linkers
++# (including the ld64 of darwin-xtools) know them, but reject
++# -reexported_symbols_list unless the deployment target is at least
++# macOS 10.7, where dyld learned to re-export individual symbols ("targeted
++# OS version does not support -reexported_symbols_list"). Re-exporting a
++# whole library with -reexport_library works since macOS 10.5.
++#
++# Results (plain variables):
++#   RUNTIMES_DARWIN_LD64_SUPPORTS_SYMBOL_LISTS
++#       the linker knows the options above (ld64 >= 127);
++#   RUNTIMES_DARWIN_LD64_SUPPORTS_REEXPORTED_SYMBOLS_LIST
++#       -reexported_symbols_list can be used (ld64 >= 127 and a deployment
++#       target >= 10.7).
++#
++# This file is included from both libc++ and libc++abi, which live in sibling
++# directory scopes, so it must be idempotent: the probe results are cached,
++# the derived variables are (re)computed on every inclusion.
++
++set(RUNTIMES_DARWIN_LD64_VERSION "" CACHE STRING
++    "Version of ld64 used by the compiler driver (auto-detected when empty).")
++set(RUNTIMES_DARWIN_DEPLOYMENT_TARGET "" CACHE STRING
++    "macOS deployment target of the build (auto-detected when empty).")
++
++if (APPLE AND NOT RUNTIMES_DARWIN_LINKER_FEATURES_PROBED)
++  set(RUNTIMES_DARWIN_LINKER_FEATURES_PROBED ON CACHE INTERNAL "Darwin linker probes already ran")
++  set(_probe_dir "${CMAKE_BINARY_DIR}/CMakeFiles/darwin-linker-probe")
++  file(MAKE_DIRECTORY "${_probe_dir}")
++  set(_probe_flags)
++  if (CMAKE_OSX_SYSROOT)
++    list(APPEND _probe_flags "-isysroot" "${CMAKE_OSX_SYSROOT}")
++  endif()
++  if (CMAKE_OSX_DEPLOYMENT_TARGET)
++    list(APPEND _probe_flags "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++  endif()
++
++  if (NOT RUNTIMES_DARWIN_LD64_VERSION)
++    file(WRITE "${_probe_dir}/probe.cpp" "int main() { return 0; }\n")
++    execute_process(
++      COMMAND ${CMAKE_CXX_COMPILER} ${_probe_flags} -Wl,-v "${_probe_dir}/probe.cpp" -o "${_probe_dir}/probe"
++      OUTPUT_VARIABLE _ld_stdout
++      ERROR_VARIABLE _ld_stderr
++      RESULT_VARIABLE _ld_result)
++    if ("${_ld_stdout}${_ld_stderr}" MATCHES "ld64-([0-9]+(\\.[0-9]+)*)")
++      set(RUNTIMES_DARWIN_LD64_VERSION "${CMAKE_MATCH_1}" CACHE STRING
++          "Version of ld64 used by the compiler driver (auto-detected when empty)." FORCE)
++      message(STATUS "Darwin linker version: ld64-${RUNTIMES_DARWIN_LD64_VERSION}")
++    else()
++      message(STATUS "Darwin linker version: unknown, assuming an old ld64")
++    endif()
++  endif()
++
++  if (NOT RUNTIMES_DARWIN_DEPLOYMENT_TARGET)
++    set(_target)
++    if (CMAKE_OSX_DEPLOYMENT_TARGET)
++      set(_target "${CMAKE_OSX_DEPLOYMENT_TARGET}")
++    else()
++      # Ask the compiler for its default:
++      # __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ is 1050 for 10.5 and
++      # 101300 for 10.13.
++      execute_process(
++        COMMAND ${CMAKE_CXX_COMPILER} ${_probe_flags} -x c++ -dM -E /dev/null
++        OUTPUT_VARIABLE _macros
++        ERROR_QUIET
++        RESULT_VARIABLE _cpp_result)
++      if (_macros MATCHES "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ +([0-9]+)")
++        set(_value "${CMAKE_MATCH_1}")
++        if (_value MATCHES "^([0-9]+)([0-9][0-9])[0-9][0-9]$")
++          set(_major "${CMAKE_MATCH_1}")
++          string(REGEX REPLACE "^0" "" _minor "${CMAKE_MATCH_2}")
++          set(_target "${_major}.${_minor}")
++        elseif (_value MATCHES "^([0-9]+)([0-9])[0-9]$")
++          set(_target "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
++        endif()
++      endif()
++    endif()
++    if (_target)
++      set(RUNTIMES_DARWIN_DEPLOYMENT_TARGET "${_target}" CACHE STRING
++          "macOS deployment target of the build (auto-detected when empty)." FORCE)
++      message(STATUS "Darwin deployment target: ${RUNTIMES_DARWIN_DEPLOYMENT_TARGET}")
++    else()
++      message(STATUS "Darwin deployment target: unknown, assuming an old one")
++    endif()
++  endif()
++endif()
++
++if (APPLE AND RUNTIMES_DARWIN_LD64_VERSION AND NOT RUNTIMES_DARWIN_LD64_VERSION VERSION_LESS 127)
++  set(RUNTIMES_DARWIN_LD64_SUPPORTS_SYMBOL_LISTS ON)
++else()
++  set(RUNTIMES_DARWIN_LD64_SUPPORTS_SYMBOL_LISTS OFF)
++endif()
++
++if (RUNTIMES_DARWIN_LD64_SUPPORTS_SYMBOL_LISTS AND RUNTIMES_DARWIN_DEPLOYMENT_TARGET
++    AND NOT RUNTIMES_DARWIN_DEPLOYMENT_TARGET VERSION_LESS 10.7)
++  set(RUNTIMES_DARWIN_LD64_SUPPORTS_REEXPORTED_SYMBOLS_LIST ON)
++else()
++  set(RUNTIMES_DARWIN_LD64_SUPPORTS_REEXPORTED_SYMBOLS_LIST OFF)
++endif()
