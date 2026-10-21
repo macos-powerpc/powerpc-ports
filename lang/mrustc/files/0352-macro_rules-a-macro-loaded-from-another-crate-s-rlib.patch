@@ -1,0 +1,110 @@
+From d8e62383721469125ae9abbb57eb039965fe8f3e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 08:40:47 +0000
+Subject: [PATCH] macro_rules: a macro loaded from another crate's rlib keeps a hygiene
+ scope per expansion (0343 regression)
+
+thiserror-impl 2.0.20/2.0.21 `#[error("{0}")]` on a positional field (tombi-glob 1.8.4 error.rs:3, flexi_logger 0.31.10
+flexi_error.rs:71 under repgrep 0.17.1, ratatui-core 0.1.2 symbols/merge.rs:439 under skim 5.8.0): Expand
+`MACRO<core::write> error:0: Positional argument 0 out of range in "cannot parse &str `{00}` to BorderSymbol"`.
+thiserror's fmt.rs builds the binding name with quote's `format_ident!("{}{}", prefix, index)`, whose
+`format_ident_impl!` binds every positional argument as `arg` in a `match` arm of its own expansion and forwards the
+accumulated `arg` tokens to `format!`: the two `arg`s are distinct identifiers only through per-expansion macro_rules
+hygiene. 0343 (C194) made a macro whose definition hygiene is empty and has no module path keep that hygiene for its
+body (a macro_rules defined in proc-macro output, whose empty hygiene is the call-site marker). A macro_rules
+deserialised from another crate's rlib has exactly that hygiene: only the module path is serialised, and only
+`#[macro_export(local_inner_macros)]` macros and `macro` items have one. So since 0343 every imported macro_rules
+expanded without a scope of its own: both `arg`s were one binding, `format!("{}{}", arg, arg)` printed "00" and `{0}`
+became `{00}`. Named members survived by accident (the binding and the format string got the same wrong name). The
+thiserror code is identical in 2.0.17 (syn 2) and 2.0.21: any thiserror-impl built by a 0343..0351 compiler fails the
+same way, and any nested expansion of an rlib macro that forwards a body binding into another expansion binding the
+same name was silently resolved to the inner one whenever the types agreed.
+
+MacroRules::m_from_rlib, set on deserialise, excludes such macros from the call-site rule; Macro_InvokeRules decides
+the rule and the expander takes the result (source files and macro expansions always give a definition a scope of
+its own, so the remaining empty-hygiene definitions are the proc-macro-output ones). Not serialised: no rlib change.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index fadfc612..c3832fe4 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -394,6 +394,7 @@ namespace {
+             rv.m_is_macro_item = m_in.read_bool();
+             rv.m_rules = deserialise_vec_c< ::MacroRulesArm>( [&](){ return deserialise_macrorulesarm(); });
+             rv.m_hygiene = deserialise_hygine();
++            rv.m_from_rlib = true;
+             return rv;
+         }
+         ::SimplePatIfCheck deserialise_simplepatifcheck() {
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 506710fb..74c584a0 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -548,11 +548,10 @@ class MacroExpander:
+     AST::Edition    m_source_edition;
+     bool m_is_macro_item;
+     Ident::Hygiene  m_hygiene;
+-    /// The macro was defined in a proc macro's output (empty hygiene, no module path: source files always have
+-    /// a scope, another crate's macros a module path). Its body keeps that call-site hygiene: an empty-hygiene identifier
+-    /// can see the caller's locals (resolve/absolute.cpp `src_is_call_site`), which are the definition site's here,
+-    /// where a new scope chained from nothing saw none of them. pydantic_core 2.46.5 generator.rs: `macro_rules! next`
+-    /// inside a `#[pymethods]` method, "Couldn't find variable name 'py'".
++    /// The macro was defined in a proc macro's output (decided in Macro_InvokeRules). Its body keeps that call-site
++    /// hygiene: an empty-hygiene identifier can see the caller's locals (resolve/absolute.cpp `src_is_call_site`),
++    /// which are the definition site's here, where a new scope chained from nothing saw none of them. pydantic_core
++    /// 2.46.5 generator.rs: `macro_rules! next` inside a `#[pymethods]` method, "Couldn't find variable name 'py'".
+     bool m_def_is_call_site;
+ 
+ public:
+@@ -563,6 +562,7 @@ public:
+         const Span& sp,
+         AST::Edition edition,
+         bool is_macro_item,
++        bool def_is_call_site,
+         const Ident::Hygiene& parent_hygiene,
+         const ::std::vector<MacroExpansionEnt>& contents,
+         ParameterMappings mappings,
+@@ -580,7 +580,7 @@ public:
+         m_source_edition( source_edition ),
+         m_is_macro_item(is_macro_item),
+         m_hygiene( Ident::Hygiene::new_scope_chained(parent_hygiene) ),
+-        m_def_is_call_site( !is_macro_item && parent_hygiene == Ident::Hygiene() && !parent_hygiene.has_mod_path() )
++        m_def_is_call_site( def_is_call_site )
+     {
+     }
+ 
+@@ -739,8 +739,15 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+     // Run through the expansion counting the number of times each fragment is used
+     Macro_InvokeRules_CountSubstUses(bound_tts, rule.m_contents);
+ 
++    // A macro_rules defined in a proc macro's output resolves its body at the call site (0343): its definition hygiene
++    // is the empty hygiene (the call-site marker) with no module path. Source files and macro expansions always give
++    // a definition a scope of its own, and a `macro` item a module path. A macro loaded from another crate's rlib has
++    // the empty hygiene too (contexts are not serialised) but is an ordinary macro: it keeps a fresh scope per
++    // expansion, or every expansion of quote's `format_ident_impl!` would bind the same `arg` (thiserror `{0}` = `{00}`).
++    bool def_is_call_site = !rules.m_is_macro_item && !rules.m_from_rlib
++        && rules.m_hygiene == Ident::Hygiene() && !rules.m_hygiene.has_mod_path();
+     auto* ret_ptr = new MacroExpander(
+-        name, sp, crate.m_edition, rules.m_is_macro_item, rules.m_hygiene, rule.m_contents, mv$(bound_tts), rules.m_source_crate == "" ? crate.m_crate_name_real : rules.m_source_crate,
++        name, sp, crate.m_edition, rules.m_is_macro_item, def_is_call_site, rules.m_hygiene, rule.m_contents, mv$(bound_tts), rules.m_source_crate == "" ? crate.m_crate_name_real : rules.m_source_crate,
+         rules.m_edition
+         );
+     // The body's identifiers resolve as if written at the macro's definition (see def_site.hpp)
+diff --git a/src/macro_rules/macro_rules.hpp b/src/macro_rules/macro_rules.hpp
+index f02a6a7d..fef10be2 100644
+--- a/src/macro_rules/macro_rules.hpp
++++ b/src/macro_rules/macro_rules.hpp
+@@ -199,6 +199,10 @@ public:
+     /// Crate that defined this macro
+     /// - Populated on deserialise if not already set
+     RcString   m_source_crate;
++    /// Loaded from another crate's rlib. Its definition hygiene is then the empty hygiene only because hygiene
++    /// contexts are not serialised (the module path is), not the call-site marker of a macro defined in proc-macro
++    /// output: such a body must still get a scope of its own per expansion (see Macro_InvokeRules).
++    bool m_from_rlib = false;
+     AST::Edition m_edition;
+ 
+     Ident::Hygiene  m_hygiene;

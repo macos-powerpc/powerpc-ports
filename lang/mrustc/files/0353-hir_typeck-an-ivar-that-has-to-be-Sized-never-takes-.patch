@@ -1,0 +1,151 @@
+From 6c1641d5dc7a8e61f8bc7effc5c755a84d1e6b3c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 12:17:14 +0000
+Subject: [PATCH] hir_typeck: an ivar that has to be Sized never takes an unsized
+ possibility
+
+tsrs 0.18.0 crates/tsrs_fswatch/src/kqueue.rs, `kqueueBackend::compare_dir`
+(the user's no-atomic64 patch applied, not involved):
+
+    let mut to_remove = Vec::new();
+    to_remove.extend(m.keys().filter_map(|p| {
+        let rest = p.strip_prefix(&dir_start)?; .. Some(p.clone())
+    }));
+    for p in to_remove {
+        sub.dir_watch.events.remove(&p);            // fn remove(&self, path: &str)
+        .. .filter(|(d, _)| *d == &p || is_descendant(d, &p)) ..
+    }
+
+    <null> error:0: Unsized type not valid here - str
+
+`to_remove`'s element type comes only from `extend`. Its lookup pauses
+(f4932480): `Extend<T> for Vec<T>` and `Extend<&T> for Vec<T> where T: Copy`
+both match `Vec<_>` fuzzily, and the `filter_map` closure stays uncoerced while
+the call is open. Meanwhile `*d == &p` reduced to `String: PartialEq<_>` (impl
+list ByteString, ByteStr, str, &str, Cow<str>, String) and `remove(&p)` gave
+a `&_ -> &str` destination. The plain "IVar possibilities" stage, which runs
+before the deferred-methods stage, took `str` through "Bounded and possible
+type". The ivar is flagged Sized (Vec's `T`), so equating it errored, from
+check_ivar_poss's static null span.
+
+check_ivar_poss computed `allow_unsized`, but only the late filter of
+`possible_tys` read it. "Source/Destination type", "Bounded and possible
+type", "One possibility (before ivar removal)", "Most accepting pointer
+class", the least/most-restrictive rules and the Assume "Suitable option"
+picked a type without that test (the others go through
+check_ivar_poss__fails_bounds, which has it). These rules now skip a type that
+is unsized when the ivar has to be Sized. Such a pick always ended in this
+error (set_ivar_to -> require_sized makes the same test), so code that
+compiled before is unaffected. Here the stage leaves the ivar alone, the
+deferred-methods stage commits `extend`, and the element type is `String` as
+in rustc. A genuinely unsized use is still rejected, now from the node's span.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index d03f174f..82ec6062 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -7104,6 +7104,20 @@ namespace
+         ///
+         /// TODO: If in fallback mode, there's no infer options, and there are bounds - Pick a random bound
+ 
++        // An ivar used where the value has to be Sized (`Vec<T>`'s `T`, a call's result, a tuple field) can't take an unsized
++        // possibility. Every rule below that picks a type without `check_ivar_poss__fails_bounds` (which tests this) skips
++        // such a type: `&_ -> &str` destinations and a bound's impl list (`String: PartialEq<_>` = str, &str, String..) gave
++        // `str` while the real type was still to come from a method paused on a fuzzy impl (tsrs 0.18.0 kqueue.rs
++        // `let mut to_remove = Vec::new(); to_remove.extend(..); for p in to_remove { .. *d == &p .. remove(&p) }`).
++        const bool allow_unsized = !(i < context.m_ivars_sized.size() ? context.m_ivars_sized.at(i) : false);
++        auto unsized_for_sized = [&](const ::HIR::TypeRef& t)->bool {
++            if( !allow_unsized && context.m_resolve.type_is_sized(sp, t) == ::HIR::Compare::Unequal ) {
++                DEBUG(i << ": " << t << " is unsized, the ivar has to be Sized");
++                return true;
++            }
++            return false;
++            };
++
+         // ---
+         // Always rules:
+         // ---
+@@ -7114,7 +7128,7 @@ namespace
+                 for(const auto& t2 : ivar_ent.types_coerce_from)
+                 {
+                     // TODO: Compare such that &[_; 1] == &[u8; 1]? and `&[_]` == `&[T]`
+-                    if(t.ty == t2.ty && t.ty != ty_l)
++                    if(t.ty == t2.ty && t.ty != ty_l && !unsized_for_sized(t.ty))
+                     {
+                         DEBUG("- Source/Destination type");
+                         context.equate_types(sp, ty_l, t.ty);
+@@ -7164,9 +7178,6 @@ namespace
+         // Fill a single list with all possibilities, and pick the most suitable type.
+         // - This list needs to include flags to say if the type can be dereferenced.
+         {
+-
+-            bool allow_unsized = !(i < context.m_ivars_sized.size() ? context.m_ivars_sized.at(i) : false);
+-
+             ::std::vector<PossibleType> possible_tys;
+             static ::HIR::TypeRef   null_placeholder;
+             bool add_placeholders = (fallback_ty < IvarPossFallbackType::IgnoreWeakDisable);
+@@ -7278,6 +7289,9 @@ namespace
+                     if( H::get_borrow_inner(bounded_ty).data().is_Infer() ) {
+                         continue;
+                     }
++                    if( unsized_for_sized(bounded_ty) ) {
++                        continue;
++                    }
+                     for(const auto& t : possible_tys)
+                     {
+                         // Skip ivars
+@@ -7463,9 +7477,12 @@ namespace
+                     //    ERROR(
+                     //}
+                 }
+-                DEBUG("One possibility (before ivar removal), setting to " << *ty_p);
+-                context.equate_types(sp, ty_l, *ty_p);
+-                return true;
++                if( !unsized_for_sized(*ty_p) )
++                {
++                    DEBUG("One possibility (before ivar removal), setting to " << *ty_p);
++                    context.equate_types(sp, ty_l, *ty_p);
++                    return true;
++                }
+             }
+ 
+             // TODO: This shouldn't just return, instead the above null placeholders should be tested
+@@ -7583,7 +7600,7 @@ namespace
+                     }
+                     else {
+                     }
+-                    if( is_max_accepting )
++                    if( is_max_accepting && !unsized_for_sized(*ent.ty) )
+                     {
+                         DEBUG("Most accepting pointer class, and most permissive inner type - " << *ent.ty);
+                         context.equate_types(sp, ty_l, *ent.ty);
+@@ -7662,7 +7679,7 @@ namespace
+                 }
+                 // TODO: Unsized types? Don't pick an unsized if coercions are present?
+                 // TODO: If in a fallback mode, then don't require >1 (just require dest_type)
+-                if( (num_distinct > 1 || fallback_ty == IvarPossFallbackType::Assume) && dest_type && !is_unordered )
++                if( (num_distinct > 1 || fallback_ty == IvarPossFallbackType::Assume) && dest_type && !is_unordered && !unsized_for_sized(*dest_type) )
+                 {
+                     DEBUG("- Least-restrictive source " << *dest_type);
+                     context.equate_types(sp, ty_l, *dest_type);
+@@ -7742,7 +7759,7 @@ namespace
+                 }
+                 // TODO: Unsized types? Don't pick an unsized if coercions are present?
+                 // TODO: If in a fallback mode, then don't require >1 (just require dest_type)
+-                if( (num_distinct > 1 || fallback_ty == IvarPossFallbackType::Assume) && dest_type && !is_unordered )
++                if( (num_distinct > 1 || fallback_ty == IvarPossFallbackType::Assume) && dest_type && !is_unordered && !unsized_for_sized(*dest_type) )
+                 {
+                     DEBUG("- Most-restrictive destination " << *dest_type);
+                     context.equate_types(sp, ty_l, *dest_type);
+@@ -7830,7 +7847,7 @@ namespace
+                         }
+                     }
+ 
+-                    if( dest_type && n_ivars == 0 && any_ivar_present == false && !TU_TEST1(dest_type->data(), NodeType, .is_Closure()) && !is_unordered )
++                    if( dest_type && n_ivars == 0 && any_ivar_present == false && !TU_TEST1(dest_type->data(), NodeType, .is_Closure()) && !is_unordered && !unsized_for_sized(*dest_type) )
+                     {
+                         DEBUG("Suitable option " << *dest_type << " from " << possible_tys);
+                         context.equate_types(sp, ty_l, *dest_type);
