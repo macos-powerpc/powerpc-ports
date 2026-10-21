@@ -22,7 +22,9 @@ This script answers those calls:
   crates get crates.io ids, the others `path+file` ones. The workspace is
   reported as the root package alone (so maturin needs no `cargo tree`).
 - `cargo build` / `cargo rustc`: minicargo, then the messages for the binaries
-  and the cdylib it made. A cdylib is built with `--panic unwind` (rustc's
+  and the cdylib it made (a `staticlib` is just left in the target directory,
+  for makefiles: newsboat links `target/<triple>/release/libnewsboat.a`).
+  `--package` picks a member of the workspace. A cdylib is built with `--panic unwind` (rustc's
   default; pyo3 turns panics into Python exceptions), MRUSTC_SHIM_PANIC
   overrides it. Linker arguments from `-C link-arg(s)` (after `--`, or in
   RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS) go to minicargo's `--link-arg`;
@@ -335,7 +337,8 @@ class Package:
         self.dir = self.manifest_path.parent
         self.manifest = load_toml(self.manifest_path)
         self.ws_root, ws_manifest = self.find_workspace()
-        self.ws_package = (ws_manifest or {}).get("workspace", {}).get("package", {})
+        self.ws = (ws_manifest or {}).get("workspace", {})
+        self.ws_package = self.ws.get("package", {})
         pkg = self.manifest.get("package")
         if pkg is None:
             self.name = None    # virtual manifest
@@ -364,6 +367,23 @@ class Package:
                 if "workspace" in m:
                     return d, m
         return self.dir, None
+
+    def workspace_member(self, name):
+        """The workspace member package called `name` (`cargo build -p name` at the workspace root)"""
+        excluded = {(self.ws_root / e).resolve() for e in self.ws.get("exclude", [])}
+        dirs = [self.ws_root] + [d for pattern in self.ws.get("members", [])
+                                 for d in sorted(self.ws_root.glob(pattern))]
+        for d in dirs:
+            d = d.resolve()
+            if d in excluded or not (d / "Cargo.toml").is_file():
+                continue
+            if d == self.dir:
+                member = self
+            else:
+                member = Package(d / "Cargo.toml")
+            if member.name == name:
+                return member
+        return None
 
     def field(self, key, default=None):
         value = self.pkg.get(key, default)
@@ -630,11 +650,15 @@ def cargo_build(command, opts):
     link_args = rustc_link_args(flags, where) + rustc_link_args(opts.rustc_args, "`cargo rustc --` arguments")
 
     pkg = Package(find_manifest(opts))
-    if pkg.name is None:
-        die(f"{pkg.manifest_path} is a virtual manifest; use the member's Cargo.toml as --manifest-path")
+    # `cargo build -p member` at the workspace root (newsboat's Makefile: `cargo build --package libnewsboat-ffi`)
     package = opts.get("--package", "-p")
     if package and package != pkg.name:
-        die(f"--package {package}: use the member's Cargo.toml as --manifest-path")
+        member = pkg.workspace_member(package)
+        if member is None:
+            die(f"--package {package}: no such package in the workspace of {pkg.manifest_path}")
+        pkg = member
+    if pkg.name is None:
+        die(f"{pkg.manifest_path} is a virtual manifest; name the member with --package")
 
     host = env("MRUSTC_SHIM_HOST")
     target = opts.get("--target") or os.environ.get("CARGO_BUILD_TARGET")

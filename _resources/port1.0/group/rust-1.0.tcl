@@ -16,6 +16,10 @@
 global os.arch
 
 if {${os.arch} eq "powerpc"} {
+    # This port's build system runs cargo: the mrustc PortGroup gives it the stand-ins (mrustc.cargo_shim)
+    namespace eval rust {
+        variable runs_cargo yes
+    }
     PortGroup                   mrustc 1.0
 } else {
     namespace eval rust {

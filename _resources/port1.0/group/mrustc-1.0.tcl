@@ -43,8 +43,9 @@
 # Ports whose own build system runs cargo (PortGroup rust 1.0, which selects
 # this PortGroup on powerpc) get cargo and rustc stand-ins in ${cargo.home}/bin
 # that build with minicargo, see mrustc.cargo_shim. By default this is on for
-# ports that use the python PortGroup, i.e. Python packages built by
-# setuptools-rust or maturin (binaries and cdylib extension modules).
+# ports that use the rust PortGroup (configure scripts and makefiles that run
+# `cargo build`, e.g. newsboat) or the python PortGroup (Python packages built
+# by setuptools-rust or maturin: binaries and cdylib extension modules).
 #
 
 # This portgroup is modelled upon rust 1.0, with extra overrides to support powerpc.
@@ -96,10 +97,24 @@ default     cargo.update        {no}
 default     mrustc.incremental  {no}
 
 # cargo and rustc stand-ins for build systems that run cargo themselves (see
-# rust::write_cargo_shim). They need a Python interpreter, so the default is on
-# for ports that use the python PortGroup (not for its py-foo stub port).
+# rust::write_cargo_shim): on by default for ports that use the rust PortGroup
+# (rust-1.0.tcl sets rust::runs_cargo before it selects this PortGroup) and for
+# ports that use the python PortGroup (not for its py-foo stub port).
 options     mrustc.cargo_shim
-default     mrustc.cargo_shim   {[info exists ::python.version]}
+default     mrustc.cargo_shim   {[expr {[info exists ::python.version] || [info exists ::rust::runs_cargo]}]}
+
+# The stand-ins are a Python script: they run on the interpreter of the python PortGroup, else on this
+# Python, a build dependency then (python3.11 or later: tomllib)
+namespace eval rust {
+    variable cargo_shim_python_version  314
+}
+
+# Before configure as well: configure scripts look for cargo (newsboat's config.sh: `command -v cargo`)
+pre-configure {
+    if {[option mrustc.cargo_shim]} {
+        rust::write_cargo_shim
+    }
+}
 
 pre-build {
     if {[option mrustc.incremental]} {
@@ -891,11 +906,25 @@ proc rust::get_sdkroot {sdk_version} {
 # `rustc` that answer these with minicargo and mrustc (mrustc/cargo-shim.py next
 # to the PortGroups says what is covered). Extension modules need mrustc and
 # minicargo with cdylib support (mrustc patches 0272-0275).
+proc rust::cargo_shim_python {} {
+    if {[info exists ::python.version]} {
+        return [option python.bin]
+    }
+    set v ${::rust::cargo_shim_python_version}
+    return [option prefix]/bin/python[string index ${v} 0].[string range ${v} 1 end]
+}
+
+# Ports without the python PortGroup get the shim's interpreter as a build dependency
+proc rust::cargo_shim_depends {} {
+    if {[option mrustc.cargo_shim] && ![info exists ::python.version]} {
+        depends_build-delete    port:python${::rust::cargo_shim_python_version}
+        depends_build-append    port:python${::rust::cargo_shim_python_version}
+    }
+}
+port::register_callback rust::cargo_shim_depends
+
 proc rust::write_cargo_shim {} {
     global mrustc_root rustc_target_ver
-    if {![info exists ::python.version]} {
-        return -code error "mrustc.cargo_shim runs on the interpreter of the python PortGroup, which this port does not use"
-    }
     set bindir [option cargo.home]/bin
     file mkdir ${bindir}
     xinstall -m 0644 ${::rust::cargo_shim_script} ${bindir}/cargo-shim.py
@@ -915,7 +944,7 @@ proc rust::write_cargo_shim {} {
         foreach {var value} ${vars} {
             puts ${fd} "export ${var}=[shellescape ${value}]"
         }
-        puts ${fd} "exec [shellescape [option python.bin]] [shellescape ${bindir}/cargo-shim.py] ${tool} \"\$@\""
+        puts ${fd} "exec [shellescape [rust::cargo_shim_python]] [shellescape ${bindir}/cargo-shim.py] ${tool} \"\$@\""
         close ${fd}
     }
     # Portfiles run cargo themselves as well, e.g. py-pydantic_core's `pre-build { system -W ${worksrcpath} "cargo
@@ -937,7 +966,7 @@ proc rust::set_environment {} {
     rust::append_envs     MRUSTC_TARGET_VER=${rustc_target_ver} {build destroot}
 
     if {[option mrustc.cargo_shim]} {
-        rust::append_envs PATH=[option cargo.home]/bin:$env(PATH) {build destroot}
+        rust::append_envs PATH=[option cargo.home]/bin:$env(PATH) {configure build destroot}
     }
 
     rust::append_envs     CC=[compwrap::wrap_compiler cc]   {build destroot}
