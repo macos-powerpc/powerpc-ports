@@ -1,0 +1,220 @@
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Subject: [PATCH] compiler: model Darwin/PowerPC "power" alignment
+
+On 32-bit Darwin/PowerPC, GCC lays out structs using the "power"
+alignment rules (gcc/config/rs6000/darwin.h):
+
+* ADJUST_FIELD_ALIGN pegs the alignment of every member to 32 bits
+  (except 128-bit aligned vectors and long double), so double, long long
+  and any aggregate containing them are only 4-aligned as members;
+* ROUND_TYPE_ALIGN (darwin_rs6000_special_round_type_align) raises the
+  alignment of a struct or union to the TYPE_ALIGN of its first scalar
+  member, looking through nested aggregates and arrays; for double and
+  long long that is 8, so such aggregates get their size rounded up to
+  a multiple of 8.
+
+Nim assumed natural alignment (8) for 8-byte scalars on this target, so
+its constant-folded sizeof/alignof/offsetOf disagreed with GCC, e.g.
+object {a: int32; b: float64} was 16 bytes with b at offset 8 in Nim but
+12 bytes with b at offset 4 in C. The seqs_v2 runtime computes payload
+addresses from these values (nimCopySeqPayload, used for =copy/=dup of
+seqs of trivially copyable types; the copy-on-write path of constant seq
+literals; zeroNewElements), so with --mm:arc/orc seq contents were
+silently corrupted.
+
+Report member alignment (4) for 8-byte scalars and aggregates, like on
+i386, and round the size of objects, tuples, unions and variant branches
+(including the anonymous union of variant branches) up to 8 when their
+first member is an 8-byte scalar. Other targets are unaffected.
+
+Verified against Nim 2.2.12 with a probe comparing Nim's and GCC's sizeof/alignof/offsetof
+on a G4/G5 running Mac OS X 10.6.8 with GCC.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+diff --git a/compiler/options.nim b/compiler/options.nim
+index ba77a92..81f8946 100644
+--- a/compiler/options.nim
++++ b/compiler/options.nim
+@@ -1109,4 +1109,10 @@ proc floatInt64Align*(conf: ConfigRef): int16 =
+       # on i386 for all known POSIX systems, 64bits ints are aligned
+       # to 4bytes (except with -malign-double)
+       return 4
++  if conf != nil and conf.target.targetCPU == cpuPowerpc and
++      conf.target.targetOS == osMacosx:
++    # 32-bit Darwin/PowerPC uses the "power" alignment rules: 8-byte
++    # scalars are 4-aligned inside aggregates.  (An aggregate whose first
++    # member is a double is still 8-aligned; see sizealignoffsetimpl.)
++    return 4
+   return 8
+diff --git a/compiler/sizealignoffsetimpl.nim b/compiler/sizealignoffsetimpl.nim
+index a3dc801..5e888a1 100644
+--- a/compiler/sizealignoffsetimpl.nim
++++ b/compiler/sizealignoffsetimpl.nim
+@@ -112,6 +112,107 @@ proc setOffsetsToUnknown(n: PNode) =
+     for i in 0..<n.safeLen:
+       setOffsetsToUnknown(n[i])
+ 
++# 32-bit Darwin/PowerPC "power" alignment, as implemented by GCC:
++# * every member is at most 4-aligned (8-byte scalars and aggregates alike),
++#   which floatInt64Align and the member alignment reported below take care
++#   of;
++# * but a struct or union whose first member is (looking through nested
++#   aggregates and arrays) an 8-byte scalar is itself 8-aligned, so its size
++#   is rounded up to a multiple of 8.
++# The type's reported alignment stays the member alignment (like i386,
++# where GCC also 8-aligns standalone doubles but 4-aligns double members),
++# which also keeps the seq payload header consistent with C.
++const DarwinPpcFirstMemberKinds = {tyFloat64, tyFloat, tyInt64, tyUInt64}
++
++proc usesDarwinPowerAlign(conf: ConfigRef): bool =
++  conf.target.targetCPU == cpuPowerpc and conf.target.targetOS == osMacosx
++
++proc firstMemberBumpsAlign(conf: ConfigRef; typ: PType): bool
++
++proc hasCFields(n: PNode): bool =
++  ## Whether `n` produces any C struct fields (codegen drops empty
++  ## variant branches from the anonymous union).
++  if n == nil:
++    return false
++  case n.kind
++  of nkSym:
++    result = n.sym.typ.kind != tyVoid
++  of nkRecList:
++    result = false
++    for child in n.sons:
++      if hasCFields(child):
++        return true
++  of nkRecCase:
++    result = true
++  else:
++    result = false
++
++proc firstFieldBumpsAlign(conf: ConfigRef; n: PNode): bool =
++  if n == nil:
++    return false
++  case n.kind
++  of nkSym:
++    result = firstMemberBumpsAlign(conf, n.sym.typ)
++  of nkRecList:
++    # the first member is the first child that produces C fields
++    result = false
++    for child in n.sons:
++      if hasCFields(child):
++        return firstFieldBumpsAlign(conf, child)
++  of nkRecCase:
++    result = firstFieldBumpsAlign(conf, n[0])
++  else:
++    result = false
++
++proc firstMemberBumpsAlign(conf: ConfigRef; typ: PType): bool =
++  let t = typ.skipTypes({tyGenericInst, tyDistinct, tyAlias, tySink,
++    tyOwned, tyRange, tyInferred})
++  case t.kind
++  of DarwinPpcFirstMemberKinds:
++    result = true
++  of tyEnum, tySet:
++    computeSizeAlign(conf, t)
++    result = t.size == 8
++  of tyArray:
++    result = firstMemberBumpsAlign(conf, t.elementType)
++  of tyTuple:
++    result = false
++    for _, child in t.ikids:
++      result = firstMemberBumpsAlign(conf, child)
++      break
++  of tyObject:
++    if tfPacked in t.flags:
++      result = false
++    elif t.baseClass != nil:
++      var st = t.baseClass
++      while st.kind in skipPtrs:
++        st = st.skipModifier
++      result = firstMemberBumpsAlign(conf, st)
++    elif isObjectWithTypeFieldPredicate(t):
++      result = false # first member is the m_type pointer
++    else:
++      result = firstFieldBumpsAlign(conf, t.n)
++  else:
++    result = false
++
++proc roundRel8(accum: var OffsetAccum; start: int32) =
++  ## Round the size of a C sub-aggregate starting at `start` up to 8.
++  if accum.offset != szUnknownSize:
++    accum.offset = start + align(accum.offset - start, 8'i32)
++
++proc applyDarwinPowerAlign(conf: ConfigRef; typ: PType;
++    accum: var OffsetAccum): int32 =
++  ## Rounds the aggregate's size up to 8 if the first-member rule applies;
++  ## returns the member alignment to report for the type, or -1 if the
++  ## rule does not apply.
++  if usesDarwinPowerAlign(conf) and tfPacked notin typ.flags and
++      accum.maxAlign != szUnknownSize and accum.offset != szUnknownSize and
++      firstMemberBumpsAlign(conf, typ):
++    result = accum.maxAlign
++    accum.maxAlign = max(accum.maxAlign, 8'i32)
++  else:
++    result = -1
++
+ proc computeObjectOffsetsFoldFunction(conf: ConfigRef; n: PNode; packed: bool; accum: var OffsetAccum) =
+   ## ``offset`` is the offset within the object, after the node has been written, no padding bytes added
+   ## ``align`` maximum alignment from all sub nodes
+@@ -141,11 +242,28 @@ proc computeObjectOffsetsFoldFunction(conf: ConfigRef; n: PNode; packed: bool; a
+       # the union needs to be aligned first, before the offsets can be assigned
+       accum.align(maxChildAlign)
+       let accumRoot = accum # copy, because each branch should start af the same offset
++      let darwinPower = usesDarwinPowerAlign(conf) and not packed
++      var sawFirstMember = false
++      var unionFirstBumps = false
+       for i in 1..<n.len:
+         var branchAccum = OffsetAccum(offset: accumRoot.offset, maxAlign: 1)
+         computeObjectOffsetsFoldFunction(conf, n[i].lastSon, packed, branchAccum)
+         discard finish(branchAccum)
++        if darwinPower:
++          # Branches with several fields become anonymous structs in a union
++          # (see genRecordFieldsAux); both are subject to the first-member
++          # rule of Darwin/PPC "power" alignment.
++          let k = n[i].lastSon
++          if hasCFields(k):
++            let bumps = firstFieldBumpsAlign(conf, k)
++            if k.kind != nkSym and bumps:
++              branchAccum.roundRel8(accumRoot.offset)
++            if not sawFirstMember:
++              sawFirstMember = true
++              unionFirstBumps = bumps
+         accum.mergeBranch(branchAccum)
++      if darwinPower and unionFirstBumps:
++        accum.roundRel8(accumRoot.offset)
+   of nkRecList:
+     for i, child in n.sons:
+       computeObjectOffsetsFoldFunction(conf, child, packed, accum)
+@@ -339,9 +457,12 @@ proc computeSizeAlign(conf: ConfigRef; typ: PType) =
+           let sym = typ.n[i].sym
+           sym.offset = accum.offset
+         accum.inc(int32(child.size))
++      let memberAlign = applyDarwinPowerAlign(conf, typ, accum)
+       typ.paddingAtEnd = int16(accum.finish())
+       typ.size = if accum.offset == 0: 1 else: accum.offset
+       typ.align = int16(accum.maxAlign)
++      if memberAlign > 0:
++        typ.align = int16(memberAlign)
+     except IllegalTypeRecursionError:
+       typ.paddingAtEnd = szIllegalRecursion
+       typ.size = szIllegalRecursion
+@@ -393,6 +514,7 @@ proc computeSizeAlign(conf: ConfigRef; typ: PType) =
+           assert accum.offset == 0
+           accum.offset = 1
+         computeObjectOffsetsFoldFunction(conf, typ.n, false, accum)
++      let memberAlign = applyDarwinPowerAlign(conf, typ, accum)
+       let paddingAtEnd = int16(accum.finish())
+       if (typ.sym != nil and
+           typ.sym.flags * {sfCompilerProc, sfImportc} == {sfImportc} and
+@@ -404,6 +526,8 @@ proc computeSizeAlign(conf: ConfigRef; typ: PType) =
+       else:
+         typ.size = if accum.offset == 0: 1 else: accum.offset
+         typ.align = int16(accum.maxAlign)
++        if memberAlign > 0:
++          typ.align = int16(memberAlign)
+         typ.paddingAtEnd = paddingAtEnd
+     except IllegalTypeRecursionError:
+       typ.size = szIllegalRecursion
