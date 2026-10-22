@@ -1,0 +1,421 @@
+From 8eb8656ac77723dbd89e9f0973da1d6b520d2a4e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 21:39:59 +0000
+Subject: [PATCH] trans/minicargo: a `staticlib` carries the `static=` native
+ archives of its crate graph
+
+newsboat 2.45 (net/newsboat, upstream Portfile: PortGroup rust + makefile) links its Rust half as just
+target/<triple>/release/libnewsboat.a (libnewsboat-ffi, `crate-type = ["staticlib"]`, `[lib] name = "newsboat"`).
+Its cxx bridge code is C++ that the build scripts compile into archives: cxx-build in libnewsboat-ffi's build.rs
+(`cargo:rustc-link-lib=static=libnewsboat-ffi-<module>`, 16 of them) and cc in cxx's (`static=cxxbridge1`). rustc
+copies the members of such archives into the staticlib (`static` = `+bundle` by default); mrustc's staticlib (0147)
+only listed native libraries in `lib<name>.a.libs`, and minicargo passed every library on as a bare name, so the C++
+link of newsboat would lack the bridge functions. (minicargo even recorded a missing kind as "static", and stopped
+with "TODO: rustc-link-lib static:-bundle" on a modifier, which cc prints when asked to.)
+
+- minicargo: `rustc-link-lib` takes `KIND[:MODIFIERS]=NAME`; an explicit `static` goes to mrustc as
+  `-l static=NAME` (`-l static:-bundle=NAME` with `-bundle`), no kind / `dylib` stay bare names, `framework=` as before.
+- expand: `#[link(kind = "static")]` is encoded the same way (the `framework=` precedent), `modifiers` kept.
+- C backend: library names are parsed (`NativeLib::parse`); a `staticlib` resolves each bundled `static=` library of
+  the crate and of every dependency to `lib<name>.a` (the crate's own search directories, then this crate's: std's
+  `static=emutls`/`static=MacportsLegacySupport` come from build_std.txt), extracts its object members (System V/GNU
+  and BSD `ar` formats, symbol tables skipped; written as `<lib>-<n>-<member>` in `<out>.bundle/`, so same-named
+  members don't collide) and adds them to the archive. Unbundled ones stay in `.libs`; a missing or unreadable
+  archive is a warning and stays there too. Executables and dylibs link exactly as before (the kind is stripped).
+
+No rlib format change (the kind travels in the library name, like `framework=`). Rlibs built before carry bare
+names, so only crates built after this are bundled; the mrustc port's own libstd build then records std's
+`static=MacportsLegacySupport`/`static=emutls` (build_std.txt), which every staticlib then carries. An archive that
+can't be read (a universal one, a GNU thin archive) is a warning and goes to `.libs` as its path.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/expand/codegen.cpp b/src/expand/codegen.cpp
+index b316247a..17ba3f9b 100644
+--- a/src/expand/codegen.cpp
++++ b/src/expand/codegen.cpp
+@@ -451,6 +451,7 @@ class CHandler_Link:
+             lex.getTokenCheck(TOK_PAREN_OPEN);
+             std::string lib_name;
+             std::string kind;
++            std::string modifiers;
+             bool emit = true;
+             AST::ExternBlock::Link  link;
+ 
+@@ -479,7 +480,7 @@ class CHandler_Link:
+                     auto v = lex.getTokenCheck(TOK_STRING).str();
+                     if(v == "")
+                         ERROR(sp, E0000, "Empty `modifiers` on extern block #[link]");
+-                    // TODO: save and use the `modifiers` value
++                    modifiers = v;
+                 }
+                 else {
+                     TODO(sp, "Unknown attribute `#[link(" << key << ")]`");
+@@ -490,12 +491,17 @@ class CHandler_Link:
+             if(link.lib_name == "")
+                 ERROR(sp, E0000, "No name in `#[link]`");
+             // Apple frameworks use the same `framework=` encoding as `-l framework=Foo` (from minicargo),
+-            // which the C backend turns into `-framework Foo` instead of `-lFoo`
+-            // TODO: Use the other kinds (`static`, `dylib`, `raw-dylib`)
++            // which the C backend turns into `-framework Foo` instead of `-lFoo`; `static=` (`-l static=foo`) makes
++            // a `staticlib` carry the archive's members, unless the modifiers say `-bundle`
++            // TODO: Use the other kinds (`dylib`, `raw-dylib`)
+             if( kind == "framework" )
+             {
+                 link.lib_name = "framework=" + link.lib_name;
+             }
++            else if( kind == "static" )
++            {
++                link.lib_name = (modifiers == "" ? "static=" : "static:" + modifiers + "=") + link.lib_name;
++            }
+             if( emit )
+             {
+                 b->m_libraries.push_back(std::move(link));
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 2a1b233a..d3b37387 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -21,6 +21,12 @@
+ #include <iomanip>
+ #include "target_version.hpp"
+ #include <string_view.hpp>
++#include <cstring>
++#ifdef _WIN32
++# include <direct.h>
++#else
++# include <sys/stat.h>
++#endif
+ 
+ namespace {
+     struct FmtShell
+@@ -111,6 +117,136 @@ namespace {
+             m_strings.push_back(s);
+         }
+     };
++
++    /// A native library of the link (`-l`, a build script's `cargo:rustc-link-lib`, `#[link]`): `[kind[:modifiers]=]name`
++    struct NativeLib
++    {
++        /// What the link list gets: the name, or `framework=Name` (which the C backend turns into `-framework Name`)
++        ::std::string   spec;
++        ::std::string   name;
++        /// `static=` (rustc's default modifier `+bundle`): a `staticlib` carries the archive's members
++        bool    bundle = false;
++
++        static NativeLib parse(const ::std::string& s)
++        {
++            NativeLib   rv;
++            rv.spec = s;
++            rv.name = s;
++            auto eq = s.find('=');
++            if( eq == ::std::string::npos )
++                return rv;
++            auto kind = s.substr(0, eq);
++            ::std::string   modifiers;
++            auto colon = kind.find(':');
++            if( colon != ::std::string::npos ) {
++                modifiers = kind.substr(colon+1);
++                kind = kind.substr(0, colon);
++            }
++            if( kind == "framework" ) {
++                rv.name = s.substr(eq+1);
++                rv.spec = "framework=" + rv.name;
++            }
++            else if( kind == "static" || kind == "dylib" ) {
++                rv.name = s.substr(eq+1);
++                rv.spec = rv.name;
++                rv.bundle = (kind == "static" && modifiers.find("-bundle") == ::std::string::npos);
++            }
++            return rv;
++        }
++    };
++
++    /// Write the object members of a Unix `ar` archive (System V/GNU or BSD format) to `dir`, named `<prefix>-<n>-<member>`
++    /// so members of several archives (or same-named members of one) don't collide. Returns the written paths, or an error.
++    bool extract_archive_members(const ::std::string& archive, const ::std::string& dir, const ::std::string& prefix, ::std::vector<::std::string>& out_paths, ::std::string& error)
++    {
++        ::std::ifstream is(archive, ::std::ios::binary);
++        if( !is.is_open() ) {
++            error = "cannot open it";
++            return false;
++        }
++        char magic[8];
++        if( !is.read(magic, 8) || ::std::memcmp(magic, "!<arch>\n", 8) != 0 ) {
++            error = "not an `ar` archive (thin archives are not supported)";
++            return false;
++        }
++        ::std::string   gnu_names;  // GNU `//` member: the long names
++        unsigned    n = 0;
++        for(;;)
++        {
++            char hdr[60];
++            if( !is.read(hdr, 60) ) {
++                break;
++            }
++            if( hdr[58] != '`' || hdr[59] != '\n' ) {
++                error = "malformed member header";
++                return false;
++            }
++            auto field = [&](size_t ofs, size_t len) {
++                ::std::string   f(hdr + ofs, len);
++                auto e = f.find_last_not_of(' ');
++                return e == ::std::string::npos ? ::std::string() : f.substr(0, e+1);
++                };
++            auto name = field(0, 16);
++            size_t  size = ::std::strtoul(field(48, 10).c_str(), nullptr, 10);
++            ::std::string   data(size, '\0');
++            if( size > 0 && !is.read(&data[0], size) ) {
++                error = "truncated member";
++                return false;
++            }
++            if( size % 2 == 1 ) {
++                is.ignore(1);
++            }
++
++            if( name.compare(0, 3, "#1/") == 0 ) {
++                // BSD: the name is the start of the data
++                size_t  len = ::std::strtoul(name.c_str() + 3, nullptr, 10);
++                if( len > data.size() ) {
++                    error = "malformed BSD member name";
++                    return false;
++                }
++                name = data.substr(0, len);
++                name = name.substr(0, name.find('\0'));
++                data.erase(0, len);
++            }
++            else if( name == "//" ) {
++                gnu_names = ::std::move(data);
++                continue;
++            }
++            else if( name == "/" || name == "/SYM64/" ) {
++                // GNU symbol table
++                continue;
++            }
++            else if( name.size() > 1 && name[0] == '/' && '0' <= name[1] && name[1] <= '9' ) {
++                size_t  ofs = ::std::strtoul(name.c_str() + 1, nullptr, 10);
++                if( ofs >= gnu_names.size() ) {
++                    error = "malformed GNU member name";
++                    return false;
++                }
++                name = gnu_names.substr(ofs, gnu_names.find('\n', ofs) - ofs);
++            }
++            if( !name.empty() && name.back() == '/' ) {
++                name.pop_back();
++            }
++            // BSD symbol tables
++            if( name.compare(0, 9, "__.SYMDEF") == 0 ) {
++                continue;
++            }
++            auto slash = name.find_last_of("/\\");
++            if( slash != ::std::string::npos ) {
++                name = name.substr(slash+1);
++            }
++
++            auto path = dir + "/" + prefix + "-" + ::std::to_string(n++) + "-" + name;
++            ::std::ofstream os(path, ::std::ios::binary);
++            os.write(data.data(), data.size());
++            if( !os.good() ) {
++                error = "cannot write " + path;
++                return false;
++            }
++            out_paths.push_back(::std::move(path));
++        }
++        return true;
++    }
+ }
+ 
+ ::std::ostream& operator<<(::std::ostream& os, const FmtShell& x)
+@@ -1212,11 +1348,13 @@ namespace {
+ 
+             StringList  ext_crates;
+             StringList  ext_crates_dylib;
++            // (name, path) of the archives a `staticlib` carries
++            ::std::vector<::std::pair<::std::string, ::std::string>>   bundled_archives;
+             switch(out_ty)
+             {
+             case CodegenOutput::Executable:
+             case CodegenOutput::DynamicLibrary:
+-            case CodegenOutput::StaticArchive:
++            case CodegenOutput::StaticArchive: {
+                 for( const auto& crate_name : m_crate.m_ext_crates_ordered )
+                 {
+                     const auto& crate = m_crate.m_ext_crates.at(crate_name);
+@@ -1307,6 +1445,18 @@ namespace {
+                         }
+                         return "";
+                     }
++                    static std::string find_archive(const std::vector<std::string>& paths1, const std::vector<std::string>& paths2, const std::string& name) {
++                        for(const auto* paths : { &paths1, &paths2 })
++                        {
++                            for(const auto& p : *paths)
++                            {
++                                auto lib_path = FMT(p << "/lib" << name << ".a");
++                                if( file_exists(lib_path) )
++                                    return lib_path;
++                            }
++                        }
++                        return "";
++                    }
+                     static std::string find_library(const std::vector<std::string>& paths1, const std::vector<std::string>& paths2, const std::string& name, bool is_windows) {
+                         std::string rv;
+                         for(const auto& p : paths1)
+@@ -1323,11 +1473,32 @@ namespace {
+                     }
+                 };
+ 
++                // A `staticlib` carries the members of the `static=` archives of the whole crate graph (rustc's default
++                // `+bundle`), as its consumer links just `lib<name>.a`: newsboat's makefile links libnewsboat.a, whose
++                // cxx bridge code (C++, compiled by the build scripts of libnewsboat-ffi and cxx) is in such archives.
++                // Other libraries are left to the consumer (`.libs`); executables and dylibs link them all as before.
++                auto bundle_archive = [&](const NativeLib& nl, const std::vector<std::string>& dirs1, const std::vector<std::string>& dirs2, const std::string& from)->bool {
++                    if( out_ty != CodegenOutput::StaticArchive || m_compiler == Compiler::Msvc || !nl.bundle )
++                        return false;
++                    auto path = H::find_archive(dirs1, dirs2, nl.name);
++                    if( path == "" ) {
++                        ::std::cerr << "warning: static library `" << nl.name << "` (" << from << ") not found, left to the consumer's link" << ::std::endl;
++                        return false;
++                    }
++                    for(const auto& b : bundled_archives)
++                        if( b.second == path )
++                            return true;
++                    bundled_archives.push_back(std::make_pair(nl.name, path));
++                    return true;
++                    };
++
+                 for(const auto& path : opt.library_search_dirs ) {
+                     libraries_and_dirs.push_dir(path.c_str());
+                 }
+                 for(const auto& path : opt.libraries ) {
+-                    libraries_and_dirs.push_lib(path.c_str());
++                    auto nl = NativeLib::parse(path);
++                    if( !bundle_archive(nl, opt.library_search_dirs, m_crate.m_link_paths, "-l") )
++                        libraries_and_dirs.push_lib(nl.spec);
+                 }
+                 libraries_and_dirs.push_border();
+ 
+@@ -1336,7 +1507,9 @@ namespace {
+                 }
+                 for(const auto& lib : m_crate.m_ext_libs) {
+                     ASSERT_BUG(Span(), lib.name != "", "");
+-                    libraries_and_dirs.push_lib(lib.name.c_str());
++                    auto nl = NativeLib::parse(lib.name);
++                    if( !bundle_archive(nl, m_crate.m_link_paths, opt.library_search_dirs, "this crate") )
++                        libraries_and_dirs.push_lib(nl.spec);
+                 }
+ 
+                 for( const auto& crate_name : m_crate.m_ext_crates_ordered )
+@@ -1352,18 +1525,22 @@ namespace {
+                     // - Needed for 1.39 cargo on linux when libgit2 and libz exist on the system, butsystem libgit2 isn't new enough
+                     for(const auto& lib : crate.m_data->m_ext_libs) {
+                         ASSERT_BUG(Span(), lib.name != "", "Empty lib from " << crate_name);
+-                        auto path = H::find_library(crate.m_data->m_link_paths, opt.library_search_dirs, lib.name, m_compiler == Compiler::Msvc);
++                        auto nl = NativeLib::parse(lib.name);
++                        // (the crate's own search directories, then this crate's: std's `emutls` is in the installed libdir)
++                        if( bundle_archive(nl, crate.m_data->m_link_paths, m_crate.m_link_paths, std::string("crate ") + crate_name.c_str()) )
++                            continue;
++                        auto path = H::find_library(crate.m_data->m_link_paths, opt.library_search_dirs, nl.spec, m_compiler == Compiler::Msvc);
+                         if( path != "" )
+                         {
+                             libraries_and_dirs.push_explicit(std::move(path));
+                         }
+                         else
+                         {
+-                            libraries_and_dirs.push_lib(lib.name.c_str());
++                            libraries_and_dirs.push_lib(nl.spec);
+                         }
+                     }
+                 }
+-                break;
++                break; }
+             case CodegenOutput::Object:
+             case CodegenOutput::StaticLibrary:
+                 break;
+@@ -1739,6 +1916,33 @@ namespace {
+                 {
+                     ar_args.push_back(std::string(c) + ".o");
+                 }
++                // - and the members of the bundled native archives, written out now (they are inputs, which exist already)
++                if( !bundled_archives.empty() )
++                {
++                    auto dir = m_outfile_path + ".bundle";
++#ifdef _WIN32
++                    _mkdir(dir.c_str());
++#else
++                    mkdir(dir.c_str(), 0777);
++#endif
++                    for(const auto& a : bundled_archives)
++                    {
++                        ::std::string   prefix = a.first;
++                        ::std::replace(prefix.begin(), prefix.end(), '/', '_');
++                        ::std::vector<::std::string>    members;
++                        ::std::string   error;
++                        if( !extract_archive_members(a.second, dir, prefix, members, error) )
++                        {
++                            // (e.g. a universal archive) the consumer links it, as before
++                            ::std::cerr << "warning: cannot bundle static library `" << a.first << "` (" << a.second << ") into " << m_outfile_path << ": " << error << ", left to the consumer's link" << ::std::endl;
++                            libraries_and_dirs.push_explicit(a.second);
++                            continue;
++                        }
++                        DEBUG("Bundle " << a.second << ": " << members.size() << " members");
++                        for(auto& m : members)
++                            ar_args.push_back(::std::move(m));
++                    }
++                }
+                 commands.push_back( make_command(ar_args, 0, "") );
+ 
+                 // An archive can't carry link flags: record the native libraries (and dylib crates) a consumer has to
+
+diff --git a/tools/minicargo/build.cpp b/tools/minicargo/build.cpp
+index 989dd0bc..48194c0d 100644
+--- a/tools/minicargo/build.cpp
++++ b/tools/minicargo/build.cpp
+@@ -1243,6 +1243,14 @@ RunnableJob Job_BuildTarget::start()
+         if(!strcmp(lib.first, "framework")) {
+             args.push_back("-l"); args.push_back(format("framework=",lib.second.c_str()));
+         }
++        // An explicit `static` keeps its kind: a `staticlib` carries such archives (cxx's and cxx-build's C++ halves
++        // in newsboat's libnewsboat.a); other link outputs link it like any other library
++        else if(!strcmp(lib.first, "static")) {
++            args.push_back("-l"); args.push_back(format("static=",lib.second.c_str()));
++        }
++        else if(!strcmp(lib.first, "static-nobundle")) {
++            args.push_back("-l"); args.push_back(format("static:-bundle=",lib.second.c_str()));
++        }
+         else {
+             args.push_back("-l"); args.push_back(lib.second.c_str());
+         }
+diff --git a/tools/minicargo/manifest.cpp b/tools/minicargo/manifest.cpp
+index e0182168..3f255b78 100644
+--- a/tools/minicargo/manifest.cpp
++++ b/tools/minicargo/manifest.cpp
+@@ -1607,10 +1607,10 @@ void PackageManifest::load_build_script(const ::std::string& path)
+             }
+             // cargo:rustc-link-lib=mysql
+             else if( key == "rustc-link-lib" ) {
+-                // Check for an = (otherwise default to dynamic)
++                // `[KIND[:MODIFIERS]=]NAME`: no kind = rustc's unspecified (linked however the linker finds it)
+                 ::std::string   value_str = value;
+                 auto pos = value_str.find_first_of('=');
+-                const char* type = "static";
++                const char* type = "";
+                 ::std::string   name;
+                 if(pos == ::std::string::npos) {
+                     name = ::std::move(value_str);
+@@ -1618,8 +1618,15 @@ void PackageManifest::load_build_script(const ::std::string& path)
+                 else {
+                     name = value_str.substr(pos+1);
+                     auto ty_str = value_str.substr(0, pos);
++                    ::std::string   modifiers;
++                    auto colon = ty_str.find(':');
++                    if( colon != ::std::string::npos ) {
++                        modifiers = ty_str.substr(colon+1);
++                        ty_str = ty_str.substr(0, colon);
++                    }
+                     if( ty_str == "static" ) {
+-                        type = "static";
++                        // A `staticlib` carries the archive (rustc's default `+bundle`), see mrustc's `-l static=`
++                        type = modifiers.find("-bundle") == ::std::string::npos ? "static" : "static-nobundle";
+                     }
+                     else if( ty_str == "dylib" ) {
+                         type = "dynamic";

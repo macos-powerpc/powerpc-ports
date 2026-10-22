@@ -1,0 +1,114 @@
+From 5d6ced7e0c8f4b9152f89f302527cb75f29c4c3b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 18:45:51 +0000
+Subject: [PATCH] hir: an erased type's origin path compares with ivars
+ resolved when matching generics
+
+tsrs 0.18.0 (crates/tsrs_checker/src/basedmap.rs:55):
+
+    self.base.into_iter().flat_map(PackedMap::values).chain(self.own.values())
+
+    error:0: No applicable methods for {FlatMap<IntoIter<&PackedMap<K,V>>,
+    impl Iterator+'_ /*fn <PackedMap<K,V>>::values#0*/, fn{PackedMap::values}>}.chain
+
+`PackedMap::values(&self) -> impl Iterator<Item = V> + '_` is passed as
+a fn item whose path params are still ivars (`fn{<PackedMap<_5,_6>>::values}`)
+until the `F: FnMut(I::Item) -> U` bound of `impl Iterator for FlatMap<I, U, F>`
+fixes them. Checking that bound, the fn item's `Output` is its return type
+decayed: the erased type with origin `<PackedMap<_5,_6>>::values`. It is
+compared against `U`, the same erased type after expansion, with origin
+`<PackedMap<K,V>>::values`. MatchGenerics::cmp_type's ErasedType arm was
+a strict `m_inner` equality (`ord` on the origin paths, ivars unresolved),
+so the two were Unequal, the impl failed and `chain` was not found. The
+`compare_with_placeholders` arm already compared the origins as paths.
+A closure (`|m| m.values()`) holds one erased type in its return ivar,
+and a non-generic map has no params in the origin, so neither showed it.
+
+Three changes:
+- hir/type.cpp cmp_type, ErasedType: compare the inner data like
+  `compare_with_placeholders` does (Fcn: index + `cmp_path` on the origins,
+  Known: `cmp_type`, Alias: same inner + params through the callback).
+- hir_typeck/helpers.cpp ftic_check_params' Matcher::match_ty: resolve
+  a bound ivar before judging it, so the bound's `K` against the impl side's
+  `_5` with `_5 := K` is Equal instead of the fuzzy match an unresolved
+  ivar gets (the origin path keeps the fn item's path ivars).
+- hir/type.cpp cmp_type, Generic/Generic (reached when the template side
+  is an ivar bound to a generic of the enclosing item, e.g. the erased
+  type's `Item = _12` with `_12 := V`): equal only to the same generic,
+  fuzzy against a placeholder. It was `throw ""`: a generic free fn item
+  with the same return type (`flat_map(pm_values)`) terminated there.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/type.cpp b/src/hir/type.cpp
+index 389cfb82..629f1ff7 100644
+--- a/src/hir/type.cpp
++++ b/src/hir/type.cpp
+@@ -996,7 +996,16 @@ const HIR::GenericParams* HIR::TrackHrbStack::hrb_declaring_lifetime(unsigned id
+             }
+         }
+         }
+-    TU_ARMA(Generic, te, xe) throw "";
++    TU_ARMA(Generic, te, xe) {
++        // A generic written in `ty_l` went to `match_ty` above. Here `ty_l` is an ivar bound to a generic of the
++        // enclosing item (the erased type's `Item = _12` with `_12 := V`, checking `FlatMap<_, impl Iterator, fn{pm_values}>:
++        // Iterator` inside `fn values<K, V>`): a concrete type, equal only to the same generic. Was `throw ""` (terminate).
++        if( te == xe )
++            return Compare::Equal;
++        if( xe.is_placeholder() )
++            return Compare::Fuzzy;
++        return Compare::Unequal;
++        }
+     TU_ARMA(Primitive, te, xe) {
+         return (te == xe ? Compare::Equal : Compare::Unequal);
+         }
+@@ -1058,8 +1067,29 @@ const HIR::GenericParams* HIR::TrackHrbStack::hrb_declaring_lifetime(unsigned id
+         return cmp;
+         }
+     TU_ARMA(ErasedType, te, xe) {
+-        if( te.m_inner != xe.m_inner )
++        // One erased type, its origin written two ways: the fn item's path with its own ivars (`fn{<PackedMap<_5,_6>>
++        // ::values}` decayed for `FnMut::Output`) against what those ivars resolved to (the `U` of `FlatMap<I, U, F>`
++        // after expansion). A strict `m_inner` comparison called them Unequal, so `FlatMap<_, impl Iterator + '_,
++        // fn{PackedMap::values}>: Iterator` failed its `Output = U` bound: tsrs 0.18.0 tsrs_checker basedmap.rs:55
++        // `self.base.into_iter().flat_map(PackedMap::values).chain(..)`, "No applicable methods for {FlatMap<..>}.chain".
++        // Compare the inner data as `compare_with_placeholders` does, with the generic callback.
++        if( te.m_inner.tag() != xe.m_inner.tag() )
+             return Compare::Unequal;
++        TU_MATCH_HDRA( (te.m_inner, xe.m_inner), {)
++        TU_ARMA(Fcn, l, r) {
++            if( l.m_index != r.m_index )
++                return Compare::Unequal;
++            return this->cmp_path(sp, l.m_origin, r.m_origin, resolve_placeholder);
++            }
++        TU_ARMA(Known, l, r) {
++            return this->cmp_type(sp, l, r, resolve_placeholder);
++            }
++        TU_ARMA(Alias, l, r) {
++            if( l.inner.get() != r.inner.get() )
++                return Compare::Unequal;
++            return match_generics_pp(sp, l.params, r.params, resolve_placeholder, *this);
++            }
++        }
+         return Compare::Equal;
+         }
+     TU_ARMA(Array, te, xe) {
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 680f3aa7..d1b1a8b5 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -3915,8 +3915,12 @@ namespace {
+         {
+         }
+ 
+-        ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty, ::HIR::t_cb_resolve_type resolve_cb) override
++        ::HIR::Compare match_ty(const ::HIR::GenericRef& g, const ::HIR::TypeRef& ty_in, ::HIR::t_cb_resolve_type resolve_cb) override
+         {
++            // A bound ivar stands for its type: the bound's `K` against the impl side's `_5` with `_5 := K` is Equal,
++            // not the fuzzy match an unresolved ivar gets below (the origin path of an erased return type keeps the fn
++            // item's path ivars, see MatchGenerics::cmp_type's ErasedType arm)
++            const auto& ty = ty_in.data().is_Infer() ? resolve_cb.get_type(sp, ty_in) : ty_in;
+             if( const auto* e = ty.data().opt_Generic() )
+             {
+                 // Only placeholders are told apart by name, a real generic is identified by its binding alone (the

@@ -1,0 +1,73 @@
+From 17e4f449ea86036302477ceec3ae038b6b5c0e3d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 21:56:09 +0000
+Subject: [PATCH] trans/hir_expand: vtable static types list the associated
+ types at their slots, not in hash order
+
+http-body 0.4.6 (feedr 0.8.0, under hyper 0.14), C compile of libhttp_body-0_4_6.rlib.c:
+    error: unknown type name 't_ZRTF2G2cE9core0_0_03pin3Pin1g..Poll1gG2c_A6result6Result2g..Option$7281c91f';
+           did you mean '..$9341f1bd'?
+in `struct Body#vtable<Bytes, Infallible>`, whose `poll_trailers`/`poll_data` fields read `Error = Bytes` and
+`Data = Infallible`. The default methods `boxed()`/`boxed_unsync()` of the non-generic `impl Body for String`
+(Data = Bytes, Error = Infallible) unsize `String` to `dyn Body<..>`, so the rlib makes `<String as Body>::vtable#`.
+
+hir_expand/vtable.cpp hands out the vtable struct's associated-type slots while iterating `Trait::m_types` and records
+them in `m_type_indexes`; both are unordered maps, and their iteration orders differ (here Error = 0, Data = 1 vs
+Data, Error). trans/auto_impls.cpp built the vtable static's type by pushing the associated types in `m_type_indexes`
+order, i.e. swapped, and added that struct type after enumeration, so its fields' fn-pointer typedefs were never
+emitted (the enumerated, correct instantiation `Body#vtable<Infallible, Bytes>` was emitted too). The layouts agree
+(every field is a function pointer), which is why this only ever surfaced as a C compile error, and only when the
+swapped types' typedefs happened to be missing. hir_expand/vtable.cpp built the trait's own `vtable#` item type the
+same way (latent: that type only reaches MIR-level typing, where any vtable pointer is alike).
+
+Both now place each associated type at `m_type_indexes[name]` (as enumerate.cpp and Trait::get_vtable_type did).
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/hir_expand/vtable.cpp b/src/hir_expand/vtable.cpp
+index 3702548f..732402b2 100644
+--- a/src/hir_expand/vtable.cpp
++++ b/src/hir_expand/vtable.cpp
+@@ -444,13 +444,20 @@ namespace {
+                     params.m_types.push_back( ::HIR::TypeRef(tp.m_name, i) );
+                     i ++;
+                 }
++                // Each associated type goes to its own slot: `m_type_indexes` is an unordered map, its iteration order is
++                // not the order the slots were handed out in (that of `m_types`). Pushing in map order swapped `Data` and
++                // `Error` in the type of http-body 0.4.6's `<String as Body>::vtable#` (`Body#vtable<Bytes, Infallible>`
++                // with the fields of `<Infallible, Bytes>`): same layout, but the C fn-pointer typedefs of the swapped
++                // field types were never emitted -> "unknown type name" in libhttp_body-0_4_6.rlib.c (feedr 0.8.0)
++                params.m_types.resize( params.m_types.size() + tr.m_type_indexes.size() );
+                 for(const auto& ty : tr.m_type_indexes) {
+                     DEBUG("ATY " << ty.first << " : " << ty.second);
++                    ASSERT_BUG(sp, ty.second < params.m_types.size(), "ATY index " << ty.second << " of " << ty.first << " out of range");
+                     auto ty_def = tr.get_aty_def(ty.first);
+                     ASSERT_BUG(sp, ty_def.first, "Unable to find ATY defintiion");
+                     auto aty_params = ty_def.first->m_generics.make_nop_params(1);
+                     ::HIR::Path path( ::HIR::TypeRef::new_self(), trait_path.clone(), ty.first, std::move(aty_params) );
+-                    params.m_types.push_back( ::HIR::TypeRef::new_path( mv$(path), {} ) );
++                    params.m_types[ty.second] = ::HIR::TypeRef::new_path( mv$(path), {} );
+                 }
+             }
+             ASSERT_BUG(sp,
+diff --git a/src/trans/auto_impls.cpp b/src/trans/auto_impls.cpp
+index 703aae02..3dc123bb 100644
+--- a/src/trans/auto_impls.cpp
++++ b/src/trans/auto_impls.cpp
+@@ -869,10 +869,14 @@ void Trans_AutoImpls(::HIR::Crate& crate, TransList& trans_list)
+             const auto& vtable_sp = trait.m_vtable_path;
+             ASSERT_BUG(sp, vtable_sp != HIR::SimplePath(), "Trait " << trait_path.m_path << " doesn't have a vtable");
+             auto vtable_params = trait_path.m_params.clone();
++            // Each associated type at its slot (`m_type_indexes` is unordered: pushing in map order swapped http-body
++            // 0.4.6's `Data`/`Error`, see hir_expand/vtable.cpp)
++            vtable_params.m_types.resize( vtable_params.m_types.size() + trait.m_type_indexes.size() );
+             for(const auto& ty : trait.m_type_indexes) {
++                ASSERT_BUG(sp, ty.second < vtable_params.m_types.size(), "ATY index " << ty.second << " of " << ty.first << " out of range");
+                 auto aty = ::HIR::TypeRef::new_path( ::HIR::Path( type.clone(), trait_path.clone(), ty.first ), {} );
+                 state.resolve.expand_associated_types(sp, aty);
+-                vtable_params.m_types.push_back( mv$(aty) );
++                vtable_params.m_types[ty.second] = mv$(aty);
+             }
+             const auto& vtable_ref = crate.get_struct_by_path(sp, vtable_sp);
+             auto vtable_ty = ::HIR::TypeRef::new_path( ::HIR::GenericPath(mv$(vtable_sp), mv$(vtable_params)), &vtable_ref );
