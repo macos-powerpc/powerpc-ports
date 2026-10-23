@@ -125,10 +125,6 @@ foreach ver ${gcc_versions} {
         set cdb(gcc$ver_nodot,depends)  port:gcc-devel
         set cdb(gcc$ver_nodot,dependsl) "port:libgcc-devel"
         set cdb(gcc$ver_nodot,dependsa) gcc-devel
-    } elseif { $ver eq "powerpc" } {
-        set cdb(gcc$ver_nodot,depends)  port:gcc-powerpc
-        set cdb(gcc$ver_nodot,dependsl) "port:libgcc-powerpc"
-        set cdb(gcc$ver_nodot,dependsa) gcc-powerpc
     } else {
         set cdb(gcc$ver_nodot,depends)  port:gcc$ver_nodot
         if {[vercmp ${ver} < 4.6]} {
