@@ -1,0 +1,958 @@
+diff --git a/gcc/config/rs6000/darwin.h b/gcc/config/rs6000/darwin.h
+--- gcc/config/rs6000/darwin.h
++++ gcc/config/rs6000/darwin.h
+@@ -381,6 +381,16 @@
+ #undef  TARGET_IEEEQUAD_DEFAULT
+ #define TARGET_IEEEQUAD_DEFAULT 0
+ 
++/* Darwin PowerPC has no VSX hardware, but with -mfloat128 we still provide
++   IEEE 128-bit floating point as a separate __float128 / _Float128 type
++   (long double remains IBM double-double).  The value is kept in Altivec
++   registers, passed in v2..v13 and returned in v2 exactly like the existing
++   16-byte vector types in the Darwin ABI, and all operations are implemented
++   by the soft-fp routines in libgcc.  This is off unless -mfloat128 is given,
++   and requires -maltivec (the default for -m64 and for 10.5+ deployment).  */
++#undef  TARGET_FLOAT128_VMX_ABI
++#define TARGET_FLOAT128_VMX_ABI 1
++
+ /* Since Darwin doesn't do TOCs, stub this out.  */
+ 
+ #define ASM_OUTPUT_SPECIAL_POOL_ENTRY_P(X, MODE)  ((void)X, (void)MODE, 0)
+diff --git a/gcc/config/rs6000/rs6000.cc b/gcc/config/rs6000/rs6000.cc
+--- gcc/config/rs6000/rs6000.cc
++++ gcc/config/rs6000/rs6000.cc
+@@ -2619,6 +2619,8 @@
+ 
+   fprintf (stderr, DEBUG_FMT_D, "Enable float128 on VSX",
+ 	   (int)TARGET_FLOAT128_ENABLE_TYPE);
++  fprintf (stderr, DEBUG_FMT_D, "Allow float128 on Altivec w/o VSX",
++	   (int)TARGET_FLOAT128_VMX_ABI);
+ 
+   if (TARGET_VSX)
+     fprintf (stderr, DEBUG_FMT_D, "VSX easy 64-bit scalar element",
+@@ -2899,15 +2901,24 @@
+     }
+ 
+   /* KF mode (IEEE 128-bit in VSX registers).  We do not have arithmetic, so
+-     only set the memory modes.  Include TFmode if -mabi=ieeelongdouble.  */
++     only set the memory modes.  Include TFmode if -mabi=ieeelongdouble.
++
++     On targets with TARGET_FLOAT128_VMX_ABI (Darwin), -mfloat128 is allowed
++     with Altivec but without VSX.  KFmode then lives in the Altivec registers
++     and is moved with lvx/stvx/vor via the *altivec_mov<mode> pattern, so mark
++     it as an Altivec memory mode.  Everything else (arithmetic, compares and
++     conversions) is done by libgcc.  */
+   if (TARGET_FLOAT128_TYPE)
+     {
+-      rs6000_vector_mem[KFmode] = VECTOR_VSX;
++      enum rs6000_vector vmem = TARGET_VSX ? VECTOR_VSX : VECTOR_ALTIVEC;
++      gcc_assert (TARGET_VSX || TARGET_ALTIVEC);
++
++      rs6000_vector_mem[KFmode] = vmem;
+       rs6000_vector_align[KFmode] = 128;
+ 
+       if (FLOAT128_IEEE_P (TFmode))
+ 	{
+-	  rs6000_vector_mem[TFmode] = VECTOR_VSX;
++	  rs6000_vector_mem[TFmode] = vmem;
+ 	  rs6000_vector_align[TFmode] = 128;
+ 	}
+     }
+@@ -4226,10 +4237,18 @@
+      the keyword as well as the type.  */
+   TARGET_FLOAT128_TYPE = TARGET_FLOAT128_ENABLE_TYPE && TARGET_VSX;
+ 
+-  /* IEEE 128-bit floating point requires VSX support.  */
++  /* IEEE 128-bit floating point requires VSX support.  Targets that set
++     TARGET_FLOAT128_VMX_ABI (Darwin) also accept -mfloat128 with just the
++     Altivec instruction set; since the subtarget override below may still
++     turn Altivec on by default (Darwin does so for -m64 and for 10.5 and later
++     deployment targets), that configuration is provisionally accepted here and
++     validated after SUBTARGET_OVERRIDE_OPTIONS has run.  */
+   if (TARGET_FLOAT128_KEYWORD)
+     {
+-      if (!TARGET_VSX)
++      if (!TARGET_VSX && TARGET_FLOAT128_VMX_ABI)
++	TARGET_FLOAT128_TYPE = 1;
++
++      else if (!TARGET_VSX)
+ 	{
+ 	  if ((rs6000_isa_flags_explicit & OPTION_MASK_FLOAT128_KEYWORD) != 0)
+ 	    error ("%qs requires VSX support", "-mfloat128");
+@@ -4419,6 +4438,22 @@
+   SUB3TARGET_OVERRIDE_OPTIONS;
+ #endif
+ 
++  /* Now that the subtarget has had its say about Altivec, finish validating
++     the Altivec-only IEEE 128-bit configuration (TARGET_FLOAT128_VMX_ABI,
++     provisionally accepted above): __float128 lives in Altivec registers and
++     is moved with Altivec instructions, so without Altivec it cannot be
++     supported at all.  */
++  if (TARGET_FLOAT128_VMX_ABI && TARGET_FLOAT128_TYPE && !TARGET_VSX
++      && !TARGET_ALTIVEC)
++    {
++      if ((rs6000_isa_flags_explicit & OPTION_MASK_FLOAT128_KEYWORD) != 0)
++	error ("%qs requires %qs", "-mfloat128", "-maltivec");
++
++      TARGET_FLOAT128_TYPE = 0;
++      rs6000_isa_flags &= ~(OPTION_MASK_FLOAT128_KEYWORD
++			    | OPTION_MASK_FLOAT128_HW);
++    }
++
+   /* If the ABI has support for PC-relative relocations, enable it by default.
+      This test depends on the sub-target tests above setting the code model to
+      medium for ELF v2 systems.  */
+diff --git a/gcc/config/rs6000/rs6000.h b/gcc/config/rs6000/rs6000.h
+--- gcc/config/rs6000/rs6000.h
++++ gcc/config/rs6000/rs6000.h
+@@ -260,6 +260,19 @@
+ #define TARGET_FLOAT128_ENABLE_TYPE 0
+ #endif
+ 
++/* Nonzero if the target allows -mfloat128 (IEEE 128-bit floating point,
++   KFmode) when the Altivec (VMX) instruction set is available but VSX is not.
++   In that configuration a __float128 value lives in an Altivec register, is
++   passed and returned in VRs like any other 16-byte vector type (v2..v13 for
++   arguments, v2 for the return value), only lvx/stvx/vor/vxor/vandc/vsel are
++   used to move it around, and all arithmetic, comparisons and conversions go
++   through the libgcc soft-fp routines (__addkf3 etc.).  Darwin sets this; the
++   default is off, so nothing changes for the other PowerPC targets which still
++   require VSX for -mfloat128.  */
++#ifndef TARGET_FLOAT128_VMX_ABI
++#define TARGET_FLOAT128_VMX_ABI 0
++#endif
++
+ /* Return 1 for a symbol ref for a thread-local storage symbol.  */
+ #define RS6000_SYMBOL_REF_TLS_P(RTX) \
+   (SYMBOL_REF_P (RTX) && SYMBOL_REF_TLS_MODEL (RTX) != 0)
+@@ -347,6 +360,13 @@
+ #define SCALAR_FLOAT_MODE_NOT_VECTOR_P(MODE)				\
+   (SCALAR_FLOAT_MODE_P (MODE) && !FLOAT128_VECTOR_P (MODE))
+ 
++/* True if IEEE 128-bit floating point mode MODE is kept in vector registers,
++   but only the Altivec instruction set is available to operate on it (see
++   TARGET_FLOAT128_VMX_ABI).  This is never true unless the target opted in,
++   since otherwise TARGET_FLOAT128_TYPE implies TARGET_VSX.  */
++#define FLOAT128_ALTIVEC_ONLY_P(MODE)					\
++  (FLOAT128_VECTOR_P (MODE) && !TARGET_VSX)
++
+ /* Describe the vector unit used for arithmetic operations.  */
+ extern enum rs6000_vector rs6000_vector_unit[];
+ 
+diff --git a/gcc/config/rs6000/rs6000.md b/gcc/config/rs6000/rs6000.md
+--- gcc/config/rs6000/rs6000.md
++++ gcc/config/rs6000/rs6000.md
+@@ -9196,9 +9196,12 @@
+     {
+       if (TARGET_FLOAT128_HW)
+ 	emit_insn (gen_neg2_hw (<MODE>mode, operands[0], operands[1]));
+-      else if (TARGET_FLOAT128_TYPE)
++      else if (TARGET_FLOAT128_TYPE && TARGET_VSX)
+ 	emit_insn (gen_ieee_128bit_vsx_neg2 (<MODE>mode,
+ 					     operands[0], operands[1]));
++      else if (FLOAT128_ALTIVEC_ONLY_P (<MODE>mode))
++	emit_insn (gen_ieee_128bit_vmx_neg2 (<MODE>mode,
++					     operands[0], operands[1]));
+       else
+ 	{
+ 	  rtx libfunc = optab_libfunc (neg_optab, <MODE>mode);
+@@ -9241,12 +9244,18 @@
+ 	  emit_insn (gen_abs2_hw (<MODE>mode, operands[0], operands[1]));
+ 	  DONE;
+ 	}
+-      else if (TARGET_FLOAT128_TYPE)
++      else if (TARGET_FLOAT128_TYPE && TARGET_VSX)
+ 	{
+ 	  emit_insn (gen_ieee_128bit_vsx_abs2 (<MODE>mode,
+ 					       operands[0], operands[1]));
+ 	  DONE;
+ 	}
++      else if (FLOAT128_ALTIVEC_ONLY_P (<MODE>mode))
++	{
++	  emit_insn (gen_ieee_128bit_vmx_abs2 (<MODE>mode,
++					       operands[0], operands[1]));
++	  DONE;
++	}
+       else
+ 	FAIL;
+     }
+@@ -9310,7 +9319,7 @@
+   [(set (match_operand:IEEE128 0 "register_operand" "=wa")
+ 	(neg:IEEE128 (match_operand:IEEE128 1 "register_operand" "wa")))
+    (clobber (match_scratch:V16QI 2 "=v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "#"
+   "&& 1"
+   [(parallel [(set (match_dup 0)
+@@ -9329,7 +9338,7 @@
+   [(set (match_operand:IEEE128 0 "register_operand" "=wa")
+ 	(neg:IEEE128 (match_operand:IEEE128 1 "register_operand" "wa")))
+    (use (match_operand:V16QI 2 "register_operand" "v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "xxlxor %x0,%x1,%x2"
+   [(set_attr "type" "veclogical")])
+ 
+@@ -9338,7 +9347,7 @@
+   [(set (match_operand:IEEE128 0 "register_operand" "=wa")
+ 	(abs:IEEE128 (match_operand:IEEE128 1 "register_operand" "wa")))
+    (clobber (match_scratch:V16QI 2 "=v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "#"
+   "&& 1"
+   [(parallel [(set (match_dup 0)
+@@ -9357,7 +9366,7 @@
+   [(set (match_operand:IEEE128 0 "register_operand" "=wa")
+ 	(abs:IEEE128 (match_operand:IEEE128 1 "register_operand" "wa")))
+    (use (match_operand:V16QI 2 "register_operand" "v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "xxlandc %x0,%x1,%x2"
+   [(set_attr "type" "veclogical")])
+ 
+@@ -9368,7 +9377,7 @@
+ 	 (abs:IEEE128
+ 	  (match_operand:IEEE128 1 "register_operand" "wa"))))
+    (clobber (match_scratch:V16QI 2 "=v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "#"
+   "&& 1"
+   [(parallel [(set (match_dup 0)
+@@ -9389,10 +9398,103 @@
+ 	 (abs:IEEE128
+ 	  (match_operand:IEEE128 1 "register_operand" "wa"))))
+    (use (match_operand:V16QI 2 "register_operand" "v"))]
+-  "TARGET_FLOAT128_TYPE && !TARGET_FLOAT128_HW"
++  "TARGET_FLOAT128_TYPE && TARGET_VSX && !TARGET_FLOAT128_HW"
+   "xxlor %x0,%x1,%x2"
+   [(set_attr "type" "veclogical")])
+ 
++;; IEEE 128-bit negate, absolute value and negative absolute value using only
++;; Altivec (VMX) instructions.  These are used on targets where __float128 is
++;; kept in Altivec registers without VSX (TARGET_FLOAT128_VMX_ABI, Darwin).
++;; They mirror the VSX versions above: the first insn of each pair has a
++;; match_scratch so that the generic neg/abs RTL is recognized, and the split
++;; materializes the -0.0 sign-bit mask (loaded from the constant pool, which
++;; later GCSE passes can share between uses).
++
++(define_insn_and_split "@ieee_128bit_vmx_neg<mode>2"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(neg:IEEE128 (match_operand:IEEE128 1 "altivec_register_operand" "v")))
++   (clobber (match_scratch:V16QI 2 "=v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "#"
++  "&& 1"
++  [(parallel [(set (match_dup 0)
++		   (neg:IEEE128 (match_dup 1)))
++	      (use (match_dup 2))])]
++{
++  if (GET_CODE (operands[2]) == SCRATCH)
++    operands[2] = gen_reg_rtx (V16QImode);
++
++  emit_insn (gen_ieee_128bit_negative_zero (operands[2]));
++}
++  [(set_attr "length" "8")
++   (set_attr "type" "vecsimple")])
++
++(define_insn "*ieee_128bit_vmx_neg<mode>2_internal"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(neg:IEEE128 (match_operand:IEEE128 1 "altivec_register_operand" "v")))
++   (use (match_operand:V16QI 2 "altivec_register_operand" "v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "vxor %0,%1,%2"
++  [(set_attr "type" "veclogical")])
++
++(define_insn_and_split "@ieee_128bit_vmx_abs<mode>2"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(abs:IEEE128 (match_operand:IEEE128 1 "altivec_register_operand" "v")))
++   (clobber (match_scratch:V16QI 2 "=v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "#"
++  "&& 1"
++  [(parallel [(set (match_dup 0)
++		   (abs:IEEE128 (match_dup 1)))
++	      (use (match_dup 2))])]
++{
++  if (GET_CODE (operands[2]) == SCRATCH)
++    operands[2] = gen_reg_rtx (V16QImode);
++
++  emit_insn (gen_ieee_128bit_negative_zero (operands[2]));
++}
++  [(set_attr "length" "8")
++   (set_attr "type" "vecsimple")])
++
++(define_insn "*ieee_128bit_vmx_abs<mode>2_internal"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(abs:IEEE128 (match_operand:IEEE128 1 "altivec_register_operand" "v")))
++   (use (match_operand:V16QI 2 "altivec_register_operand" "v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "vandc %0,%1,%2"
++  [(set_attr "type" "veclogical")])
++
++(define_insn_and_split "*ieee_128bit_vmx_nabs<mode>2"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(neg:IEEE128
++	 (abs:IEEE128
++	  (match_operand:IEEE128 1 "altivec_register_operand" "v"))))
++   (clobber (match_scratch:V16QI 2 "=v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "#"
++  "&& 1"
++  [(parallel [(set (match_dup 0)
++		   (neg:IEEE128 (abs:IEEE128 (match_dup 1))))
++	      (use (match_dup 2))])]
++{
++  if (GET_CODE (operands[2]) == SCRATCH)
++    operands[2] = gen_reg_rtx (V16QImode);
++
++  emit_insn (gen_ieee_128bit_negative_zero (operands[2]));
++}
++  [(set_attr "length" "8")
++   (set_attr "type" "vecsimple")])
++
++(define_insn "*ieee_128bit_vmx_nabs<mode>2_internal"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(neg:IEEE128
++	 (abs:IEEE128
++	  (match_operand:IEEE128 1 "altivec_register_operand" "v"))))
++   (use (match_operand:V16QI 2 "altivec_register_operand" "v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "vor %0,%1,%2"
++  [(set_attr "type" "veclogical")])
++
+ ; Float128 conversion functions.
+ ; If the conversion happens between IBM double double and
+ ; IEEE 128-bit, it expands to library function calls.
+@@ -15002,7 +15104,7 @@
+ 	(unspec:DI [(match_operand:FMOVE128_VSX 1 "register_operand" "0,wa")
+ 		    (match_operand:QI 2 "const_0_to_1_operand" "O,i")]
+ 	 UNSPEC_UNPACK_128BIT))]
+-  "VECTOR_MEM_ALTIVEC_OR_VSX_P (<MODE>mode)"
++  "VECTOR_MEM_VSX_P (<MODE>mode)"
+ {
+   if (REGNO (operands[0]) == REGNO (operands[1]) && INTVAL (operands[2]) == 0)
+     return ASM_COMMENT_START " xxpermdi to same register";
+@@ -15102,9 +15204,14 @@
+   if (TARGET_FLOAT128_HW)
+     emit_insn (gen_copysign<mode>3_hard (operands[0], operands[1],
+ 					 operands[2]));
+-  else
++  else if (TARGET_VSX)
+     emit_insn (gen_copysign<mode>3_soft (operands[0], operands[1],
+ 					 operands[2]));
++  /* copysign cannot FAIL.  Without VSX, IEEE 128-bit values only exist with
++     TARGET_FLOAT128_VMX_ABI, where FLOAT128_ALTIVEC_ONLY_P is true.  */
++  else
++    emit_insn (gen_copysign<mode>3_vmx (operands[0], operands[1],
++					operands[2]));
+   DONE;
+ })
+ 
+@@ -15124,11 +15231,46 @@
+ 	 (match_operand:IEEE128 1 "altivec_register_operand" "v")
+ 	 (match_operand:IEEE128 2 "altivec_register_operand" "v")))
+    (clobber (match_scratch:IEEE128 3 "=&v"))]
+-  "!TARGET_FLOAT128_HW"
++  "TARGET_VSX && !TARGET_FLOAT128_HW"
+    "xscpsgndp %x3,%x2,%x1\;xxpermdi %x0,%x3,%x1,1"
+   [(set_attr "type" "veccomplex")
+    (set_attr "length" "8")])
+ 
++;; copysign for IEEE 128-bit using only Altivec instructions: select the sign
++;; bit from operand 2 and everything else from operand 1 with VSEL, using the
++;; -0.0 bit pattern as the selector mask.  Used when __float128 is kept in
++;; Altivec registers without VSX (TARGET_FLOAT128_VMX_ABI, Darwin).
++(define_insn_and_split "copysign<mode>3_vmx"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(copysign:IEEE128
++	 (match_operand:IEEE128 1 "altivec_register_operand" "v")
++	 (match_operand:IEEE128 2 "altivec_register_operand" "v")))
++   (clobber (match_scratch:V16QI 3 "=v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "#"
++  "&& 1"
++  [(parallel [(set (match_dup 0)
++		   (copysign:IEEE128 (match_dup 1) (match_dup 2)))
++	      (use (match_dup 3))])]
++{
++  if (GET_CODE (operands[3]) == SCRATCH)
++    operands[3] = gen_reg_rtx (V16QImode);
++
++  emit_insn (gen_ieee_128bit_negative_zero (operands[3]));
++}
++  [(set_attr "length" "8")
++   (set_attr "type" "vecperm")])
++
++(define_insn "*copysign<mode>3_vmx_internal"
++  [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
++	(copysign:IEEE128
++	 (match_operand:IEEE128 1 "altivec_register_operand" "v")
++	 (match_operand:IEEE128 2 "altivec_register_operand" "v")))
++   (use (match_operand:V16QI 3 "altivec_register_operand" "v"))]
++  "FLOAT128_ALTIVEC_ONLY_P (<MODE>mode)"
++  "vsel %0,%1,%2,%3"
++  [(set_attr "type" "vecperm")])
++
+ (define_insn "@neg<mode>2_hw"
+   [(set (match_operand:IEEE128 0 "altivec_register_operand" "=v")
+ 	(neg:IEEE128
+diff --git a/gcc/doc/extend.texi b/gcc/doc/extend.texi
+--- gcc/doc/extend.texi
++++ gcc/doc/extend.texi
+@@ -237,7 +237,8 @@
+ @itemize @bullet
+ @item @code{__float128} is available on i386, x86_64, IA-64, LoongArch
+ and hppa HP-UX, as well as on PowerPC GNU/Linux targets that enable
+-the vector scalar (VSX) instruction set.  @code{__float128} supports
++the vector scalar (VSX) instruction set and on PowerPC Darwin targets
++that enable AltiVec and use @option{-mfloat128}.  @code{__float128} supports
+ the 128-bit floating type.  On i386, x86_64, PowerPC, LoongArch and IA-64,
+ other than HP-UX, @code{__float128} is an alias for @code{_Float128}.
+ On hppa and IA-64 HP-UX, @code{__float128} is an alias for @code{long
+@@ -264,7 +265,9 @@
+ In order to use @code{_Float128}, @code{__float128}, and @code{__ibm128}
+ on PowerPC Linux systems, you must use the @option{-mfloat128} option. It is
+ expected in future versions of GCC that @code{_Float128} and @code{__float128}
+-will be enabled automatically.
++will be enabled automatically.  On PowerPC Darwin systems @code{_Float128}
++and @code{__float128} are only available with @option{-mfloat128}, which
++also requires @option{-maltivec}; see @ref{RS/6000 and PowerPC Options}.
+ 
+ The @code{_Float128} type is supported on all systems where
+ @code{__float128} is supported or where @code{long double} has the
+diff --git a/gcc/doc/invoke.texi b/gcc/doc/invoke.texi
+--- gcc/doc/invoke.texi
++++ gcc/doc/invoke.texi
+@@ -31870,10 +31870,23 @@
+ 
+ The VSX instruction set (@option{-mvsx}) must be enabled to use the IEEE
+ 128-bit floating point support.  The IEEE 128-bit floating point is only
+-supported on Linux.
++supported on Linux and Darwin.
++
++On PowerPC Darwin (which has no VSX hardware) @option{-mfloat128} is
++accepted when the AltiVec instruction set (@option{-maltivec}) is
++enabled, and is an error otherwise.  The @code{__float128} type is
++distinct from @code{long double}, which remains the IBM double-double
++format.  A @code{__float128} value is kept in an AltiVec register, is
++passed in @code{v2}@dots{}@code{v13} and returned in @code{v2} like the
++other 16-byte vector types of the Darwin ABI, requires 16-byte
++alignment in memory, and all arithmetic, comparisons and conversions
++are performed by software routines in @file{libgcc}.  Code compiled
++with @option{-mfloat128} therefore requires an AltiVec capable processor
++(G4 or later) at run time, but only if it actually uses the type.
+ 
+ The default for @option{-mfloat128} is enabled on PowerPC Linux
+-systems using the VSX instruction set, and disabled on other systems.
++systems using the VSX instruction set, and disabled on other systems,
++including Darwin.
+ 
+ If you use the ISA 3.0 instruction set (@option{-mcpu=power9}) on a
+ 64-bit system, the IEEE 128-bit floating point support also enables
+diff --git a/gcc/testsuite/g++.target/powerpc/darwin-float128-1.C b/gcc/testsuite/g++.target/powerpc/darwin-float128-1.C
+--- gcc/testsuite/g++.target/powerpc/darwin-float128-1.C
++++ gcc/testsuite/g++.target/powerpc/darwin-float128-1.C
+@@ -0,0 +1,38 @@
++// { dg-do run { target powerpc*-*-darwin* } }
++// { dg-require-effective-target powerpc_float128_altivec_ok }
++// { dg-require-effective-target vmx_hw }
++// { dg-options "-O2 -maltivec -mfloat128 -std=gnu++17" }
++
++// Check the C++ view of the Darwin __float128 type: it is distinct from
++// long double (IBM double-double, mangled "g") and from _Float128
++// (mangled "DF128_"), and mangles like the PowerPC __ieee128 type.
++
++#include <string>
++#include <typeinfo>
++
++__float128 f (__float128 a, __float128 b) { return a + b; }
++
++template <typename T> struct is_long_double { static const bool value = false; };
++template <> struct is_long_double<long double> { static const bool value = true; };
++
++int
++main ()
++{
++  if (sizeof (__float128) != 16 || alignof (__float128) != 16)
++    __builtin_abort ();
++  if (is_long_double<__float128>::value)
++    __builtin_abort ();
++  if (typeid (long double).name () != std::string ("g"))
++    __builtin_abort ();
++  if (typeid (__float128).name () != std::string ("u9__ieee128"))
++    __builtin_abort ();
++  if (typeid (_Float128).name () != std::string ("DF128_"))
++    __builtin_abort ();
++  if (typeid (1.0Q).name () != std::string ("u9__ieee128"))
++    __builtin_abort ();
++  if (f (1.0Q, 2.0Q) != 3.0Q)
++    __builtin_abort ();
++  return 0;
++}
++
++// { dg-final { scan-assembler {__Z1fu9__ieee128u9__ieee128} } }
+diff --git a/gcc/testsuite/gcc.target/powerpc/darwin-float128-1.c b/gcc/testsuite/gcc.target/powerpc/darwin-float128-1.c
+--- gcc/testsuite/gcc.target/powerpc/darwin-float128-1.c
++++ gcc/testsuite/gcc.target/powerpc/darwin-float128-1.c
+@@ -0,0 +1,68 @@
++/* { dg-do compile { target powerpc*-*-darwin* } } */
++/* { dg-require-effective-target powerpc_float128_altivec_ok } */
++/* { dg-options "-O2 -maltivec -mfloat128" } */
++
++/* Check the Darwin __float128 ABI: IEEE 128-bit values live in Altivec
++   registers, are passed in v2.. and returned in v2, are only moved with
++   Altivec loads/stores, and all arithmetic goes through libgcc.  No VSX
++   instruction may be generated.  */
++
++#ifndef __FLOAT128__
++#error "-mfloat128 is not supported."
++#endif
++
++#if __SIZEOF_FLOAT128__ != 16
++#error "__float128 must be 16 bytes"
++#endif
++
++_Static_assert (__alignof__ (__float128) == 16,
++		"__float128 must be 16-byte aligned");
++
++/* Pick a constant that is not all zero bits so that it is loaded from the
++   constant pool with lvx.  */
++__float128 one (void) { return 10.0Q; }
++
++/* Argument passed in v2, stored with stvx.  */
++void store (__float128 a, __float128 *p) { *p = a; }
++
++/* Arithmetic is a libcall taking v2/v3 and returning v2.  */
++__float128 add (__float128 a, __float128 b) { return a + b; }
++__float128 mul (__float128 a, __float128 b) { return a * b; }
++
++/* Comparisons are libcalls too.  */
++int lt (__float128 a, __float128 b) { return a < b; }
++
++/* Sign manipulation is done inline with Altivec logical operations.  */
++__float128 neg (__float128 a) { return -a; }
++__float128 fabsq (__float128 a) { return __builtin_fabsf128 (a); }
++__float128 cpsgn (__float128 a, __float128 b)
++{
++  return __builtin_copysignf128 (a, b);
++}
++
++/* Conversions to/from the other floating point types and integers.  */
++double to_double (__float128 a) { return a; }
++__float128 from_double (double d) { return d; }
++long double to_ibm128 (__float128 a) { return a; }
++__float128 from_ibm128 (long double a) { return a; }
++int to_int (__float128 a) { return a; }
++__float128 from_int (int i) { return i; }
++
++/* { dg-final { scan-assembler {\mlvx v?2,} } } */
++/* { dg-final { scan-assembler {\mstvx v?2,} } } */
++/* { dg-final { scan-assembler {\mvxor\M} } } */
++/* { dg-final { scan-assembler {\mvandc\M} } } */
++/* { dg-final { scan-assembler {\mvsel\M} } } */
++/* { dg-final { scan-assembler {___addkf3} } } */
++/* { dg-final { scan-assembler {___mulkf3} } } */
++/* { dg-final { scan-assembler {___ltkf2|___lekf2} } } */
++/* { dg-final { scan-assembler {___trunckfdf2} } } */
++/* { dg-final { scan-assembler {___extenddfkf2} } } */
++/* { dg-final { scan-assembler {___extendkftf2} } } */
++/* { dg-final { scan-assembler {___trunctfkf2} } } */
++/* { dg-final { scan-assembler {___fixkfsi} } } */
++/* { dg-final { scan-assembler {___floatsikf} } } */
++/* { dg-final { scan-assembler-not {\mxx[a-z]+\M} } } */
++/* { dg-final { scan-assembler-not {\mxs[a-z]+\M} } } */
++/* { dg-final { scan-assembler-not {\m(p?l|st)xv[a-z0-9]*\M} } } */
++/* { dg-final { scan-assembler-not {\mm[ft]vsr[a-z]*\M} } } */
+diff --git a/gcc/testsuite/gcc.target/powerpc/darwin-float128-2.c b/gcc/testsuite/gcc.target/powerpc/darwin-float128-2.c
+--- gcc/testsuite/gcc.target/powerpc/darwin-float128-2.c
++++ gcc/testsuite/gcc.target/powerpc/darwin-float128-2.c
+@@ -0,0 +1,211 @@
++/* { dg-do run { target powerpc*-*-darwin* } } */
++/* { dg-require-effective-target powerpc_float128_altivec_ok } */
++/* { dg-require-effective-target vmx_hw } */
++/* { dg-options "-O2 -maltivec -mfloat128" } */
++
++/* Exercise the Darwin Altivec-only __float128 implementation end to end:
++   arithmetic, comparisons, sign operations, conversions, passing values
++   through calls and through memory, and complex arithmetic (all of which
++   use the libgcc soft-fp routines).  */
++
++extern void abort (void);
++
++#define N 8
++
++__attribute__ ((noipa)) __float128
++addq (__float128 a, __float128 b) { return a + b; }
++
++__attribute__ ((noipa)) __float128
++subq (__float128 a, __float128 b) { return a - b; }
++
++__attribute__ ((noipa)) __float128
++mulq (__float128 a, __float128 b) { return a * b; }
++
++__attribute__ ((noipa)) __float128
++divq (__float128 a, __float128 b) { return a / b; }
++
++__attribute__ ((noipa)) __float128
++negq (__float128 a) { return -a; }
++
++__attribute__ ((noipa)) __float128
++absq (__float128 a) { return __builtin_fabsf128 (a); }
++
++__attribute__ ((noipa)) __float128
++cpsgnq (__float128 a, __float128 b) { return __builtin_copysignf128 (a, b); }
++
++__attribute__ ((noipa)) int
++ltq (__float128 a, __float128 b) { return a < b; }
++
++__attribute__ ((noipa)) int
++eqq (__float128 a, __float128 b) { return a == b; }
++
++__attribute__ ((noipa)) int
++unordq (__float128 a, __float128 b) { return __builtin_isunordered (a, b); }
++
++/* Many arguments: the first 12 go in v2..v13, the rest in memory.  */
++__attribute__ ((noipa)) __float128
++sum14 (__float128 a1, __float128 a2, __float128 a3, __float128 a4,
++       __float128 a5, __float128 a6, __float128 a7, __float128 a8,
++       __float128 a9, __float128 a10, __float128 a11, __float128 a12,
++       __float128 a13, __float128 a14)
++{
++  return a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12
++	 + a13 + a14;
++}
++
++/* Mixed with integer and double arguments.  */
++__attribute__ ((noipa)) __float128
++mixed (int i, __float128 a, double d, __float128 b, long l)
++{
++  return a * i + b * d + l;
++}
++
++/* Varargs: unnamed __float128 arguments go through the overflow area like
++   vectors do in the Darwin ABI.  */
++__attribute__ ((noipa)) __float128
++vsum (int n, ...)
++{
++  __builtin_va_list ap;
++  __float128 s = 0;
++  __builtin_va_start (ap, n);
++  for (int i = 0; i < n; i++)
++    s += __builtin_va_arg (ap, __float128);
++  __builtin_va_end (ap);
++  return s;
++}
++
++struct S { int tag; __float128 v; double d; };
++
++__attribute__ ((noipa)) __float128
++get_v (struct S *s) { return s->v; }
++
++__attribute__ ((noipa)) void
++set_v (struct S *s, __float128 v) { s->v = v; }
++
++__attribute__ ((noipa)) _Complex _Float128
++cmul (_Complex _Float128 a, _Complex _Float128 b) { return a * b; }
++
++__attribute__ ((noipa)) double
++to_d (__float128 a) { return a; }
++
++__attribute__ ((noipa)) __float128
++from_d (double d) { return d; }
++
++__attribute__ ((noipa)) float
++to_f (__float128 a) { return a; }
++
++__attribute__ ((noipa)) __float128
++from_f (float f) { return f; }
++
++__attribute__ ((noipa)) long double
++to_ld (__float128 a) { return a; }
++
++__attribute__ ((noipa)) __float128
++from_ld (long double a) { return a; }
++
++__attribute__ ((noipa)) int
++to_i (__float128 a) { return a; }
++
++__attribute__ ((noipa)) __float128
++from_i (int i) { return i; }
++
++__attribute__ ((noipa)) unsigned long long
++to_ull (__float128 a) { return a; }
++
++__attribute__ ((noipa)) __float128
++from_ull (unsigned long long u) { return u; }
++
++int
++main (void)
++{
++  __float128 one = 1.0Q, two = 2.0Q, three = 3.0Q;
++  __float128 big = 0x1p100Q;
++  __float128 tiny = 0x1p-100Q;
++  __float128 arr[N];
++  struct S s;
++  int i;
++
++  if (addq (one, two) != three)
++    abort ();
++  if (subq (three, two) != one)
++    abort ();
++  if (mulq (two, three) != 6.0Q)
++    abort ();
++  if (divq (three, two) != 1.5Q)
++    abort ();
++
++  /* Precision beyond double: 2^100 + 2^-100 must not round to 2^100.  */
++  if (addq (big, tiny) == big)
++    abort ();
++  if (subq (addq (big, tiny), big) != tiny)
++    abort ();
++
++  if (negq (one) != -1.0Q)
++    abort ();
++  if (!__builtin_signbit (negq (0.0Q)))
++    abort ();
++  if (absq (negq (two)) != two)
++    abort ();
++  if (__builtin_signbit (absq (negq (0.0Q))))
++    abort ();
++  if (cpsgnq (two, negq (one)) != -2.0Q)
++    abort ();
++  if (cpsgnq (negq (two), one) != two)
++    abort ();
++
++  if (!ltq (one, two) || ltq (two, one) || ltq (one, one))
++    abort ();
++  if (!eqq (two, two) || eqq (one, two))
++    abort ();
++  if (unordq (one, two))
++    abort ();
++  if (!unordq (one, __builtin_nanf128 ("")))
++    abort ();
++  if (!__builtin_isinf (__builtin_inff128 ()))
++    abort ();
++  if (!__builtin_isnan (__builtin_nanf128 ("")))
++    abort ();
++
++  if (sum14 (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14) != 105.0Q)
++    abort ();
++  if (mixed (3, two, 0.5, 4.0Q, 7) != 15.0Q)
++    abort ();
++  if (vsum (3, one, two, three) != 6.0Q)
++    abort ();
++
++  for (i = 0; i < N; i++)
++    arr[i] = i * 0.5Q;
++  for (i = 0; i < N; i++)
++    if (arr[i] != from_i (i) / two)
++      abort ();
++
++  s.tag = 1;
++  s.d = 2.0;
++  set_v (&s, three);
++  if (get_v (&s) != three || s.tag != 1 || s.d != 2.0)
++    abort ();
++
++  {
++    _Complex _Float128 a, b, c;
++    __real__ a = 1.0Q;
++    __imag__ a = 2.0Q;
++    __real__ b = 3.0Q;
++    __imag__ b = 4.0Q;
++    c = cmul (a, b);
++    if (__real__ c != -5.0Q || __imag__ c != 10.0Q)
++      abort ();
++  }
++
++  if (to_d (three) != 3.0 || from_d (0.25) != 0.25Q)
++    abort ();
++  if (to_f (three) != 3.0f || from_f (0.5f) != 0.5Q)
++    abort ();
++  if (to_ld (three) != 3.0L || from_ld (0.75L) != 0.75Q)
++    abort ();
++  if (to_i (negq (three)) != -3 || from_i (-7) != -7.0Q)
++    abort ();
++  if (to_ull (0x1p40Q) != (1ULL << 40) || from_ull (1ULL << 50) != 0x1p50Q)
++    abort ();
++
++  return 0;
++}
+diff --git a/gcc/testsuite/gcc.target/powerpc/darwin-float128-3.c b/gcc/testsuite/gcc.target/powerpc/darwin-float128-3.c
+--- gcc/testsuite/gcc.target/powerpc/darwin-float128-3.c
++++ gcc/testsuite/gcc.target/powerpc/darwin-float128-3.c
+@@ -0,0 +1,8 @@
++/* { dg-do compile { target powerpc*-*-darwin* } } */
++/* { dg-options "-mfloat128 -mno-altivec" } */
++
++/* On Darwin __float128 is implemented on top of Altivec; without it the
++   option must be rejected rather than silently ignored.  */
++/* { dg-error "'-mfloat128' requires '-maltivec'" "" { target *-*-* } 0 } */
++
++int x;
+diff --git a/gcc/testsuite/gcc.target/powerpc/darwin-float128-4.c b/gcc/testsuite/gcc.target/powerpc/darwin-float128-4.c
+--- gcc/testsuite/gcc.target/powerpc/darwin-float128-4.c
++++ gcc/testsuite/gcc.target/powerpc/darwin-float128-4.c
+@@ -0,0 +1,15 @@
++/* { dg-do compile { target powerpc*-*-darwin* } } */
++/* { dg-options "-maltivec" } */
++
++/* The default is unchanged: without -mfloat128 there is no __float128 type
++   on Darwin, even when Altivec is enabled.  */
++
++#ifdef __FLOAT128__
++#error "__FLOAT128__ must not be defined by default"
++#endif
++
++#ifdef __FLOAT128_TYPE__
++#error "__FLOAT128_TYPE__ must not be defined by default"
++#endif
++
++__float128 x;	/* { dg-error "unknown type name '__float128'" } */
+diff --git a/gcc/testsuite/lib/target-supports.exp b/gcc/testsuite/lib/target-supports.exp
+--- gcc/testsuite/lib/target-supports.exp
++++ gcc/testsuite/lib/target-supports.exp
+@@ -8150,7 +8150,8 @@
+ proc check_effective_target_powerpc_float128_sw_ok { } {
+     if { [istarget powerpc*-*-*]
+ 	 || [istarget rs6000-*-*] } {
+-	# Darwin doesn't have VSX, so no soft support for float128.
++	# Darwin doesn't have VSX, so no VSX soft support for float128; see
++	# powerpc_float128_altivec_ok for the Altivec-only configuration.
+ 	if { [istarget *-*-darwin*] } {
+ 	    return 0
+ 	}
+@@ -8165,6 +8166,25 @@
+     } else {
+ 	return 0
+     }
++}
++
++# Return 1 if this is a PowerPC target supporting -mfloat128 with only the
++# Altivec instruction set (no VSX), i.e. the Darwin __float128 configuration
++# where the value lives in Altivec registers and all arithmetic is in libgcc.
++
++proc check_effective_target_powerpc_float128_altivec_ok { } {
++    if { [istarget powerpc*-*-darwin*] } {
++	return [check_no_compiler_messages powerpc_float128_altivec_ok object {
++		volatile __float128 x = 1.0q;
++		volatile __float128 y = 2.0q;
++		int main() {
++		    __float128 z = x + y;
++		    return (z == 3.0q);
++		}
++	    } "-mfloat128 -maltivec"]
++    } else {
++	return 0
++    }
+ }
+ 
+ # Return 1 if this is a PowerPC target supporting -mfloat128 via hardware
+diff --git a/libgcc/config/rs6000/quad-float128.h b/libgcc/config/rs6000/quad-float128.h
+--- libgcc/config/rs6000/quad-float128.h
++++ libgcc/config/rs6000/quad-float128.h
+@@ -60,8 +60,15 @@
+ #define TCtype _Complex _Float128
+ #endif
+ 
+-/* Force the use of the VSX instruction set.  */
+-#if defined(_ARCH_PPC) && (!defined(__VSX__) || !defined(__FLOAT128__))
++/* Force the use of the VSX instruction set, except on Darwin where __float128
++   is kept in Altivec registers without VSX (see TARGET_FLOAT128_VMX_ABI in
++   gcc/config/rs6000/darwin.h) and t-darwin builds these files with
++   -maltivec -mfloat128 explicitly.  */
++#if defined(__APPLE__)
++# if !defined(__ALTIVEC__) || !defined(__FLOAT128__)
++#  error "quad-float128.h must be compiled with -maltivec -mfloat128 on Darwin"
++# endif
++#elif defined(_ARCH_PPC) && (!defined(__VSX__) || !defined(__FLOAT128__))
+ #pragma GCC target ("vsx,float128")
+ #endif
+ 
+diff --git a/libgcc/config/rs6000/sfp-machine.h b/libgcc/config/rs6000/sfp-machine.h
+--- libgcc/config/rs6000/sfp-machine.h
++++ libgcc/config/rs6000/sfp-machine.h
+@@ -158,6 +158,16 @@
+ #endif	/* !__FLOAT128__ */
+ 
+ /* Define ALIASNAME as a strong alias for NAME.  */
++#if defined (__APPLE__)
++/* Mach-O does not support symbol aliases, so build a secondary function
++   instead.  The only uses of strong_alias in soft-fp are for the comparison
++   routines (__nekf2 -> __eqkf2, __gtkf2 -> __gekf2, __ltkf2 -> __lekf2), which
++   all take two IEEE 128-bit arguments and return CMPtype; TFtype is the
++   IEEE 128-bit type set up by quad-float128.h before quad.h is included.  */
++# define strong_alias(name, aliasname) \
++  CMPtype aliasname (TFtype a, TFtype b) { return name (a, b); }
++#else
+ # define strong_alias(name, aliasname) _strong_alias(name, aliasname)
+ # define _strong_alias(name, aliasname) \
+   extern __typeof (name) aliasname __attribute__ ((alias (#name)));
++#endif
+diff --git a/libgcc/config/rs6000/t-darwin b/libgcc/config/rs6000/t-darwin
+--- libgcc/config/rs6000/t-darwin
++++ libgcc/config/rs6000/t-darwin
+@@ -56,3 +56,13 @@
+ unwind-dw2.o: HOST_LIBGCC2_CFLAGS += -maltivec
+ 
+ LIB2ADDEH += $(srcdir)/config/rs6000/darwin-fallback.c
++
++# The IEEE 128-bit (__float128) emulation from t-float128 is built for the
++# Altivec-only ABI on Darwin (there is no VSX hardware); the objects only use
++# lvx/stvx and friends to move values and are only linked when __float128 is
++# actually used.  -mmacosx-version-min is left alone so the multilib's default
++# applies; the explicit -maltivec is required because 10.4 and earlier default
++# to G3.
++FP128_ISA_CFLAGS = -maltivec
++# The darwin driver does not know -mno-gnu-attribute (ELF only).
++FP128_GNU_ATTR_CFLAGS =
+diff --git a/libgcc/config/rs6000/t-float128 b/libgcc/config/rs6000/t-float128
+--- libgcc/config/rs6000/t-float128
++++ libgcc/config/rs6000/t-float128
+@@ -73,9 +73,18 @@
+ 			  $(srcdir)/soft-fp/quad.h \
+ 			  $(srcdir)/soft-fp/soft-fp.h
+ 
++# The vector ISA the emulator is built for.  __float128 normally lives in VSX
++# registers; targets that keep it in Altivec registers without VSX (Darwin,
++# see TARGET_FLOAT128_VMX_ABI) override this with -maltivec in their t-* file.
++FP128_ISA_CFLAGS	?= -mvsx
++
++# -mno-gnu-attribute only exists on ELF targets.  Mach-O has no .gnu_attribute,
++# so Darwin sets this to empty in its t-* file.
++FP128_GNU_ATTR_CFLAGS	?= -mno-gnu-attribute
++
+ # Build the emulator without ISA 3.0 hardware support.
+-FP128_CFLAGS_SW		 = -Wno-type-limits -mvsx -mfloat128 \
+-			   -mno-float128-hardware -mno-gnu-attribute \
++FP128_CFLAGS_SW		 = -Wno-type-limits $(FP128_ISA_CFLAGS) -mfloat128 \
++			   -mno-float128-hardware $(FP128_GNU_ATTR_CFLAGS) \
+ 			   -I$(srcdir)/soft-fp \
+ 			   -I$(srcdir)/config/rs6000 \
+ 			   $(FLOAT128_HW_INSNS)
+diff --git a/libgcc/config.host b/libgcc/config.host
+--- libgcc/config.host
++++ libgcc/config.host
+@@ -1230,6 +1230,10 @@
+ 	# We build the darwin10 EH shim for Rosetta (running on x86 machines).
+ 	tm_file="$tm_file i386/darwin-lib.h"
+ 	tmake_file="$tmake_file rs6000/t-ppc64-fp rs6000/t-ibm-ldouble"
++	# IEEE 128-bit (__float128) soft-fp support, kept in Altivec registers.
++	# These objects go into the static libgcc.a only and are pulled in on
++	# demand, so programs that do not use __float128 are unaffected.
++	tmake_file="$tmake_file rs6000/t-float128"
+ 	extra_parts="$extra_parts libd10-uwfef.a "
+ 	extra_parts="$extra_parts crt2.o crt3_2.o libef_ppc.a dw_ppc.o"
+ 	;;
+@@ -1237,6 +1241,8 @@
+ 	# We build the darwin10 EH shim for Rosetta (running on x86 machines).
+ 	tm_file="$tm_file i386/darwin-lib.h"
+ 	tmake_file="$tmake_file rs6000/t-darwin64 rs6000/t-ibm-ldouble"
++	# IEEE 128-bit (__float128) soft-fp support, kept in Altivec registers.
++	tmake_file="$tmake_file rs6000/t-float128"
+ 	extra_parts="$extra_parts libd10-uwfef.a "
+ 	extra_parts="$extra_parts crt2.o crt3_2.o libef_ppc.a dw_ppc.o"
+ 	;;
