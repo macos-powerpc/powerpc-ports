@@ -1,0 +1,89 @@
+From 2af28b287a1a4cdd4d4df50aa8bdf5ed6879376a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 17:14:52 +0000
+Subject: [PATCH 372/372] hir_expand: parent-trait methods in a vtable take the supertrait
+ path's arguments
+
+aead 0.5.2 src/lib.rs (kbs2 0.7.3), `trait Buffer: AsRef<[u8]> + AsMut<[u8]>` used as `&mut dyn Buffer`:
+    MIR Cleanup: <null> BUG: ASSERT FAIL: src/hir_typeck/common.cpp:685:ty.idx() < p->m_types.size():
+    Type param T/*I:0*/ out of range for (max 0)
+figment 0.10.19 (gitu 0.43.0), `trait Interpolator: Fn(..) -> String` called through `Box<dyn Interpolator>`:
+    MIR Cleanup: Calling method 'call' from Fn<(Profile,),> through Interpolator which isn't in the vtable
+
+The vtable builder adds the parent traits' methods to the root trait's vtable struct, but monomorphised their
+signatures with an identity mapping, so a parent's own `I:n` parameters survived (the monomorphised parent path
+`st_mono` was computed and never used). This worked whenever the parent's arguments are the root's own params
+in the same positions (`FnMut<Args>` under `Fn<Args>`, `Index<Idx>` under `IndexMut<Idx>`, every parameterless
+parent), which is every case in Rust 1.90's library. With a concrete argument, `as_mut`'s `&mut T/*I:0*/`
+reached MIR Cleanup, whose field-type monomorph has no type params to offer; with `Fn<(Profile,)>`, the
+`Args/*I:0*/` inside `<Self as FnOnce<Args>>::Output` kept the associated type from expanding, so `call`,
+`call_mut` and `call_once` were silently dropped as "uses Self" and the virtual call died later.
+
+A parent's `I:n` type, const and lifetime parameters now map to the supertrait path's arguments, which are
+already in terms of the root trait. The root's own signatures are unchanged.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_expand/vtable.cpp b/src/hir_expand/vtable.cpp
+index 732402b2..16d085f0 100644
+--- a/src/hir_expand/vtable.cpp
++++ b/src/hir_expand/vtable.cpp
+@@ -254,11 +254,27 @@ namespace {
+                     TRACE_FUNCTION_F(trait_path);
+                     struct M: public Monomorphiser {
+                         ::HIR::Trait*   trait_ptr;
++                        // For a parent trait: the arguments written in the supertrait path (in terms of the root trait),
++                        // which its method signatures' own `I:n` parameters stand for. `null` for the root trait, whose
++                        // parameters are the vtable struct's own.
++                        // (aead 0.5.2 `Buffer: AsRef<[u8]> + AsMut<[u8]>`: `as_mut` kept `T/*I:0*/`, the vtable struct
++                        // has no type params -> MIR Cleanup "Type param T/*I:0*/ out of range"; figment `Interpolator:
++                        // Fn(..) -> String`: `call` kept `Args/*I:0*/` so `<Self as FnOnce<Args>>::Output` never expanded
++                        // and the method was dropped as "uses Self" -> "isn't in the vtable")
++                        const ::HIR::PathParams*    parent_params = nullptr;
+ 
+                         ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& g) const override {
++                            if( parent_params && g.group() == ::HIR::GENERIC_Impl ) {
++                                ASSERT_BUG(sp, g.idx() < parent_params->m_types.size(), "Parent trait param " << g << " out of range for " << *parent_params);
++                                return parent_params->m_types[g.idx()].clone();
++                            }
+                             return HIR::TypeRef(g.name, g.binding);
+                         }
+                         ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
++                            if( parent_params && g.group() == ::HIR::GENERIC_Impl ) {
++                                ASSERT_BUG(sp, g.idx() < parent_params->m_values.size(), "Parent trait value param " << g << " out of range for " << *parent_params);
++                                return parent_params->m_values[g.idx()].clone();
++                            }
+                             return g;
+                         }
+                         ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
+@@ -266,6 +282,10 @@ namespace {
+                             if( (g.binding >> 8) == 1 ) {
+                                 return (g.binding & 0xFF) + 3*256;
+                             }
++                            if( parent_params && g.group() == ::HIR::GENERIC_Impl ) {
++                                // Omitted in the supertrait path = omitted here
++                                return g.idx() < parent_params->m_lifetimes.size() ? parent_params->m_lifetimes[g.idx()] : HIR::LifetimeRef();
++                            }
+                             return HIR::LifetimeRef(g.binding);
+                         }
+ 
+@@ -289,6 +309,8 @@ namespace {
+                         }
+                     } m;
+                     m.trait_ptr = trait_ptr;
++                    // Only the root call has `supertrait_flags`
++                    m.parent_params = supertrait_flags ? nullptr : &trait_path.m_params;
+                     auto clone_self_cb = [](const auto& t, auto&o) {
+                         if( t == ::HIR::TypeRef::new_self() ) {
+                             o = ::HIR::TypeRef::new_unit();
+@@ -378,8 +400,7 @@ namespace {
+                     if( supertrait_flags ) {
+                         supertrait_flags->reserve(tr.m_all_parent_traits.size());
+                         for(const auto& st : tr.m_all_parent_traits) {
+-                            auto self = ::HIR::TypeRef::new_self();
+-                            auto st_mono = MonomorphStatePtr(&self, &trait_path.m_params, nullptr).monomorph_traitpath(sp, st, false);
++                            // `st.m_path` is already in terms of the root trait (`trait_path` is its nop params)
+                             // NOTE: Doesn't trigger non-object-safe
+                             supertrait_flags->push_back( add_ents_from_trait(*st.m_trait_ptr, st.m_path, nullptr) );
+                         }

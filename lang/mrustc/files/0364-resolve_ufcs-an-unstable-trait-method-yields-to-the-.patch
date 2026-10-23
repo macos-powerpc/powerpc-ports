@@ -1,0 +1,87 @@
+From ac4572784b93f3b1768e392a95ca1b3e36af0356 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 11:52:45 +0000
+Subject: [PATCH] resolve_ufcs: an unstable trait method yields to the other
+ traits in scope, as inherent ones do
+
+tokio-tcp 0.1.4 src/stream.rs:817 (ffsend 0.2.77):
+    "Type mismatch between ::"core-0_0_0"::io::borrowed_buf::BorrowedCursor<'#omitted,> and &mut B/*M:0*/"
+`impl AsyncRead for TcpStream { fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> .. { <&TcpStream>::read_buf(&mut
+&*self, buf) } }`, with `use std::io::{self, Read, Write}` written before `use tokio_io::{AsyncRead, AsyncWrite}`.
+Both traits are implemented for `&TcpStream`, and std 1.90's `Read` has `#[unstable(feature = "read_buf")] fn
+read_buf(&mut self, BorrowedCursor<'_>)`. Resolve UFCS (resolve_UfcsUnknown_trait) took the first in-scope trait
+that has the item and an impl, in import order, so the path became `<&TcpStream as Read>::read_buf`.
+
+rustc's probe (method/probe.rs pick_core) takes an unstable method of a feature the crate hasn't enabled only when
+nothing stable applies. 0242 modelled that for method calls (autoderef_find_method) and for the inherent candidates
+of a `Type::item` path; the trait candidates of such a path now get the same treatment: skipped on the first pass,
+retried last, after the inherent retry (rustc's second pass orders inherent before extension candidates).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_conv/resolve_ufcs.cpp b/src/hir_conv/resolve_ufcs.cpp
+index 1ba9aaed..5d49fd6d 100644
+--- a/src/hir_conv/resolve_ufcs.cpp
++++ b/src/hir_conv/resolve_ufcs.cpp
+@@ -696,7 +696,8 @@ namespace resolve_ufcs {
+                 });
+         }
+ 
+-        bool resolve_UfcsUnknown_trait(const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd)
++        /// - `out_skipped_unstable` (if set): skip an unstable method of a feature the crate hasn't enabled, and record that one was
++        bool resolve_UfcsUnknown_trait(const ::HIR::Path& p, ::HIR::Visitor::PathContext pc, ::HIR::Path::Data& pd, bool* out_skipped_unstable = nullptr)
+         {
+             static Span sp;
+             auto& e = pd.as_UfcsUnknown();
+@@ -708,10 +709,24 @@ namespace resolve_ufcs {
+                 DEBUG( e.item << " in? " << *trait_info.first );
+                 switch(pc)
+                 {
+-                case ::HIR::Visitor::PathContext::VALUE:
+-                    if( trait.m_values.find(e.item) == trait.m_values.end() )
++                case ::HIR::Visitor::PathContext::VALUE: {
++                    auto it = trait.m_values.find(e.item);
++                    if( it == trait.m_values.end() )
+                         continue ;
+-                    break;
++                    // An unstable library method of a feature the crate hasn't enabled yields to the other traits in
++                    // scope (as the inherent search does): tokio-tcp 0.1.4 stream.rs:817 `<&TcpStream>::read_buf(&mut
++                    // &*self, buf)` with std's `Read` (1.90 `read_buf(&mut self, BorrowedCursor<'_>)`, unstable) imported
++                    // before tokio_io's `AsyncRead` (`read_buf<B: BufMut>(&mut self, &mut B)`), both implemented for
++                    // `&TcpStream`: "Type mismatch between BorrowedCursor<'#omitted,> and &mut B/*M:0*/"
++                    if( out_skipped_unstable && it->second.is_Function() ) {
++                        const auto& feature = it->second.as_Function().m_markings.unstable_feature;
++                        if( feature != "" && m_crate.m_enabled_features.count(feature) == 0 ) {
++                            DEBUG("- Unstable (feature " << feature << "), skipped: " << *trait_info.first);
++                            *out_skipped_unstable = true;
++                            continue ;
++                        }
++                    }
++                    } break;
+                 case ::HIR::Visitor::PathContext::TRAIT:
+                 case ::HIR::Visitor::PathContext::TYPE:
+                     if( trait.m_types.find(e.item) == trait.m_types.end() )
+@@ -953,7 +968,9 @@ namespace resolve_ufcs {
+                 }
+ 
+                 // 2. Search all impls of in-scope traits for this method on this type
+-                if( this->resolve_UfcsUnknown_trait(p, pc, p.m_data) ) {
++                // - Again without the unstable library methods first (retried below, after the inherent one)
++                bool skipped_unstable_trait = false;
++                if( this->resolve_UfcsUnknown_trait(p, pc, p.m_data, &skipped_unstable_trait) ) {
+                     assert(!p.m_data.is_UfcsUnknown());
+                     return ;
+                 }
+@@ -1015,6 +1032,11 @@ namespace resolve_ufcs {
+                     assert(!p.m_data.is_UfcsUnknown());
+                     return ;
+                 }
++                if( skipped_unstable_trait && this->resolve_UfcsUnknown_trait(p, pc, p.m_data) ) {
++                    DEBUG("Only an unstable trait method applies, p = " << p);
++                    assert(!p.m_data.is_UfcsUnknown());
++                    return ;
++                }
+ 
+                 // Couldn't find it
+                 ERROR(sp, E0000, "Failed to find impl with '" << e.item << "' for " << e.type << " (in " << p << ")");

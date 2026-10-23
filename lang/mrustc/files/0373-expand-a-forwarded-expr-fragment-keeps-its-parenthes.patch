@@ -1,0 +1,549 @@
+From 217b6536512d7cdc6b40310f8390a3cfaf919b2c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 19:54:13 +0000
+Subject: [PATCH] expand: a forwarded `:expr` fragment keeps its parentheses
+ and stays one operand in proc-macro input
+
+age 0.11.1 (kbs2 0.7.3) src/error.rs:385 `wfl!(f, "rec-excessive-work",
+duration = (1 << (required - target)))`:
+  MACRO<age::fl> error:0: Failed to find an impl of core::ops::bit::Shl<_,> for
+  i32 with Output = fluent_bundle::types::FluentValue<'_>
+
+`wfl!` -> age's `fl!` -> i18n-embed-fl 0.9.4 `fl!` (proc macro). The `$args:expr`
+fragment is the assignment `duration = (1 << (required - target))`; the proc
+macro parses `key = value` through it (syn looks through rustc's invisible
+`Delimiter::None` group) and emits `args.insert("duration", #value.into())`.
+mrustc hands a `:expr` fragment to a proc macro by printing the AST
+(DumpAST_Node) and re-lexing it, and the AST had no trace of the source's
+parentheses (the parser returns the inner node of `( e )`), so the macro's
+output re-parsed as `1 << (required - target).into()`. The same loss hit
+`stringify!($e)` of a parenthesised fragment and a `(self.f)(x)` call of
+a field (printed as the method call `self.f(x)`).
+
+- AST::ExprNode records "written in parentheses": parse/expr.cpp sets it for
+  `( e )` (not tuples), clone copies it (ast/expr.cpp NEWNODE).
+- The source-form printer (ast/dump.cpp) prints them once: every child goes
+  through RustPrinter::visit(ExprNodeP&), paren_wrap and the cast / type
+  annotation / call-object / if-let condition wrapping defer to the node's own,
+  DumpAST_Node handles a parenthesised root.
+- The bridge (expand/proc_macro.cpp) additionally parenthesises an operator
+  fragment the source did not: BinOp (incl. ranges), prefix UniOp, Deref, Cast,
+  type annotation, `return`/`break`/`continue` - what rustc's invisible group
+  does for the macro's OUTPUT - while everything a proc macro takes apart or
+  that binds tighter than its context goes as written: `key = value`, closures,
+  blocks, `if`/`match`/loops, calls, method chains, fields, indexing, `x?`,
+  `.await`, literals, paths, tuples, arrays, macro invocations.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index 3d51ab9a..45e25a79 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -19,7 +19,7 @@
+ 
+ #define IS(v, c)    (dynamic_cast<c*>(&v) != 0)
+ #define WRAPIF_CMD(v, t)  || IS(v, t)
+-#define WRAPIF(uniq_ptr, class1, ...) do { auto& _v = *(uniq_ptr); if( IS(_v, class1) CC_ITERATE(WRAPIF_CMD, (_v), __VA_ARGS__) ) { paren_wrap(uniq_ptr); } else { AST::NodeVisitor::visit(uniq_ptr); } } while(0)
++#define WRAPIF(uniq_ptr, class1, ...) do { auto& _v = *(uniq_ptr); if( IS(_v, class1) CC_ITERATE(WRAPIF_CMD, (_v), __VA_ARGS__) ) { paren_wrap(uniq_ptr); } else { this->visit(uniq_ptr); } } while(0)
+ 
+ class RustPrinter:
+     public AST::NodeVisitor
+@@ -48,6 +48,19 @@ public:
+     void handle_function(const AST::Visibility& vis, const RcString& name, const AST::Function& f);
+ 
+     virtual bool is_const() const override { return true; }
++    /// Every child node goes through here: one the source parenthesised prints its parentheses (`(self.f)(x)`;
++    /// a `$e:expr` fragment `(1 << n)` re-lexed as proc-macro input must stay one operand of the `.into()` the macro
++    /// appends - i18n-embed-fl 0.9.4 `fl!` for age 0.11.1 `duration = (1 << (required - target))`)
++    void visit(AST::ExprNodeP& cnode) {
++        if( cnode.get() && cnode->is_parenthesised() ) {
++            m_os << "(";
++            AST::NodeVisitor::visit(cnode);
++            m_os << ")";
++        }
++        else {
++            AST::NodeVisitor::visit(cnode);
++        }
++    }
+     virtual void visit(AST::ExprNode_Block& n) override {
+         switch(n.m_block_type) {
+         case AST::ExprNode_Block::Type::Bare:
+@@ -83,7 +96,7 @@ public:
+             if( !child.node.get() )
+                 m_os << "/* nil */";
+             else
+-                AST::NodeVisitor::visit(child.node);
++                this->visit(child.node);
+             if( child.has_semicolon ) {
+                 m_os << ";";
+             }
+@@ -97,18 +110,18 @@ public:
+         if( n.m_is_move ) {
+             m_os << "move ";
+         }
+-        AST::NodeVisitor::visit(n.m_inner);
++        this->visit(n.m_inner);
+     }
+     virtual void visit(AST::ExprNode_GeneratorBlock& n) override {
+         m_os << "gen ";
+         if( n.m_is_move ) {
+             m_os << "move ";
+         }
+-        AST::NodeVisitor::visit(n.m_inner);
++        this->visit(n.m_inner);
+     }
+     virtual void visit(AST::ExprNode_Try& n) override {
+         m_os << "try ";
+-        AST::NodeVisitor::visit(n.m_inner);
++        this->visit(n.m_inner);
+     }
+     void dump_token(const Token& t) {
+         m_os << t.to_str() << " ";
+@@ -142,14 +155,14 @@ public:
+         for(auto& v : n.m_output)
+         {
+             m_os << " \"" << v.name << "\" (";
+-            AST::NodeVisitor::visit(v.value);
++            this->visit(v.value);
+             m_os << "),";
+         }
+         m_os << " :";
+         for(auto& v : n.m_input)
+         {
+             m_os << " \"" << v.name << "\" (";
+-            AST::NodeVisitor::visit(v.value);
++            this->visit(v.value);
+             m_os << "),";
+         }
+         m_os << " :";
+@@ -172,24 +185,24 @@ public:
+             TU_MATCH_HDRA((p), {)
+             TU_ARMA(Const, e) {
+                 m_os << "const ";
+-                AST::NodeVisitor::visit(e);
++                this->visit(e);
+                 }
+             TU_ARMA(Sym, e) {
+                 m_os << "sym " << e;
+                 }
+             TU_ARMA(RegSingle, e) {
+                 m_os << e.dir << "(" << e.spec << ") ";
+-                AST::NodeVisitor::visit(e.val);
++                this->visit(e.val);
+                 }
+             TU_ARMA(Reg, e) {
+                 m_os << e.dir << "(" << e.spec << ") ";
+                 if(e.val_in) {
+-                    AST::NodeVisitor::visit(e.val_in);
++                    this->visit(e.val_in);
+                     if(e.val_out)
+                         m_os << " => ";
+                 }
+                 if(e.val_out)
+-                    AST::NodeVisitor::visit(e.val_out);
++                    this->visit(e.val_out);
+                 }
+             }
+             m_os << ", ";
+@@ -217,7 +230,7 @@ public:
+             print_ident(n.m_target);
+             m_os << " ";
+         }
+-        AST::NodeVisitor::visit(n.m_value);
++        this->visit(n.m_value);
+     }
+     virtual void visit(AST::ExprNode_LetBinding& n) override {
+         m_expr_root = false;
+@@ -227,17 +240,17 @@ public:
+         print_type(n.m_type);
+         if( n.m_value ) {
+             m_os << " = ";
+-            AST::NodeVisitor::visit(n.m_value);
++            this->visit(n.m_value);
+         }
+         if( n.m_else ) {
+             m_os << " else ";
+-            AST::NodeVisitor::visit(n.m_else);
++            this->visit(n.m_else);
+         }
+         m_os << ";";
+     }
+     virtual void visit(AST::ExprNode_Assign& n) override {
+         m_expr_root = false;
+-        AST::NodeVisitor::visit(n.m_slot);
++        this->visit(n.m_slot);
+         switch(n.m_op)
+         {
+         case AST::ExprNode_Assign::NONE:    m_os << "  = ";  break;
+@@ -252,7 +265,7 @@ public:
+         case AST::ExprNode_Assign::SHR:     m_os << " >>= ";  break;
+         case AST::ExprNode_Assign::SHL:     m_os << " <<= ";  break;
+         }
+-        AST::NodeVisitor::visit(n.m_value);
++        this->visit(n.m_value);
+     }
+     // An element of an argument/tuple/array list, with its attributes: this text becomes an attribute proc macro's
+     // input (DumpAST_Node), where a `#[cfg]` element sent bare would be kept unconditionally
+@@ -263,7 +276,7 @@ public:
+         {
+             m_os << "#[" << a << "] ";
+         }
+-        AST::NodeVisitor::visit(node);
++        this->visit(node);
+     }
+     virtual void visit(AST::ExprNode_CallPath& n) override {
+         m_expr_root = false;
+@@ -309,9 +322,8 @@ public:
+     }
+     virtual void visit(AST::ExprNode_CallObject& n) override {
+         m_expr_root = false;
++        paren_wrap(n.m_val);
+         m_os << "(";
+-        AST::NodeVisitor::visit(n.m_val);
+-        m_os << ")(";
+         bool is_first = true;
+         for( auto& arg : n.m_args )
+         {
+@@ -344,7 +356,7 @@ public:
+             m_os << " ";
+         }
+ 
+-        AST::NodeVisitor::visit(n.m_code);
++        this->visit(n.m_code);
+     }
+     virtual void visit(AST::ExprNode_For& n) override {
+         bool expr_root = m_expr_root;
+@@ -358,7 +370,7 @@ public:
+         m_os << "for ";
+         print_pattern(n.m_pattern, true);
+         m_os << " in ";
+-        AST::NodeVisitor::visit(n.m_value);
++        this->visit(n.m_value);
+ 
+         if( expr_root ) {
+             m_os << "\n";
+@@ -368,7 +380,7 @@ public:
+             m_os << " ";
+         }
+ 
+-        AST::NodeVisitor::visit(n.m_code);
++        this->visit(n.m_code);
+     }
+     void visit_iflet_conditions(std::vector<AST::IfLet_Condition>& conds) {
+         for(size_t i = 0; i < conds.size(); i ++) {
+@@ -378,9 +390,7 @@ public:
+                 print_pattern(*conds[i].opt_pat, true);
+                 m_os << " = ";
+             }
+-            m_os << "(";
+-            AST::NodeVisitor::visit(conds[i].value);
+-            m_os << ")";
++            paren_wrap(conds[i].value);
+         }
+     }
+     void visit(AST::ExprNode_While& n) override {
+@@ -405,13 +415,13 @@ public:
+             m_os << " ";
+         }
+ 
+-        AST::NodeVisitor::visit(n.m_code);
++        this->visit(n.m_code);
+     }
+     virtual void visit(AST::ExprNode_Match& n) override {
+         bool expr_root = m_expr_root;
+         m_expr_root = false;
+         m_os << "match ";
+-        AST::NodeVisitor::visit(n.m_val);
++        this->visit(n.m_val);
+ 
+         if(expr_root)
+         {
+@@ -445,7 +455,7 @@ public:
+             m_os << " => ";
+             // Increase indent, but don't print. Causes nested blocks to be indented above the match
+             inc_indent();
+-            AST::NodeVisitor::visit(arm.m_code);
++            this->visit(arm.m_code);
+             dec_indent();
+             m_os << ",\n";
+         }
+@@ -476,7 +486,7 @@ public:
+ 
+             bool is_block = (dynamic_cast<const AST::ExprNode_Block*>(&*arm.m_body) != nullptr);
+             if( !is_block ) m_os << "{ ";
+-            AST::NodeVisitor::visit(arm.m_body);
++            this->visit(arm.m_body);
+             if( !is_block ) m_os << " }";
+             if( expr_root ) {
+                 m_os << "\n";
+@@ -489,7 +499,7 @@ public:
+             m_os << "else";
+             bool is_block = (dynamic_cast<const AST::ExprNode_Block*>(&*n.m_else) != nullptr);
+             if( !is_block ) m_os << "{ ";
+-            AST::NodeVisitor::visit(n.m_else);
++            this->visit(n.m_else);
+             if( !is_block ) m_os << " }";
+         }
+     }
+@@ -511,7 +521,7 @@ public:
+         m_os << "| ->";
+         print_type(n.m_return);
+         m_os << " { ";
+-        AST::NodeVisitor::visit(n.m_code);
++        this->visit(n.m_code);
+         m_os << " }";
+     }
+     virtual void visit(AST::ExprNode_WildcardPattern& n) override {
+@@ -662,13 +672,13 @@ public:
+         {
+             print_attrs(i.attrs);
+             m_os << indent() << "r#" << i.name << ": ";
+-            AST::NodeVisitor::visit(i.value);
++            this->visit(i.value);
+             m_os << ",\n";
+         }
+         if( n.m_base_value.get() )
+         {
+             m_os << indent() << ".. ";
+-            AST::NodeVisitor::visit(n.m_base_value);
++            this->visit(n.m_base_value);
+             m_os << "\n";
+         }
+         m_os << indent() << "}";
+@@ -683,7 +693,7 @@ public:
+         {
+             print_attrs(i.attrs);
+             m_os << indent() << "r#" << i.name << ": ";
+-            AST::NodeVisitor::visit(i.value);
++            this->visit(i.value);
+             m_os << ",\n";
+         }
+         m_os << indent() << "..\n";
+@@ -695,9 +705,9 @@ public:
+         m_os << "[";
+         if( n.m_size.get() )
+         {
+-            AST::NodeVisitor::visit(n.m_values[0]);
++            this->visit(n.m_values[0]);
+             m_os << "; ";
+-            AST::NodeVisitor::visit(n.m_size);
++            this->visit(n.m_size);
+         }
+         else {
+             for( auto& item : n.m_values )
+@@ -739,27 +749,25 @@ public:
+             , AST::ExprNode_Match, AST::ExprNode_If, AST::ExprNode_Match
+             );
+         m_os << "[";
+-        AST::NodeVisitor::visit(n.m_idx);
++        this->visit(n.m_idx);
+         m_os << "]";
+     }
+     virtual void visit(AST::ExprNode_Deref& n) override {
+         m_expr_root = false;
+         m_os << "*(";
+-        AST::NodeVisitor::visit(n.m_value);
++        this->visit(n.m_value);
+         m_os << ")";
+     }
+     virtual void visit(AST::ExprNode_Cast& n) override {
+         m_expr_root = false;
+-        m_os << "(";
+-        AST::NodeVisitor::visit(n.m_value);
+-        m_os << ") as ";
++        paren_wrap(n.m_value);
++        m_os << " as ";
+         print_type(n.m_type);
+     }
+     virtual void visit(AST::ExprNode_TypeAnnotation& n) override {
+         m_expr_root = false;
+-        m_os << "(";
+-        AST::NodeVisitor::visit(n.m_value);
+-        m_os << ") : ";
++        paren_wrap(n.m_value);
++        m_os << " : ";
+         print_type(n.m_type);
+     }
+     virtual void visit(AST::ExprNode_BinOp& n) override {
+@@ -768,7 +776,7 @@ public:
+             m_os << "/*null*/";
+         }
+         else if( IS(*n.m_left, AST::ExprNode_BinOp) && dynamic_cast<AST::ExprNode_BinOp&>(*n.m_left).m_type == n.m_type ) {
+-            AST::NodeVisitor::visit(n.m_left);
++            this->visit(n.m_left);
+         }
+         else {
+             WRAPIF(n.m_left
+@@ -808,7 +816,7 @@ public:
+             paren_wrap(n.m_right);
+         }
+         else
+-            AST::NodeVisitor::visit(n.m_right);
++            this->visit(n.m_right);
+     }
+     virtual void visit(AST::ExprNode_UniOp& n) override {
+         m_expr_root = false;
+@@ -827,10 +835,9 @@ public:
+ 
+         bool wrap = IS(*n.m_value, AST::ExprNode_BinOp) || IS(*n.m_value, AST::ExprNode_Cast);
+         if( wrap )
+-            m_os << "(";
+-        AST::NodeVisitor::visit(n.m_value);
+-        if( wrap )
+-            m_os << ")";
++            paren_wrap(n.m_value);
++        else
++            this->visit(n.m_value);
+         switch(n.m_type)
+         {
+         case AST::ExprNode_UniOp::QMARK: m_os << "?"; break;
+@@ -841,9 +848,14 @@ public:
+ 
+ 
+ private:
++    /// One pair of parentheses: the node's own if the source had them
+     void paren_wrap(::AST::ExprNodeP& node) {
++        if( node.get() && node->is_parenthesised() ) {
++            this->visit(node);
++            return;
++        }
+         m_os << "(";
+-        AST::NodeVisitor::visit(node);
++        this->visit(node);
+         m_os << ")";
+     }
+ 
+@@ -1574,7 +1586,11 @@ void Dump_Rust(const char *filename, const AST::Crate& crate)
+ void DumpAST_Node(::std::ostream& os, const AST::ExprNode& node)
+ {
+     RustPrinter printer(os, /*is_debug=*/false);
++    if( node.is_parenthesised() )
++        os << "(";
+     const_cast<AST::ExprNode&>( node ).visit(printer);
++    if( node.is_parenthesised() )
++        os << ")";
+ }
+ void DumpAST_Pattern(::std::ostream& os, const AST::Pattern& pat)
+ {
+diff --git a/src/ast/expr.cpp b/src/ast/expr.cpp
+index 28dd13be..7e668b29 100644
+--- a/src/ast/expr.cpp
++++ b/src/ast/expr.cpp
+@@ -89,11 +89,12 @@ ExprNode::~ExprNode() {
+ #define OPT_CLONE(node) (node.get() ? node->clone() : ::AST::ExprNodeP())
+ 
+ namespace {
+-    static inline ExprNodeP mk_exprnodep(const Span& pos, AST::ExprNode* en) {
+-        en->set_span(pos);
++    static inline ExprNodeP mk_exprnodep(const AST::ExprNode& src, AST::ExprNode* en) {
++        en->set_span(src.span());
++        en->copy_parenthesised(src);
+         return ExprNodeP(en);
+     }
+-    #define NEWNODE(type, ...)  mk_exprnodep(span(), new type(__VA_ARGS__))
++    #define NEWNODE(type, ...)  mk_exprnodep(*this, new type(__VA_ARGS__))
+ }
+ 
+ NODE(ExprNode_Block, {
+diff --git a/src/ast/expr.hpp b/src/ast/expr.hpp
+index 9c5e78e4..f0dbe30c 100644
+--- a/src/ast/expr.hpp
++++ b/src/ast/expr.hpp
+@@ -28,6 +28,9 @@ class ExprNode
+ {
+     AttributeList   m_attrs;
+     Span    m_span;
++    /// Written in parentheses in the source (`(self.f)(x)`, `(1 << n)`): read only by the source-form printers,
++    /// so a forwarded `$e:expr` fragment reaches a proc macro or `stringify!` as written (rustc keeps the tokens)
++    bool    m_parenthesised = false;
+ public:
+     virtual ~ExprNode() = 0;
+ 
+@@ -37,6 +40,9 @@ public:
+ 
+     void set_span(Span s) { m_span = ::std::move(s); }
+     const Span& span() const { return m_span; }
++    void set_parenthesised() { m_parenthesised = true; }
++    bool is_parenthesised() const { return m_parenthesised; }
++    void copy_parenthesised(const ExprNode& src) { m_parenthesised = src.m_parenthesised; }
+ 
+     void set_attrs(AttributeList&& mi) {
+         for(auto& i : mi.m_items)
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index a5f3465f..fa2b960b 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -546,6 +546,31 @@ namespace {
+         {
+         }
+ 
++        /// rustc hands a forwarded `$e:expr` over as an invisible (`Delimiter::None`) group: the parser of the macro's
++        /// output reads it as one operand, while syn's parsers look through it (`key = value` arguments, a
++        /// `syn::Block`). The protocol has no invisible groups, so an operator expression gets real parentheses;
++        /// everything that binds tighter than its context, or that a proc macro takes apart, is sent as written
++        /// (what rustc's token form also gives once the group is dissolved). The source's own parentheses are
++        /// printed by the dump.
++        static bool expr_fragment_needs_parens(const ::AST::ExprNode& e)
++        {
++            if( e.is_parenthesised() )
++                return false;
++            if( dynamic_cast<const ::AST::ExprNode_BinOp*>(&e)
++             || dynamic_cast<const ::AST::ExprNode_Cast*>(&e)
++             || dynamic_cast<const ::AST::ExprNode_TypeAnnotation*>(&e)
++             || dynamic_cast<const ::AST::ExprNode_Deref*>(&e)
++             || dynamic_cast<const ::AST::ExprNode_Flow*>(&e)
++             )
++            {
++                return true;
++            }
++            if( const auto* u = dynamic_cast<const ::AST::ExprNode_UniOp*>(&e) ) {
++                // Postfix forms bind tightest (their operand is printed in parentheses when it needs them)
++                return !(u->m_type == ::AST::ExprNode_UniOp::QMARK || u->m_type == ::AST::ExprNode_UniOp::AWait);
++            }
++            return false;
++        }
+         void visit_token(const ::Token& tok)
+         {
+             switch(tok.type())
+@@ -573,9 +598,22 @@ namespace {
+                 break;
+             case TOK_INTERPOLATED_STMT:
+             case TOK_INTERPOLATED_BLOCK:
+-            case TOK_INTERPOLATED_EXPR:
+                 visit_node( const_cast<::Token&>(tok).frag_node() );
+                 break;
++            // A `:expr` fragment: i18n-embed-fl 0.9.4 `fl!` emits `args.insert("duration", #value.into())` for age
++            // 0.11.1 error.rs `duration = (1 << (required - target))` (kbs2); the dump had dropped the source's
++            // parentheses, so the output re-parsed as `1 << (required - target).into()`
++            case TOK_INTERPOLATED_EXPR: {
++                const auto& e = const_cast<::Token&>(tok).frag_node();
++                bool wrap = expr_fragment_needs_parens(e);
++                if( wrap ) {
++                    m_pmi.send_symbol("(");
++                }
++                visit_node(e);
++                if( wrap ) {
++                    m_pmi.send_symbol(")");
++                }
++                } break;
+             case TOK_INTERPOLATED_META:
+                 visit_meta_item(const_cast<::Token&>(tok).frag_meta());
+                 break;
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 4c87b7e5..e72e497b 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -1624,6 +1624,11 @@ ExprNodeP Parse_ExprVal_Inner(TokenStream& lex)
+                 } while( GET_TOK(tok, lex) == TOK_COMMA );
+                 rv = NEWNODE( AST::ExprNode_Tuple, ::std::move(ents) );
+             }
++            else {
++                // Part of the source form: `(self.f)(x)`, and a `$e:expr` fragment `(1 << n)` is handed to a proc
++                // macro (or `stringify!`) as written
++                rv->set_parenthesised();
++            }
+             CHECK_TOK(tok, TOK_PAREN_CLOSE);
+             return rv;
+         }
