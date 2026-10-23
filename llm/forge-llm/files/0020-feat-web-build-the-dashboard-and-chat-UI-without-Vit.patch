@@ -1,0 +1,1266 @@
+From 540a37ec54eab7e8f69a35d7f3a872dbfe637ca9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 05:50:45 +0000
+Subject: [PATCH 20/20] feat(web): build the dashboard and chat UI without
+ Vite's native tools
+
+Vite 7 cannot run where esbuild (Go) and Rollup 4 (a Rust parser) have no
+prebuilt binaries, and neither can be built on hosts without Go/Rust
+(e.g. PowerPC Macs), so -DFORGE_BUILD_DASHBOARD=ON was unusable there.
+
+tools/web-build/build.mjs produces the same dist/ layout from web/ and
+web-chat/ in plain JavaScript: Rollup 3 (+ node-resolve, commonjs),
+@vue/compiler-sfc for <script setup lang="ts"> / <style scoped>,
+TypeScript's transpileModule for type stripping, terser, and a small CSS
+collector that copies url() assets (the KaTeX fonts). Its dependencies
+are pinned in its own package-lock.json at the frontends' runtime
+versions; TypeScript is optional and may come from NODE_PATH.
+
+CMake: -DFORGE_DASHBOARD_BUILDER=portable selects it (default: vite, as
+before). FORGE_NPM_CACHE and FORGE_NPM_CI_ARGS let packagers install from
+a pre-filled cache offline (e.g. "--offline;--omit=optional"), for both
+builders.
+
+Checked on x86-64 against a Vite build of the same sources: bundle sizes
+within 2% (Vite: 678/460 KB JS, portable: 667/457 KB), and the frontends'
+own jsdom tests pass on the portable output (web: bundle + theme;
+web-chat: test-ui-bundle, 73 checks). An offline npm ci from the 58
+locked tarballs with TypeScript 6.0.2 from NODE_PATH gives byte-identical
+output.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ CMakeLists.txt                    | 153 +++++--
+ docs/build.md                     |   9 +
+ tools/web-build/build.mjs         | 296 ++++++++++++++
+ tools/web-build/package-lock.json | 660 ++++++++++++++++++++++++++++++
+ tools/web-build/package.json      |  24 ++
+ 5 files changed, 1097 insertions(+), 45 deletions(-)
+ create mode 100644 tools/web-build/build.mjs
+ create mode 100644 tools/web-build/package-lock.json
+ create mode 100644 tools/web-build/package.json
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d4c9dc8..023ed38 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -454,6 +454,19 @@ option(
+   OFF)
+ find_program(FORGE_NPM_EXECUTABLE NAMES npm)
+ 
++# How the frontends are built when FORGE_BUILD_DASHBOARD is ON:
++#   vite      their own Vite toolchain (web/, web-chat/ package.json; Node >= 20.19)
++#   portable  tools/web-build: plain JavaScript (Rollup 3, the Vue SFC compiler,
++#             TypeScript's transpiler, terser) for hosts where Vite's esbuild and
++#             Rollup 4 native binaries do not exist (e.g. PowerPC Macs); Node >= 18
++# FORGE_NPM_CACHE / FORGE_NPM_CI_ARGS let packagers point npm at a pre-filled
++# cache and install offline (e.g. "--offline;--omit=optional").
++set(FORGE_DASHBOARD_BUILDER "vite" CACHE STRING "Frontend builder: vite or portable")
++set_property(CACHE FORGE_DASHBOARD_BUILDER PROPERTY STRINGS vite portable)
++set(FORGE_NPM_CACHE "${CMAKE_CURRENT_BINARY_DIR}/npm-cache" CACHE PATH
++    "npm cache directory used by the frontend builds")
++set(FORGE_NPM_CI_ARGS "" CACHE STRING "Extra arguments for npm ci in the frontend builds")
++
+ # ---- Standalone chat UI (web-chat/) ----------------------------------------
+ # A Vue 3 + Vite project mirroring web/ (the dashboard), built by the same npm
+ # pipeline and embedded with FUNC_PREFIX=chat so the accessors become
+@@ -473,19 +486,40 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
+   # per lockfile change instead of on every `cmake --build`, which removes that
+   # race in practice and stops every incremental build from spending a minute
+   # reinstalling ~200 packages it already has.
+-  set(_forge_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-dashboard-npm.stamp)
+-  add_custom_command(
+-    OUTPUT ${_forge_npm_stamp}
+-    # --cache pins the store inside the build tree so a dashboard build never
+-    # writes to ~/.npm (read-only CI containers) and never pollutes the repo.
+-    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_web_dir} -- --cache
+-            ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
+-    COMMAND ${CMAKE_COMMAND} -E touch ${_forge_npm_stamp}
+-    WORKING_DIRECTORY ${_forge_web_dir}
+-    DEPENDS ${_forge_web_dir}/package.json ${_forge_web_dir}/package-lock.json
+-    COMMENT "npm ci (web dashboard dependencies)"
+-    VERBATIM)
+-  add_custom_target(forge-dashboard-deps DEPENDS ${_forge_npm_stamp})
++  if(FORGE_DASHBOARD_BUILDER STREQUAL "portable")
++    # One dependency set (tools/web-build) serves both frontends.
++    find_program(FORGE_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
++    set(_forge_webbuild_dir ${CMAKE_CURRENT_SOURCE_DIR}/tools/web-build)
++    set(_forge_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-web-build-npm.stamp)
++    add_custom_command(
++      OUTPUT ${_forge_npm_stamp}
++      COMMAND npm ci --prefix ${_forge_webbuild_dir} --cache ${FORGE_NPM_CACHE}
++              --no-audit --no-fund ${FORGE_NPM_CI_ARGS}
++      COMMAND ${CMAKE_COMMAND} -E touch ${_forge_npm_stamp}
++      WORKING_DIRECTORY ${_forge_webbuild_dir}
++      DEPENDS ${_forge_webbuild_dir}/package.json
++              ${_forge_webbuild_dir}/package-lock.json
++      COMMENT "npm ci (tools/web-build dependencies)"
++      VERBATIM)
++    set(_forge_chat_npm_stamp ${_forge_npm_stamp})
++    add_custom_target(forge-dashboard-deps DEPENDS ${_forge_npm_stamp})
++    add_custom_target(forge-chat-deps)
++    add_dependencies(forge-chat-deps forge-dashboard-deps)
++  else()
++    set(_forge_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-dashboard-npm.stamp)
++    add_custom_command(
++      OUTPUT ${_forge_npm_stamp}
++      # --cache pins the store inside the build tree so a dashboard build never
++      # writes to ~/.npm (read-only CI containers) and never pollutes the repo.
++      COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_web_dir} -- --cache
++              ${FORGE_NPM_CACHE} ${FORGE_NPM_CI_ARGS}
++      COMMAND ${CMAKE_COMMAND} -E touch ${_forge_npm_stamp}
++      WORKING_DIRECTORY ${_forge_web_dir}
++      DEPENDS ${_forge_web_dir}/package.json ${_forge_web_dir}/package-lock.json
++      COMMENT "npm ci (web dashboard dependencies)"
++      VERBATIM)
++    add_custom_target(forge-dashboard-deps DEPENDS ${_forge_npm_stamp})
++  endif()
+   # Every frontend source file is an explicit build dependency.
+   #
+   # An explicit list, not file(GLOB_RECURSE ... CONFIGURE_DEPENDS). The
+@@ -528,20 +562,33 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
+       ${_forge_web_dir}/src/components/StatTile.vue
+       ${_forge_web_dir}/src/components/ThemeSlider.vue
+       ${_forge_web_dir}/src/components/TimeSeriesChart.vue)
+-  add_custom_command(
+-    OUTPUT ${_forge_web_dist}/index.html
+-    # --outDir sends the bundle into the build tree so a `npm run build` never
+-    # leaves generated files in the source checkout. --emptyOutDir is what
+-    # suppresses Vite's interactive confirmation for an outDir outside the
+-    # project root, which would otherwise hang a non-interactive build.
+-    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir ${_forge_web_dist}
+-            --emptyOutDir
+-    WORKING_DIRECTORY ${_forge_web_dir}
+-    DEPENDS ${_forge_npm_stamp} ${_forge_web_sources}
+-    COMMENT "npm run build (web dashboard)"
+-    VERBATIM)
++  if(FORGE_DASHBOARD_BUILDER STREQUAL "portable")
++    add_custom_command(
++      OUTPUT ${_forge_web_dist}/index.html
++      COMMAND ${FORGE_NODE_EXECUTABLE} ${_forge_webbuild_dir}/build.mjs
++              ${_forge_web_dir} ${_forge_web_dist}
++      WORKING_DIRECTORY ${_forge_webbuild_dir}
++      DEPENDS ${_forge_npm_stamp} ${_forge_web_sources}
++              ${_forge_webbuild_dir}/build.mjs
++      COMMENT "tools/web-build (web dashboard)"
++      VERBATIM)
++  else()
++    add_custom_command(
++      OUTPUT ${_forge_web_dist}/index.html
++      # --outDir sends the bundle into the build tree so a `npm run build` never
++      # leaves generated files in the source checkout. --emptyOutDir is what
++      # suppresses Vite's interactive confirmation for an outDir outside the
++      # project root, which would otherwise hang a non-interactive build.
++      COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir ${_forge_web_dist}
++              --emptyOutDir
++      WORKING_DIRECTORY ${_forge_web_dir}
++      DEPENDS ${_forge_npm_stamp} ${_forge_web_sources}
++      COMMENT "npm run build (web dashboard)"
++      VERBATIM)
++  endif()
+   add_custom_target(forge-dashboard-assets ALL
+                     DEPENDS ${_forge_web_dist}/index.html)
++  add_dependencies(forge-dashboard-assets forge-dashboard-deps)
+ 
+   set(_forge_dashboard_assets_src
+       ${CMAKE_CURRENT_BINARY_DIR}/dashboard_assets.cpp)
+@@ -563,17 +610,19 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
+     VERBATIM)
+ 
+   # ---- chat UI: npm ci + build + embed (mirrors the dashboard pipeline) ----
+-  set(_forge_chat_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-chat-npm.stamp)
+-  add_custom_command(
+-    OUTPUT ${_forge_chat_npm_stamp}
+-    COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_chat_dir} --
+-            --cache ${CMAKE_CURRENT_BINARY_DIR}/npm-cache
+-    COMMAND ${CMAKE_COMMAND} -E touch ${_forge_chat_npm_stamp}
+-    WORKING_DIRECTORY ${_forge_chat_dir}
+-    DEPENDS ${_forge_chat_dir}/package.json ${_forge_chat_dir}/package-lock.json
+-    COMMENT "npm ci (web chat UI dependencies)"
+-    VERBATIM)
+-  add_custom_target(forge-chat-deps DEPENDS ${_forge_chat_npm_stamp})
++  if(NOT FORGE_DASHBOARD_BUILDER STREQUAL "portable")
++    set(_forge_chat_npm_stamp ${CMAKE_CURRENT_BINARY_DIR}/forge-chat-npm.stamp)
++    add_custom_command(
++      OUTPUT ${_forge_chat_npm_stamp}
++      COMMAND ${CMAKE_COMMAND} -E env npm ci --prefix ${_forge_chat_dir} --
++              --cache ${FORGE_NPM_CACHE} ${FORGE_NPM_CI_ARGS}
++      COMMAND ${CMAKE_COMMAND} -E touch ${_forge_chat_npm_stamp}
++      WORKING_DIRECTORY ${_forge_chat_dir}
++      DEPENDS ${_forge_chat_dir}/package.json ${_forge_chat_dir}/package-lock.json
++      COMMENT "npm ci (web chat UI dependencies)"
++      VERBATIM)
++    add_custom_target(forge-chat-deps DEPENDS ${_forge_chat_npm_stamp})
++  endif()
+ 
+   set(_forge_chat_sources
+       ${_forge_chat_dir}/index.html
+@@ -600,16 +649,29 @@ if(FORGE_BUILD_DASHBOARD AND FORGE_NPM_EXECUTABLE)
+       ${_forge_chat_dir}/src/components/SettingsPanel.vue
+       ${_forge_chat_dir}/src/components/ThinkingIndicator.vue
+       ${_forge_chat_dir}/src/components/TopBar.vue)
+-  add_custom_command(
+-    OUTPUT ${_forge_chat_dist}/index.html
+-    COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir
+-            ${_forge_chat_dist} --emptyOutDir
+-    WORKING_DIRECTORY ${_forge_chat_dir}
+-    DEPENDS ${_forge_chat_npm_stamp} ${_forge_chat_sources}
+-    COMMENT "npm run build (web chat UI)"
+-    VERBATIM)
++  if(FORGE_DASHBOARD_BUILDER STREQUAL "portable")
++    add_custom_command(
++      OUTPUT ${_forge_chat_dist}/index.html
++      COMMAND ${FORGE_NODE_EXECUTABLE} ${_forge_webbuild_dir}/build.mjs
++              ${_forge_chat_dir} ${_forge_chat_dist}
++      WORKING_DIRECTORY ${_forge_webbuild_dir}
++      DEPENDS ${_forge_chat_npm_stamp} ${_forge_chat_sources}
++              ${_forge_webbuild_dir}/build.mjs
++      COMMENT "tools/web-build (web chat UI)"
++      VERBATIM)
++  else()
++    add_custom_command(
++      OUTPUT ${_forge_chat_dist}/index.html
++      COMMAND ${CMAKE_COMMAND} -E env npm run build -- --outDir
++              ${_forge_chat_dist} --emptyOutDir
++      WORKING_DIRECTORY ${_forge_chat_dir}
++      DEPENDS ${_forge_chat_npm_stamp} ${_forge_chat_sources}
++      COMMENT "npm run build (web chat UI)"
++      VERBATIM)
++  endif()
+   add_custom_target(forge-chat-assets ALL
+                     DEPENDS ${_forge_chat_dist}/index.html)
++  add_dependencies(forge-chat-assets forge-chat-deps)
+ 
+   add_custom_command(
+     OUTPUT ${_forge_chat_assets_src}
+@@ -635,7 +697,8 @@ else()
+       WARNING
+         "FORGE_BUILD_DASHBOARD=ON but npm was not found. Building without the "
+         "web frontend: /api/metrics will still work, /dashboard/ will explain "
+-        "how to rebuild. Install Node.js >= 18 and reconfigure.")
++        "how to rebuild. Install Node.js (>= 20.19 for the vite builder, >= 18 for "
++        "-DFORGE_DASHBOARD_BUILDER=portable) and reconfigure.")
+   else()
+     message(
+       STATUS
+diff --git a/docs/build.md b/docs/build.md
+index faadf39..58a43b0 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -100,6 +100,15 @@ cmake -B build -DFORGE_NATIVE_BUILD=OFF -DFORGE_CPU_FEATURES=ALTIVEC -DFORGE_BUI
+ cmake --build build
+ ```
+ 
++The web dashboard and chat UI (`-DFORGE_BUILD_DASHBOARD=ON`) are normally built
++with Vite, whose esbuild and Rollup 4 binaries do not exist for every platform
++(PowerPC Macs among them). `-DFORGE_DASHBOARD_BUILDER=portable` builds them with
++`tools/web-build` instead: plain JavaScript (Rollup 3, the Vue SFC compiler,
++TypeScript's transpiler, terser) that needs only Node.js 18 or later. TypeScript
++may come from `NODE_PATH` (it is an optional dependency there), and
++`FORGE_NPM_CACHE` / `FORGE_NPM_CI_ARGS` (e.g. `--offline;--omit=optional`)
++allow an offline install from a pre-filled npm cache.
++
+ Big-endian hosts load ordinary (little-endian) GGUF files: the tensor data is
+ converted to host byte order once at load time, in private copy-on-write pages,
+ so memory use matches a fully resident model. Big-endian GGUF files load without
+diff --git a/tools/web-build/build.mjs b/tools/web-build/build.mjs
+new file mode 100644
+index 0000000..6cd6c48
+--- /dev/null
++++ b/tools/web-build/build.mjs
+@@ -0,0 +1,296 @@
++#!/usr/bin/env node
++// Vite-free production build of a Forge web frontend (web/ or web-chat/).
++//
++//   node build.mjs <app dir> <output dir>
++//
++// Vite 7 needs esbuild (Go) and Rollup 4 (a Rust parser), both shipped as
++// per-platform native binaries, so it cannot run where neither exists (e.g.
++// PowerPC Macs). This script does the same job for these two frontends with
++// pure JavaScript only: Rollup 3 (+ node-resolve, commonjs), @vue/compiler-sfc, TypeScript's
++// transpileModule (type stripping only, no type checking) and terser. It
++// writes the layout Vite does -- index.html plus assets/index-<hash>.{js,css}
++// and the files the CSS references, all referenced relatively (base './') --
++// which is what cmake/EmbedDashboardAssets.cmake embeds.
++//
++// TypeScript is an optional dependency: it is taken from node_modules, or from
++// NODE_PATH (e.g. a system-wide install), so packagers can supply their own.
++//
++// Supported, and all the frontends use: <script setup lang="ts">,
++// <style scoped>, .ts modules, CSS imports (url() assets are copied).
++
++import { createHash } from 'node:crypto';
++import fs from 'node:fs';
++import { createRequire } from 'node:module';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++import commonjs from '@rollup/plugin-commonjs';
++import nodeResolve from '@rollup/plugin-node-resolve';
++import { rollup } from 'rollup';
++import { minify } from 'terser';
++import { compileScript, compileStyle, parse, registerTS } from 'vue/compiler-sfc';
++
++const require = createRequire(import.meta.url);
++const ts = require('typescript');
++registerTS(() => ts);
++
++const [appArg, outArg] = process.argv.slice(2);
++if (!appArg || !outArg) {
++    console.error('usage: node build.mjs <app dir> <output dir>');
++    process.exit(2);
++}
++const appDir = path.resolve(appArg);
++// The frontends' imports resolve against this tool's own node_modules.
++const toolModules = path.join(path.dirname(fileURLToPath(import.meta.url)), 'node_modules');
++const outDir = path.resolve(outArg);
++
++const hash8 = (data) => createHash('sha256').update(data).digest('hex').slice(0, 8);
++
++// Values Vite substitutes for a production build of a Vue app.
++const DEFINES = {
++    'process.env.NODE_ENV': '"production"',
++    __VUE_OPTIONS_API__: 'true',
++    __VUE_PROD_DEVTOOLS__: 'false',
++    __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false',
++};
++const defineRe = new RegExp(
++    '(?<![\\w$.])(' + Object.keys(DEFINES).map((k) => k.replace(/[.$]/g, '\\$&')).join('|') +
++        ')(?![\\w$])',
++    'g',
++);
++
++function define() {
++    return {
++        name: 'forge-define',
++        transform(code, id) {
++            if (!/\.(m?js|ts|vue)$/.test(id) || !defineRe.test(code))
++                return null;
++            defineRe.lastIndex = 0;
++            return { code: code.replace(defineRe, (m) => DEFINES[m]), map: null };
++        },
++    };
++}
++
++function stripTypes(code, fileName) {
++    return ts.transpileModule(code, {
++        fileName,
++        compilerOptions: {
++            target: ts.ScriptTarget.ES2020,
++            module: ts.ModuleKind.ESNext,
++            isolatedModules: true,
++            useDefineForClassFields: true,
++            sourceMap: false,
++        },
++    }).outputText;
++}
++
++function typescript() {
++    return {
++        name: 'forge-typescript',
++        transform(code, id) {
++            if (!id.endsWith('.ts') || id.endsWith('.d.ts'))
++                return null;
++            return { code: stripTypes(code, id), map: null };
++        },
++    };
++}
++
++// CSS from `import './x.css'` and from SFC <style> blocks, collected per module
++// and concatenated in chunk (execution) order; url() references are emitted
++// as assets.
++function css(cssByModule) {
++    const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
++    return {
++        name: 'forge-css',
++        transform(code, id) {
++            if (!id.endsWith('.css'))
++                return null;
++            cssByModule.set(id, rewriteUrls.call(this, code, id));
++            return { code: 'export default ""', map: null, moduleSideEffects: true };
++        },
++        // Exposed for the SFC plugin.
++        api: { rewriteUrls },
++    };
++
++    function rewriteUrls(code, id) {
++        return code.replace(urlRe, (whole, quote, ref) => {
++            if (/^(data:|https?:|#|\/)/.test(ref))
++                return whole;
++            const clean = ref.split(/[?#]/)[0];
++            const file = path.resolve(path.dirname(id), clean);
++            const source = fs.readFileSync(file);
++            const handle = this.emitFile({ type: 'asset', name: path.basename(file), source });
++            return `url(__FORGE_ASSET_${handle}__)`;
++        });
++    }
++}
++
++function vueSfc(cssByModule, cssApi) {
++    return {
++        name: 'forge-vue-sfc',
++        transform(source, id) {
++            if (!id.endsWith('.vue'))
++                return null;
++            const { descriptor, errors } = parse(source, { filename: id });
++            if (errors.length)
++                this.error(errors[0]);
++            if (!descriptor.scriptSetup)
++                this.error(`${id}: only <script setup> components are supported`);
++            const scopeId = hash8(path.relative(appDir, id).split(path.sep).join('/'));
++            const scoped = descriptor.styles.some((s) => s.scoped);
++
++            const script = compileScript(descriptor, {
++                id: scopeId,
++                isProd: true,
++                inlineTemplate: true,
++                genDefaultAs: '_sfc_main',
++                templateOptions: { compilerOptions: { scopeId: scoped ? `data-v-${scopeId}` : undefined } },
++                fs: {
++                    fileExists: (f) => fs.existsSync(f),
++                    readFile: (f) => fs.readFileSync(f, 'utf-8'),
++                    realpath: (f) => fs.realpathSync(f),
++                },
++            });
++            let code = script.content;
++            if (scoped)
++                code += `\n_sfc_main.__scopeId = "data-v-${scopeId}";`;
++            code += '\nexport default _sfc_main;\n';
++            if (script.lang === 'ts')
++                code = stripTypes(code, id + '.ts');
++
++            let styles = '';
++            for (const style of descriptor.styles) {
++                if (style.lang || style.module)
++                    this.error(`${id}: <style lang>/<style module> are not supported`);
++                const out = compileStyle({
++                    source: style.content,
++                    filename: id,
++                    id: `data-v-${scopeId}`,
++                    scoped: style.scoped,
++                    isProd: true,
++                });
++                if (out.errors.length)
++                    this.error(out.errors[0]);
++                styles += out.code + '\n';
++            }
++            if (styles)
++                cssByModule.set(id, cssApi.rewriteUrls.call(this, styles, id));
++            return { code, map: null };
++        },
++    };
++}
++
++function minifyCss(code) {
++    return code
++        .replace(/\/\*[\s\S]*?\*\//g, '')
++        .replace(/\s+/g, ' ')
++        .replace(/\s*([{}:;,>])\s*/g, '$1')
++        .replace(/;}/g, '}')
++        // [attr='ident'] -> [attr=ident], as esbuild's minifier (Vite) writes it
++        .replace(/\[([\w-]+)([~|^$*]?=)(['"])(-?[A-Za-z_][\w-]*)\3\]/g, '[$1$2$4]')
++        .trim();
++}
++
++async function build() {
++    const cssByModule = new Map();
++    const cssPlugin = css(cssByModule);
++    let cssFileName = null;
++
++    const bundle = await rollup({
++        input: path.join(appDir, 'src/main.ts'),
++        plugins: [
++            define(),
++            nodeResolve({
++                browser: true,
++                exportConditions: ['browser', 'import', 'module', 'default', 'production'],
++                extensions: ['.mjs', '.js', '.ts', '.json'],
++                modulePaths: [toolModules],
++            }),
++            commonjs(),  // highlight.js's ESM entry wraps its CommonJS core
++            cssPlugin,
++            vueSfc(cssByModule, cssPlugin.api),
++            typescript(),
++            {
++                name: 'forge-emit',
++                async renderChunk(code) {
++                    const out = await minify(code, {
++                        module: true,
++                        ecma: 2020,
++                        compress: { passes: 2 },
++                        format: { comments: false },
++                    });
++                    return { code: out.code, map: null };
++                },
++                generateBundle(_options, output) {
++                    // CSS of every module in execution order: a post-order walk
++                    // of the import graph. (CSS-only modules render no code, so
++                    // they are not in the chunks' module lists.)
++                    const parts = [];
++                    const seen = new Set();
++                    const visit = (id) => {
++                        if (seen.has(id))
++                            return;
++                        seen.add(id);
++                        for (const dep of this.getModuleInfo(id)?.importedIds ?? [])
++                            visit(dep);
++                        if (cssByModule.has(id))
++                            parts.push(cssByModule.get(id));
++                    };
++                    for (const file of Object.values(output))
++                        if (file.type === 'chunk' && file.isEntry)
++                            visit(file.facadeModuleId);
++                    if (!parts.length)
++                        return;
++                    // Assets and the stylesheet both live in assets/, so the
++                    // url()s become plain file names.
++                    const text = minifyCss(parts.join('\n')).replace(
++                        /__FORGE_ASSET_([\w$]+)__/g,
++                        (_, handle) => path.basename(this.getFileName(handle)),
++                    );
++                    cssFileName = `assets/index-${hash8(text)}.css`;
++                    this.emitFile({ type: 'asset', fileName: cssFileName, source: text });
++                },
++            },
++        ],
++        onwarn(warning, warn) {
++            if (warning.code === 'CIRCULAR_DEPENDENCY')
++                return;  // echarts/zrender have harmless cycles
++            if (warning.code === 'UNRESOLVED_IMPORT')
++                throw new Error(warning.message);
++            warn(warning);
++        },
++    });
++
++    fs.rmSync(outDir, { recursive: true, force: true });
++    const { output } = await bundle.write({
++        dir: outDir,
++        format: 'es',
++        entryFileNames: 'assets/index-[hash].js',
++        chunkFileNames: 'assets/[name]-[hash].js',
++        assetFileNames: 'assets/[name]-[hash][extname]',
++    });
++    await bundle.close();
++
++    const entry = output.find((f) => f.type === 'chunk' && f.isEntry);
++    let html = fs.readFileSync(path.join(appDir, 'index.html'), 'utf-8');
++    const scriptRe = /\s*<script type="module" src="\/src\/main\.ts"><\/script>/;
++    if (!scriptRe.test(html))
++        throw new Error('index.html: entry <script> not found');
++    html = html.replace(scriptRe, '');
++    html = html.replace(/\n([ \t]*)<\/head>/, (_, indent) => {
++        let tags = `\n${indent}  <script type="module" crossorigin src="./${entry.fileName}"></script>`;
++        if (cssFileName)
++            tags += `\n${indent}  <link rel="stylesheet" crossorigin href="./${cssFileName}">`;
++        return `${tags}\n${indent}</head>`;
++    });
++    fs.writeFileSync(path.join(outDir, 'index.html'), html);
++
++    for (const f of fs.readdirSync(path.join(outDir, 'assets')).sort())
++        console.log(`${path.relative(process.cwd(), path.join(outDir, 'assets', f))}  ` +
++                    `${fs.statSync(path.join(outDir, 'assets', f)).size} bytes`);
++}
++
++build().catch((err) => {
++    console.error(err.stack || String(err));
++    process.exit(1);
++});
+diff --git a/tools/web-build/package-lock.json b/tools/web-build/package-lock.json
+new file mode 100644
+index 0000000..95fc85f
+--- /dev/null
++++ b/tools/web-build/package-lock.json
+@@ -0,0 +1,660 @@
++{
++  "name": "forge-web-build",
++  "version": "0.1.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "forge-web-build",
++      "version": "0.1.0",
++      "dependencies": {
++        "@rollup/plugin-commonjs": "28.0.9",
++        "@rollup/plugin-node-resolve": "15.3.1",
++        "echarts": "6.1.0",
++        "highlight.js": "11.12.0",
++        "katex": "0.16.47",
++        "rollup": "3.30.0",
++        "terser": "5.51.2",
++        "vue": "3.5.43"
++      },
++      "optionalDependencies": {
++        "typescript": "5.6.3"
++      }
++    },
++    "node_modules/@babel/helper-string-parser": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-string-parser/-/helper-string-parser-7.29.7.tgz",
++      "integrity": "sha512-Pb5ijPrZ89GDH8223L4UP8i6QApWxs04RbPQJTeWDV0/keR2E36MeKnyr6LYmUUvqRRI+Iv87SuF1W6ErINzYw==",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/helper-validator-identifier": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/helper-validator-identifier/-/helper-validator-identifier-7.29.7.tgz",
++      "integrity": "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==",
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@babel/parser": {
++      "version": "7.29.9",
++      "resolved": "https://registry.npmjs.org/@babel/parser/-/parser-7.29.9.tgz",
++      "integrity": "sha512-CjXrNHTnvqBVqHgdBysY3vk2T8tpJHb5/RMeHJBTyVa9xgugCB0CJTx/3oO8RV2QRQP391RWpB7D6hLjm8V9uA==",
++      "dependencies": {
++        "@babel/types": "^7.29.8"
++      },
++      "bin": {
++        "parser": "bin/babel-parser.js"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@babel/types": {
++      "version": "7.29.8",
++      "resolved": "https://registry.npmjs.org/@babel/types/-/types-7.29.8.tgz",
++      "integrity": "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==",
++      "dependencies": {
++        "@babel/helper-string-parser": "^7.29.7",
++        "@babel/helper-validator-identifier": "^7.29.7"
++      },
++      "engines": {
++        "node": ">=6.9.0"
++      }
++    },
++    "node_modules/@jridgewell/gen-mapping": {
++      "version": "0.3.13",
++      "resolved": "https://registry.npmjs.org/@jridgewell/gen-mapping/-/gen-mapping-0.3.13.tgz",
++      "integrity": "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.0",
++        "@jridgewell/trace-mapping": "^0.3.24"
++      }
++    },
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
++      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@jridgewell/source-map": {
++      "version": "0.3.11",
++      "resolved": "https://registry.npmjs.org/@jridgewell/source-map/-/source-map-0.3.11.tgz",
++      "integrity": "sha512-ZMp1V8ZFcPG5dIWnQLr3NSI1MiCU7UETdS/A0G8V/XWHvJv3ZsFqutJn1Y5RPmAPX6F3BiE397OqveU/9NCuIA==",
++      "dependencies": {
++        "@jridgewell/gen-mapping": "^0.3.5",
++        "@jridgewell/trace-mapping": "^0.3.25"
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz",
++      "integrity": "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw=="
++    },
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
++      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
++      }
++    },
++    "node_modules/@rollup/plugin-commonjs": {
++      "version": "28.0.9",
++      "resolved": "https://registry.npmjs.org/@rollup/plugin-commonjs/-/plugin-commonjs-28.0.9.tgz",
++      "integrity": "sha512-PIR4/OHZ79romx0BVVll/PkwWpJ7e5lsqFa3gFfcrFPWwLXLV39JVUzQV9RKjWerE7B845Hqjj9VYlQeieZ2dA==",
++      "dependencies": {
++        "@rollup/pluginutils": "^5.0.1",
++        "commondir": "^1.0.1",
++        "estree-walker": "^2.0.2",
++        "fdir": "^6.2.0",
++        "is-reference": "1.2.1",
++        "magic-string": "^0.30.3",
++        "picomatch": "^4.0.2"
++      },
++      "engines": {
++        "node": ">=16.0.0 || 14 >= 14.17"
++      },
++      "peerDependencies": {
++        "rollup": "^2.68.0||^3.0.0||^4.0.0"
++      },
++      "peerDependenciesMeta": {
++        "rollup": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@rollup/plugin-node-resolve": {
++      "version": "15.3.1",
++      "resolved": "https://registry.npmjs.org/@rollup/plugin-node-resolve/-/plugin-node-resolve-15.3.1.tgz",
++      "integrity": "sha512-tgg6b91pAybXHJQMAAwW9VuWBO6Thi+q7BCNARLwSqlmsHz0XYURtGvh/AuwSADXSI4h/2uHbs7s4FzlZDGSGA==",
++      "dependencies": {
++        "@rollup/pluginutils": "^5.0.1",
++        "@types/resolve": "1.20.2",
++        "deepmerge": "^4.2.2",
++        "is-module": "^1.0.0",
++        "resolve": "^1.22.1"
++      },
++      "engines": {
++        "node": ">=14.0.0"
++      },
++      "peerDependencies": {
++        "rollup": "^2.78.0||^3.0.0||^4.0.0"
++      },
++      "peerDependenciesMeta": {
++        "rollup": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@rollup/pluginutils": {
++      "version": "5.5.1",
++      "resolved": "https://registry.npmjs.org/@rollup/pluginutils/-/pluginutils-5.5.1.tgz",
++      "integrity": "sha512-P9ZvnfouRu4MSC+ilERaw6FmZs8zqKhpHxEs4aGDGWQAMzQGXnhvCSvoNwokfNvdt7t3Y5Y4p6gStQgezeIqug==",
++      "dependencies": {
++        "@types/estree": "^1.0.0",
++        "estree-walker": "^2.0.2",
++        "picomatch": "^4.0.2"
++      },
++      "engines": {
++        "node": ">=14.0.0"
++      },
++      "peerDependencies": {
++        "rollup": "^1.20.0||^2.0.0||^3.0.0||^4.0.0"
++      },
++      "peerDependenciesMeta": {
++        "rollup": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@types/estree": {
++      "version": "1.0.9",
++      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
++      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg=="
++    },
++    "node_modules/@types/resolve": {
++      "version": "1.20.2",
++      "resolved": "https://registry.npmjs.org/@types/resolve/-/resolve-1.20.2.tgz",
++      "integrity": "sha512-60BCwRFOZCQhDncwQdxxeOEEkbc5dIMccYLwbxsS4TUNeVECQ/pBJ0j09mrHOl/JJvpRPGwO9SvE4nR2Nb/a4Q=="
++    },
++    "node_modules/@vue/compiler-core": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-core/-/compiler-core-3.5.43.tgz",
++      "integrity": "sha512-zdiLhnbe1QQqgDT8xZMpNmyqZ3qlI+/Q/FHQco57Kwl/b05HhCzN6eVGN9QU9rbga4CrS0H5SYY8VGHZCt/1Hg==",
++      "dependencies": {
++        "@babel/parser": "^7.29.8",
++        "@vue/shared": "3.5.43",
++        "entities": "^7.0.1",
++        "estree-walker": "^2.0.2",
++        "source-map-js": "^1.2.1"
++      }
++    },
++    "node_modules/@vue/compiler-dom": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-dom/-/compiler-dom-3.5.43.tgz",
++      "integrity": "sha512-PEZoAk3NQmsn/ejMzSOCyTYqwGqczrWm70PuhBKjjv1+TCoQAaO/zOqNwjV+honlNstT5ILxtc+8r8UUfj+iEQ==",
++      "dependencies": {
++        "@vue/compiler-core": "3.5.43",
++        "@vue/shared": "3.5.43"
++      }
++    },
++    "node_modules/@vue/compiler-sfc": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-sfc/-/compiler-sfc-3.5.43.tgz",
++      "integrity": "sha512-FCbrG3XNCRl+js3huuKx4IVHBLTvMkJhVepjbxSPu1gn4yWLaYtGNQdjJGZaMytXB6qb76qQDDmDSLy/vkmleQ==",
++      "dependencies": {
++        "@babel/parser": "^7.29.8",
++        "@vue/compiler-core": "3.5.43",
++        "@vue/compiler-dom": "3.5.43",
++        "@vue/compiler-ssr": "3.5.43",
++        "@vue/shared": "3.5.43",
++        "estree-walker": "^2.0.2",
++        "magic-string": "^0.30.21",
++        "postcss": "^8.5.28",
++        "source-map-js": "^1.2.1"
++      }
++    },
++    "node_modules/@vue/compiler-ssr": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/compiler-ssr/-/compiler-ssr-3.5.43.tgz",
++      "integrity": "sha512-GF62orf7KiJX9RqrHNGrYBudsQGD0OhJ5nDs90O8UiDuS40+YMYomiXu6w6EuvtXuRDc3MSNis3EaaSKAVSWpg==",
++      "dependencies": {
++        "@vue/compiler-dom": "3.5.43",
++        "@vue/shared": "3.5.43"
++      }
++    },
++    "node_modules/@vue/reactivity": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/reactivity/-/reactivity-3.5.43.tgz",
++      "integrity": "sha512-G/c9GyOZNI2jVaaS6OX1EF1SSFSv7H0ERqNTl4+DTFMlZmB5eVAB53aLQNam/7NL2NPtaDD7RdVrzf8uJzMuOA==",
++      "dependencies": {
++        "@vue/shared": "3.5.43"
++      }
++    },
++    "node_modules/@vue/runtime-core": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/runtime-core/-/runtime-core-3.5.43.tgz",
++      "integrity": "sha512-hU6U6VnVhBGQDpvlnnDlIB8ZGJBiOcgk2lh/0InltHiz3D8oSkluvuvY+do1G2H3+udeKFsmaBlgVYP7gXQzEw==",
++      "dependencies": {
++        "@vue/reactivity": "3.5.43",
++        "@vue/shared": "3.5.43"
++      }
++    },
++    "node_modules/@vue/runtime-dom": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/runtime-dom/-/runtime-dom-3.5.43.tgz",
++      "integrity": "sha512-Bb2Jc0YjjJdMt1SJmb9b2L/IWd3I8lIT9x9eS/xvvP9CiVgna0ffua74xKRmt4/uSJ+0r4iN8ex1jrqkhQGWQw==",
++      "dependencies": {
++        "@vue/reactivity": "3.5.43",
++        "@vue/runtime-core": "3.5.43",
++        "@vue/shared": "3.5.43",
++        "csstype": "^3.2.3"
++      }
++    },
++    "node_modules/@vue/server-renderer": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/server-renderer/-/server-renderer-3.5.43.tgz",
++      "integrity": "sha512-l2Ygjv9NehV94PSBxNWsAHC0j/eIIKbn92mBuWXAPGLnn6HfJ6MH5ubsd+Nk0YoZ5FRuxWI1P2VSoh+dbPQhCQ==",
++      "dependencies": {
++        "@vue/compiler-ssr": "3.5.43",
++        "@vue/runtime-dom": "3.5.43",
++        "@vue/shared": "3.5.43"
++      }
++    },
++    "node_modules/@vue/shared": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/@vue/shared/-/shared-3.5.43.tgz",
++      "integrity": "sha512-uksS7YGMR5NZyr4JNq0Rp+QyLns0ueaz20KwzIPW9R0LH1Vnt4E+XUM29PNseEbf1www2gOuhuDi5AKOIXag9Q=="
++    },
++    "node_modules/acorn": {
++      "version": "8.19.0",
++      "resolved": "https://registry.npmjs.org/acorn/-/acorn-8.19.0.tgz",
++      "integrity": "sha512-oJlA3XiRm7Cyk6qFD2Jn8ak9B7jSy0qy00ADO3+8dpT0LSjFihQYv4C02LFCSYJV3Q37xYwwRy5m+IpIiUzqWw==",
++      "bin": {
++        "acorn": "bin/acorn"
++      },
++      "engines": {
++        "node": ">=0.4.0"
++      }
++    },
++    "node_modules/buffer-from": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/buffer-from/-/buffer-from-1.1.2.tgz",
++      "integrity": "sha512-E+XQCRwSbaaiChtv6k6Dwgc+bx+Bs6vuKJHHl5kox/BaKbhiXzqQOwK4cO22yElGp2OCmjwVhT3HmxgyPGnJfQ=="
++    },
++    "node_modules/commander": {
++      "version": "8.3.0",
++      "resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
++      "integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww==",
++      "engines": {
++        "node": ">= 12"
++      }
++    },
++    "node_modules/commondir": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/commondir/-/commondir-1.0.1.tgz",
++      "integrity": "sha512-W9pAhw0ja1Edb5GVdIF1mjZw/ASI0AlShXM83UUGe2DVr5TdAPEA1OA8m/g8zWp9x6On7gqufY+FatDbC3MDQg=="
++    },
++    "node_modules/csstype": {
++      "version": "3.2.3",
++      "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
++      "integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="
++    },
++    "node_modules/deepmerge": {
++      "version": "4.3.1",
++      "resolved": "https://registry.npmjs.org/deepmerge/-/deepmerge-4.3.1.tgz",
++      "integrity": "sha512-3sUqbMEc77XqpdNO7FRyRog+eW3ph+GYCbj+rK+uYyRMuwsVy0rMiVtPn+QJlKFvWP/1PYpapqYn0Me2knFn+A==",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/echarts": {
++      "version": "6.1.0",
++      "resolved": "https://registry.npmjs.org/echarts/-/echarts-6.1.0.tgz",
++      "integrity": "sha512-q0yaFPggC9FUdsWH4blavRWFmxdrIodbkoKNAjJudAI6CA9gNPxHtV2RcZNEepZVlk4yvBYkOkbk6HIVpIyHZA==",
++      "dependencies": {
++        "tslib": "2.3.0",
++        "zrender": "6.1.0"
++      }
++    },
++    "node_modules/entities": {
++      "version": "7.0.1",
++      "resolved": "https://registry.npmjs.org/entities/-/entities-7.0.1.tgz",
++      "integrity": "sha512-TWrgLOFUQTH994YUyl1yT4uyavY5nNB5muff+RtWaqNVCAK408b5ZnnbNAUEWLTCpum9w6arT70i1XdQ4UeOPA==",
++      "engines": {
++        "node": ">=0.12"
++      },
++      "funding": {
++        "url": "https://github.com/fb55/entities?sponsor=1"
++      }
++    },
++    "node_modules/es-errors": {
++      "version": "1.3.0",
++      "resolved": "https://registry.npmjs.org/es-errors/-/es-errors-1.3.0.tgz",
++      "integrity": "sha512-Zf5H2Kxt2xjTvbJvP2ZWLEICxA6j+hAmMzIlypy4xcBg1vKVnx89Wy0GbS+kf5cwCVFFzdCFh2XSCFNULS6csw==",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/estree-walker": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/estree-walker/-/estree-walker-2.0.2.tgz",
++      "integrity": "sha512-Rfkk/Mp/DL7JVje3u18FxFujQlTNR2q6QfMSMB7AvCBx91NGj/ba3kCfza0f6dVDbw7YlRf/nDrn7pQrCCyQ/w=="
++    },
++    "node_modules/fdir": {
++      "version": "6.5.0",
++      "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
++      "integrity": "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==",
++      "engines": {
++        "node": ">=12.0.0"
++      },
++      "peerDependencies": {
++        "picomatch": "^3 || ^4"
++      },
++      "peerDependenciesMeta": {
++        "picomatch": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/fsevents": {
++      "version": "2.3.3",
++      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
++      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
++      "hasInstallScript": true,
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
++      }
++    },
++    "node_modules/function-bind": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/function-bind/-/function-bind-1.1.2.tgz",
++      "integrity": "sha512-7XHNxH7qX9xG5mIwxkhumTox/MIRNcOgDrxWsMt2pAr23WHp6MrRlN7FBSFpCpr+oVO0F744iUgR82nJMfG2SA==",
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/hasown": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.4.tgz",
++      "integrity": "sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==",
++      "dependencies": {
++        "function-bind": "^1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/highlight.js": {
++      "version": "11.12.0",
++      "resolved": "https://registry.npmjs.org/highlight.js/-/highlight.js-11.12.0.tgz",
++      "integrity": "sha512-nbfWpyRMcMrPMmDwJB+dhX/eiaPKtc2RB+0QZskqJ3WjRA/FDS0e9hZrx8EC/lbEv8gXy98FcDbNa/dspAaJMg==",
++      "engines": {
++        "node": ">=12.0.0"
++      }
++    },
++    "node_modules/is-core-module": {
++      "version": "2.17.0",
++      "resolved": "https://registry.npmjs.org/is-core-module/-/is-core-module-2.17.0.tgz",
++      "integrity": "sha512-J/vG0zBCbIKOQFfufSwyXdMrsohyJIUNkrnmo6WZGzoM7tr/lsbfW5b2BvisL6zsyMzK9UxV9L6c7AoFbyXHOA==",
++      "dependencies": {
++        "hasown": "^2.0.4"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/is-module": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/is-module/-/is-module-1.0.0.tgz",
++      "integrity": "sha512-51ypPSPCoTEIN9dy5Oy+h4pShgJmPCygKfyRCISBI+JoWT/2oJvK8QPxmwv7b/p239jXrm9M1mlQbyKJ5A152g=="
++    },
++    "node_modules/is-reference": {
++      "version": "1.2.1",
++      "resolved": "https://registry.npmjs.org/is-reference/-/is-reference-1.2.1.tgz",
++      "integrity": "sha512-U82MsXXiFIrjCK4otLT+o2NA2Cd2g5MLoOVXUZjIOhLurrRxpEXzI8O0KZHr3IjLvlAH1kTPYSuqer5T9ZVBKQ==",
++      "dependencies": {
++        "@types/estree": "*"
++      }
++    },
++    "node_modules/katex": {
++      "version": "0.16.47",
++      "resolved": "https://registry.npmjs.org/katex/-/katex-0.16.47.tgz",
++      "integrity": "sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg==",
++      "funding": [
++        "https://opencollective.com/katex",
++        "https://github.com/sponsors/katex"
++      ],
++      "dependencies": {
++        "commander": "^8.3.0"
++      },
++      "bin": {
++        "katex": "cli.js"
++      }
++    },
++    "node_modules/magic-string": {
++      "version": "0.30.21",
++      "resolved": "https://registry.npmjs.org/magic-string/-/magic-string-0.30.21.tgz",
++      "integrity": "sha512-vd2F4YUyEXKGcLHoq+TEyCjxueSeHnFxyyjNp80yg0XV4vUhnDer/lvvlqM/arB5bXQN5K2/3oinyCRyx8T2CQ==",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.5"
++      }
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.20",
++      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.20.tgz",
++      "integrity": "sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/path-parse": {
++      "version": "1.0.7",
++      "resolved": "https://registry.npmjs.org/path-parse/-/path-parse-1.0.7.tgz",
++      "integrity": "sha512-LDJzPVEEEPR+y48z93A0Ed0yXb8pAByGWo/k5YYdYgpY2/2EsOsksJrq7lOHxryrVOn1ejG6oAp8ahvOIQD8sw=="
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA=="
++    },
++    "node_modules/picomatch": {
++      "version": "4.0.7",
++      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.7.tgz",
++      "integrity": "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==",
++      "engines": {
++        "node": ">=12"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/jonschlinkert"
++      }
++    },
++    "node_modules/postcss": {
++      "version": "8.5.31",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.31.tgz",
++      "integrity": "sha512-YUbWYCgErwnMAVkjUnYa+KlMBzGpHwiIt/DE7f0G33AuX2LH9UcTk6KgWxd3zRU+pN3u/C+Xl3EnMLM4Hea7Sg==",
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "dependencies": {
++        "nanoid": "^3.3.20",
++        "picocolors": "^1.1.1",
++        "source-map-js": "^1.2.2"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/resolve": {
++      "version": "1.22.13",
++      "resolved": "https://registry.npmjs.org/resolve/-/resolve-1.22.13.tgz",
++      "integrity": "sha512-Dj/cW9zBV2aRj6XzCxuGIs3ESZKv02jixne3q6jFZYZ3/Tg09gHHviSMDL4kObh9pqSahdRHEnDoaP2gn8YLhA==",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "is-core-module": "^2.17.0",
++        "path-parse": "^1.0.7",
++        "supports-preserve-symlinks-flag": "^1.0.0"
++      },
++      "bin": {
++        "resolve": "bin/resolve"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/rollup": {
++      "version": "3.30.0",
++      "resolved": "https://registry.npmjs.org/rollup/-/rollup-3.30.0.tgz",
++      "integrity": "sha512-kQvGasUgN+AlWGliFn2POSajRQEsULVYFGTvOZmK06d7vCD+YhZztt70kGk3qaeAXeWYL5eO7zx+rAubBc55eA==",
++      "bin": {
++        "rollup": "dist/bin/rollup"
++      },
++      "engines": {
++        "node": ">=14.18.0",
++        "npm": ">=8.0.0"
++      },
++      "optionalDependencies": {
++        "fsevents": "~2.3.2"
++      }
++    },
++    "node_modules/source-map": {
++      "version": "0.6.1",
++      "resolved": "https://registry.npmjs.org/source-map/-/source-map-0.6.1.tgz",
++      "integrity": "sha512-UjgapumWlbMhkBgzT7Ykc5YXUT46F0iKu8SGXq0bcwP5dz/h0Plj6enJqjz1Zbq2l5WaqYnrVbwWOWMyF3F47g==",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/source-map-js": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/source-map-support": {
++      "version": "0.5.21",
++      "resolved": "https://registry.npmjs.org/source-map-support/-/source-map-support-0.5.21.tgz",
++      "integrity": "sha512-uBHU3L3czsIyYXKX88fdrGovxdSCoTGDRZ6SYXtSRxLZUzHg5P/66Ht6uoUlHu9EZod+inXhKo3qQgwXUT/y1w==",
++      "dependencies": {
++        "buffer-from": "^1.0.0",
++        "source-map": "^0.6.0"
++      }
++    },
++    "node_modules/supports-preserve-symlinks-flag": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/supports-preserve-symlinks-flag/-/supports-preserve-symlinks-flag-1.0.0.tgz",
++      "integrity": "sha512-ot0WnXS9fgdkgIcePe6RHNk1WA8+muPa6cSjeR3V8K27q9BB1rTE3R1p7Hv0z1ZyAc8s6Vvv8DIyWf681MAt0w==",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/terser": {
++      "version": "5.51.2",
++      "resolved": "https://registry.npmjs.org/terser/-/terser-5.51.2.tgz",
++      "integrity": "sha512-bWnjSNscmuI+GJze6ZupnHP8G/cTcsJF+bXCeQknk2SHQsgbNJnLrqiH9jZ2W4STPVXH2mDKKRX3iwPhc9Cn/Q==",
++      "dependencies": {
++        "@jridgewell/source-map": "^0.3.3",
++        "acorn": "^8.15.0",
++        "commander": "^2.20.0",
++        "source-map-support": "~0.5.20"
++      },
++      "bin": {
++        "terser": "bin/terser"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/terser/node_modules/commander": {
++      "version": "2.20.3",
++      "resolved": "https://registry.npmjs.org/commander/-/commander-2.20.3.tgz",
++      "integrity": "sha512-GpVkmM8vF2vQUkj2LvZmD35JxeJOLCwJ9cUkugyk2nuhbv3+mJvpLYYt+0+USMxE+oj+ey/lJEnhZw75x/OMcQ=="
++    },
++    "node_modules/tslib": {
++      "version": "2.3.0",
++      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.3.0.tgz",
++      "integrity": "sha512-N82ooyxVNm6h1riLCoyS9e3fuJ3AMG2zIZs2Gd1ATcSFjSA23Q0fzjjZeh0jbJvWVDZ0cJT8yaNNaaXHzueNjg=="
++    },
++    "node_modules/typescript": {
++      "version": "5.6.3",
++      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.6.3.tgz",
++      "integrity": "sha512-hjcS1mhfuyi4WW8IWtjP7brDrG2cuDZukyrYrSauoXGNgx0S7zceP07adYkJycEr56BOUTNPzbInooiN3fn1qw==",
++      "optional": true,
++      "bin": {
++        "tsc": "bin/tsc",
++        "tsserver": "bin/tsserver"
++      },
++      "engines": {
++        "node": ">=14.17"
++      }
++    },
++    "node_modules/vue": {
++      "version": "3.5.43",
++      "resolved": "https://registry.npmjs.org/vue/-/vue-3.5.43.tgz",
++      "integrity": "sha512-o5qZoksdnjIKvW1srZ3ab7pcDNYAerBjRe54D0LBLfRdCYFrSgBHVXokMas35czQc0//lmx4/tuY4ZNQ+Rf2Ng==",
++      "dependencies": {
++        "@vue/compiler-dom": "3.5.43",
++        "@vue/compiler-sfc": "3.5.43",
++        "@vue/runtime-dom": "3.5.43",
++        "@vue/server-renderer": "3.5.43",
++        "@vue/shared": "3.5.43"
++      },
++      "peerDependencies": {
++        "typescript": "*"
++      },
++      "peerDependenciesMeta": {
++        "typescript": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/zrender": {
++      "version": "6.1.0",
++      "resolved": "https://registry.npmjs.org/zrender/-/zrender-6.1.0.tgz",
++      "integrity": "sha512-oEGMDB6pOP2S6OwRR4PdVv610zrjnA3Bh+JnSG12fYJlBKjtNAoEb5fSUoCOOINlH96I2fU38/A2UpRKs67xYQ==",
++      "dependencies": {
++        "tslib": "2.3.0"
++      }
++    }
++  }
++}
+diff --git a/tools/web-build/package.json b/tools/web-build/package.json
+new file mode 100644
+index 0000000..2782426
+--- /dev/null
++++ b/tools/web-build/package.json
+@@ -0,0 +1,24 @@
++{
++  "name": "forge-web-build",
++  "version": "0.1.0",
++  "private": true,
++  "type": "module",
++  "description": "Vite-free build of web/ and web-chat/ in plain JavaScript (Rollup 3, the Vue SFC compiler, TypeScript's transpiler, terser) for hosts where esbuild and Rollup 4 have no native binaries.",
++  "scripts": {
++    "build:dashboard": "node build.mjs ../../web ../../web/dist",
++    "build:chat": "node build.mjs ../../web-chat ../../web-chat/dist"
++  },
++  "dependencies": {
++    "@rollup/plugin-commonjs": "28.0.9",
++    "@rollup/plugin-node-resolve": "15.3.1",
++    "echarts": "6.1.0",
++    "highlight.js": "11.12.0",
++    "katex": "0.16.47",
++    "rollup": "3.30.0",
++    "terser": "5.51.2",
++    "vue": "3.5.43"
++  },
++  "optionalDependencies": {
++    "typescript": "5.6.3"
++  }
++}
+-- 
+2.43.0
+

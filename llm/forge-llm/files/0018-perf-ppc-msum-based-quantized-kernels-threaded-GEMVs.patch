@@ -1,0 +1,1346 @@
+From 93cbc58f5193d04c940605e32bb3362abadbe837 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 04:27:53 +0000
+Subject: [PATCH 18/20] perf(ppc): msum-based quantized kernels, threaded
+ GEMVs, fused K-quants
+
+Rework the PowerPC quantized matmul kernels (shared by AltiVec and VSX):
+
+- Q2_K, Q3_K and Q5_K no longer dequantize the whole N x K weight matrix
+  to fp32 on every call (hundreds of MB for an output projection, which
+  also cannot be allocated in a 32-bit process). They get fused per-block
+  kernels like Q4_K/Q6_K.
+- Unsigned x signed byte dots use vec_msum (vmsummbm: 16 multiply-adds
+  in one instruction, available on every AltiVec/VSX CPU) instead of
+  vmulesb/vmulosb + two vsum4shs. Weights are widened to unsigned bytes
+  (Q4_x/Q5_x nibbles, K-quant 2..6-bit values, I-quant grids); format
+  offsets and minimums are applied once per block from the activation
+  sums (Q8_K bsums, or per-block sums for the 32-element formats)
+  instead of a 32-iteration scalar loop per block and weight row.
+- Q5_0/Q5_1 build their fifth bit with a permute/mask instead of a
+  per-element scalar loop; horizontal sums use vsumsws.
+- The Q4_0/Q4_1/Q5_x/Q8_0 GEMVs ran on one thread; split the weight rows
+  across the pool like the other kernels. Activations are quantized once
+  per row into a 16-byte-aligned layout so their loads are plain lvx.
+- Block scales are decoded with a branch-free exact fp16 conversion
+  instead of std::ldexp.
+- The row-wise dequant fallback (formats without a fused kernel) uses the
+  vectorized dot_f32.
+
+Kernels are checked against the scalar dequant routines; Q2_K/Q3_K/Q5_K
+GEMM tests are added. The PowerPC kernel suite (396 checks) and the IQ
+tests pass on a 7450 (qemu-ppc), and the sources compile for VSX.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/operators/cpu/arch/ppc64/gemm.h     | 493 ++++++++++--------------
+ src/operators/cpu/arch/ppc64/gemv.h     | 476 +++++++----------------
+ src/operators/cpu/arch/ppc64/ppc_simd.h |  52 +++
+ src/operators/cpu/arch/ppc64/quants.h   |  20 +-
+ src/operators/cpu/arch/ppc64/vec_dot.h  |  43 +--
+ src/operators/cpu/matmul.cpp            |  11 +
+ tests/test_ppc64_vsx_kernels.cpp        |   6 +
+ 7 files changed, 427 insertions(+), 674 deletions(-)
+
+diff --git a/src/operators/cpu/arch/ppc64/gemm.h b/src/operators/cpu/arch/ppc64/gemm.h
+index def32cf..c2f7085 100644
+--- a/src/operators/cpu/arch/ppc64/gemm.h
++++ b/src/operators/cpu/arch/ppc64/gemm.h
+@@ -1,13 +1,9 @@
+ #pragma once
+ #include "cpu/common/thread_pool.h"
+-// PowerPC64 VSX GEMM micro-kernels for batch decode (M >= 1, both decode & prefill).
+-// Provides gemm_q4_K_vsx, gemm_q6_K_vsx, gemm_q2_K_vsx, gemm_q3_K_vsx, gemm_q5_K_vsx.
+-// All functions compute: out = a @ w^T, where a is [M, K] and w is [N, K] in quantized format.
+-//
+-// Decode (M=1): act quantized once, then RM=4 row-grouped dot product against weight rows.
+-// Prefill (M>1): work-stealing over N, shared weight block decoding per N-column.
+-//
+-// VSX has NO dotprod instruction — always uses vec_mule/vec_mulo + vec_sum4s fallback.
++// PowerPC (AltiVec/VSX) K-quant GEMMs for decode and prefill (M >= 1).
++// Provides gemm_q2_K_vsx .. gemm_q6_K_vsx (the suffix is historical; they build
++// for AltiVec too). All compute out = a @ w^T, a is [M, K], w is [N, K]
++// quantized.
+ 
+ #include "ppc_simd.h"
+ #include <cstring>
+@@ -57,335 +53,240 @@ static inline void decode_q4_k_scales_vsx(const uint8_t scales[12],
+ }
+ 
+ // ============================================================================
+-// Shared helpers for the K-quant GEMMs
++// K-quant GEMMs (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K): out = a @ w^T
++//
++// Activations are quantized once per call to Q8_K and copied into an aligned
++// layout (activations_q8_K); weight rows are split across the thread pool.
++// Each 256-element block is decoded to unsigned bytes and multiplied with
++// vec_msum (vmsummbm); per-sub-block offsets and minimums are applied through
++// the Q8_K bsums. Block layouts follow dequantize_q*_k_row in dequant.cpp.
+ // ============================================================================
+ 
+-// acc += 16-lane signed-byte dot product of a and b, as 4 int32 partial sums.
+-static inline __vector signed int dot16_s8_acc_vsx(__vector signed char a,
+-                                                   __vector signed char b,
+-                                                   __vector signed int acc) {
+-    acc = vec_sum4s(vec_mule(a, b), acc);
+-    return vec_sum4s(vec_mulo(a, b), acc);
++// M rows of Q8_K activations: 16-byte aligned quants plus bsums and scales.
++struct activations_q8_K {
++    int nb;
++    scratch_vec<int8_t> qs;      // [M * nb][256]
++    scratch_vec<int16_t> bsums;  // [M * nb][16]: sums of 16-element groups
++    scratch_vec<float> d;        // [M * nb]
++
++    activations_q8_K(const float* a, int M, int K)
++        : nb((K + 255) / 256),
++          qs((size_t)M * ((K + 255) / 256) * 256),
++          bsums((size_t)M * ((K + 255) / 256) * 16),
++          d((size_t)M * ((K + 255) / 256)) {
++        scratch_vec<block_q8_K> blocks(nb);
++        for (int m = 0; m < M; ++m) {
++            quantize_row_q8_K(a + (size_t)m * K, blocks.data(), K);
++            for (int i = 0; i < nb; ++i) {
++                const size_t b = (size_t)m * nb + i;
++                std::memcpy(qs.data() + b * 256, blocks[i].qs, 256);
++                std::memcpy(bsums.data() + b * 16, blocks[i].bsums, 32);
++                d[b] = blocks[i].d;
++            }
++        }
++    }
++    const int8_t* q(int m, int i) const { return qs.data() + ((size_t)m * nb + i) * 256; }
++    const int16_t* bs(int m, int i) const { return bsums.data() + ((size_t)m * nb + i) * 16; }
++    float scale(int m, int i) const { return d[(size_t)m * nb + i]; }
++};
++
++// sum(u[0..16) * q8[0..16)) for unsigned weight bytes u and aligned q8.
++static inline int dot16_u8_q8(__vector unsigned char u, const int8_t* q8) {
++    return ppc_hsum_i32(ppc_msum_u8s8(u, ppc_load_aligned(q8), vec_splats(0)));
+ }
+ 
+-static inline int hsum_i32x4_vsx(__vector signed int v) {
+-    union { __vector signed int vi; int i[4]; } u;
+-    u.vi = v;
+-    return u.i[0] + u.i[1] + u.i[2] + u.i[3];
++// Same over 32 elements: u0 with q8[0..16), u1 with q8[16..32).
++static inline int dot32_u8_q8(__vector unsigned char u0, __vector unsigned char u1,
++                              const int8_t* q8) {
++    __vector signed int s = ppc_msum_u8s8(u0, ppc_load_aligned(q8), vec_splats(0));
++    return ppc_hsum_i32(ppc_msum_u8s8(u1, ppc_load_aligned(q8 + 16), s));
+ }
+ 
+-// ============================================================================
+-// Q4_K GEMM: decode (M=1) and prefill (M>1)
+-// Q4_K block: 144 bytes per 256 elements
+-// Layout: d[2](fp16) + dmin[2](fp16) + scales[12] + qs[128]
+-// 8 sub-blocks of 32 elements; qs is consumed 32 bytes (64 elements) at a time:
+-// the low nibbles are sub-block 2j, the high nibbles sub-block 2j+1.
+-// Value = d * sc[sb] * nibble - dmin * mn[sb]  (see dequantize_q4_k_row).
+-// ============================================================================
+-
+-// Dot product of one Q4_K block with one Q8_K block, before the d / dmin
+-// scaling: returns sum_sb sc[sb] * dot(q4, q8) and, via *min_acc,
+-// sum_sb mn[sb] * sum(q8) for the sub-block.
+-static inline int dot_q4_K_q8_K_block_vsx(const uint8_t* q4_qs, const uint8_t sc[8],
+-                                          const uint8_t mn[8], const block_q8_K* y,
+-                                          int* min_acc) {
+-    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
+-    const __vector unsigned char s4 = vec_splats((unsigned char)4);
+-    const __vector signed int zero = vec_splats((int)0);
+-    const int8_t* q8 = y->qs;
++// Q2_K block (84 bytes): scales[16] (low nibble scale, high nibble min),
++// qs[64] (2-bit), d, dmin. Value = d * sc * q - dmin * mn.
++static inline float dot_q2_K_block_ppc(const uint8_t* x, const int8_t* q8, const int16_t* bsums) {
++    const uint8_t* scales = x;
++    const __vector unsigned char m3 = vec_splats((unsigned char)3);
+     int acc = 0, macc = 0;
+-    for (int j = 0; j < 4; ++j) {
+-        __vector unsigned char b0 = ppc_load(q4_qs + 32 * j);
+-        __vector unsigned char b1 = ppc_load(q4_qs + 32 * j + 16);
+-        __vector signed char q8_0 = ppc_load(q8 + 64 * j);
+-        __vector signed char q8_1 = ppc_load(q8 + 64 * j + 16);
+-        __vector signed char q8_2 = ppc_load(q8 + 64 * j + 32);
+-        __vector signed char q8_3 = ppc_load(q8 + 64 * j + 48);
+-
+-        __vector signed int lo = dot16_s8_acc_vsx((__vector signed char)(b0 & m4), q8_0, zero);
+-        lo = dot16_s8_acc_vsx((__vector signed char)(b1 & m4), q8_1, lo);
+-        __vector signed int hi = dot16_s8_acc_vsx((__vector signed char)vec_sr(b0, s4), q8_2, zero);
+-        hi = dot16_s8_acc_vsx((__vector signed char)vec_sr(b1, s4), q8_3, hi);
+-
+-        acc += hsum_i32x4_vsx(lo) * sc[2 * j] + hsum_i32x4_vsx(hi) * sc[2 * j + 1];
+-        // bsums[k] = sum of q8[16k .. 16k+15]
+-        macc += (y->bsums[4 * j] + y->bsums[4 * j + 1]) * mn[2 * j] +
+-                (y->bsums[4 * j + 2] + y->bsums[4 * j + 3]) * mn[2 * j + 1];
++    for (int half = 0; half < 2; ++half) {
++        const __vector unsigned char qa = ppc_load(x + 16 + 32 * half);
++        const __vector unsigned char qb = ppc_load(x + 16 + 32 * half + 16);
++        for (int j = 0; j < 4; ++j) {
++            const __vector unsigned char sh = vec_splats((unsigned char)(2 * j));
++            const int is = 8 * half + 2 * j;  // sub-block (16 elements) index
++            const int8_t* q = q8 + 128 * half + 32 * j;
++            acc += dot16_u8_q8(vec_sr(qa, sh) & m3, q) * (scales[is] & 0xF);
++            acc += dot16_u8_q8(vec_sr(qb, sh) & m3, q + 16) * (scales[is + 1] & 0xF);
++            macc += bsums[is] * (scales[is] >> 4) + bsums[is + 1] * (scales[is + 1] >> 4);
++        }
+     }
+-    *min_acc = macc;
+-    return acc;
++    return ppc_half_at(x + 80) * (float)acc - ppc_half_at(x + 82) * (float)macc;
+ }
+ 
+-static void gemm_q4_K_vsx(
+-    const float* a_data,
+-    const uint8_t* w_data,
+-    float* o_data,
+-    int M, int K, int N)
+-{
+-    constexpr int QK_K = 256;
+-    constexpr int Q4_K_BLOCK_BYTES = 144;
+-    const int nb = (K + QK_K - 1) / QK_K;
++// Q3_K block (110 bytes): hmask[32], qs[64] (2-bit), scales[12] (16 x 6-bit,
++// offset 32), d. Value = d * (sc - 32) * (q + 4 * hbit - 4).
++static inline float dot_q3_K_block_ppc(const uint8_t* x, const int8_t* q8, const int16_t* bsums) {
++    // Unpack the scales exactly as dequantize_q3_k_row does (the kmask trick
++    // only moves bits within bytes, so it is byte-order independent).
++    const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
++    uint32_t aux[4];
++    std::memcpy(aux, x + 96, 12);
++    const uint32_t tmp = aux[2];
++    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
++    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
++    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
++    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
++    int8_t sc[16];
++    std::memcpy(sc, aux, 16);
+ 
+-    // Quantize all M activation rows to Q8_K (one-time cost)
+-    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
+-    for (int m = 0; m < M; ++m)
+-        quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
+-
+-    if (M == 1) {
+-        // Decode: RM=4 row grouping, Q8_K shared across 4 weight rows
+-        const size_t row_bytes = (size_t)nb * Q4_K_BLOCK_BYTES;
+-        cpu::parallel_for_chunks(N, 4, [&](int n_base0, int n_base1) {
+-            for (int n_base = n_base0; n_base < n_base1; n_base += 4) {
+-            int rows = (n_base + 4 <= N) ? 4 : (N - n_base);
+-            for (int r = 0; r < rows; ++r) {
+-                const uint8_t* q4_row = w_data + (size_t)(n_base + r) * row_bytes;
+-                float sum = 0.0f;
+-
+-                for (int bi = 0; bi < nb; ++bi) {
+-                    const block_q4_K* x =
+-                        reinterpret_cast<const block_q4_K*>(q4_row) + bi;
+-                    const block_q8_K* y = q8_all.data() + bi;
+-
+-                    uint8_t sc[8], mn[8];
+-                    decode_q4_k_scales_vsx(x->scales, sc, mn);
+-                    int min_acc;
+-                    const int acc = dot_q4_K_q8_K_block_vsx(x->qs, sc, mn, y, &min_acc);
+-                    sum += y->d * (fp16_to_float_scalar(x->d) * (float)acc -
+-                                   fp16_to_float_scalar(x->dmin) * (float)min_acc);
+-                }
+-                o_data[n_base + r] = sum;
+-            }
++    const __vector unsigned char m3 = vec_splats((unsigned char)3);
++    const __vector unsigned char one = vec_splats((unsigned char)1);
++    const __vector unsigned char two = vec_splats((unsigned char)2);
++    const __vector unsigned char hm_a = ppc_load(x);
++    const __vector unsigned char hm_b = ppc_load(x + 16);
++    int acc = 0;
++    for (int half = 0; half < 2; ++half) {
++        const __vector unsigned char qa = ppc_load(x + 32 + 32 * half);
++        const __vector unsigned char qb = ppc_load(x + 32 + 32 * half + 16);
++        for (int j = 0; j < 4; ++j) {
++            const __vector unsigned char sh = vec_splats((unsigned char)(2 * j));
++            const __vector unsigned char hb = vec_splats((unsigned char)(4 * half + j));
++            const int is = 8 * half + 2 * j;
++            const int8_t* q = q8 + 128 * half + 32 * j;
++            // q + 4 * hbit in [0, 8); the -4 comes off via the bsums
++            const __vector unsigned char ua = (vec_sr(qa, sh) & m3) | vec_sl(vec_sr(hm_a, hb) & one, two);
++            const __vector unsigned char ub = (vec_sr(qb, sh) & m3) | vec_sl(vec_sr(hm_b, hb) & one, two);
++            acc += (dot16_u8_q8(ua, q) - 4 * bsums[is]) * (sc[is] - 32);
++            acc += (dot16_u8_q8(ub, q + 16) - 4 * bsums[is + 1]) * (sc[is + 1] - 32);
+         }
+-            });
+-    } else {
+-        // Prefill: work-stealing over N, shared Q4_K decoding per N-column
+-        std::atomic<int> next_n{0};
+-        cpu::parallel_for_chunks(N, 1, [&](int g0, int g1) {
+-            // Stack accumulators (up to M=64)
+-            float acc_vec[64];
+-            while (true) {
+-                int n = next_n.fetch_add(1, std::memory_order_relaxed);
+-                if (n >= N)
+-                    break;
+-
+-                const uint8_t* q4_row = w_data +
+-                    (size_t)n * (size_t)nb * Q4_K_BLOCK_BYTES;
+-
+-                for (int m = 0; m < M; ++m)
+-                    acc_vec[m] = 0.0f;
+-
+-                for (int bi = 0; bi < nb; ++bi) {
+-                    const block_q4_K* x =
+-                        reinterpret_cast<const block_q4_K*>(q4_row) + bi;
+-
+-                    // Shared Q4_K decode
+-                    const float d_half = fp16_to_float_scalar(x->d);
+-                    const float dmin_half = fp16_to_float_scalar(x->dmin);
+-                    uint8_t sc[8], mn[8];
+-                    decode_q4_k_scales_vsx(x->scales, sc, mn);
++    }
++    return ppc_half_at(x + 108) * (float)acc;
++}
+ 
+-                    // Per activation row: load Q8_K and dot
+-                    for (int m = 0; m < M; ++m) {
+-                        const block_q8_K* y =
+-                            q8_all.data() + (size_t)m * nb + bi;
+-                        int min_acc;
+-                        const int acc = dot_q4_K_q8_K_block_vsx(x->qs, sc, mn, y, &min_acc);
+-                        acc_vec[m] += y->d * (d_half * (float)acc - dmin_half * (float)min_acc);
+-                    }
+-                }
++// Q4_K block (144 bytes): d, dmin, scales[12] (8 x 6-bit scale/min), qs[128].
++// Each 32-byte qs run holds two 32-element sub-blocks: low nibbles, then high.
++static inline float dot_q4_K_block_ppc(const uint8_t* x, const int8_t* q8, const int16_t* bsums) {
++    uint8_t sc[8], mn[8];
++    decode_q4_k_scales_vsx(x + 4, sc, mn);
++    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
++    const __vector unsigned char s4 = vec_splats((unsigned char)4);
++    int acc = 0, macc = 0;
++    for (int j = 0; j < 4; ++j) {
++        const __vector unsigned char b0 = ppc_load(x + 16 + 32 * j);
++        const __vector unsigned char b1 = ppc_load(x + 16 + 32 * j + 16);
++        acc += dot32_u8_q8(b0 & m4, b1 & m4, q8 + 64 * j) * sc[2 * j];
++        acc += dot32_u8_q8(vec_sr(b0, s4), vec_sr(b1, s4), q8 + 64 * j + 32) * sc[2 * j + 1];
++        macc += (bsums[4 * j] + bsums[4 * j + 1]) * mn[2 * j] +
++                (bsums[4 * j + 2] + bsums[4 * j + 3]) * mn[2 * j + 1];
++    }
++    return ppc_half_at(x) * (float)acc - ppc_half_at(x + 2) * (float)macc;
++}
+ 
+-                for (int m = 0; m < M; ++m)
+-                    o_data[(size_t)m * N + n] = acc_vec[m];
+-            }
+-        });
++// Q5_K block (176 bytes): d, dmin, scales[12], qh[32], qs[128]. As Q4_K, with
++// the fifth bit of sub-block s in bit s of qh.
++static inline float dot_q5_K_block_ppc(const uint8_t* x, const int8_t* q8, const int16_t* bsums) {
++    uint8_t sc[8], mn[8];
++    decode_q4_k_scales_vsx(x + 4, sc, mn);
++    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
++    const __vector unsigned char s4 = vec_splats((unsigned char)4);
++    const __vector unsigned char one = vec_splats((unsigned char)1);
++    const __vector unsigned char h0 = ppc_load(x + 16);
++    const __vector unsigned char h1 = ppc_load(x + 32);
++    int acc = 0, macc = 0;
++    for (int j = 0; j < 4; ++j) {
++        const __vector unsigned char sl = vec_splats((unsigned char)(2 * j));
++        const __vector unsigned char sh = vec_splats((unsigned char)(2 * j + 1));
++        const __vector unsigned char b0 = ppc_load(x + 48 + 32 * j);
++        const __vector unsigned char b1 = ppc_load(x + 48 + 32 * j + 16);
++        const __vector unsigned char lo0 = (b0 & m4) | vec_sl(vec_sr(h0, sl) & one, s4);
++        const __vector unsigned char lo1 = (b1 & m4) | vec_sl(vec_sr(h1, sl) & one, s4);
++        const __vector unsigned char hi0 = vec_sr(b0, s4) | vec_sl(vec_sr(h0, sh) & one, s4);
++        const __vector unsigned char hi1 = vec_sr(b1, s4) | vec_sl(vec_sr(h1, sh) & one, s4);
++        acc += dot32_u8_q8(lo0, lo1, q8 + 64 * j) * sc[2 * j];
++        acc += dot32_u8_q8(hi0, hi1, q8 + 64 * j + 32) * sc[2 * j + 1];
++        macc += (bsums[4 * j] + bsums[4 * j + 1]) * mn[2 * j] +
++                (bsums[4 * j + 2] + bsums[4 * j + 3]) * mn[2 * j + 1];
+     }
++    return ppc_half_at(x) * (float)acc - ppc_half_at(x + 2) * (float)macc;
+ }
+ 
+-// ============================================================================
+-// Q6_K GEMM: decode (M=1) and prefill (M>1)
+-// Q6_K block: 210 bytes per 256 elements
+-// Layout: ql[128] + qh[64] + scales[16] int8 + d[2] fp16
+-// Two 128-element halves, each using 64 ql bytes, 32 qh bytes and 8 scales.
+-// Within a half, for l in [0, 32):
++// Q6_K block (210 bytes): ql[128], qh[64], scales[16] (int8), d. Two 128-
++// element halves, each using 64 ql bytes, 32 qh bytes and 8 scales; for l in
++// [0, 32):
+ //   e[l]      = (ql[l]    & 0xF) | ((qh[l] >> 0) & 3) << 4   (scale sc[l/16 + 0])
+ //   e[l + 32] = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4   (scale sc[l/16 + 2])
+ //   e[l + 64] = (ql[l]    >> 4)  | ((qh[l] >> 4) & 3) << 4   (scale sc[l/16 + 4])
+ //   e[l + 96] = (ql[l+32] >> 4)  | ((qh[l] >> 6) & 3) << 4   (scale sc[l/16 + 6])
+-// minus 32, times d (see dequantize_q6_k_row).
+-// ============================================================================
+-
+-// sum_sub-block sc * dot(q6, q8) for one Q6_K block, before the d scaling.
+-static inline int dot_q6_K_q8_K_block_vsx(const block_q6_K* x, const block_q8_K* y) {
++// minus 32, times d.
++static inline float dot_q6_K_block_ppc(const uint8_t* x, const int8_t* q8, const int16_t* bsums) {
+     const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
+     const __vector unsigned char m3 = vec_splats((unsigned char)3);
+     const __vector unsigned char s2 = vec_splats((unsigned char)2);
+     const __vector unsigned char s4 = vec_splats((unsigned char)4);
+     const __vector unsigned char s6 = vec_splats((unsigned char)6);
+-    const __vector signed char off = vec_splats((signed char)32);
+-    const __vector signed int zero = vec_splats((int)0);
++    const int8_t* scales = reinterpret_cast<const int8_t*>(x + 192);
+     int acc = 0;
+     for (int half = 0; half < 2; ++half) {
+-        const uint8_t* ql = x->ql + 64 * half;
+-        const uint8_t* qh = x->qh + 32 * half;
+-        const int8_t* sc = x->scales + 8 * half;
+-        const int8_t* q8 = y->qs + 128 * half;
++        const uint8_t* ql = x + 64 * half;
++        const uint8_t* qh = x + 128 + 32 * half;
++        const int8_t* sc = scales + 8 * half;
++        const int8_t* q = q8 + 128 * half;
++        const int16_t* bs = bsums + 8 * half;
+         for (int g = 0; g < 2; ++g) {  // l in [16g, 16g + 16)
+             const int l0 = 16 * g;
+-            __vector unsigned char a = ppc_load(ql + l0);
+-            __vector unsigned char b = ppc_load(ql + 32 + l0);
+-            __vector unsigned char h = ppc_load(qh + l0);
+-            __vector signed char q1 = (__vector signed char)((a & m4) | vec_sl(h & m3, s4)) - off;
+-            __vector signed char q2 = (__vector signed char)((b & m4) | vec_sl(vec_sr(h, s2) & m3, s4)) - off;
+-            __vector signed char q3 = (__vector signed char)(vec_sr(a, s4) | vec_sl(vec_sr(h, s4) & m3, s4)) - off;
+-            __vector signed char q4 = (__vector signed char)(vec_sr(b, s4) | vec_sl(vec_sr(h, s6), s4)) - off;
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q1, ppc_load(q8 + l0), zero)) * sc[g + 0];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q2, ppc_load(q8 + 32 + l0), zero)) * sc[g + 2];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q3, ppc_load(q8 + 64 + l0), zero)) * sc[g + 4];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q4, ppc_load(q8 + 96 + l0), zero)) * sc[g + 6];
++            const __vector unsigned char a = ppc_load(ql + l0);
++            const __vector unsigned char b = ppc_load(ql + 32 + l0);
++            const __vector unsigned char h = ppc_load(qh + l0);
++            // unsigned 6-bit values; the -32 comes off via the bsums
++            const __vector unsigned char u1 = (a & m4) | vec_sl(h & m3, s4);
++            const __vector unsigned char u2 = (b & m4) | vec_sl(vec_sr(h, s2) & m3, s4);
++            const __vector unsigned char u3 = vec_sr(a, s4) | vec_sl(vec_sr(h, s4) & m3, s4);
++            const __vector unsigned char u4 = vec_sr(b, s4) | vec_sl(vec_sr(h, s6), s4);
++            acc += (dot16_u8_q8(u1, q + l0) - 32 * bs[g + 0]) * sc[g + 0];
++            acc += (dot16_u8_q8(u2, q + 32 + l0) - 32 * bs[g + 2]) * sc[g + 2];
++            acc += (dot16_u8_q8(u3, q + 64 + l0) - 32 * bs[g + 4]) * sc[g + 4];
++            acc += (dot16_u8_q8(u4, q + 96 + l0) - 32 * bs[g + 6]) * sc[g + 6];
+         }
+     }
+-    return acc;
++    return ppc_half_at(x + 208) * (float)acc;
+ }
+ 
+-static void gemm_q6_K_vsx(
+-    const float* a_data,
+-    const uint8_t* w_data,
+-    float* o_data,
+-    int M, int K, int N)
+-{
+-    constexpr int QK_K = 256;
+-    constexpr int Q6_K_BLOCK_BYTES = 210;
+-    const int nb = (K + QK_K - 1) / QK_K;
+-
+-    scratch_vec<block_q8_K> q8_all((size_t)M * nb);
+-    for (int m = 0; m < M; ++m)
+-        quantize_row_q8_K(a_data + (size_t)m * K, q8_all.data() + (size_t)m * nb, K);
+-
+-    if (M == 1) {
+-        const size_t row_bytes = (size_t)nb * Q6_K_BLOCK_BYTES;
+-        cpu::parallel_for_chunks(N, 4, [&](int n_base0, int n_base1) {
+-            for (int n_base = n_base0; n_base < n_base1; n_base += 4) {
+-            int rows = (n_base + 4 <= N) ? 4 : (N - n_base);
+-            for (int r = 0; r < rows; ++r) {
+-                const uint8_t* q6_row = w_data + (size_t)(n_base + r) * row_bytes;
++using KQuantBlockDot = float (*)(const uint8_t*, const int8_t*, const int16_t*);
++
++template <KQuantBlockDot BlockDot>
++static void gemm_kquant_ppc(const float* a, const uint8_t* w, float* out, int M, int K, int N,
++                            int block_bytes) {
++    const activations_q8_K q8(a, M, K);
++    const int nb = q8.nb;
++    const size_t row_bytes = (size_t)nb * block_bytes;
++    cpu::parallel_for_chunks(N, 4, [&](int n0, int n1) {
++        for (int n = n0; n < n1; ++n) {
++            const uint8_t* row = w + (size_t)n * row_bytes;
++            for (int m = 0; m < M; ++m) {
+                 float sum = 0.0f;
+-
+-                for (int bi = 0; bi < nb; ++bi) {
+-                    const block_q6_K* x =
+-                        reinterpret_cast<const block_q6_K*>(q6_row) + bi;
+-                    const block_q8_K* y = q8_all.data() + bi;
+-                    sum += y->d * fp16_to_float_scalar(x->d) *
+-                           (float)dot_q6_K_q8_K_block_vsx(x, y);
+-                }
+-                o_data[n_base + r] = sum;
++                for (int i = 0; i < nb; ++i)
++                    sum += q8.scale(m, i) * BlockDot(row + (size_t)i * block_bytes, q8.q(m, i),
++                                                     q8.bs(m, i));
++                out[(size_t)m * N + n] = sum;
+             }
+         }
+-            });
+-    } else {
+-        // Prefill: work-stealing over N
+-        std::atomic<int> next_n{0};
+-        cpu::parallel_for_chunks(N, 1, [&](int g0, int g1) {
+-            float acc_vec[64];
+-            while (true) {
+-                int n = next_n.fetch_add(1, std::memory_order_relaxed);
+-                if (n >= N)
+-                    break;
+-
+-                const uint8_t* q6_row = w_data +
+-                    (size_t)n * (size_t)nb * Q6_K_BLOCK_BYTES;
+-
+-                for (int m = 0; m < M; ++m)
+-                    acc_vec[m] = 0.0f;
+-
+-                for (int bi = 0; bi < nb; ++bi) {
+-                    const block_q6_K* x =
+-                        reinterpret_cast<const block_q6_K*>(q6_row) + bi;
+-                    const float d_half = fp16_to_float_scalar(x->d);
+-
+-                    for (int m = 0; m < M; ++m) {
+-                        const block_q8_K* y =
+-                            q8_all.data() + (size_t)m * nb + bi;
+-                        acc_vec[m] += y->d * d_half * (float)dot_q6_K_q8_K_block_vsx(x, y);
+-                    }
+-                }
+-
+-                for (int m = 0; m < M; ++m)
+-                    o_data[(size_t)m * N + n] = acc_vec[m];
+-            }
+-        });
+-    }
++    });
+ }
+ 
+-// ============================================================================
+-// Q2_K GEMM fallback: dequantize + fp32 gemv
+-// ============================================================================
+-
+-static void gemm_q2_K_vsx(
+-    const float* a_data,
+-    const uint8_t* w_data,
+-    float* o_data,
+-    int M, int K, int N)
+-{
+-    // Dequantize weight rows to fp32, then use fp32 gemv
+-    scratch_vec<float> w_fp32((size_t)N * K);
+-    auto dequant_fn = get_dequant_row_fn(DataType::Q2_K);
+-    if (!dequant_fn) {
+-        // Cannot dequantize — zero output
+-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
+-        return;
+-    }
+-    cpu::parallel_for_dynamic(N, 1, [&](int n) {
+-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
+-        });
+-
+-    // Reuse fp32 gemv (defined in gemv.h, included via kernels.h)
+-    gemv_fp32_transB_vsx(a_data, w_fp32.data(), o_data, M, K, N);
++static void gemm_q2_K_vsx(const float* a, const uint8_t* w, float* o, int M, int K, int N) {
++    gemm_kquant_ppc<dot_q2_K_block_ppc>(a, w, o, M, K, N, 84);
+ }
+-
+-// ============================================================================
+-// Q3_K GEMM fallback: dequantize + fp32 gemv
+-// ============================================================================
+-
+-static void gemm_q3_K_vsx(
+-    const float* a_data,
+-    const uint8_t* w_data,
+-    float* o_data,
+-    int M, int K, int N)
+-{
+-    scratch_vec<float> w_fp32((size_t)N * K);
+-    auto dequant_fn = get_dequant_row_fn(DataType::Q3_K);
+-    if (!dequant_fn) {
+-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
+-        return;
+-    }
+-    cpu::parallel_for_dynamic(N, 1, [&](int n) {
+-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
+-        });
+-
+-    gemv_fp32_transB_vsx(a_data, w_fp32.data(), o_data, M, K, N);
++static void gemm_q3_K_vsx(const float* a, const uint8_t* w, float* o, int M, int K, int N) {
++    gemm_kquant_ppc<dot_q3_K_block_ppc>(a, w, o, M, K, N, 110);
+ }
+-
+-// ============================================================================
+-// Q5_K GEMM fallback: dequantize + fp32 gemv
+-// ============================================================================
+-
+-static void gemm_q5_K_vsx(
+-    const float* a_data,
+-    const uint8_t* w_data,
+-    float* o_data,
+-    int M, int K, int N)
+-{
+-    scratch_vec<float> w_fp32((size_t)N * K);
+-    auto dequant_fn = get_dequant_row_fn(DataType::Q5_K);
+-    if (!dequant_fn) {
+-        std::memset(o_data, 0, (size_t)M * N * sizeof(float));
+-        return;
+-    }
+-    cpu::parallel_for_dynamic(N, 1, [&](int n) {
+-        dequant_fn(w_data, w_fp32.data() + (size_t)n * K, K, n);
+-        });
+-
+-    gemv_fp32_transB_vsx(a_data, w_fp32.data(), o_data, M, K, N);
++static void gemm_q4_K_vsx(const float* a, const uint8_t* w, float* o, int M, int K, int N) {
++    gemm_kquant_ppc<dot_q4_K_block_ppc>(a, w, o, M, K, N, 144);
++}
++static void gemm_q5_K_vsx(const float* a, const uint8_t* w, float* o, int M, int K, int N) {
++    gemm_kquant_ppc<dot_q5_K_block_ppc>(a, w, o, M, K, N, 176);
++}
++static void gemm_q6_K_vsx(const float* a, const uint8_t* w, float* o, int M, int K, int N) {
++    gemm_kquant_ppc<dot_q6_K_block_ppc>(a, w, o, M, K, N, 210);
+ }
+ 
+ #endif // USE_ALTIVEC
+diff --git a/src/operators/cpu/arch/ppc64/gemv.h b/src/operators/cpu/arch/ppc64/gemv.h
+index 6a3870b..53b4239 100644
+--- a/src/operators/cpu/arch/ppc64/gemv.h
++++ b/src/operators/cpu/arch/ppc64/gemv.h
+@@ -1,10 +1,6 @@
+ #pragma once
+-// PowerPC64 VSX GEMV kernels — decode-phase (M=1) matrix-vector products.
+-// Provides gemv_fp32_transB_vsx, gemv_q4_0_transB_vsx, gemv_q8_0_transB_vsx.
+-// All functions compute: out = a * w^T, where a is [1, K] and w is [N, K].
+-//
+-// VSX has NO dotprod instruction, so we always use the vec_mule/vec_mulo
+-// + vec_sum4s fallback path for nibble×q8 dot products.
++// PowerPC (AltiVec/VSX) GEMV kernels: FP32 and the 32-element block formats.
++// All functions compute out = a * w^T, where a is [M, K] and w is [N, K].
+ 
+ #include "ppc_simd.h"
+ #include <cstdint>
+@@ -12,6 +8,7 @@
+ #include <cmath>
+ #include <vector>
+ 
++#include "cpu/common/thread_pool.h"
+ #include "../../common/quant_helpers.h"
+ 
+ #include "vec.h"
+@@ -86,359 +83,178 @@ static inline void gemv_fp32_transB_vsx(const float* a, const float* b,
+     }
+ }
+ 
+-// block_q8_0_act and quantize_row_q8_0_act are defined in vec_dot.h.
+-// This file provides its own inline GEMV implementations that call them.
+-
+-// ---- Helper: software fp16_to_fp32 inline (self-contained for GEMV) ----
+-static inline float gemv_fp16_to_fp32(uint16_t bits) {
+-    uint32_t sign     = (bits >> 15) & 1;
+-    uint32_t exponent = (bits >> 10) & 0x1F;
+-    uint32_t mantissa = bits & 0x3FF;
+-    float value;
+-    if (exponent == 0) {
+-        value = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+-    } else {
+-        value = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+-                           static_cast<int>(exponent) - 15);
++// ============================================================================
++// GEMVs for the 32-element block formats (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0)
++//
++// out[m][n] = dot(a[m], w[n]). Each activation row is quantized once to Q8_0
++// (activations_q8_32) into an aligned layout together with its per-block sums,
++// then the weight rows are split across the thread pool. Weight values are
++// widened to unsigned bytes and multiplied with vec_msum (vmsummbm: 16
++// u8 x s8 multiply-adds per instruction); the formats' offsets (-8, -16, the
++// Q4_1/Q5_1 minimum) are applied once per block through the activation sums.
++// ============================================================================
++
++// One activation row quantized to Q8_0: 16-byte aligned quants, scales and
++// per-block quant sums.
++struct activations_q8_32 {
++    int nb;
++    scratch_vec<int8_t> qs;  // nb * 32, host pool allocations are 64-byte aligned
++    scratch_vec<float> d;
++    scratch_vec<int> sum;
++
++    activations_q8_32(const float* a, int K)
++        : nb(K / 32), qs((size_t)(K / 32) * 32), d(K / 32), sum(K / 32) {
++        scratch_vec<block_q8_0_act> blocks(nb);
++        quantize_row_q8_0_act(a, blocks.data(), nb * 32);
++        for (int i = 0; i < nb; ++i) {
++            std::memcpy(qs.data() + (size_t)i * 32, blocks[i].qs, 32);
++            d[i] = blocks[i].d;
++            int s = 0;
++            for (int j = 0; j < 32; ++j)
++                s += blocks[i].qs[j];
++            sum[i] = s;
++        }
+     }
+-    return sign ? -value : value;
++};
++
++// 16 bytes of qh bits -> 16 or 0 per element. bits = the qh bytes in
++// memory order; elements [0,16) use qh bytes 0-1, [16,32) bytes 2-3.
++static inline __vector unsigned char q5_high_bits(__vector unsigned char bits, int half) {
++    static const __vector unsigned char sel_lo = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
++    static const __vector unsigned char sel_hi = {2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
++    static const __vector unsigned char bit = {1, 2, 4, 8, 16, 32, 64, 128,
++                                               1, 2, 4, 8, 16, 32, 64, 128};
++    const __vector unsigned char spread = vec_perm(bits, bits, half ? sel_hi : sel_lo);
++    const __vector unsigned char clear =
++        (__vector unsigned char)vec_cmpeq(vec_and(spread, bit), vec_splats((unsigned char)0));
++    return vec_andc(vec_splats((unsigned char)16), clear);
+ }
+ 
+-// ---- Q4_0 GEMV: quantize a once, then dot product with all weight rows ----
+-// Q4_0 block = 18 bytes: d[2](fp16) + qs[16](32 nibbles).
+-// K is the total activation dimension.
+-// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
+-static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+-                                         float* out, int M, int K, int N) {
+-    const int QK = 32;
+-    const int BLOCK_BYTES = 18;
+-    int nb = K / QK;
+-    int blocks_per_row = nb;
+-
+-    for (int m = 0; m < M; ++m) {
+-        const float* a_row = a + (size_t)m * K;
+-        float* o_row = out + (size_t)m * N;
+-
+-    // Quantize activation to Q8_0_act blocks
+-    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
+-    quantize_row_q8_0_act(a_row, q8_act.data(), K);
+-
+-    const int NR = 4;
+-    int n = 0;
+-    for (; n + NR - 1 < N; n += NR) {
+-        __vector float acc = vec_splats(0.0f);
+-        const uint8_t* w_ptrs[4] = {
+-            w + (size_t)n * blocks_per_row * BLOCK_BYTES,
+-            w + (size_t)(n+1) * blocks_per_row * BLOCK_BYTES,
+-            w + (size_t)(n+2) * blocks_per_row * BLOCK_BYTES,
+-            w + (size_t)(n+3) * blocks_per_row * BLOCK_BYTES,
+-        };
+-
+-        for (int bi = 0; bi < nb; ++bi) {
+-            float scale_a = q8_act[bi].d;
+-            __vector signed char q8_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-            __vector signed char q8_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+-
+-            // Process 4 weight rows for this block
+-            float row_sum[4] = {0, 0, 0, 0};
+-            for (int r = 0; r < 4; ++r) {
+-                const uint8_t* blk = w_ptrs[r] + (size_t)bi * BLOCK_BYTES;
+-                uint16_t ws;
+-                std::memcpy(&ws, blk, sizeof(uint16_t));
+-                float scale_w = gemv_fp16_to_fp32(ws);
+-                float scale = scale_w * scale_a;
+-
+-                // Expand nibbles (ggml layout): low nibbles are
+-                // q_lo=[e0..e15], high nibbles q_hi=[e16..e31].
+-                __vector unsigned char q4_bytes = ppc_load((const uint8_t*)(blk + 2));
+-                __vector unsigned char q_lo = q4_bytes & vec_splats((unsigned char)0x0F);
+-                __vector unsigned char q_hi = vec_sr(q4_bytes, vec_splats((unsigned char)4));
+-
+-                // Dot using vec_mule/mulo + vec_sum4s (nibbles [0..15], bias -8*sum(q8))
+-                __vector signed char q_lo_s = (__vector signed char)q_lo;
+-                __vector signed char q_hi_s = (__vector signed char)q_hi;
+-
+-                __vector signed short pe0 = vec_mule(q_lo_s, q8_lo);
+-                __vector signed short po0 = vec_mulo(q_lo_s, q8_lo);
+-                __vector signed short pe1 = vec_mule(q_hi_s, q8_hi);
+-                __vector signed short po1 = vec_mulo(q_hi_s, q8_hi);
+-
+-                __vector signed int zero = vec_splats((int)0);
+-                __vector signed int se0 = vec_sum4s(pe0, zero);
+-                __vector signed int so0 = vec_sum4s(po0, zero);
+-                __vector signed int se1 = vec_sum4s(pe1, zero);
+-                __vector signed int so1 = vec_sum4s(po1, zero);
+-
+-                __vector signed int dot_vec = (se0 + so0) + (se1 + so1);
+-                union { __vector signed int vi; int i[4]; } u;
+-                u.vi = dot_vec;
+-                int dot_i32 = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+-
+-                // Bias correction: nibbles [0..15] represent (nibble - 8)
+-                int sum_q8 = 0;
+-                for (int j = 0; j < 32; ++j) sum_q8 += (int)q8_act[bi].qs[j];
+-                dot_i32 -= sum_q8 * 8;
+-
+-                row_sum[r] += scale * (float)dot_i32;
+-            }
+-            acc = acc + ppc_load(row_sum);
+-        }
+-        ppc_store(acc, o_row + n);
++// Row dot products. blk points at the row's first block; q8 is one activation
++// row.
++static inline float dot_q4_0_row_ppc(const uint8_t* blk, const activations_q8_32& q8) {
++    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
++    const __vector unsigned char s4 = vec_splats((unsigned char)4);
++    const __vector signed int zero = vec_splats(0);
++    float acc = 0.0f;
++    for (int i = 0; i < q8.nb; ++i, blk += 18) {
++        // ggml layout: byte j holds element j (low nibble) and j+16 (high)
++        const __vector unsigned char b = ppc_load(blk + 2);
++        const int8_t* a = q8.qs.data() + (size_t)i * 32;
++        __vector signed int s = ppc_msum_u8s8(b & m4, ppc_load_aligned(a), zero);
++        s = ppc_msum_u8s8(vec_sr(b, s4), ppc_load_aligned(a + 16), s);
++        acc += ppc_half_at(blk) * q8.d[i] * (float)(ppc_hsum_i32(s) - 8 * q8.sum[i]);
+     }
+-    // Remaining rows
+-    for (; n < N; ++n) {
+-        float sum = 0.0f;
+-        const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
+-        for (int bi = 0; bi < nb; ++bi) {
+-            uint16_t ws;
+-            std::memcpy(&ws, w_row + (size_t)bi * BLOCK_BYTES, sizeof(uint16_t));
+-            float scale_w = gemv_fp16_to_fp32(ws);
+-            float scale = scale_w * q8_act[bi].d;
+-
+-            __vector unsigned char q4_bytes = ppc_load((const uint8_t*)(w_row + (size_t)bi * BLOCK_BYTES + 2));
+-            __vector unsigned char q_lo = q4_bytes & vec_splats((unsigned char)0x0F);
+-            __vector unsigned char q_hi = vec_sr(q4_bytes, vec_splats((unsigned char)4));
+-
+-            __vector signed char q8_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-            __vector signed char q8_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+-
+-            __vector signed char q_lo_s = (__vector signed char)q_lo;
+-            __vector signed char q_hi_s = (__vector signed char)q_hi;
++    return acc;
++}
+ 
+-            __vector signed short pe0 = vec_mule(q_lo_s, q8_lo);
+-            __vector signed short po0 = vec_mulo(q_lo_s, q8_lo);
+-            __vector signed short pe1 = vec_mule(q_hi_s, q8_hi);
+-            __vector signed short po1 = vec_mulo(q_hi_s, q8_hi);
++static inline float dot_q4_1_row_ppc(const uint8_t* blk, const activations_q8_32& q8) {
++    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
++    const __vector unsigned char s4 = vec_splats((unsigned char)4);
++    const __vector signed int zero = vec_splats(0);
++    float acc = 0.0f;
++    for (int i = 0; i < q8.nb; ++i, blk += 20) {
++        const __vector unsigned char b = ppc_load(blk + 4);
++        const int8_t* a = q8.qs.data() + (size_t)i * 32;
++        __vector signed int s = ppc_msum_u8s8(b & m4, ppc_load_aligned(a), zero);
++        s = ppc_msum_u8s8(vec_sr(b, s4), ppc_load_aligned(a + 16), s);
++        acc += q8.d[i] * (ppc_half_at(blk) * (float)ppc_hsum_i32(s) +
++                          ppc_half_at(blk + 2) * (float)q8.sum[i]);
++    }
++    return acc;
++}
+ 
+-            __vector signed int zero = vec_splats((int)0);
+-            __vector signed int dot_vec = vec_sum4s(pe0, zero) + vec_sum4s(po0, zero)
+-                                      + vec_sum4s(pe1, zero) + vec_sum4s(po1, zero);
+-            union { __vector signed int vi; int i[4]; } u;
+-            u.vi = dot_vec;
+-            int dot_i32 = u.i[0] + u.i[1] + u.i[2] + u.i[3];
++// Q5_0/Q5_1: qh (4 bytes) at qh_off, qs (16 bytes) at qh_off + 4.
++static inline int q5_dot_ppc(const uint8_t* blk, int qh_off, const int8_t* a) {
++    const __vector unsigned char m4 = vec_splats((unsigned char)0x0F);
++    const __vector unsigned char s4 = vec_splats((unsigned char)4);
++    const __vector unsigned char h = ppc_load(blk + qh_off);
++    const __vector unsigned char b = ppc_load(blk + qh_off + 4);
++    __vector signed int s = ppc_msum_u8s8((b & m4) | q5_high_bits(h, 0), ppc_load_aligned(a),
++                                          vec_splats(0));
++    s = ppc_msum_u8s8(vec_sr(b, s4) | q5_high_bits(h, 1), ppc_load_aligned(a + 16), s);
++    return ppc_hsum_i32(s);
++}
+ 
+-            // Bias correction
+-            int sum_q8 = 0;
+-            for (int j = 0; j < 32; ++j) sum_q8 += (int)q8_act[bi].qs[j];
+-            dot_i32 -= sum_q8 * 8;
++static inline float dot_q5_0_row_ppc(const uint8_t* blk, const activations_q8_32& q8) {
++    float acc = 0.0f;
++    for (int i = 0; i < q8.nb; ++i, blk += 22) {
++        const int dot = q5_dot_ppc(blk, 2, q8.qs.data() + (size_t)i * 32);
++        acc += ppc_half_at(blk) * q8.d[i] * (float)(dot - 16 * q8.sum[i]);
++    }
++    return acc;
++}
+ 
+-            sum += scale * (float)dot_i32;
+-        }
+-        o_row[n] = sum;
++static inline float dot_q5_1_row_ppc(const uint8_t* blk, const activations_q8_32& q8) {
++    float acc = 0.0f;
++    for (int i = 0; i < q8.nb; ++i, blk += 24) {
++        const int dot = q5_dot_ppc(blk, 4, q8.qs.data() + (size_t)i * 32);
++        acc += q8.d[i] * (ppc_half_at(blk) * (float)dot + ppc_half_at(blk + 2) * (float)q8.sum[i]);
+     }
+-    }  // end M loop
++    return acc;
+ }
+ 
+-// ---- Q8_0 GEMV: same pattern as Q4_0 but simpler (no nibble expansion) ----
+-// Q8_0 block = 34 bytes: d[2](fp16) + qs[32](signed int8)
+-// Supports both M=1 (decode) and M>1 (prefill) by looping over M.
+-static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
+-                                         float* out, int M, int K, int N) {
+-    const int QK = 32;
+-    const int BLOCK_BYTES = 34;
+-    int nb = K / QK;
+-    int blocks_per_row = nb;
++static inline float dot_q8_0_row_ppc(const uint8_t* blk, const activations_q8_32& q8) {
++    const __vector signed int zero = vec_splats(0);
++    float acc = 0.0f;
++    for (int i = 0; i < q8.nb; ++i, blk += 34) {
++        const __vector signed char w0 = ppc_load((const int8_t*)(blk + 2));
++        const __vector signed char w1 = ppc_load((const int8_t*)(blk + 18));
++        const int8_t* a = q8.qs.data() + (size_t)i * 32;
++        const __vector signed char a0 = ppc_load_aligned(a);
++        const __vector signed char a1 = ppc_load_aligned(a + 16);
++        // signed x signed: widen through vmulesb/vmulosb
++        __vector signed int s = vec_sum4s(vec_mule(w0, a0), zero);
++        s = vec_sum4s(vec_mulo(w0, a0), s);
++        s = vec_sum4s(vec_mule(w1, a1), s);
++        s = vec_sum4s(vec_mulo(w1, a1), s);
++        acc += ppc_half_at(blk) * q8.d[i] * (float)ppc_hsum_i32(s);
++    }
++    return acc;
++}
+ 
++template <float (*RowDot)(const uint8_t*, const activations_q8_32&)>
++static inline void gemv_q32_transB_ppc(const float* a, const uint8_t* w, float* out, int M,
++                                       int K, int N, int block_bytes) {
++    const size_t row_bytes = (size_t)(K / 32) * block_bytes;
+     for (int m = 0; m < M; ++m) {
+-        const float* a_row = a + (size_t)m * K;
++        const activations_q8_32 q8(a + (size_t)m * K, K);
+         float* o_row = out + (size_t)m * N;
+-
+-    scratch_vec<block_q8_0_act> q8_act(blocks_per_row);
+-    quantize_row_q8_0_act(a_row, q8_act.data(), K);
+-
+-    int n = 0;
+-    for (; n < N; ++n) {
+-        float sum = 0.0f;
+-        const uint8_t* w_row = w + (size_t)n * blocks_per_row * BLOCK_BYTES;
+-        for (int bi = 0; bi < nb; ++bi) {
+-            uint16_t ws;
+-            std::memcpy(&ws, w_row + (size_t)bi * BLOCK_BYTES, sizeof(uint16_t));
+-            float scale_w = gemv_fp16_to_fp32(ws);
+-            float scale = scale_w * q8_act[bi].d;
+-
+-            __vector signed char w_lo = (__vector signed char)ppc_load(w_row + (size_t)bi * BLOCK_BYTES + 2);
+-            __vector signed char w_hi = (__vector signed char)ppc_load(w_row + (size_t)bi * BLOCK_BYTES + 18);
+-            __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-            __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+-
+-            // Signed×signed dot via vec_mule/mulo
+-            __vector signed short pe0 = vec_mule(w_lo, a_lo);
+-            __vector signed short po0 = vec_mulo(w_lo, a_lo);
+-            __vector signed short pe1 = vec_mule(w_hi, a_hi);
+-            __vector signed short po1 = vec_mulo(w_hi, a_hi);
+-
+-            __vector signed int zero = vec_splats((int)0);
+-            __vector signed int dot_vec = vec_sum4s(pe0, zero) + vec_sum4s(po0, zero)
+-                                      + vec_sum4s(pe1, zero) + vec_sum4s(po1, zero);
+-            union { __vector signed int vi; int i[4]; } u;
+-            u.vi = dot_vec;
+-            int dot_i32 = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+-
+-            sum += scale * (float)dot_i32;
+-        }
+-        o_row[n] = sum;
++        cpu::parallel_for_chunks(N, 4, [&](int n0, int n1) {
++            for (int n = n0; n < n1; ++n)
++                o_row[n] = RowDot(w + (size_t)n * row_bytes, q8);
++        });
+     }
+-    }  // end M loop
+ }
+ 
+-// ---- Q4_1 GEMV: q = d * nibble + m ----
+-static inline void gemv_q4_1_transB_vsx(const float* a, const uint8_t* w,
++// Q4_0 block = 18 bytes: d[2](fp16) + qs[16](32 nibbles).
++static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+                                          float* out, int M, int K, int N) {
+-    constexpr int QK = 32;
+-    constexpr int BLOCK_BYTES = 20;
+-    const int nb = K / QK;
+-
+-    for (int m = 0; m < M; ++m) {
+-        const float* a_row = a + (size_t)m * K;
+-        float* o_row = out + (size_t)m * N;
+-        scratch_vec<block_q8_0_act> q8_act(nb);
+-        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+-
+-        for (int n = 0; n < N; ++n) {
+-            float sum = 0.0f;
+-            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+-            for (int bi = 0; bi < nb; ++bi) {
+-                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+-                uint16_t d_bits, m_bits;
+-                std::memcpy(&d_bits, blk, sizeof(d_bits));
+-                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+-                float d = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+-                float min = gemv_fp16_to_fp32(m_bits) * q8_act[bi].d;
++    gemv_q32_transB_ppc<dot_q4_0_row_ppc>(a, w, out, M, K, N, 18);
++}
+ 
+-                // ggml layout: low nibbles = e0..e15, high nibbles = e16..e31
+-                __vector unsigned char packed = ppc_load(blk + 4);
+-                __vector signed char q_lo = (__vector signed char)(packed & vec_splats((unsigned char)0x0F));
+-                __vector signed char q_hi = (__vector signed char)vec_sr(packed, vec_splats((unsigned char)4));
+-                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
++// Q8_0 block = 34 bytes: d[2](fp16) + qs[32](signed int8)
++static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
++                                         float* out, int M, int K, int N) {
++    gemv_q32_transB_ppc<dot_q8_0_row_ppc>(a, w, out, M, K, N, 34);
++}
+ 
+-                __vector signed int zero = vec_splats((int)0);
+-                __vector signed int dot_vec = vec_sum4s(vec_mule(q_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mulo(q_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mule(q_hi, a_hi), zero) +
+-                                              vec_sum4s(vec_mulo(q_hi, a_hi), zero);
+-                union { __vector signed int vi; int i[4]; } u;
+-                u.vi = dot_vec;
+-                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+-                int sum_q8 = 0;
+-                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+-                sum += d * dot + min * sum_q8;
+-            }
+-            o_row[n] = sum;
+-        }
+-    }
++// Q4_1 block = 20 bytes: d[2] + m[2] (fp16) + qs[16]; q = d * nibble + m
++static inline void gemv_q4_1_transB_vsx(const float* a, const uint8_t* w,
++                                         float* out, int M, int K, int N) {
++    gemv_q32_transB_ppc<dot_q4_1_row_ppc>(a, w, out, M, K, N, 20);
+ }
+ 
+-// ---- Q5_0 GEMV: value = 5bit - 16, 5bit = nibble | (bit5 << 4) ----
+-// Q5_0 block = 22 bytes: d[2](fp16) + qh[4](bit5) + qs[16](nibbles)
++// Q5_0 block = 22 bytes: d[2](fp16) + qh[4](bit5) + qs[16](nibbles); value = 5bit - 16
+ static inline void gemv_q5_0_transB_vsx(const float* a, const uint8_t* w,
+                                         float* out, int M, int K, int N) {
+-    constexpr int QK = 32;
+-    constexpr int BLOCK_BYTES = 22;
+-    const int nb = K / QK;
+-
+-    for (int m = 0; m < M; ++m) {
+-        const float* a_row = a + (size_t)m * K;
+-        float* o_row = out + (size_t)m * N;
+-        scratch_vec<block_q8_0_act> q8_act(nb);
+-        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+-
+-        for (int n = 0; n < N; ++n) {
+-            float sum = 0.0f;
+-            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+-            for (int bi = 0; bi < nb; ++bi) {
+-                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+-                uint16_t d_bits;
+-                std::memcpy(&d_bits, blk, sizeof(d_bits));
+-                float combined_scale = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+-
+-                alignas(16) signed char vals[QK];
+-                const uint8_t* qh = blk + 2;
+-                const uint8_t* qs = blk + 6;
+-                for (int j = 0; j < QK; ++j) {
+-                    // ggml layout: qs[j] holds e_j (low) and e_{j+16} (high);
+-                    // qh bit j is e_j's fifth bit.
+-                    const int nib = j < 16 ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+-                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+-                    vals[j] = (signed char)(nib | (bit5 << 4));
+-                }
+-                __vector signed char w_lo = ppc_load(vals);
+-                __vector signed char w_hi = ppc_load(vals + 16);
+-                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+-
+-                __vector signed int zero = vec_splats((int)0);
+-                __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mulo(w_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mule(w_hi, a_hi), zero) +
+-                                              vec_sum4s(vec_mulo(w_hi, a_hi), zero);
+-                union { __vector signed int vi; int i[4]; } u;
+-                u.vi = dot_vec;
+-                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+-                int sum_q8 = 0;
+-                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+-                sum += combined_scale * (float)(dot - 16 * sum_q8);
+-            }
+-            o_row[n] = sum;
+-        }
+-    }
++    gemv_q32_transB_ppc<dot_q5_0_row_ppc>(a, w, out, M, K, N, 22);
+ }
+ 
+-// ---- Q5_1 GEMV: value = 5bit * d + m ----
+ // Q5_1 block = 24 bytes: d[2](fp16) + m[2](fp16) + qh[4](bit5) + qs[16](nibbles)
+ static inline void gemv_q5_1_transB_vsx(const float* a, const uint8_t* w,
+                                         float* out, int M, int K, int N) {
+-    constexpr int QK = 32;
+-    constexpr int BLOCK_BYTES = 24;
+-    const int nb = K / QK;
+-
+-    for (int m = 0; m < M; ++m) {
+-        const float* a_row = a + (size_t)m * K;
+-        float* o_row = out + (size_t)m * N;
+-        scratch_vec<block_q8_0_act> q8_act(nb);
+-        quantize_row_q8_0_act(a_row, q8_act.data(), K);
+-
+-        for (int n = 0; n < N; ++n) {
+-            float sum = 0.0f;
+-            const uint8_t* w_row = w + (size_t)n * nb * BLOCK_BYTES;
+-            for (int bi = 0; bi < nb; ++bi) {
+-                const uint8_t* blk = w_row + (size_t)bi * BLOCK_BYTES;
+-                uint16_t d_bits, m_bits;
+-                std::memcpy(&d_bits, blk, sizeof(d_bits));
+-                std::memcpy(&m_bits, blk + 2, sizeof(m_bits));
+-                float d = gemv_fp16_to_fp32(d_bits) * q8_act[bi].d;
+-                float min = gemv_fp16_to_fp32(m_bits) * q8_act[bi].d;
+-
+-                alignas(16) signed char vals[QK];
+-                const uint8_t* qh = blk + 4;
+-                const uint8_t* qs = blk + 8;
+-                for (int j = 0; j < QK; ++j) {
+-                    // ggml layout: qs[j] holds e_j (low) and e_{j+16} (high);
+-                    // qh bit j is e_j's fifth bit.
+-                    const int nib = j < 16 ? (qs[j] & 0x0F) : (qs[j - 16] >> 4);
+-                    const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+-                    vals[j] = (signed char)(nib | (bit5 << 4));
+-                }
+-                __vector signed char w_lo = ppc_load(vals);
+-                __vector signed char w_hi = ppc_load(vals + 16);
+-                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+-
+-                __vector signed int zero = vec_splats((int)0);
+-                __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mulo(w_lo, a_lo), zero) +
+-                                              vec_sum4s(vec_mule(w_hi, a_hi), zero) +
+-                                              vec_sum4s(vec_mulo(w_hi, a_hi), zero);
+-                union { __vector signed int vi; int i[4]; } u;
+-                u.vi = dot_vec;
+-                int dot = u.i[0] + u.i[1] + u.i[2] + u.i[3];
+-                int sum_q8 = 0;
+-                for (int j = 0; j < QK; ++j) sum_q8 += q8_act[bi].qs[j];
+-                sum += d * (float)dot + min * (float)sum_q8;
+-            }
+-            o_row[n] = sum;
+-        }
+-    }
++    gemv_q32_transB_ppc<dot_q5_1_row_ppc>(a, w, out, M, K, N, 24);
+ }
+ 
+ #endif // USE_ALTIVEC
+diff --git a/src/operators/cpu/arch/ppc64/ppc_simd.h b/src/operators/cpu/arch/ppc64/ppc_simd.h
+index fa5add9..ee19a43 100644
+--- a/src/operators/cpu/arch/ppc64/ppc_simd.h
++++ b/src/operators/cpu/arch/ppc64/ppc_simd.h
+@@ -95,6 +95,58 @@ static inline __vector float ppc_div(__vector float a, __vector float b) {
+ #    endif
+ }
+ 
++// 16-byte load from a pointer known to be 16-byte aligned.
++template <typename T>
++static inline typename ppc_detail::vec_of<T>::type ppc_load_aligned(const T* p) {
++#    ifdef USE_VSX
++    return vec_xl(0, p);  // lvx's element order differs on little-endian
++#    else
++    return vec_ld(0, p);
++#    endif
++}
++
++// acc + 16 products u[i] * s[i] (unsigned x signed bytes), as 4 int32 partial
++// sums (vmsummbm: one instruction on every AltiVec/VSX CPU).
++static inline __vector signed int ppc_msum_u8s8(__vector unsigned char u, __vector signed char s,
++                                                __vector signed int acc) {
++    return vec_msum(s, u, acc);
++}
++
++// Sum of the four int32 lanes.
++static inline int ppc_hsum_i32(__vector signed int v) {
++    return vec_extract(vec_sums(v, vec_splats(0)), 3);
++}
++
++// IEEE binary16 -> binary32, exact for every input (including subnormals,
++// infinities and NaNs) and branch-free; replaces ldexp() in the per-block
++// scale decode of the quantized kernels. From Maratyszcza/FP16 (MIT).
++static inline float ppc_half_to_float(uint16_t h) {
++    const uint32_t w = static_cast<uint32_t>(h) << 16;
++    const uint32_t sign = w & 0x80000000u;
++    const uint32_t two_w = w + w;
++    uint32_t bits = (two_w >> 4) + (0xE0u << 23);
++    float normalized;
++    std::memcpy(&normalized, &bits, 4);
++    normalized *= 0x1.0p-112f;
++    bits = (two_w >> 17) | (126u << 23);
++    float denormalized;
++    std::memcpy(&denormalized, &bits, 4);
++    denormalized -= 0.5f;
++    const float magnitude = two_w < (1u << 27) ? denormalized : normalized;
++    std::memcpy(&bits, &magnitude, 4);
++    bits |= sign;
++    float out;
++    std::memcpy(&out, &bits, 4);
++    return out;
++}
++
++// fp16 field stored in host order (tensors are converted at load time).
++static inline float ppc_half_at(const uint8_t* p) {
++    uint16_t h;
++    std::memcpy(&h, p, 2);
++    return ppc_half_to_float(h);
++}
++
+ }  // namespace cpu
+ }  // namespace forge
+ 
+diff --git a/src/operators/cpu/arch/ppc64/quants.h b/src/operators/cpu/arch/ppc64/quants.h
+index 841a586..059d2dc 100644
+--- a/src/operators/cpu/arch/ppc64/quants.h
++++ b/src/operators/cpu/arch/ppc64/quants.h
+@@ -3,15 +3,12 @@
+ // PPC64 VSX I-quant (IQ2_S / IQ2_XS / IQ3_S / IQ4_NL) fused dot-product and
+ // GEMV kernels.
+ //
+-// These are VSX translations of the ARM64 NEON kernels in arch/arm64/quants.h
+-// (same block layouts, same grid/LUT tables from quant_tables.h). VSX has no
+-// dotprod instruction, so every 16-element dot uses the vec_mule/vec_mulo +
+-// vec_sum4s fallback from vec_dot.h.
++// These are AltiVec/VSX translations of the ARM64 NEON kernels in
++// arch/arm64/quants.h (same block layouts, same grid/LUT tables from
++// quant_tables.h).
+ //
+-// All I-quant grid values are small non-negative integers (0..7), so their
+-// bit patterns are identical when reinterpreted as signed int8; the signed×
+-// signed dot helper therefore computes the same result as the unsigned×signed
+-// maddubs used on NEON.
++// I-quant grid values are unsigned bytes, so the grid dots use vmsummbm
++// (unsigned x signed), like the unsigned x signed maddubs used on NEON.
+ 
+ #include "ppc_simd.h"
+ #include <cstring>
+@@ -34,13 +31,10 @@ namespace cpu {
+ // Internal helpers
+ // ============================================================================
+ 
+-// Dot product of 16 grid bytes (non-negative) with 16 signed q8 bytes.
+-// Grid bytes are small (0..7) so the signed×signed helper gives the same
+-// arithmetic result as the NEON unsigned×signed maddubs.
++// Dot product of 16 unsigned grid bytes with 16 signed q8 bytes (vmsummbm).
+ static inline int dot_16_grid_q8(__vector unsigned char grid,
+                                  __vector signed char q8) {
+-    return vsx_dot::dot_16_signed_signed(
+-        (__vector signed char)grid, q8);
++    return vsx_dot::dot_16_nibble_q8(grid, q8);
+ }
+ 
+ // ============================================================================
+diff --git a/src/operators/cpu/arch/ppc64/vec_dot.h b/src/operators/cpu/arch/ppc64/vec_dot.h
+index 500013c..56c96ef 100644
+--- a/src/operators/cpu/arch/ppc64/vec_dot.h
++++ b/src/operators/cpu/arch/ppc64/vec_dot.h
+@@ -1,10 +1,8 @@
+ #pragma once
+-// PowerPC64 VSX quantized dot product kernels.
++// PowerPC (AltiVec/VSX) quantized dot product kernels.
+ // Provides vec_dot_q4_0_q8_0, vec_dot_q8_0_q8_0, vec_dot_q4_1_q8_0
+-// — matching the x86 AVX2 and ARM64 NEON API.
+-//
+-// VSX has NO dotprod instruction, so we always use the vmull fallback
+-// path via vec_mule/vec_mulo + vec_sum4s.
++// — matching the x86 AVX2 and ARM64 NEON API. Unsigned x signed byte dots
++// use vec_msum (vmsummbm); signed x signed ones widen via vec_mule/vec_mulo.
+ //
+ // This header is self-contained and does NOT include vec.h or
+ // elementwise_kernels.h.
+@@ -29,19 +27,8 @@ struct block_q8_0_act {
+ 
+ namespace vsx_dot {
+ 
+-// Software fp16-to-fp32 (same as vec.h — kept self-contained for vec_dot)
+ static inline float fp16_to_fp32(uint16_t bits) {
+-    uint32_t sign     = (bits >> 15) & 1;
+-    uint32_t exponent = (bits >> 10) & 0x1F;
+-    uint32_t mantissa = bits & 0x3FF;
+-    float value;
+-    if (exponent == 0) {
+-        value = std::ldexp(static_cast<float>(mantissa) / 1024.0f, -14);
+-    } else {
+-        value = std::ldexp(1.0f + static_cast<float>(mantissa) / 1024.0f,
+-                           static_cast<int>(exponent) - 15);
+-    }
+-    return sign ? -value : value;
++    return ppc_half_to_float(bits);
+ }
+ 
+ // Expand 16 packed nibble bytes into 32 unsigned bytes in [0..15].
+@@ -57,22 +44,11 @@ static inline void nibbles_to_bytes_32(const uint8_t* src,
+     hi = vec_sr(tmp, vec_splats((unsigned char)4));
+ }
+ 
+-// Dot product of 16 unsigned nibble bytes with 16 signed q8 bytes.
+-// Uses vec_mule/vec_mulo fallback (VSX has no dotprod instruction).
+-// Returns scalar int sum. Caller handles -8*sum(q8) bias correction.
++// Dot product of 16 unsigned bytes (nibbles, grid values: any value) with 16
++// signed q8 bytes (vmsummbm). Caller handles any offset correction.
+ static inline int dot_16_nibble_q8(__vector unsigned char q4_nibbles,
+                                    __vector signed char q8_signed) {
+-    __vector signed char q4_s = (__vector signed char)q4_nibbles;
+-    __vector signed short pe = vec_mule(q4_s, q8_signed);
+-    __vector signed short po = vec_mulo(q4_s, q8_signed);
+-    __vector signed int zero = vec_splats((int)0);
+-    __vector signed int se = vec_sum4s(pe, zero);
+-    __vector signed int so = vec_sum4s(po, zero);
+-    __vector signed int s32 = se + so;
+-    // Horizontal sum of 4 int32 lanes
+-    union { __vector signed int vi; int i[4]; } u;
+-    u.vi = s32;
+-    return u.i[0] + u.i[1] + u.i[2] + u.i[3];
++    return ppc_hsum_i32(ppc_msum_u8s8(q4_nibbles, q8_signed, vec_splats(0)));
+ }
+ 
+ // Dot product of 16 signed bytes with 16 signed bytes.
+@@ -83,10 +59,7 @@ static inline int dot_16_signed_signed(__vector signed char a, __vector signed c
+     __vector signed int zero = vec_splats((int)0);
+     __vector signed int se = vec_sum4s(pe, zero);
+     __vector signed int so = vec_sum4s(po, zero);
+-    __vector signed int s32 = se + so;
+-    union { __vector signed int vi; int i[4]; } u;
+-    u.vi = s32;
+-    return u.i[0] + u.i[1] + u.i[2] + u.i[3];
++    return ppc_hsum_i32(se + so);
+ }
+ 
+ }  // namespace vsx_dot
+diff --git a/src/operators/cpu/matmul.cpp b/src/operators/cpu/matmul.cpp
+index 02addcd..4ebe3d6 100644
+--- a/src/operators/cpu/matmul.cpp
++++ b/src/operators/cpu/matmul.cpp
+@@ -1017,6 +1017,17 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
+                     }
+                 });
+ #    endif
++#elif defined(USE_ALTIVEC)
++                // Row-wise dequant (formats without a fused PowerPC kernel) and
++                // an AltiVec/VSX dot product.
++                cpu::parallel_for_chunks_dynamic(N, 64, [&](int n0, int n1) {
++                    std::vector<float> row_buf(K);
++                    for (int n = n0; n < n1; ++n) {
++                        dequant_fn(q_data, row_buf.data(), K, n);
++                        for (int m = 0; m < M; ++m)
++                            o_data[m * N + n] = cpu::dot_f32(a_data + m * K, row_buf.data(), K);
++                    }
++                });
+ #else
+ #    if FORGE_USE_OPENBLAS
+                 PERF_SCOPE("matmul_transB/dequant+gemm_openblas");
+diff --git a/tests/test_ppc64_vsx_kernels.cpp b/tests/test_ppc64_vsx_kernels.cpp
+index ffb185d..20bbdb3 100644
+--- a/tests/test_ppc64_vsx_kernels.cpp
++++ b/tests/test_ppc64_vsx_kernels.cpp
+@@ -890,6 +890,12 @@ int main() {
+                      144, {0, 2});
+     test_gemm_kquant("gemm_q6_K", forge::cpu::gemm_q6_K_vsx, forge::ops::dequantize_q6_k_row,
+                      210, {208});
++    test_gemm_kquant("gemm_q2_K", forge::cpu::gemm_q2_K_vsx, forge::ops::dequantize_q2_k_row,
++                     84, {80, 82});
++    test_gemm_kquant("gemm_q3_K", forge::cpu::gemm_q3_K_vsx, forge::ops::dequantize_q3_k_row,
++                     110, {108});
++    test_gemm_kquant("gemm_q5_K", forge::cpu::gemm_q5_K_vsx, forge::ops::dequantize_q5_k_row,
++                     176, {0, 2});
+ 
+     std::printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
+     return tests_failed > 0 ? 1 : 0;
+-- 
+2.43.0
+

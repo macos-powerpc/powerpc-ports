@@ -1,0 +1,1956 @@
+From dc7d95731a7284e0bb4b6942582b8e7d797e25fa Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 04:18:44 +0000
+Subject: [PATCH 17/20] feat(ppc): AltiVec kernels for G4/G5 and other pre-VSX
+ PowerPC
+
+The PowerPC kernels in arch/ppc64 required VSX (POWER7+), so G4/G5 and
+POWER6 builds, and every 32-bit PowerPC build, fell back to the scalar
+kernels. Apart from unaligned loads/stores (vec_xl/vec_xst), float
+division, one vec_mul and one integer vec_cmpge, the kernels already
+used only AltiVec (VMX) operations.
+
+- arch/ppc64/ppc_simd.h wraps the differing operations: ppc_load and
+  ppc_store (VSX forms, or the classic lvsl/vperm load and an aligned
+  stvx / plain-copy store on AltiVec) and ppc_div (vdivsp, or a refined
+  vrefp estimate). The kernels and the KV-cache fp16 conversion use the
+  wrappers; vec_mul and vec_cmpge are replaced by AltiVec equivalents.
+- Kernel code is guarded by USE_ALTIVEC; USE_VSX implies it. The arch
+  is renamed PPC (-DFORGE_ARCH=PPC64 still works) and also covers 32-bit
+  PowerPC and Darwin's "Power Macintosh".
+- detect_cpu_features: probe __VSX__/__ALTIVEC__ with the CPU flags the
+  build uses (FORGE_TUNE_MARCH, or -mcpu=native for native builds);
+  -DFORGE_CPU_FEATURES=ALTIVEC|VSX overrides. Without an AltiVec CPU in
+  the flags the scalar kernels are kept, so default 32-bit builds stay
+  G3-safe. AltiVec builds add -maltivec (and -mabi=altivec off Darwin);
+  VSX builds add -mcpu=power8 as before unless FORGE_TUNE_MARCH is set.
+- Cross tests: AltiVec variants of the PowerPC kernel tests, built for a
+  7450 and run under qemu-ppc -cpu 7450 (which traps on VSX), with the
+  compiler and extra flags configurable. Add a ppc_div accuracy test.
+
+On a 32-bit big-endian 7450 (qemu-ppc) the PowerPC kernel suite (342
+checks) and the IQ dot/GEMV tests pass. The kernel sources compile for
+both -mcpu=7450 and -mcpu=power7 (VSX).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ CMakeLists.txt                                |  19 +++-
+ cmake/cross_tests.cmake                       |  25 ++++-
+ cmake/detect_cpu_features.cmake               |  95 +++++++++-------
+ src/inference/kv_cache.cpp                    |  36 ++++---
+ src/operators/cpu/arch/ppc64/attn_kernels.h   |  84 +++++++--------
+ .../cpu/arch/ppc64/elementwise_kernels.h      |  84 +++++++--------
+ src/operators/cpu/arch/ppc64/gemm.h           |  34 +++---
+ src/operators/cpu/arch/ppc64/gemv.h           |  74 +++++++------
+ src/operators/cpu/arch/ppc64/kernels.h        |  11 +-
+ src/operators/cpu/arch/ppc64/kv_kernels.h     |  30 +++---
+ src/operators/cpu/arch/ppc64/norm_kernels.h   |  68 ++++++------
+ src/operators/cpu/arch/ppc64/ppc_simd.h       | 101 ++++++++++++++++++
+ src/operators/cpu/arch/ppc64/quants.h         |  52 +++++----
+ .../cpu/arch/ppc64/sampling_kernels.h         |  46 ++++----
+ src/operators/cpu/arch/ppc64/vec.h            |   8 +-
+ src/operators/cpu/arch/ppc64/vec_dot.h        |  28 +++--
+ src/operators/cpu/common/thread_policy.h      |   2 +-
+ src/operators/cpu/matmul.cpp                  |  52 ++++-----
+ src/operators/cpu/simd.h                      |   4 +-
+ tests/test_ppc64_vsx_kernels.cpp              |  37 ++++++-
+ 20 files changed, 527 insertions(+), 363 deletions(-)
+ create mode 100644 src/operators/cpu/arch/ppc64/ppc_simd.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4f4a1f4..d4c9dc8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -85,9 +85,22 @@ if(FORGE_CPU_HAS_MATMUL_INT8)
+     forge_cpu_features
+     INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+i8mm>)
+ endif()
+-if(FORGE_CPU_HAS_VSX)
+-  target_compile_definitions(forge_cpu_features INTERFACE USE_VSX)
+-  target_compile_options(forge_cpu_features INTERFACE -mcpu=power8)
++if(FORGE_CPU_HAS_ALTIVEC)
++  # The PowerPC kernels are guarded by USE_ALTIVEC; USE_VSX adds the VSX
++  # load/store/divide forms (see src/operators/cpu/arch/ppc64/ppc_simd.h).
++  target_compile_definitions(forge_cpu_features INTERFACE USE_ALTIVEC)
++  if(FORGE_CPU_HAS_VSX)
++    target_compile_definitions(forge_cpu_features INTERFACE USE_VSX)
++    if(NOT FORGE_TUNE_MARCH)
++      target_compile_options(forge_cpu_features INTERFACE -mcpu=power8)
++    endif()
++  else()
++    target_compile_options(forge_cpu_features INTERFACE -maltivec)
++    if(NOT APPLE)
++      # Darwin's ABI already includes the AltiVec extensions.
++      target_compile_options(forge_cpu_features INTERFACE -mabi=altivec)
++    endif()
++  endif()
+ endif()
+ 
+ option(USE_CUBLAS "Use cuBLAS for GPU matrix operations" ON)
+diff --git a/cmake/cross_tests.cmake b/cmake/cross_tests.cmake
+index b26f0e7..c6356ab 100644
+--- a/cmake/cross_tests.cmake
++++ b/cmake/cross_tests.cmake
+@@ -22,6 +22,7 @@
+ #   qemu_candidates qemu binary names tried in order
+ #   cflags          arch-specific compile flags
+ #   inc_dirs        extra -I include directories (relative to PROJECT_SOURCE_DIR)
++#   [qemu_args]     optional extra arguments for the emulator (e.g. -cpu 7450)
+ function(
+   forge_add_cross_test
+   name
+@@ -77,8 +78,12 @@ function(
+   add_custom_target(${name}-build ALL DEPENDS ${out_bin})
+ 
+   # ctest wrapper script so `ctest` transparently runs under qemu.
++  set(qemu_args "")
++  if(ARGC GREATER 6)
++    string(REPLACE ";" " " qemu_args "${ARGV6}")
++  endif()
+   set(runner ${out_dir}/${name}.sh)
+-  file(WRITE ${runner} "#!/bin/sh\nexec ${qemu_found} ${out_bin}\n")
++  file(WRITE ${runner} "#!/bin/sh\nexec ${qemu_found} ${qemu_args} ${out_bin}\n")
+   execute_process(COMMAND chmod +x ${runner})
+ 
+   add_test(NAME ${name} COMMAND ${runner})
+@@ -94,6 +99,20 @@ forge_add_cross_test(
+   vsx-ppc64-kernels tests/test_ppc64_vsx_kernels.cpp powerpc64le-linux-gnu-g++
+   "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8" "")
+ 
++# The same PowerPC kernels built for AltiVec only (G4: 32-bit, big-endian, no
++# VSX) and run on an emulated 7450, which traps on any VSX instruction. The
++# compiler name and extra flags (e.g. --sysroot) can be overridden for
++# toolchains installed under other names.
++set(FORGE_CROSS_PPC32_CXX "powerpc-linux-gnu-g++"
++    CACHE STRING "32-bit big-endian PowerPC cross compiler for the AltiVec tests")
++set(FORGE_CROSS_PPC32_FLAGS "" CACHE STRING
++    "Extra flags for FORGE_CROSS_PPC32_CXX (e.g. --sysroot=...)")
++set(_forge_altivec_flags -DUSE_ALTIVEC -mcpu=7450 -maltivec -mabi=altivec
++                         ${FORGE_CROSS_PPC32_FLAGS} -pthread)
++forge_add_cross_test(
++  altivec-ppc-kernels tests/test_ppc64_vsx_kernels.cpp ${FORGE_CROSS_PPC32_CXX}
++  "qemu-ppc-static;qemu-ppc" "${_forge_altivec_flags}" "" "-cpu;7450")
++
+ # Auto-discover every *.cpp under tests/arch/<arch>/ and cross-build it with
+ # the matching toolchain + include path.
+ file(GLOB ARM64_SOURCES CONFIGURE_DEPENDS
+@@ -114,4 +133,8 @@ foreach(src IN LISTS PPC64_SOURCES)
+     ppc64-${stem} tests/arch/ppc64/${stem}.cpp powerpc64le-linux-gnu-g++
+     "qemu-ppc64le-static;qemu-ppc64le" "-DUSE_VSX;-mcpu=power8"
+     "src/operators/cpu/arch/ppc64;src/operators/cpu/common;tests/arch")
++  forge_add_cross_test(
++    altivec-${stem} tests/arch/ppc64/${stem}.cpp ${FORGE_CROSS_PPC32_CXX}
++    "qemu-ppc-static;qemu-ppc" "${_forge_altivec_flags}"
++    "src/operators/cpu/arch/ppc64;src/operators/cpu/common;tests/arch" "-cpu;7450")
+ endforeach()
+diff --git a/cmake/detect_cpu_features.cmake b/cmake/detect_cpu_features.cmake
+index 0736510..bc0f5b0 100644
+--- a/cmake/detect_cpu_features.cmake
++++ b/cmake/detect_cpu_features.cmake
+@@ -1,8 +1,8 @@
+ # detect_cpu_features.cmake — Two-level CPU feature detection for Forge.
+ #
+ # Level 1: Architecture
+-#   FORGE_ARCH_X86   / FORGE_ARCH_ARM64   / FORGE_ARCH_PPC64   / FORGE_ARCH_GENERIC
+-#   Override with -DFORGE_ARCH=X86|ARM64|PPC64|GENERIC
++#   FORGE_ARCH_X86   / FORGE_ARCH_ARM64   / FORGE_ARCH_PPC   / FORGE_ARCH_GENERIC
++#   Override with -DFORGE_ARCH=X86|ARM64|PPC|GENERIC (PPC64 is accepted as PPC)
+ #
+ # Level 2: SIMD features (native builds only; cross-compile uses FORGE_CPU_FEATURES)
+ #   FORGE_CPU_HAS_AVX2           — AVX2 + FMA + F16C
+@@ -10,15 +10,17 @@
+ #   FORGE_CPU_HAS_NEON           — ARM NEON (always true on arm64)
+ #   FORGE_CPU_HAS_DOTPROD        — ARMv8.2-a dotprod
+ #   FORGE_CPU_HAS_MATMUL_INT8    — ARMv8.2-a i8mm
+-#   FORGE_CPU_HAS_VSX            — PowerPC VSX (POWER7+, always on ppc64/ppc64le)
++#   FORGE_CPU_HAS_ALTIVEC        — PowerPC AltiVec/VMX (G4, G5, POWER6+)
++#   FORGE_CPU_HAS_VSX            — PowerPC VSX (POWER7+; implies ALTIVEC)
+ #
+ # Output variables:
+-#   FORGE_ARCH                — X86 | ARM64 | PPC64 | GENERIC
++#   FORGE_ARCH                — X86 | ARM64 | PPC | GENERIC
+ #   FORGE_CPU_HAS_AVX2        — TRUE | FALSE
+ #   FORGE_CPU_HAS_AVX512_VNNI — TRUE | FALSE
+ #   FORGE_CPU_HAS_NEON        — TRUE | FALSE
+ #   FORGE_CPU_HAS_DOTPROD     — TRUE | FALSE
+ #   FORGE_CPU_HAS_MATMUL_INT8 — TRUE | FALSE
++#   FORGE_CPU_HAS_ALTIVEC     — TRUE | FALSE
+ #   FORGE_CPU_HAS_VSX         — TRUE | FALSE
+ 
+ include(CheckCXXCompilerFlag)
+@@ -34,11 +36,13 @@ endif()
+ # ---- Level 1: Architecture detection ----
+ if(DEFINED FORGE_ARCH)
+   string(TOUPPER "${FORGE_ARCH}" FORGE_ARCH)
+-  if(NOT FORGE_ARCH MATCHES "^(X86|ARM64|PPC64|GENERIC)$")
++  if(FORGE_ARCH STREQUAL "PPC64")
++    set(FORGE_ARCH "PPC")
++  endif()
++  if(NOT FORGE_ARCH MATCHES "^(X86|ARM64|PPC|GENERIC)$")
+     message(
+       FATAL_ERROR
+-        "FORGE_ARCH must be X86, ARM64, PPC64, or GENERIC (got '${FORGE_ARCH}')"
+-    )
++        "FORGE_ARCH must be X86, ARM64, PPC, or GENERIC (got '${FORGE_ARCH}')")
+   endif()
+   message(STATUS "CPU arch: ${FORGE_ARCH} (user override)")
+ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)")
+@@ -53,11 +57,12 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|armv[78])")
+     STATUS
+       "CPU arch: ARM64 (detected from CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR})"
+   )
+-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|ppc64le|powerpc64|powerpc64le)")
+-  set(FORGE_ARCH "PPC64")
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc|powerpc|Power Macintosh)")
++  # 32- and 64-bit, either byte order (Darwin reports "Power Macintosh").
++  set(FORGE_ARCH "PPC")
+   message(
+     STATUS
+-      "CPU arch: PPC64 (detected from CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR})"
++      "CPU arch: PPC (detected from CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR})"
+   )
+ else()
+   set(FORGE_ARCH "GENERIC")
+@@ -73,6 +78,7 @@ set(FORGE_CPU_HAS_AVX512_VNNI FALSE)
+ set(FORGE_CPU_HAS_NEON FALSE)
+ set(FORGE_CPU_HAS_DOTPROD FALSE)
+ set(FORGE_CPU_HAS_MATMUL_INT8 FALSE)
++set(FORGE_CPU_HAS_ALTIVEC FALSE)
+ set(FORGE_CPU_HAS_VSX FALSE)
+ 
+ if(FORGE_ARCH STREQUAL "X86")
+@@ -354,41 +360,52 @@ elseif(FORGE_ARCH STREQUAL "ARM64")
+     endif()
+   endif()
+ 
+-elseif(FORGE_ARCH STREQUAL "PPC64")
+-  # VSX is available on POWER7+ (POWER8 is the baseline for ppc64le). VSX
+-  # provides 128-bit SIMD vector float/int operations via <altivec.h>.
+-  set(FORGE_CPU_HAS_VSX TRUE)
+-
++elseif(FORGE_ARCH STREQUAL "PPC")
++  # The arch/ppc64 kernels are written for AltiVec (VMX: G4, G5, POWER6+);
++  # VSX (POWER7+) is a superset that only speeds up their unaligned loads,
++  # stores and division, so VSX implies ALTIVEC.
+   if(DEFINED FORGE_CPU_FEATURES)
+-    message(
+-      STATUS "CPU features: ${FORGE_CPU_FEATURES} (cross-compile override)")
+-  elseif(CMAKE_CROSSCOMPILING)
+-    message(STATUS "Cross-compiling for PPC64 — VSX enabled by default.")
++    message(STATUS "CPU features: ${FORGE_CPU_FEATURES} (override)")
++    if("VSX" IN_LIST FORGE_CPU_FEATURES)
++      set(FORGE_CPU_HAS_VSX TRUE)
++      set(FORGE_CPU_HAS_ALTIVEC TRUE)
++    elseif("ALTIVEC" IN_LIST FORGE_CPU_FEATURES)
++      set(FORGE_CPU_HAS_ALTIVEC TRUE)
++    endif()
+   else()
+-    # Native PPC64: probe via compile-time predefined macros.
+-    set(_probe_dir "${CMAKE_BINARY_DIR}/CMakeFiles/forge_cpu_probe")
+-
+-    # VSX: check __VSX__ (should be defined on POWER7+)
+-    file(MAKE_DIRECTORY "${_probe_dir}")
+-    file(WRITE "${_probe_dir}/probe_vsx.cpp"
+-         "#if !defined(__VSX__)\n" "#error \"VSX not available\"\n" "#endif\n"
+-         "int probe_vsx(){ return 0; }\n")
+-    execute_process(
+-      COMMAND "${CMAKE_CXX_COMPILER}" ${CMAKE_CXX_COMPILER_ARG1}
+-              ${CMAKE_CXX_FLAGS} ${_forge_syntax_only} "${_probe_dir}/probe_vsx.cpp"
+-      RESULT_VARIABLE _vsx_result
+-      ERROR_VARIABLE _vsx_err)
+-    if(_vsx_result EQUAL 0)
+-      message(STATUS "  VSX: YES")
++    # Probe the compiler's predefined macros with the CPU flags the build will
++    # use. Without an explicit CPU (portable build, cross-compile without
++    # FORGE_TUNE_MARCH) this follows the compiler default: ppc64le defaults to
++    # POWER8 (VSX), 32-bit PowerPC to a CPU without AltiVec, so G3-safe.
++    set(_forge_ppc_flags "${FORGE_TUNE_MARCH}")
++    if(NOT _forge_ppc_flags
++       AND FORGE_NATIVE_BUILD
++       AND NOT CMAKE_CROSSCOMPILING)
++      set(_forge_ppc_flags "-mcpu=native")
++    endif()
++    set(CMAKE_REQUIRED_FLAGS "${_forge_ppc_flags}")
++    check_cxx_source_compiles(
++      "#if !defined(__VSX__)\n#error no VSX\n#endif\nint main() { return 0; }\n"
++      FORGE_PPC_HAS_VSX_MACRO)
++    check_cxx_source_compiles(
++      "#if !defined(__ALTIVEC__)\n#error no AltiVec\n#endif\nint main() { return 0; }\n"
++      FORGE_PPC_HAS_ALTIVEC_MACRO)
++    unset(CMAKE_REQUIRED_FLAGS)
++    if(FORGE_PPC_HAS_VSX_MACRO)
++      set(FORGE_CPU_HAS_VSX TRUE)
++      set(FORGE_CPU_HAS_ALTIVEC TRUE)
++    elseif(FORGE_PPC_HAS_ALTIVEC_MACRO)
++      set(FORGE_CPU_HAS_ALTIVEC TRUE)
+     else()
+       message(
+-        WARNING
+-          "  VSX: NO — unexpected on PPC64. Override with FORGE_CPU_FEATURES.")
+-      set(FORGE_CPU_HAS_VSX FALSE)
++        STATUS
++          "  AltiVec: not enabled by the target CPU flags ('${_forge_ppc_flags}'); "
++          "using scalar kernels. Set FORGE_TUNE_MARCH (e.g. -mcpu=7450 or "
++          "-mcpu=970) or -DFORGE_CPU_FEATURES=ALTIVEC for a G4/G5 build.")
+     endif()
+-    unset(_vsx_result)
+-    unset(_vsx_err)
++    unset(_forge_ppc_flags)
+   endif()
++  message(STATUS "  AltiVec: ${FORGE_CPU_HAS_ALTIVEC}, VSX: ${FORGE_CPU_HAS_VSX}")
+ 
+ else()
+   message(STATUS "CPU features: GENERIC (no SIMD)")
+diff --git a/src/inference/kv_cache.cpp b/src/inference/kv_cache.cpp
+index 4b5be3d..e26339b 100644
+--- a/src/inference/kv_cache.cpp
++++ b/src/inference/kv_cache.cpp
+@@ -17,8 +17,8 @@
+ #ifdef USE_NEON
+ #    include <arm_neon.h>
+ #endif
+-#ifdef USE_VSX
+-#    include <altivec.h>
++#if defined(USE_VSX) || defined(USE_ALTIVEC)
++#    include "cpu/arch/ppc64/ppc_simd.h"
+ #endif
+ 
+ namespace forge {
+@@ -200,10 +200,11 @@ static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
+ }
+ #endif  // USE_NEON
+ 
+-#ifdef USE_VSX
+-// VSX software fp16 batch conversion: processes 8 elements at a time using
+-// 128-bit vector integer bit manipulation. POWER8+ has no hardware F16C;
+-// subnormal fp16 inputs are treated as zero (acceptable for NN KV cache).
++#ifdef USE_ALTIVEC
++// AltiVec/VSX software fp16 batch conversion: processes 8 elements at a time
++// using 128-bit vector integer bit manipulation (AltiVec and POWER8 have no
++// hardware fp16 conversion); subnormal fp16 inputs are treated as zero
++// (acceptable for NN KV cache).
+ static __vector unsigned int vsx_half_to_float4(__vector unsigned int h) {
+     __vector unsigned int shift16 = vec_splats(16U);
+     __vector unsigned int shift10 = vec_splats(10U);
+@@ -228,13 +229,13 @@ static __vector unsigned int vsx_half_to_float4(__vector unsigned int h) {
+ static void fp16_to_fp32_batch_simd(const uint16_t* src, float* dst, int n) {
+     int i = 0;
+     for (; i + 8 <= n; i += 8) {
+-        __vector unsigned short hv = vec_xl(0, (const unsigned short*)(src + i));
++        __vector unsigned short hv = cpu::ppc_load((const unsigned short*)(src + i));
+         __vector unsigned int h_lo = vec_and(
+             (__vector unsigned int)vec_unpackl((__vector signed short)hv), vec_splats(0x0000FFFFU));
+         __vector unsigned int h_hi = vec_and(
+             (__vector unsigned int)vec_unpackh((__vector signed short)hv), vec_splats(0x0000FFFFU));
+-        vec_xst((__vector float)vsx_half_to_float4(h_hi), 0, dst + i);
+-        vec_xst((__vector float)vsx_half_to_float4(h_lo), 0, dst + i + 4);
++        cpu::ppc_store((__vector float)vsx_half_to_float4(h_hi), dst + i);
++        cpu::ppc_store((__vector float)vsx_half_to_float4(h_lo), dst + i + 4);
+     }
+     for (; i < n; ++i) {
+         dst[i] = fp16_to_fp32(src[i]);
+@@ -254,8 +255,9 @@ static __vector unsigned int vsx_float4_to_half(__vector float fv) {
+     __vector unsigned int exp = vec_sr(vec_and(bits, vec_splats(0x7F800000U)), shift23);
+     __vector unsigned int mant = vec_and(bits, vec_splats(0x007FE000U));
+ 
+-    __vector unsigned int is_ge_113 = (__vector unsigned int)vec_cmpge(exp, vec_splats(113U));
+-    __vector unsigned int is_ge_143 = (__vector unsigned int)vec_cmpge(exp, vec_splats(143U));
++    // exp >= 113 / >= 143, as vcmpgtuw (integer vec_cmpge needs VSX)
++    __vector unsigned int is_ge_113 = (__vector unsigned int)vec_cmpgt(exp, vec_splats(112U));
++    __vector unsigned int is_ge_143 = (__vector unsigned int)vec_cmpgt(exp, vec_splats(142U));
+     __vector unsigned int is_ff = (__vector unsigned int)vec_cmpeq(exp, vec_splats(0xFFU));
+ 
+     __vector unsigned int norm_exp = vec_sub(exp, vec_splats(112U));
+@@ -277,19 +279,19 @@ static void fp32_to_fp16_batch_simd(const float* src, uint16_t* dst, int n) {
+     // 8 floats per iteration so the packed result fills exactly one 16-byte
+     // store (packing 4 lanes and storing 16 bytes wrote 8 bytes past dst[n]).
+     for (; i + 8 <= n; i += 8) {
+-        __vector unsigned int lo = vsx_float4_to_half(vec_xl(0, src + i));
+-        __vector unsigned int hi = vsx_float4_to_half(vec_xl(0, src + i + 4));
+-        vec_xst(vec_pack(lo, hi), 0, (unsigned short*)(dst + i));
++        __vector unsigned int lo = vsx_float4_to_half(cpu::ppc_load(src + i));
++        __vector unsigned int hi = vsx_float4_to_half(cpu::ppc_load(src + i + 4));
++        cpu::ppc_store(vec_pack(lo, hi), (unsigned short*)(dst + i));
+     }
+     for (; i < n; ++i) {
+         dst[i] = fp32_to_fp16(src[i]);
+     }
+ }
+-#endif  // USE_VSX
++#endif  // USE_ALTIVEC
+ 
+ static void quantize_f16_cpu(const float* data, uint8_t* q_data, int n) {
+     auto* qs = reinterpret_cast<uint16_t*>(q_data);
+-#if defined(USE_AVX2) || defined(USE_NEON) || defined(USE_VSX)
++#if defined(USE_AVX2) || defined(USE_NEON) || defined(USE_ALTIVEC)
+     fp32_to_fp16_batch_simd(data, qs, n);
+ #else
+     for (int i = 0; i < n; ++i) {
+@@ -300,7 +302,7 @@ static void quantize_f16_cpu(const float* data, uint8_t* q_data, int n) {
+ 
+ static void dequantize_f16_cpu(const uint8_t* q_data, float* out, int n) {
+     auto* qs = reinterpret_cast<const uint16_t*>(q_data);
+-#if defined(USE_AVX2) || defined(USE_NEON) || defined(USE_VSX)
++#if defined(USE_AVX2) || defined(USE_NEON) || defined(USE_ALTIVEC)
+     fp16_to_fp32_batch_simd(qs, out, n);
+ #else
+     for (int i = 0; i < n; ++i) {
+diff --git a/src/operators/cpu/arch/ppc64/attn_kernels.h b/src/operators/cpu/arch/ppc64/attn_kernels.h
+index 203ac90..343d97e 100644
+--- a/src/operators/cpu/arch/ppc64/attn_kernels.h
++++ b/src/operators/cpu/arch/ppc64/attn_kernels.h
+@@ -3,14 +3,12 @@
+ // Provides dot product, scale, and fused-multiply-add for online-softmax
+ // attention (both decode and prefill paths).
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ 
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // Horizontal sum of a __vector float (delegates to hsum_f32x4 in vec.h).
+ static inline float hsum_f32(__vector float v) {
+@@ -29,22 +27,22 @@ static inline float dot_f32(const float* a, const float* b, int n) {
+ 
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float a1 = vec_xl(0, (const float*)(a + i + 4));
+-        __vector float a2 = vec_xl(0, (const float*)(a + i + 8));
+-        __vector float a3 = vec_xl(0, (const float*)(a + i + 12));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
+-        __vector float b1 = vec_xl(0, (const float*)(b + i + 4));
+-        __vector float b2 = vec_xl(0, (const float*)(b + i + 8));
+-        __vector float b3 = vec_xl(0, (const float*)(b + i + 12));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float a1 = ppc_load((const float*)(a + i + 4));
++        __vector float a2 = ppc_load((const float*)(a + i + 8));
++        __vector float a3 = ppc_load((const float*)(a + i + 12));
++        __vector float b0 = ppc_load((const float*)(b + i));
++        __vector float b1 = ppc_load((const float*)(b + i + 4));
++        __vector float b2 = ppc_load((const float*)(b + i + 8));
++        __vector float b3 = ppc_load((const float*)(b + i + 12));
+         sum0 = vec_madd(a0, b0, sum0);
+         sum1 = vec_madd(a1, b1, sum1);
+         sum2 = vec_madd(a2, b2, sum2);
+         sum3 = vec_madd(a3, b3, sum3);
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float b0 = ppc_load((const float*)(b + i));
+         sum0 = vec_madd(a0, b0, sum0);
+     }
+ 
+@@ -65,18 +63,18 @@ static inline void scale_f32(float* data, int n, float scale) {
+     __vector float s = vec_splats(scale);
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float d0 = vec_xl(0, (const float*)(data + i));
+-        __vector float d1 = vec_xl(0, (const float*)(data + i + 4));
+-        __vector float d2 = vec_xl(0, (const float*)(data + i + 8));
+-        __vector float d3 = vec_xl(0, (const float*)(data + i + 12));
+-        vec_xst(d0 * s, 0, (float*)(data + i));
+-        vec_xst(d1 * s, 0, (float*)(data + i + 4));
+-        vec_xst(d2 * s, 0, (float*)(data + i + 8));
+-        vec_xst(d3 * s, 0, (float*)(data + i + 12));
++        __vector float d0 = ppc_load((const float*)(data + i));
++        __vector float d1 = ppc_load((const float*)(data + i + 4));
++        __vector float d2 = ppc_load((const float*)(data + i + 8));
++        __vector float d3 = ppc_load((const float*)(data + i + 12));
++        ppc_store(d0 * s, (float*)(data + i));
++        ppc_store(d1 * s, (float*)(data + i + 4));
++        ppc_store(d2 * s, (float*)(data + i + 8));
++        ppc_store(d3 * s, (float*)(data + i + 12));
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float d = vec_xl(0, (const float*)(data + i));
+-        vec_xst(d * s, 0, (float*)(data + i));
++        __vector float d = ppc_load((const float*)(data + i));
++        ppc_store(d * s, (float*)(data + i));
+     }
+     for (; i < n; ++i) {
+         data[i] *= scale;
+@@ -88,23 +86,23 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight)
+     __vector float w = vec_splats(weight);
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float s0 = vec_xl(0, (const float*)(src + i));
+-        __vector float s1 = vec_xl(0, (const float*)(src + i + 4));
+-        __vector float s2 = vec_xl(0, (const float*)(src + i + 8));
+-        __vector float s3 = vec_xl(0, (const float*)(src + i + 12));
+-        __vector float a0 = vec_xl(0, (const float*)(acc + i));
+-        __vector float a1 = vec_xl(0, (const float*)(acc + i + 4));
+-        __vector float a2 = vec_xl(0, (const float*)(acc + i + 8));
+-        __vector float a3 = vec_xl(0, (const float*)(acc + i + 12));
+-        vec_xst(vec_madd(s0, w, a0), 0, (float*)(acc + i));
+-        vec_xst(vec_madd(s1, w, a1), 0, (float*)(acc + i + 4));
+-        vec_xst(vec_madd(s2, w, a2), 0, (float*)(acc + i + 8));
+-        vec_xst(vec_madd(s3, w, a3), 0, (float*)(acc + i + 12));
++        __vector float s0 = ppc_load((const float*)(src + i));
++        __vector float s1 = ppc_load((const float*)(src + i + 4));
++        __vector float s2 = ppc_load((const float*)(src + i + 8));
++        __vector float s3 = ppc_load((const float*)(src + i + 12));
++        __vector float a0 = ppc_load((const float*)(acc + i));
++        __vector float a1 = ppc_load((const float*)(acc + i + 4));
++        __vector float a2 = ppc_load((const float*)(acc + i + 8));
++        __vector float a3 = ppc_load((const float*)(acc + i + 12));
++        ppc_store(vec_madd(s0, w, a0), (float*)(acc + i));
++        ppc_store(vec_madd(s1, w, a1), (float*)(acc + i + 4));
++        ppc_store(vec_madd(s2, w, a2), (float*)(acc + i + 8));
++        ppc_store(vec_madd(s3, w, a3), (float*)(acc + i + 12));
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float s = vec_xl(0, (const float*)(src + i));
+-        __vector float a = vec_xl(0, (const float*)(acc + i));
+-        vec_xst(vec_madd(s, w, a), 0, (float*)(acc + i));
++        __vector float s = ppc_load((const float*)(src + i));
++        __vector float a = ppc_load((const float*)(acc + i));
++        ppc_store(vec_madd(s, w, a), (float*)(acc + i));
+     }
+     for (; i < n; ++i) {
+         acc[i] += weight * src[i];
+@@ -115,9 +113,9 @@ static inline void fmadd_f32(float* acc, const float* src, int n, float weight)
+ static inline void mul_vec_f32(float* dst, const float* v, int n) {
+     int i = 0;
+     for (; i + 4 <= n; i += 4) {
+-        __vector float a = vec_xl(0, (const float*)(dst + i));
+-        __vector float b = vec_xl(0, (const float*)(v + i));
+-        vec_xst(vec_mul(a, b), 0, (float*)(dst + i));
++        __vector float a = ppc_load((const float*)(dst + i));
++        __vector float b = ppc_load((const float*)(v + i));
++        ppc_store(a * b, (float*)(dst + i));
+     }
+     for (; i < n; ++i)
+         dst[i] *= v[i];
+@@ -138,7 +136,7 @@ static inline void simd_gemm(float* C, const float* A, const float* B, int M, in
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/elementwise_kernels.h b/src/operators/cpu/arch/ppc64/elementwise_kernels.h
+index 26761ac..f36444f 100644
+--- a/src/operators/cpu/arch/ppc64/elementwise_kernels.h
++++ b/src/operators/cpu/arch/ppc64/elementwise_kernels.h
+@@ -3,37 +3,35 @@
+ // Provides vectorised add / mul / silu_mul / gelu_mul for float32 vectors.
+ // VSX uses C operator overloading (+, -, *, &, |, ^) directly on vector types.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cmath>
+ 
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ---- add_f32_vec ----
+ static inline void add_f32_vec(const float* a, const float* b, float* out, int n) {
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float a1 = vec_xl(0, (const float*)(a + i + 4));
+-        __vector float a2 = vec_xl(0, (const float*)(a + i + 8));
+-        __vector float a3 = vec_xl(0, (const float*)(a + i + 12));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
+-        __vector float b1 = vec_xl(0, (const float*)(b + i + 4));
+-        __vector float b2 = vec_xl(0, (const float*)(b + i + 8));
+-        __vector float b3 = vec_xl(0, (const float*)(b + i + 12));
+-        vec_xst(a0 + b0, 0, (float*)(out + i));
+-        vec_xst(a1 + b1, 0, (float*)(out + i + 4));
+-        vec_xst(a2 + b2, 0, (float*)(out + i + 8));
+-        vec_xst(a3 + b3, 0, (float*)(out + i + 12));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float a1 = ppc_load((const float*)(a + i + 4));
++        __vector float a2 = ppc_load((const float*)(a + i + 8));
++        __vector float a3 = ppc_load((const float*)(a + i + 12));
++        __vector float b0 = ppc_load((const float*)(b + i));
++        __vector float b1 = ppc_load((const float*)(b + i + 4));
++        __vector float b2 = ppc_load((const float*)(b + i + 8));
++        __vector float b3 = ppc_load((const float*)(b + i + 12));
++        ppc_store(a0 + b0, (float*)(out + i));
++        ppc_store(a1 + b1, (float*)(out + i + 4));
++        ppc_store(a2 + b2, (float*)(out + i + 8));
++        ppc_store(a3 + b3, (float*)(out + i + 12));
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
+-        vec_xst(a0 + b0, 0, (float*)(out + i));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float b0 = ppc_load((const float*)(b + i));
++        ppc_store(a0 + b0, (float*)(out + i));
+     }
+     for (; i < n; ++i) {
+         out[i] = a[i] + b[i];
+@@ -44,23 +42,23 @@ static inline void add_f32_vec(const float* a, const float* b, float* out, int n
+ static inline void mul_f32_vec(const float* a, const float* b, float* out, int n) {
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float a1 = vec_xl(0, (const float*)(a + i + 4));
+-        __vector float a2 = vec_xl(0, (const float*)(a + i + 8));
+-        __vector float a3 = vec_xl(0, (const float*)(a + i + 12));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
+-        __vector float b1 = vec_xl(0, (const float*)(b + i + 4));
+-        __vector float b2 = vec_xl(0, (const float*)(b + i + 8));
+-        __vector float b3 = vec_xl(0, (const float*)(b + i + 12));
+-        vec_xst(a0 * b0, 0, (float*)(out + i));
+-        vec_xst(a1 * b1, 0, (float*)(out + i + 4));
+-        vec_xst(a2 * b2, 0, (float*)(out + i + 8));
+-        vec_xst(a3 * b3, 0, (float*)(out + i + 12));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float a1 = ppc_load((const float*)(a + i + 4));
++        __vector float a2 = ppc_load((const float*)(a + i + 8));
++        __vector float a3 = ppc_load((const float*)(a + i + 12));
++        __vector float b0 = ppc_load((const float*)(b + i));
++        __vector float b1 = ppc_load((const float*)(b + i + 4));
++        __vector float b2 = ppc_load((const float*)(b + i + 8));
++        __vector float b3 = ppc_load((const float*)(b + i + 12));
++        ppc_store(a0 * b0, (float*)(out + i));
++        ppc_store(a1 * b1, (float*)(out + i + 4));
++        ppc_store(a2 * b2, (float*)(out + i + 8));
++        ppc_store(a3 * b3, (float*)(out + i + 12));
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float a0 = vec_xl(0, (const float*)(a + i));
+-        __vector float b0 = vec_xl(0, (const float*)(b + i));
+-        vec_xst(a0 * b0, 0, (float*)(out + i));
++        __vector float a0 = ppc_load((const float*)(a + i));
++        __vector float b0 = ppc_load((const float*)(b + i));
++        ppc_store(a0 * b0, (float*)(out + i));
+     }
+     for (; i < n; ++i) {
+         out[i] = a[i] * b[i];
+@@ -115,15 +113,15 @@ static inline void silu_mul_f32_vec(const float* gate, const float* up, float* o
+     __vector float one = vec_splats(1.0f);
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+-        __vector float x = vec_xl(0, (const float*)(gate + i));
+-        __vector float u = vec_xl(0, (const float*)(up + i));
++        __vector float x = ppc_load((const float*)(gate + i));
++        __vector float u = ppc_load((const float*)(up + i));
+ 
+         // sigmoid(x) = 1 / (1 + exp(-x))
+         __vector float exp_neg = cephes_exp_f32_vsx(-x);
+-        __vector float sigmoid = one / (one + exp_neg);
++        __vector float sigmoid = ppc_div(one, one + exp_neg);
+ 
+         __vector float silu_v = x * sigmoid;
+-        vec_xst(silu_v * u, 0, (float*)(out + i));
++        ppc_store(silu_v * u, (float*)(out + i));
+     }
+     for (; i < n; ++i) {
+         float v = gate[i];
+@@ -147,8 +145,8 @@ static inline void gelu_mul_f32_vec(const float* gate, const float* up, float* o
+ 
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+-        __vector float x = vec_xl(0, (const float*)(gate + i));
+-        __vector float u = vec_xl(0, (const float*)(up + i));
++        __vector float x = ppc_load((const float*)(gate + i));
++        __vector float u = ppc_load((const float*)(up + i));
+ 
+         // z = sqrt(2/pi) * (x + 0.044715*x^3)
+         __vector float x2 = x * x;
+@@ -159,12 +157,12 @@ static inline void gelu_mul_f32_vec(const float* gate, const float* up, float* o
+         // tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
+         __vector float two_z = z + z;
+         __vector float e2z = cephes_exp_f32_vsx(two_z);
+-        __vector float tanh_z = (e2z - one) / (e2z + one);
++        __vector float tanh_z = ppc_div(e2z - one, e2z + one);
+ 
+         // gelu = 0.5 * x * (1 + tanh(z))
+         __vector float gelu_val = v_half * (x * (tanh_z + one));
+ 
+-        vec_xst(gelu_val * u, 0, (float*)(out + i));
++        ppc_store(gelu_val * u, (float*)(out + i));
+     }
+     for (; i < n; ++i) {
+         float x = gate[i];
+@@ -173,7 +171,7 @@ static inline void gelu_mul_f32_vec(const float* gate, const float* up, float* o
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/gemm.h b/src/operators/cpu/arch/ppc64/gemm.h
+index 413a9fb..def32cf 100644
+--- a/src/operators/cpu/arch/ppc64/gemm.h
++++ b/src/operators/cpu/arch/ppc64/gemm.h
+@@ -9,9 +9,7 @@
+ //
+ // VSX has NO dotprod instruction — always uses vec_mule/vec_mulo + vec_sum4s fallback.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cstring>
+ #include <cmath>
+ #include <cstdint>
+@@ -26,7 +24,7 @@
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ============================================================================
+ // Q4_K scale decoding helper — extracts 8 scale + 8 min uint6 values from
+@@ -97,12 +95,12 @@ static inline int dot_q4_K_q8_K_block_vsx(const uint8_t* q4_qs, const uint8_t sc
+     const int8_t* q8 = y->qs;
+     int acc = 0, macc = 0;
+     for (int j = 0; j < 4; ++j) {
+-        __vector unsigned char b0 = vec_xl(0, q4_qs + 32 * j);
+-        __vector unsigned char b1 = vec_xl(0, q4_qs + 32 * j + 16);
+-        __vector signed char q8_0 = vec_xl(0, q8 + 64 * j);
+-        __vector signed char q8_1 = vec_xl(0, q8 + 64 * j + 16);
+-        __vector signed char q8_2 = vec_xl(0, q8 + 64 * j + 32);
+-        __vector signed char q8_3 = vec_xl(0, q8 + 64 * j + 48);
++        __vector unsigned char b0 = ppc_load(q4_qs + 32 * j);
++        __vector unsigned char b1 = ppc_load(q4_qs + 32 * j + 16);
++        __vector signed char q8_0 = ppc_load(q8 + 64 * j);
++        __vector signed char q8_1 = ppc_load(q8 + 64 * j + 16);
++        __vector signed char q8_2 = ppc_load(q8 + 64 * j + 32);
++        __vector signed char q8_3 = ppc_load(q8 + 64 * j + 48);
+ 
+         __vector signed int lo = dot16_s8_acc_vsx((__vector signed char)(b0 & m4), q8_0, zero);
+         lo = dot16_s8_acc_vsx((__vector signed char)(b1 & m4), q8_1, lo);
+@@ -233,17 +231,17 @@ static inline int dot_q6_K_q8_K_block_vsx(const block_q6_K* x, const block_q8_K*
+         const int8_t* q8 = y->qs + 128 * half;
+         for (int g = 0; g < 2; ++g) {  // l in [16g, 16g + 16)
+             const int l0 = 16 * g;
+-            __vector unsigned char a = vec_xl(0, ql + l0);
+-            __vector unsigned char b = vec_xl(0, ql + 32 + l0);
+-            __vector unsigned char h = vec_xl(0, qh + l0);
++            __vector unsigned char a = ppc_load(ql + l0);
++            __vector unsigned char b = ppc_load(ql + 32 + l0);
++            __vector unsigned char h = ppc_load(qh + l0);
+             __vector signed char q1 = (__vector signed char)((a & m4) | vec_sl(h & m3, s4)) - off;
+             __vector signed char q2 = (__vector signed char)((b & m4) | vec_sl(vec_sr(h, s2) & m3, s4)) - off;
+             __vector signed char q3 = (__vector signed char)(vec_sr(a, s4) | vec_sl(vec_sr(h, s4) & m3, s4)) - off;
+             __vector signed char q4 = (__vector signed char)(vec_sr(b, s4) | vec_sl(vec_sr(h, s6), s4)) - off;
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q1, vec_xl(0, q8 + l0), zero)) * sc[g + 0];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q2, vec_xl(0, q8 + 32 + l0), zero)) * sc[g + 2];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q3, vec_xl(0, q8 + 64 + l0), zero)) * sc[g + 4];
+-            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q4, vec_xl(0, q8 + 96 + l0), zero)) * sc[g + 6];
++            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q1, ppc_load(q8 + l0), zero)) * sc[g + 0];
++            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q2, ppc_load(q8 + 32 + l0), zero)) * sc[g + 2];
++            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q3, ppc_load(q8 + 64 + l0), zero)) * sc[g + 4];
++            acc += hsum_i32x4_vsx(dot16_s8_acc_vsx(q4, ppc_load(q8 + 96 + l0), zero)) * sc[g + 6];
+         }
+     }
+     return acc;
+@@ -390,7 +388,7 @@ static void gemm_q5_K_vsx(
+     gemv_fp32_transB_vsx(a_data, w_fp32.data(), o_data, M, K, N);
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/gemv.h b/src/operators/cpu/arch/ppc64/gemv.h
+index af2f1c2..6a3870b 100644
+--- a/src/operators/cpu/arch/ppc64/gemv.h
++++ b/src/operators/cpu/arch/ppc64/gemv.h
+@@ -6,9 +6,7 @@
+ // VSX has NO dotprod instruction, so we always use the vec_mule/vec_mulo
+ // + vec_sum4s fallback path for nibble×q8 dot products.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+@@ -22,7 +20,7 @@
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ---- FP32 GEMV: out[n] = sum_k(a[k] * w[n][k]) ----
+ // NR=4 row-level unrolling. Each iteration processes 4 output rows,
+@@ -44,11 +42,11 @@ static inline void gemv_fp32_transB_vsx(const float* a, const float* b,
+ 
+             int k = 0;
+             for (; k + 3 < K; k += 4) {
+-                __vector float av = vec_xl(0, a_row + k);
+-                acc0 = vec_madd(av, vec_xl(0, b + (size_t)n * K + k), acc0);
+-                acc1 = vec_madd(av, vec_xl(0, b + (size_t)(n+1) * K + k), acc1);
+-                acc2 = vec_madd(av, vec_xl(0, b + (size_t)(n+2) * K + k), acc2);
+-                acc3 = vec_madd(av, vec_xl(0, b + (size_t)(n+3) * K + k), acc3);
++                __vector float av = ppc_load(a_row + k);
++                acc0 = vec_madd(av, ppc_load(b + (size_t)n * K + k), acc0);
++                acc1 = vec_madd(av, ppc_load(b + (size_t)(n+1) * K + k), acc1);
++                acc2 = vec_madd(av, ppc_load(b + (size_t)(n+2) * K + k), acc2);
++                acc3 = vec_madd(av, ppc_load(b + (size_t)(n+3) * K + k), acc3);
+             }
+             // Scalar tail
+             float sum0 = hsum_f32x4(acc0);
+@@ -73,13 +71,13 @@ static inline void gemv_fp32_transB_vsx(const float* a, const float* b,
+             __vector float acc1 = vec_splats(0.0f);
+             int k = 0;
+             for (; k + 7 < K; k += 8) {
+-                __vector float a0 = vec_xl(0, a_row + k);
+-                __vector float a1 = vec_xl(0, a_row + k + 4);
+-                acc0 = vec_madd(a0, vec_xl(0, b + (size_t)n * K + k), acc0);
+-                acc1 = vec_madd(a1, vec_xl(0, b + (size_t)n * K + k + 4), acc1);
++                __vector float a0 = ppc_load(a_row + k);
++                __vector float a1 = ppc_load(a_row + k + 4);
++                acc0 = vec_madd(a0, ppc_load(b + (size_t)n * K + k), acc0);
++                acc1 = vec_madd(a1, ppc_load(b + (size_t)n * K + k + 4), acc1);
+             }
+             for (; k + 3 < K; k += 4) {
+-                acc0 = vec_madd(vec_xl(0, a_row + k), vec_xl(0, b + (size_t)n * K + k), acc0);
++                acc0 = vec_madd(ppc_load(a_row + k), ppc_load(b + (size_t)n * K + k), acc0);
+             }
+             float sum = hsum_f32x4(acc0 + acc1);
+             for (; k < K; ++k) sum += a_row[k] * b[(size_t)n * K + k];
+@@ -138,8 +136,8 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+ 
+         for (int bi = 0; bi < nb; ++bi) {
+             float scale_a = q8_act[bi].d;
+-            __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-            __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++            __vector signed char q8_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++            __vector signed char q8_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+             // Process 4 weight rows for this block
+             float row_sum[4] = {0, 0, 0, 0};
+@@ -152,7 +150,7 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+ 
+                 // Expand nibbles (ggml layout): low nibbles are
+                 // q_lo=[e0..e15], high nibbles q_hi=[e16..e31].
+-                __vector unsigned char q4_bytes = vec_xl(0, (const uint8_t*)(blk + 2));
++                __vector unsigned char q4_bytes = ppc_load((const uint8_t*)(blk + 2));
+                 __vector unsigned char q_lo = q4_bytes & vec_splats((unsigned char)0x0F);
+                 __vector unsigned char q_hi = vec_sr(q4_bytes, vec_splats((unsigned char)4));
+ 
+@@ -183,9 +181,9 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+ 
+                 row_sum[r] += scale * (float)dot_i32;
+             }
+-            acc = acc + vec_xl(0, row_sum);
++            acc = acc + ppc_load(row_sum);
+         }
+-        vec_xst(acc, 0, o_row + n);
++        ppc_store(acc, o_row + n);
+     }
+     // Remaining rows
+     for (; n < N; ++n) {
+@@ -197,12 +195,12 @@ static inline void gemv_q4_0_transB_vsx(const float* a, const uint8_t* w,
+             float scale_w = gemv_fp16_to_fp32(ws);
+             float scale = scale_w * q8_act[bi].d;
+ 
+-            __vector unsigned char q4_bytes = vec_xl(0, (const uint8_t*)(w_row + (size_t)bi * BLOCK_BYTES + 2));
++            __vector unsigned char q4_bytes = ppc_load((const uint8_t*)(w_row + (size_t)bi * BLOCK_BYTES + 2));
+             __vector unsigned char q_lo = q4_bytes & vec_splats((unsigned char)0x0F);
+             __vector unsigned char q_hi = vec_sr(q4_bytes, vec_splats((unsigned char)4));
+ 
+-            __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-            __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++            __vector signed char q8_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++            __vector signed char q8_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+             __vector signed char q_lo_s = (__vector signed char)q_lo;
+             __vector signed char q_hi_s = (__vector signed char)q_hi;
+@@ -258,10 +256,10 @@ static inline void gemv_q8_0_transB_vsx(const float* a, const uint8_t* w,
+             float scale_w = gemv_fp16_to_fp32(ws);
+             float scale = scale_w * q8_act[bi].d;
+ 
+-            __vector signed char w_lo = (__vector signed char)vec_xl(0, w_row + (size_t)bi * BLOCK_BYTES + 2);
+-            __vector signed char w_hi = (__vector signed char)vec_xl(0, w_row + (size_t)bi * BLOCK_BYTES + 18);
+-            __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-            __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++            __vector signed char w_lo = (__vector signed char)ppc_load(w_row + (size_t)bi * BLOCK_BYTES + 2);
++            __vector signed char w_hi = (__vector signed char)ppc_load(w_row + (size_t)bi * BLOCK_BYTES + 18);
++            __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++            __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+             // Signed×signed dot via vec_mule/mulo
+             __vector signed short pe0 = vec_mule(w_lo, a_lo);
+@@ -308,11 +306,11 @@ static inline void gemv_q4_1_transB_vsx(const float* a, const uint8_t* w,
+                 float min = gemv_fp16_to_fp32(m_bits) * q8_act[bi].d;
+ 
+                 // ggml layout: low nibbles = e0..e15, high nibbles = e16..e31
+-                __vector unsigned char packed = vec_xl(0, blk + 4);
++                __vector unsigned char packed = ppc_load(blk + 4);
+                 __vector signed char q_lo = (__vector signed char)(packed & vec_splats((unsigned char)0x0F));
+                 __vector signed char q_hi = (__vector signed char)vec_sr(packed, vec_splats((unsigned char)4));
+-                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+                 __vector signed int zero = vec_splats((int)0);
+                 __vector signed int dot_vec = vec_sum4s(vec_mule(q_lo, a_lo), zero) +
+@@ -364,10 +362,10 @@ static inline void gemv_q5_0_transB_vsx(const float* a, const uint8_t* w,
+                     const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                     vals[j] = (signed char)(nib | (bit5 << 4));
+                 }
+-                __vector signed char w_lo = vec_xl(0, vals);
+-                __vector signed char w_hi = vec_xl(0, vals + 16);
+-                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++                __vector signed char w_lo = ppc_load(vals);
++                __vector signed char w_hi = ppc_load(vals + 16);
++                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+                 __vector signed int zero = vec_splats((int)0);
+                 __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+@@ -421,10 +419,10 @@ static inline void gemv_q5_1_transB_vsx(const float* a, const uint8_t* w,
+                     const int bit5 = (qh[j >> 3] >> (j & 7)) & 1;
+                     vals[j] = (signed char)(nib | (bit5 << 4));
+                 }
+-                __vector signed char w_lo = vec_xl(0, vals);
+-                __vector signed char w_hi = vec_xl(0, vals + 16);
+-                __vector signed char a_lo = (__vector signed char)vec_xl(0, q8_act[bi].qs);
+-                __vector signed char a_hi = (__vector signed char)vec_xl(0, q8_act[bi].qs + 16);
++                __vector signed char w_lo = ppc_load(vals);
++                __vector signed char w_hi = ppc_load(vals + 16);
++                __vector signed char a_lo = (__vector signed char)ppc_load(q8_act[bi].qs);
++                __vector signed char a_hi = (__vector signed char)ppc_load(q8_act[bi].qs + 16);
+ 
+                 __vector signed int zero = vec_splats((int)0);
+                 __vector signed int dot_vec = vec_sum4s(vec_mule(w_lo, a_lo), zero) +
+@@ -443,7 +441,7 @@ static inline void gemv_q5_1_transB_vsx(const float* a, const uint8_t* w,
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/kernels.h b/src/operators/cpu/arch/ppc64/kernels.h
+index 416bcba..15f8217 100644
+--- a/src/operators/cpu/arch/ppc64/kernels.h
++++ b/src/operators/cpu/arch/ppc64/kernels.h
+@@ -1,11 +1,10 @@
+ #pragma once
+-// PPC64 VSX kernels aggregate header (FORGE_ARCH_PPC64 + USE_VSX).
+-// Common CPU detection: always false on PPC64 (no AVX-512).
+-// Includes all PPC64 VSX-accelerated kernel sub-headers.
++// PowerPC SIMD kernels aggregate header (FORGE_ARCH_PPC + USE_ALTIVEC).
++// Built for AltiVec (G4/G5, POWER6) and VSX (POWER7+) alike; ppc_simd.h wraps
++// the few operations that differ. The "_vsx" suffix on kernel names is
++// historical. Common CPU detection: always false on PowerPC (no AVX-512).
+ 
+-#ifdef USE_VSX
+-#    include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ 
+ #include "elementwise_kernels.h"
+ #include "norm_kernels.h"
+diff --git a/src/operators/cpu/arch/ppc64/kv_kernels.h b/src/operators/cpu/arch/ppc64/kv_kernels.h
+index c6bb721..381558e 100644
+--- a/src/operators/cpu/arch/ppc64/kv_kernels.h
++++ b/src/operators/cpu/arch/ppc64/kv_kernels.h
+@@ -2,16 +2,14 @@
+ // PowerPC64 VSX KV head expansion kernel.
+ // Expands GQA KV cache heads: copies KV head data to each Q head in its group.
+ // kv_groups = num_heads / num_kv_heads.
+-// Uses 16-wide vectorised copy via vec_xl / vec_xst.
++// Uses 16-wide vectorised copy via ppc_load / ppc_store.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ 
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ static inline void expand_kv_heads_f32(const float* kv_data, float* out_data,
+                                        int seq_len, int num_heads, int num_kv_heads,
+@@ -29,18 +27,18 @@ static inline void expand_kv_heads_f32(const float* kv_data, float* out_data,
+             // Vectorised copy of head_dim floats, 16-wide
+             int d = 0;
+             for (; d + 15 < head_dim; d += 16) {
+-                __vector float v0 = vec_xl(0, (const float*)(src + d));
+-                __vector float v1 = vec_xl(0, (const float*)(src + d + 4));
+-                __vector float v2 = vec_xl(0, (const float*)(src + d + 8));
+-                __vector float v3 = vec_xl(0, (const float*)(src + d + 12));
+-                vec_xst(v0, 0, (float*)(dst + d));
+-                vec_xst(v1, 0, (float*)(dst + d + 4));
+-                vec_xst(v2, 0, (float*)(dst + d + 8));
+-                vec_xst(v3, 0, (float*)(dst + d + 12));
++                __vector float v0 = ppc_load((const float*)(src + d));
++                __vector float v1 = ppc_load((const float*)(src + d + 4));
++                __vector float v2 = ppc_load((const float*)(src + d + 8));
++                __vector float v3 = ppc_load((const float*)(src + d + 12));
++                ppc_store(v0, (float*)(dst + d));
++                ppc_store(v1, (float*)(dst + d + 4));
++                ppc_store(v2, (float*)(dst + d + 8));
++                ppc_store(v3, (float*)(dst + d + 12));
+             }
+             for (; d + 3 < head_dim; d += 4) {
+-                __vector float v = vec_xl(0, (const float*)(src + d));
+-                vec_xst(v, 0, (float*)(dst + d));
++                __vector float v = ppc_load((const float*)(src + d));
++                ppc_store(v, (float*)(dst + d));
+             }
+             for (; d < head_dim; ++d) {
+                 dst[d] = src[d];
+@@ -49,7 +47,7 @@ static inline void expand_kv_heads_f32(const float* kv_data, float* out_data,
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/norm_kernels.h b/src/operators/cpu/arch/ppc64/norm_kernels.h
+index 38035ec..e6946c3 100644
+--- a/src/operators/cpu/arch/ppc64/norm_kernels.h
++++ b/src/operators/cpu/arch/ppc64/norm_kernels.h
+@@ -3,15 +3,13 @@
+ // Processes one row: o_row = x_row * rms * w_row (optional weight).
+ // rms = 1/sqrt(sum(x^2)/cols + eps).
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cmath>
+ 
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ static inline void rms_norm_row_f32(const float* x_row, const float* w_row, float* o_row,
+                                     int cols, float eps) {
+@@ -23,17 +21,17 @@ static inline void rms_norm_row_f32(const float* x_row, const float* w_row, floa
+ 
+     int c = 0;
+     for (; c + 15 < cols; c += 16) {
+-        __vector float v0 = vec_xl(0, (const float*)(x_row + c));
+-        __vector float v1 = vec_xl(0, (const float*)(x_row + c + 4));
+-        __vector float v2 = vec_xl(0, (const float*)(x_row + c + 8));
+-        __vector float v3 = vec_xl(0, (const float*)(x_row + c + 12));
++        __vector float v0 = ppc_load((const float*)(x_row + c));
++        __vector float v1 = ppc_load((const float*)(x_row + c + 4));
++        __vector float v2 = ppc_load((const float*)(x_row + c + 8));
++        __vector float v3 = ppc_load((const float*)(x_row + c + 12));
+         sum_sq0 = vec_madd(v0, v0, sum_sq0);
+         sum_sq1 = vec_madd(v1, v1, sum_sq1);
+         sum_sq2 = vec_madd(v2, v2, sum_sq2);
+         sum_sq3 = vec_madd(v3, v3, sum_sq3);
+     }
+     for (; c + 3 < cols; c += 4) {
+-        __vector float v = vec_xl(0, (const float*)(x_row + c));
++        __vector float v = ppc_load((const float*)(x_row + c));
+         sum_sq0 = vec_madd(v, v, sum_sq0);
+     }
+ 
+@@ -57,25 +55,25 @@ static inline void rms_norm_row_f32(const float* x_row, const float* w_row, floa
+     if (w_row) {
+         int c2 = 0;
+         for (; c2 + 15 < cols; c2 += 16) {
+-            __vector float x0 = vec_xl(0, (const float*)(x_row + c2));
+-            __vector float x1 = vec_xl(0, (const float*)(x_row + c2 + 4));
+-            __vector float x2 = vec_xl(0, (const float*)(x_row + c2 + 8));
+-            __vector float x3 = vec_xl(0, (const float*)(x_row + c2 + 12));
+-            __vector float w0 = vec_xl(0, (const float*)(w_row + c2));
+-            __vector float w1 = vec_xl(0, (const float*)(w_row + c2 + 4));
+-            __vector float w2 = vec_xl(0, (const float*)(w_row + c2 + 8));
+-            __vector float w3 = vec_xl(0, (const float*)(w_row + c2 + 12));
++            __vector float x0 = ppc_load((const float*)(x_row + c2));
++            __vector float x1 = ppc_load((const float*)(x_row + c2 + 4));
++            __vector float x2 = ppc_load((const float*)(x_row + c2 + 8));
++            __vector float x3 = ppc_load((const float*)(x_row + c2 + 12));
++            __vector float w0 = ppc_load((const float*)(w_row + c2));
++            __vector float w1 = ppc_load((const float*)(w_row + c2 + 4));
++            __vector float w2 = ppc_load((const float*)(w_row + c2 + 8));
++            __vector float w3 = ppc_load((const float*)(w_row + c2 + 12));
+             __vector float s = vec_splats(rms);
+-            vec_xst((x0 * s) * w0, 0, (float*)(o_row + c2));
+-            vec_xst((x1 * s) * w1, 0, (float*)(o_row + c2 + 4));
+-            vec_xst((x2 * s) * w2, 0, (float*)(o_row + c2 + 8));
+-            vec_xst((x3 * s) * w3, 0, (float*)(o_row + c2 + 12));
++            ppc_store((x0 * s) * w0, (float*)(o_row + c2));
++            ppc_store((x1 * s) * w1, (float*)(o_row + c2 + 4));
++            ppc_store((x2 * s) * w2, (float*)(o_row + c2 + 8));
++            ppc_store((x3 * s) * w3, (float*)(o_row + c2 + 12));
+         }
+         for (; c2 + 3 < cols; c2 += 4) {
+-            __vector float x = vec_xl(0, (const float*)(x_row + c2));
+-            __vector float w = vec_xl(0, (const float*)(w_row + c2));
++            __vector float x = ppc_load((const float*)(x_row + c2));
++            __vector float w = ppc_load((const float*)(w_row + c2));
+             __vector float s = vec_splats(rms);
+-            vec_xst((x * s) * w, 0, (float*)(o_row + c2));
++            ppc_store((x * s) * w, (float*)(o_row + c2));
+         }
+         for (; c2 < cols; ++c2) {
+             o_row[c2] = x_row[c2] * rms * w_row[c2];
+@@ -84,18 +82,18 @@ static inline void rms_norm_row_f32(const float* x_row, const float* w_row, floa
+         int c2 = 0;
+         __vector float s = vec_splats(rms);
+         for (; c2 + 15 < cols; c2 += 16) {
+-            __vector float x0 = vec_xl(0, (const float*)(x_row + c2));
+-            __vector float x1 = vec_xl(0, (const float*)(x_row + c2 + 4));
+-            __vector float x2 = vec_xl(0, (const float*)(x_row + c2 + 8));
+-            __vector float x3 = vec_xl(0, (const float*)(x_row + c2 + 12));
+-            vec_xst(x0 * s, 0, (float*)(o_row + c2));
+-            vec_xst(x1 * s, 0, (float*)(o_row + c2 + 4));
+-            vec_xst(x2 * s, 0, (float*)(o_row + c2 + 8));
+-            vec_xst(x3 * s, 0, (float*)(o_row + c2 + 12));
++            __vector float x0 = ppc_load((const float*)(x_row + c2));
++            __vector float x1 = ppc_load((const float*)(x_row + c2 + 4));
++            __vector float x2 = ppc_load((const float*)(x_row + c2 + 8));
++            __vector float x3 = ppc_load((const float*)(x_row + c2 + 12));
++            ppc_store(x0 * s, (float*)(o_row + c2));
++            ppc_store(x1 * s, (float*)(o_row + c2 + 4));
++            ppc_store(x2 * s, (float*)(o_row + c2 + 8));
++            ppc_store(x3 * s, (float*)(o_row + c2 + 12));
+         }
+         for (; c2 + 3 < cols; c2 += 4) {
+-            __vector float x = vec_xl(0, (const float*)(x_row + c2));
+-            vec_xst(x * s, 0, (float*)(o_row + c2));
++            __vector float x = ppc_load((const float*)(x_row + c2));
++            ppc_store(x * s, (float*)(o_row + c2));
+         }
+         for (; c2 < cols; ++c2) {
+             o_row[c2] = x_row[c2] * rms;
+@@ -103,7 +101,7 @@ static inline void rms_norm_row_f32(const float* x_row, const float* w_row, floa
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/ppc_simd.h b/src/operators/cpu/arch/ppc64/ppc_simd.h
+new file mode 100644
+index 0000000..fa5add9
+--- /dev/null
++++ b/src/operators/cpu/arch/ppc64/ppc_simd.h
+@@ -0,0 +1,101 @@
++#pragma once
++// PowerPC SIMD portability layer for the arch/ppc64 kernels.
++//
++// The kernels are written against the AltiVec (VMX) intrinsics, which every
++// SIMD PowerPC has: G4/G5 and POWER6 (AltiVec only), POWER7+ (VSX, a superset).
++// The few operations that differ are wrapped here:
++//
++//   ppc_load(p)      unaligned 16-byte load  (VSX: lxvw4x; AltiVec: lvsl/vperm)
++//   ppc_store(v, p)  unaligned 16-byte store (VSX: stxvw4x; AltiVec: stvx when
++//                    aligned, else a plain 16-byte copy)
++//   ppc_div(a, b)    float division (VSX: xvdivsp; AltiVec: reciprocal estimate
++//                    refined by Newton-Raphson; b must be a normal float)
++//
++// USE_VSX builds also define USE_ALTIVEC (set here if a caller passed only
++// USE_VSX), so code guarded by USE_ALTIVEC covers both.
++//
++// AltiVec's lvx/stvx ignore the low four address bits instead of faulting, so
++// never use vec_ld/vec_st on data that is not known to be 16-byte aligned.
++
++#if defined(USE_VSX) && !defined(USE_ALTIVEC)
++#    define USE_ALTIVEC 1
++#endif
++
++#ifdef USE_ALTIVEC
++
++#    include <altivec.h>
++// In GNU C++ modes altivec.h may define these as macros; the kernels spell
++// the keywords __vector/__bool, and the plain names must stay usable.
++#    undef vector
++#    undef pixel
++#    undef bool
++
++#    include <cstdint>
++#    include <cstring>
++
++namespace forge {
++namespace cpu {
++
++namespace ppc_detail {
++template <typename T> struct vec_of;
++template <> struct vec_of<float> { using type = __vector float; };
++template <> struct vec_of<signed char> { using type = __vector signed char; };
++template <> struct vec_of<unsigned char> { using type = __vector unsigned char; };
++template <> struct vec_of<short> { using type = __vector signed short; };
++template <> struct vec_of<unsigned short> { using type = __vector unsigned short; };
++template <> struct vec_of<int> { using type = __vector signed int; };
++template <> struct vec_of<unsigned int> { using type = __vector unsigned int; };
++}  // namespace ppc_detail
++
++// 16 bytes from p (any alignment) as the vector type matching *p.
++template <typename T>
++static inline typename ppc_detail::vec_of<T>::type ppc_load(const T* p) {
++#    ifdef USE_VSX
++    return vec_xl(0, p);
++#    else
++    // Classic big-endian AltiVec unaligned load: the two aligned quadwords
++    // covering [p, p+16) merged by the lvsl permute. The second load uses
++    // offset 15, not 16, so it never touches the quadword after p+15 (which
++    // could be past the end of a mapping).
++    const unsigned char* b = reinterpret_cast<const unsigned char*>(p);
++    __vector unsigned char lo = vec_ld(0, b);
++    __vector unsigned char hi = vec_ld(15, b);
++    return (typename ppc_detail::vec_of<T>::type)vec_perm(lo, hi, vec_lvsl(0, b));
++#    endif
++}
++
++// Store the 16 bytes of v at p (any alignment).
++template <typename V, typename T>
++static inline void ppc_store(V v, T* p) {
++#    ifdef USE_VSX
++    vec_xst(v, 0, p);
++#    else
++    if ((reinterpret_cast<uintptr_t>(p) & 15) == 0) {
++        vec_st(v, 0, p);
++    } else {
++        // Element stores rather than a read-modify-write of the two covering
++        // quadwords: neighbouring bytes may belong to another thread's output.
++        std::memcpy(p, &v, 16);
++    }
++#    endif
++}
++
++static inline __vector float ppc_div(__vector float a, __vector float b) {
++#    ifdef USE_VSX
++    return a / b;
++#    else
++    // vrefp is accurate to ~12 bits; one Newton-Raphson step on the reciprocal
++    // and one correction of the quotient bring it to float precision.
++    const __vector float one = vec_splats(1.0f);
++    const __vector float nzero = vec_splats(-0.0f);
++    __vector float r = vec_re(b);
++    r = vec_madd(vec_nmsub(r, b, one), r, r);
++    __vector float q = vec_madd(a, r, nzero);
++    return vec_madd(vec_nmsub(q, b, a), r, q);
++#    endif
++}
++
++}  // namespace cpu
++}  // namespace forge
++
++#endif  // USE_ALTIVEC
+diff --git a/src/operators/cpu/arch/ppc64/quants.h b/src/operators/cpu/arch/ppc64/quants.h
+index a886015..841a586 100644
+--- a/src/operators/cpu/arch/ppc64/quants.h
++++ b/src/operators/cpu/arch/ppc64/quants.h
+@@ -13,9 +13,7 @@
+ // signed dot helper therefore computes the same result as the unsigned×signed
+ // maddubs used on NEON.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cstring>
+ #include <cmath>
+ #include <vector>
+@@ -30,7 +28,7 @@
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ============================================================================
+ // Internal helpers
+@@ -80,10 +78,10 @@ static inline float dot_iq4_nl_q8_K_vsx(const uint8_t* iq4nl_row,
+                 vals[16 + i]  = forge::ops::kvalues_iq4nl[(qs[i] >> 4) & 0x0F];
+             }
+ 
+-            __vector signed char v_lo = vec_xl(0, vals);
+-            __vector signed char v_hi = vec_xl(0, vals + 16);
+-            __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8d + sb * 32);
+-            __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8d + sb * 32 + 16);
++            __vector signed char v_lo = ppc_load(vals);
++            __vector signed char v_hi = ppc_load(vals + 16);
++            __vector signed char q8_lo = (__vector signed char)ppc_load(q8d + sb * 32);
++            __vector signed char q8_hi = (__vector signed char)ppc_load(q8d + sb * 32 + 16);
+ 
+             int sum = vsx_dot::dot_16_signed_signed(v_lo, q8_lo)
+                     + vsx_dot::dot_16_signed_signed(v_hi, q8_hi);
+@@ -175,13 +173,13 @@ static inline float dot_iq2_xs_q8_K_vsx(const uint8_t* iq2xs_row,
+                         (signs_byte & forge::ops::kmask_iq2xs[j]) ? 0xFF : 0x00;
+             }
+ 
+-            __vector unsigned char grid_lo = vec_xl(0, grid_vals);
+-            __vector unsigned char grid_hi = vec_xl(0, grid_vals + 16);
+-            __vector unsigned char sign_lo = vec_xl(0, sign_mask);
+-            __vector unsigned char sign_hi = vec_xl(0, sign_mask + 16);
++            __vector unsigned char grid_lo = ppc_load(grid_vals);
++            __vector unsigned char grid_hi = ppc_load(grid_vals + 16);
++            __vector unsigned char sign_lo = ppc_load(sign_mask);
++            __vector unsigned char sign_hi = ppc_load(sign_mask + 16);
+ 
+-            __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8d + ib32 * 32);
+-            __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8d + ib32 * 32 + 16);
++            __vector signed char q8_lo = (__vector signed char)ppc_load(q8d + ib32 * 32);
++            __vector signed char q8_hi = (__vector signed char)ppc_load(q8d + ib32 * 32 + 16);
+ 
+             // Apply sign: negate q8 where sign byte = 0xFF (vec_sel selects
+             // the second argument when the mask bit is 1).
+@@ -285,13 +283,13 @@ static inline float dot_iq3_s_q8_K_vsx(const uint8_t* iq3s_row,
+                             (s & forge::ops::kmask_iq2xs[j]) ? 0xFF : 0x00;
+                 }
+ 
+-                __vector unsigned char grid_lo = vec_xl(0, grid_vals);
+-                __vector unsigned char grid_hi = vec_xl(0, grid_vals + 16);
+-                __vector unsigned char sign_lo = vec_xl(0, sign_mask_arr);
+-                __vector unsigned char sign_hi = vec_xl(0, sign_mask_arr + 16);
++                __vector unsigned char grid_lo = ppc_load(grid_vals);
++                __vector unsigned char grid_hi = ppc_load(grid_vals + 16);
++                __vector unsigned char sign_lo = ppc_load(sign_mask_arr);
++                __vector unsigned char sign_hi = ppc_load(sign_mask_arr + 16);
+ 
+-                __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8d + ib32 * 32 + half * 32);
+-                __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8d + ib32 * 32 + half * 32 + 16);
++                __vector signed char q8_lo = (__vector signed char)ppc_load(q8d + ib32 * 32 + half * 32);
++                __vector signed char q8_hi = (__vector signed char)ppc_load(q8d + ib32 * 32 + half * 32 + 16);
+ 
+                 __vector signed char q8_signed_lo =
+                     vec_sel(q8_lo, -q8_lo, sign_lo);
+@@ -392,13 +390,13 @@ static inline float dot_iq2_s_q8_K_vsx(const uint8_t* iq2s_row,
+                         (s & forge::ops::kmask_iq2xs[j]) ? 0xFF : 0x00;
+             }
+ 
+-            __vector unsigned char grid_lo = vec_xl(0, grid_vals);
+-            __vector unsigned char grid_hi = vec_xl(0, grid_vals + 16);
+-            __vector unsigned char sign_lo = vec_xl(0, sign_mask_arr);
+-            __vector unsigned char sign_hi = vec_xl(0, sign_mask_arr + 16);
++            __vector unsigned char grid_lo = ppc_load(grid_vals);
++            __vector unsigned char grid_hi = ppc_load(grid_vals + 16);
++            __vector unsigned char sign_lo = ppc_load(sign_mask_arr);
++            __vector unsigned char sign_hi = ppc_load(sign_mask_arr + 16);
+ 
+-            __vector signed char q8_lo = (__vector signed char)vec_xl(0, q8d + ib32 * 32);
+-            __vector signed char q8_hi = (__vector signed char)vec_xl(0, q8d + ib32 * 32 + 16);
++            __vector signed char q8_lo = (__vector signed char)ppc_load(q8d + ib32 * 32);
++            __vector signed char q8_hi = (__vector signed char)ppc_load(q8d + ib32 * 32 + 16);
+ 
+             __vector signed char q8_signed_lo =
+                 vec_sel(q8_lo, -q8_lo, sign_lo);
+@@ -497,7 +495,7 @@ FORGE_VSX_FUSED_K(q5_K, gemm_q5_K_vsx)
+ FORGE_VSX_FUSED_K(q6_K, gemm_q6_K_vsx)
+ #undef FORGE_VSX_FUSED_K
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/sampling_kernels.h b/src/operators/cpu/arch/ppc64/sampling_kernels.h
+index 10508e0..7c37e99 100644
+--- a/src/operators/cpu/arch/ppc64/sampling_kernels.h
++++ b/src/operators/cpu/arch/ppc64/sampling_kernels.h
+@@ -7,9 +7,7 @@
+ // path (max error ~1.5%), and Cephes-style exp-based tanh for softcap.
+ // cephes_exp_f32_vsx is defined in elementwise_kernels.h.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -17,7 +15,7 @@
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ---- vector_tanh: tanh(z) = (exp(2z)-1)/(exp(2z)+1) via cephes_exp_f32_vsx ----
+ // (cephes_exp_f32_vsx is defined in elementwise_kernels.h)
+@@ -25,7 +23,7 @@ static inline __vector float vector_tanh_vsx(__vector float z) {
+     __vector float two_z = z + z;
+     __vector float e2z = cephes_exp_f32_vsx(two_z);
+     __vector float one = vec_splats(1.0f);
+-    return (e2z - one) / (e2z + one);
++    return ppc_div(e2z - one, e2z + one);
+ }
+ 
+ // ---- softcap_and_argmax_f32 ----
+@@ -37,14 +35,14 @@ static inline int softcap_and_argmax_f32(float* logits, int n, float cap) {
+ 
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+-        __vector float v = vec_xl(0, (const float*)(logits + i));
++        __vector float v = ppc_load((const float*)(logits + i));
+         __vector float z = v * vec_splats(inv_cap);
+ 
+         // tanh(z) = (exp(2z)-1)/(exp(2z)+1) via Cephes exp
+         __vector float tanh_z = vector_tanh_vsx(z);
+ 
+         __vector float result = tanh_z * vec_splats(cap);
+-        vec_xst(result, 0, (float*)(logits + i));
++        ppc_store(result, (float*)(logits + i));
+ 
+         // Find max within this vector
+         union { __vector float vf; float f[4]; } u;
+@@ -67,7 +65,7 @@ static inline int argmax_f32(const float* data, int n) {
+ 
+     int i = 1;
+     for (; i + 3 < n; i += 4) {
+-        __vector float v = vec_xl(0, (const float*)(data + i));
++        __vector float v = ppc_load((const float*)(data + i));
+         __vector float max_vec = vec_max(v, vec_splats(best_val));
+         // Check if any element in this vector exceeds current best
+         float max_v;
+@@ -99,7 +97,7 @@ static inline float max_f32(const float* data, int n) {
+     __vector float max_v = vec_splats(data[0]);
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+-        __vector float v = vec_xl(0, (const float*)(data + i));
++        __vector float v = ppc_load((const float*)(data + i));
+         max_v = vec_max(max_v, v);
+     }
+     union { __vector float vf; float f[4]; } u;
+@@ -123,11 +121,11 @@ static inline float softcap_and_max_f32(float* data, int n, float cap) {
+ 
+     int i = 1;
+     for (; i + 3 < n; i += 4) {
+-        __vector float v = vec_xl(0, (const float*)(data + i));
++        __vector float v = ppc_load((const float*)(data + i));
+         __vector float z = v * vec_splats(inv_cap);
+         __vector float tanh_z = vector_tanh_vsx(z);
+         __vector float result = tanh_z * vec_splats(cap);
+-        vec_xst(result, 0, (float*)(data + i));
++        ppc_store(result, (float*)(data + i));
+ 
+         union { __vector float vf; float f[4]; } u;
+         u.vf = result;
+@@ -164,7 +162,7 @@ static inline float exp_and_sum_f32(const float* data, float* out, int n,
+ 
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+-        __vector float d = vec_xl(0, (const float*)(data + i));
++        __vector float d = ppc_load((const float*)(data + i));
+         // x = (d - max_val) * inv_temp * log2(e), clamped so that the
+         // exponent added below stays in range (2^-125 is ~0 here anyway)
+         __vector float x = (d - v_max) * v_factor;
+@@ -187,7 +185,7 @@ static inline float exp_and_sum_f32(const float* data, float* out, int n,
+         __vector signed int exp_bits = vec_sl(x_int, vec_splats((unsigned int)23));
+         __vector float result = (__vector float)((__vector signed int)poly + exp_bits);
+ 
+-        vec_xst(result, 0, (float*)(out + i));
++        ppc_store(result, (float*)(out + i));
+         sum_all = sum_all + result;
+     }
+ 
+@@ -221,25 +219,25 @@ static inline void scale_normalize_f32(float* data, int n, float inv_sum) {
+     __vector float s = vec_splats(inv_sum);
+     int i = 0;
+     for (; i + 15 < n; i += 16) {
+-        __vector float d0 = vec_xl(0, (const float*)(data + i));
+-        __vector float d1 = vec_xl(0, (const float*)(data + i + 4));
+-        __vector float d2 = vec_xl(0, (const float*)(data + i + 8));
+-        __vector float d3 = vec_xl(0, (const float*)(data + i + 12));
+-        vec_xst(d0 * s, 0, (float*)(data + i));
+-        vec_xst(d1 * s, 0, (float*)(data + i + 4));
+-        vec_xst(d2 * s, 0, (float*)(data + i + 8));
+-        vec_xst(d3 * s, 0, (float*)(data + i + 12));
++        __vector float d0 = ppc_load((const float*)(data + i));
++        __vector float d1 = ppc_load((const float*)(data + i + 4));
++        __vector float d2 = ppc_load((const float*)(data + i + 8));
++        __vector float d3 = ppc_load((const float*)(data + i + 12));
++        ppc_store(d0 * s, (float*)(data + i));
++        ppc_store(d1 * s, (float*)(data + i + 4));
++        ppc_store(d2 * s, (float*)(data + i + 8));
++        ppc_store(d3 * s, (float*)(data + i + 12));
+     }
+     for (; i + 3 < n; i += 4) {
+-        __vector float d = vec_xl(0, (const float*)(data + i));
+-        vec_xst(d * s, 0, (float*)(data + i));
++        __vector float d = ppc_load((const float*)(data + i));
++        ppc_store(d * s, (float*)(data + i));
+     }
+     for (; i < n; ++i) {
+         data[i] *= inv_sum;
+     }
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/vec.h b/src/operators/cpu/arch/ppc64/vec.h
+index cdc6fc1..539e716 100644
+--- a/src/operators/cpu/arch/ppc64/vec.h
++++ b/src/operators/cpu/arch/ppc64/vec.h
+@@ -3,9 +3,7 @@
+ // Provides hsum, fp16 conversion, and broadcast utilities for VSX.
+ // VSX registers are 128-bit, matching ARM NEON register width.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+@@ -13,7 +11,7 @@
+ namespace forge {
+ namespace cpu {
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ---- Horizontal sum of __vector float ----
+ // VSX does not have a single-instruction horizontal sum like ARM vaddvq_f32.
+@@ -46,7 +44,7 @@ static inline __vector float fp16_to_fp32_broadcast_vsx(uint16_t fp16_val) {
+     return vec_splats(f);
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/vec_dot.h b/src/operators/cpu/arch/ppc64/vec_dot.h
+index 07cbb42..500013c 100644
+--- a/src/operators/cpu/arch/ppc64/vec_dot.h
++++ b/src/operators/cpu/arch/ppc64/vec_dot.h
+@@ -9,9 +9,7 @@
+ // This header is self-contained and does NOT include vec.h or
+ // elementwise_kernels.h.
+ 
+-#ifdef USE_VSX
+-#include <altivec.h>
+-#endif
++#include "ppc_simd.h"
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+@@ -25,7 +23,7 @@ struct block_q8_0_act {
+     int8_t  qs[32];  // quantized values
+ };
+ 
+-#ifdef USE_VSX
++#ifdef USE_ALTIVEC
+ 
+ // ---- Internal helpers (namespace vsx_dot) ----
+ 
+@@ -53,7 +51,7 @@ static inline float fp16_to_fp32(uint16_t bits) {
+ static inline void nibbles_to_bytes_32(const uint8_t* src,
+                                        __vector unsigned char& lo,
+                                        __vector unsigned char& hi) {
+-    __vector unsigned char tmp = vec_xl(0, src);
++    __vector unsigned char tmp = ppc_load(src);
+     __vector unsigned char mask = vec_splats((unsigned char)0x0F);
+     lo = tmp & mask;
+     hi = vec_sr(tmp, vec_splats((unsigned char)4));
+@@ -158,8 +156,8 @@ static inline float vec_dot_q4_0_q8_0_vsx(const uint8_t* w_row,
+         vsx_dot::nibbles_to_bytes_32(w_row + i * BLOCK_BYTES + 2, q0, q1);
+ 
+         // Load activation quants as signed int8
+-        __vector signed char q8_lo = (__vector signed char)vec_xl(0, act[i].qs);
+-        __vector signed char q8_hi = (__vector signed char)vec_xl(0, act[i].qs + 16);
++        __vector signed char q8_lo = (__vector signed char)ppc_load(act[i].qs);
++        __vector signed char q8_hi = (__vector signed char)ppc_load(act[i].qs + 16);
+ 
+         // Dot product of 2×16 elements
+         int dot_i32 = vsx_dot::dot_16_nibble_q8(q0, q8_lo);
+@@ -190,13 +188,11 @@ static inline float vec_dot_q8_0_q8_0_vsx(const uint8_t* w_row,
+         float scale = vsx_dot::fp16_to_fp32(scale_bits) * act[i].d;
+ 
+         // Load weight quants as signed int8
+-        __vector signed char w_lo = (__vector signed char)vec_xl(0,
+-            w_row + i * BLOCK_BYTES + 2);
+-        __vector signed char w_hi = (__vector signed char)vec_xl(0,
+-            w_row + i * BLOCK_BYTES + 18);
++        __vector signed char w_lo = (__vector signed char)ppc_load(w_row + i * BLOCK_BYTES + 2);
++        __vector signed char w_hi = (__vector signed char)ppc_load(w_row + i * BLOCK_BYTES + 18);
+         // Load activation quants
+-        __vector signed char a_lo = (__vector signed char)vec_xl(0, act[i].qs);
+-        __vector signed char a_hi = (__vector signed char)vec_xl(0, act[i].qs + 16);
++        __vector signed char a_lo = (__vector signed char)ppc_load(act[i].qs);
++        __vector signed char a_hi = (__vector signed char)ppc_load(act[i].qs + 16);
+ 
+         int dot = vsx_dot::dot_16_signed_signed(w_lo, a_lo);
+         dot += vsx_dot::dot_16_signed_signed(w_hi, a_hi);
+@@ -229,8 +225,8 @@ static inline float vec_dot_q4_1_q8_0_vsx(const uint8_t* w_row,
+         __vector unsigned char q0, q1;
+         vsx_dot::nibbles_to_bytes_32(w_row + i * BLOCK_BYTES + 4, q0, q1);
+ 
+-        __vector signed char q8_lo = (__vector signed char)vec_xl(0, act[i].qs);
+-        __vector signed char q8_hi = (__vector signed char)vec_xl(0, act[i].qs + 16);
++        __vector signed char q8_lo = (__vector signed char)ppc_load(act[i].qs);
++        __vector signed char q8_hi = (__vector signed char)ppc_load(act[i].qs + 16);
+ 
+         // Raw dot: nibble values [0..15] — no bias correction
+         int dot_i32 = vsx_dot::dot_16_nibble_q8(q0, q8_lo);
+@@ -246,7 +242,7 @@ static inline float vec_dot_q4_1_q8_0_vsx(const uint8_t* w_row,
+     return acc_d + acc_m;
+ }
+ 
+-#endif // USE_VSX
++#endif // USE_ALTIVEC
+ 
+ }  // namespace cpu
+ }  // namespace forge
+diff --git a/src/operators/cpu/common/thread_policy.h b/src/operators/cpu/common/thread_policy.h
+index e439b9c..0028e05 100644
+--- a/src/operators/cpu/common/thread_policy.h
++++ b/src/operators/cpu/common/thread_policy.h
+@@ -54,7 +54,7 @@ inline ThreadPoolPolicy arch_policy_defaults() {
+     // efficiency cores.
+ #elif defined(FORGE_ARCH_ARM64)
+     // big.LITTLE has the same asymmetry as x86 hybrids: no hard pinning.
+-#elif defined(FORGE_ARCH_PPC64)
++#elif defined(FORGE_ARCH_PPC)
+     // SMT-heavy parts expose many cheap hardware threads; a shorter spin would
+     // be friendlier once measured.
+ #else
+diff --git a/src/operators/cpu/matmul.cpp b/src/operators/cpu/matmul.cpp
+index 830db79..02addcd 100644
+--- a/src/operators/cpu/matmul.cpp
++++ b/src/operators/cpu/matmul.cpp
+@@ -423,7 +423,7 @@ TensorPtr matmul_transB_shared_input(const TensorPtr& input,
+         });
+         return out;
+     }
+-#elif defined(USE_NEON) || defined(USE_VSX)
++#elif defined(USE_NEON) || defined(USE_ALTIVEC)
+     {
+         auto dot_fn = cpu::get_dot_q8k_fn(dt);
+         for (int w = 1; w < n_w && dot_fn; ++w) {
+@@ -534,7 +534,7 @@ TensorPtr matmul_transB_batched_pairs(const TensorPtr& inputs,
+         });
+         return out;
+     }
+-#elif defined(USE_NEON) || defined(USE_VSX)
++#elif defined(USE_NEON) || defined(USE_ALTIVEC)
+     {
+         auto dot_fn = cpu::get_dot_q8k_fn(dt);
+         for (int p = 1; p < n_pairs && dot_fn; ++p) {
+@@ -908,7 +908,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
+                 forge::cpu::gemv_iq4_nl_q8k_transB_neon(a_data, static_cast<const uint8_t*>(b->data()),
+                                                         o_data, M, K, N);
+             } else
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+             if (b->dtype() == DataType::Q4_0) {
+                 PERF_SCOPE("matmul_transB/q4_0_gemv_vsx");
+                 cpu::gemv_q4_0_transB_vsx(a_data, static_cast<const uint8_t*>(b->data()),
+@@ -1108,7 +1108,7 @@ TensorPtr matmul_transB(const TensorPtr& a, const TensorPtr& b, const TensorPtr&
+ #elif defined(USE_NEON)
+             PERF_SCOPE("matmul_transB/fp32_gemv_neon");
+             forge::cpu::gemv_fp32_transB_neon(a_data, static_cast<const float*>(b->data()), o_data, M, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+             PERF_SCOPE("matmul_transB/fp32_gemv_vsx");
+             cpu::gemv_fp32_transB_vsx(a_data, static_cast<const float*>(b->data()), o_data, M, K, N);
+ #else
+@@ -1291,7 +1291,7 @@ TensorPtr matmul_transB_fused_qkv_q4_0(const TensorPtr& input, const TensorPtr&
+         cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(wv->data()),
+                                    static_cast<float*>(v_out->data()) + m * N_v, 1, K, N_v);
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_qkv_q4_0_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m) {
+@@ -1379,7 +1379,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_0(const TensorPtr& input,
+         cpu::gemv_q4_0_transB_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+         for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -1433,7 +1433,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_1(const TensorPtr& input,
+         cpu::gemv_q4_1_transB_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), o_data + m * N, 1, K, N);
+         for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -1501,7 +1501,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_0(const TensorPtr& input,
+                                    o_data + m * N, 1, K, N);
+         for (int n = 0; n < N; ++n) o_data[m * N + n] += r_data[m * N + n];
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -1559,7 +1559,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q4_k(const TensorPtr& input,
+         cpu::gemv_q4_K_ffn_down_residual_neon(a_data + m * K,
+                                               static_cast<const uint8_t*>(weight->data()),
+                                               r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/attn_proj_residual_q4_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -1609,7 +1609,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q5_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q5_K_attn_proj_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/attn_proj_residual_q5_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -1661,7 +1661,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q6_k(const TensorPtr& input,
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m) cpu::gemv_q6_K_attn_proj_residual_neon(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/attn_proj_residual_q6_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -1710,7 +1710,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q2_k(const TensorPtr& input,
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m) cpu::gemv_q2_K_attn_proj_residual_neon(a_data + m*K, static_cast<const uint8_t*>(weight->data()), r_data + m*N, o_data + m*N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -1761,7 +1761,7 @@ TensorPtr matmul_transB_fused_attn_proj_residual_q3_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q3_K_attn_proj_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/attn_proj_residual_q3_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -1821,7 +1821,7 @@ TensorPtr matmul_transB_fused_qkv_q4_k(const TensorPtr& input, const TensorPtr&
+             static_cast<float*>(k_out->data()) + m * N_k,
+             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_qkv_q4_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m) {
+@@ -1951,7 +1951,7 @@ TensorPtr matmul_transB_fused_ffn_up_q4_k(const TensorPtr& input, const TensorPt
+         cpu::gemv_q4_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+                                          static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_ffn_up_q4_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -2038,7 +2038,7 @@ TensorPtr matmul_transB_fused_ffn_up_q3_k(const TensorPtr& input, const TensorPt
+             a_data + m * K, static_cast<const uint8_t*>(w_gate->data()),
+             static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_ffn_up_q3_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -2149,7 +2149,7 @@ TensorPtr matmul_transB_fused_qkv_q3_k(const TensorPtr& input, const TensorPtr&
+             static_cast<float*>(k_out->data()) + m * N_k,
+             static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+     }
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_qkv_q3_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m)
+@@ -2275,7 +2275,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q6_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q6_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/ffn_down_residual_q6_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -2326,7 +2326,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q4_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q4_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/ffn_down_residual_q4_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -2414,7 +2414,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q5_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q5_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/ffn_down_residual_q5_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -2465,7 +2465,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q2_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q2_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/ffn_down_residual_q2_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -2516,7 +2516,7 @@ TensorPtr matmul_transB_fused_ffn_down_residual_q3_k(const TensorPtr& input,
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q3_K_ffn_down_residual_neon(a_data + m * K, static_cast<const uint8_t*>(weight->data()), r_data + m * N, o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/ffn_down_residual_q3_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     const float* r_data = static_cast<const float*>(residual->data());
+@@ -2630,7 +2630,7 @@ TensorPtr matmul_transB_fused_ffn_up_q5_k(const TensorPtr& input, const TensorPt
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q5_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_ffn_up_q5_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -2677,7 +2677,7 @@ TensorPtr matmul_transB_fused_ffn_up_q2_k(const TensorPtr& input, const TensorPt
+     float* o_data = static_cast<float*>(out->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q2_K_fused_ffn_up_neon(a_data + m * K, static_cast<const uint8_t*>(w_gate->data()), static_cast<const uint8_t*>(w_up->data()), o_data + m * N, K, N);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_ffn_up_q2_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     float* o_data = static_cast<float*>(out->data());
+@@ -2728,7 +2728,7 @@ TensorPtr matmul_transB_fused_qkv_q5_k(const TensorPtr& input, const TensorPtr&
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q5_K_fused_qkv_neon(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_qkv_q5_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m)
+@@ -2793,7 +2793,7 @@ TensorPtr matmul_transB_fused_qkv_q2_k(const TensorPtr& input, const TensorPtr&
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m)
+         cpu::gemv_q2_K_fused_qkv_neon(a_data + m * K, static_cast<const uint8_t*>(wq->data()), static_cast<const uint8_t*>(wk->data()), static_cast<const uint8_t*>(wv->data()), static_cast<float*>(q_out->data()) + m * N_q, static_cast<float*>(k_out->data()) + m * N_k, static_cast<float*>(v_out->data()) + m * N_v, K, N_q, N_k, N_v);
+-#elif defined(USE_VSX)
++#elif defined(USE_ALTIVEC)
+     PERF_SCOPE("matmul_transB/fused_qkv_q2_k_vsx");
+     const float* a_data = static_cast<const float*>(input->data());
+     for (int m = 0; m < M; ++m)
+diff --git a/src/operators/cpu/simd.h b/src/operators/cpu/simd.h
+index 7ec19f3..031ebc9 100644
+--- a/src/operators/cpu/simd.h
++++ b/src/operators/cpu/simd.h
+@@ -6,14 +6,14 @@
+ // Selection logic:
+ //   FORGE_ARCH_X86    + USE_AVX2          -> arch/x86/kernels.h
+ //   FORGE_ARCH_ARM64  + USE_NEON          -> arch/arm64/kernels.h
+-//   FORGE_ARCH_PPC64  + USE_VSX           -> arch/ppc64/kernels.h
++//   FORGE_ARCH_PPC    + USE_ALTIVEC       -> arch/ppc64/kernels.h (AltiVec or VSX)
+ //   otherwise                              -> arch/generic/kernels.h
+ 
+ #if defined(FORGE_ARCH_X86) && defined(USE_AVX2)
+ #    include "arch/x86/kernels.h"
+ #elif defined(FORGE_ARCH_ARM64) && defined(USE_NEON)
+ #    include "arch/arm64/kernels.h"
+-#elif defined(FORGE_ARCH_PPC64) && defined(USE_VSX)
++#elif defined(FORGE_ARCH_PPC) && (defined(USE_ALTIVEC) || defined(USE_VSX))
+ #    include "arch/ppc64/kernels.h"
+ #else
+ #    include "arch/generic/kernels.h"
+diff --git a/tests/test_ppc64_vsx_kernels.cpp b/tests/test_ppc64_vsx_kernels.cpp
+index 7117055..ffb185d 100644
+--- a/tests/test_ppc64_vsx_kernels.cpp
++++ b/tests/test_ppc64_vsx_kernels.cpp
+@@ -1,5 +1,7 @@
+-// Unit tests for PowerPC64 VSX kernel functions.
+-// Compiles on PPC64LE, or cross-compile + QEMU for verification on x86.
++// Unit tests for the PowerPC (AltiVec / VSX) kernel functions.
++// Compiles on PPC64LE, or cross-compile + QEMU for verification on x86. Build
++// with -DUSE_VSX for POWER7+, or -DUSE_ALTIVEC -mcpu=7450 -maltivec for the
++// AltiVec-only path (run under qemu-ppc -cpu 7450).
+ //
+ // Build (native PPC64LE):
+ //   g++ -std=c++17 -mcpu=power8 -O2 -DUSE_VSX \
+@@ -182,6 +184,32 @@ static void fill_random(std::mt19937& rng, float* data, int n, float scale) {
+ 
+ // ---- Tests ----
+ 
++// ppc_div: VSX divides; AltiVec refines a reciprocal estimate. Either must be
++// within a couple of ulps of the correctly rounded quotient.
++static void test_ppc_div() {
++    std::mt19937 rng(3);
++    std::uniform_real_distribution<float> mant(1.0f, 2.0f);
++    std::uniform_int_distribution<int> expo(-60, 60);
++    int bad = 0;
++    for (int i = 0; i < 4096 && bad < 3; ++i) {
++        alignas(16) float a[4], b[4], q[4];
++        for (int j = 0; j < 4; ++j) {
++            a[j] = std::ldexp(mant(rng), expo(rng)) * ((rng() & 1) ? -1.0f : 1.0f);
++            b[j] = std::ldexp(mant(rng), expo(rng));
++        }
++        forge::cpu::ppc_store(forge::cpu::ppc_div(forge::cpu::ppc_load(a), forge::cpu::ppc_load(b)), q);
++        for (int j = 0; j < 4; ++j) {
++            const float want = a[j] / b[j];
++            if (std::fabs(q[j] - want) > 2.5e-7f * std::fabs(want)) {
++                std::printf("  FAIL ppc_div %g / %g: got=%.9g want=%.9g\n", a[j], b[j], q[j], want);
++                ++bad;
++            }
++        }
++    }
++    if (bad) ++tests_failed;
++    else { ++tests_passed; std::printf("  PASS ppc_div (4096 x 4)\n"); }
++}
++
+ static void test_elementwise() {
+     std::mt19937 rng(42);
+     const int N = 1024;
+@@ -827,7 +855,10 @@ static void test_gemm_kquant(const char* name, GemmFn gemm, DequantRowFn dequant
+ int main() {
+     std::printf("=== PPC64 VSX Kernel Unit Tests ===\n\n");
+ 
+-    std::printf("--- Elementwise Kernels ---\n");
++    std::printf("--- SIMD helpers ---\n");
++    test_ppc_div();
++
++    std::printf("\n--- Elementwise Kernels ---\n");
+     test_elementwise();
+ 
+     std::printf("\n--- RMS Norm Kernel ---\n");
+-- 
+2.43.0
+

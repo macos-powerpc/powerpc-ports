@@ -1,0 +1,122 @@
+From 1a5a28d63bd4e0e94a21af3b1a687018cd32b7b9 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 04:02:16 +0000
+Subject: [PATCH 11/20] fix(ppc64): clamp the VSX exp approximations to their
+ valid range
+
+cephes_exp_f32_vsx (SiLU, GELU, softcap tanh) and the sampler's
+exp_and_sum_f32 build 2^n by adding n into the float exponent field
+without bounding n. For |x| beyond ~88 (or a logit more than ~88*T below
+the max) the exponent wraps: SiLU(-100) came out as -100 instead of ~0,
+and far-below-max logits became huge negative numbers, corrupting the
+softmax sum. The AVX2 paths clamp their inputs; the VSX ones did not.
+
+Clamp x*log2(e) to [-125, 125] in both (vector and scalar tail). 2^-125
+is ~0 for these uses, and the bound keeps exp(x) and 1/(1+exp(x)) normal
+floats. Add wide-range SiLU/GELU/exp_and_sum cases to the unit tests;
+the old kernels fail them.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../cpu/arch/ppc64/elementwise_kernels.h      |  4 ++++
+ .../cpu/arch/ppc64/sampling_kernels.h         |  6 ++++-
+ tests/test_ppc64_vsx_kernels.cpp              | 22 +++++++++++++++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/operators/cpu/arch/ppc64/elementwise_kernels.h b/src/operators/cpu/arch/ppc64/elementwise_kernels.h
+index 8edbb7f..26761ac 100644
+--- a/src/operators/cpu/arch/ppc64/elementwise_kernels.h
++++ b/src/operators/cpu/arch/ppc64/elementwise_kernels.h
+@@ -71,6 +71,9 @@ static inline void mul_f32_vec(const float* a, const float* b, float* out, int n
+ // exp(x) = 2^(x/ln2), separate integer and fractional parts.
+ // Uses 6th-order polynomial for 2^f, f in [0,1).
+ // Max relative error < 1e-6 for |x| <= 20. Matches the x86 AVX2 / ARM64 NEON Cephes path.
++// x * log2(e) is clamped to [-125, 125] (|x| <~ 86.6): beyond that the
++// exponent bits built below would wrap. The bound also keeps exp(x) and
++// 1 / (1 + exp(x)) normal floats.
+ static inline __vector float cephes_exp_f32_vsx(__vector float x) {
+     const float log2e = 1.4426950408889634f;
+     const float c1    = 0.6931471805599453f;
+@@ -81,6 +84,7 @@ static inline __vector float cephes_exp_f32_vsx(__vector float x) {
+     const float c6    = 0.0001540353039338152f;
+ 
+     __vector float xl = x * vec_splats(log2e);
++    xl = vec_min(vec_max(xl, vec_splats(-125.0f)), vec_splats(125.0f));
+     // floor(xl) via trunc + adjust for negative non-integers
+     __vector signed int n = vec_cts(xl, 0);
+     __vector float nf = vec_ctf(n, 0);
+diff --git a/src/operators/cpu/arch/ppc64/sampling_kernels.h b/src/operators/cpu/arch/ppc64/sampling_kernels.h
+index 4a1f36a..10508e0 100644
+--- a/src/operators/cpu/arch/ppc64/sampling_kernels.h
++++ b/src/operators/cpu/arch/ppc64/sampling_kernels.h
+@@ -10,6 +10,7 @@
+ #ifdef USE_VSX
+ #include <altivec.h>
+ #endif
++#include <algorithm>
+ #include <cmath>
+ #include <cstring>
+ 
+@@ -164,8 +165,10 @@ static inline float exp_and_sum_f32(const float* data, float* out, int n,
+     int i = 0;
+     for (; i + 3 < n; i += 4) {
+         __vector float d = vec_xl(0, (const float*)(data + i));
+-        // x = (d - max_val) * inv_temp * log2(e)
++        // x = (d - max_val) * inv_temp * log2(e), clamped so that the
++        // exponent added below stays in range (2^-125 is ~0 here anyway)
+         __vector float x = (d - v_max) * v_factor;
++        x = vec_min(vec_max(x, vec_splats(-125.0f)), vec_splats(125.0f));
+         // Floor to get integer exponent
+         __vector signed int x_int = vec_cts(x, 0);
+         // Fractional part f = x - floor(x) in [0, 1)
+@@ -195,6 +198,7 @@ static inline float exp_and_sum_f32(const float* data, float* out, int n,
+ 
+     for (; i < n; ++i) {
+         float x = (data[i] - max_val) * inv_temp * log2e;
++        x = std::min(std::max(x, -125.0f), 125.0f);
+         int x_int = (int)x;
+         if (x < (float)x_int) x_int--;  // floor for negative
+         float f = x - (float)x_int;
+diff --git a/tests/test_ppc64_vsx_kernels.cpp b/tests/test_ppc64_vsx_kernels.cpp
+index 233637f..7117055 100644
+--- a/tests/test_ppc64_vsx_kernels.cpp
++++ b/tests/test_ppc64_vsx_kernels.cpp
+@@ -215,6 +215,19 @@ static void test_elementwise() {
+         ref_gelu_mul_f32_vec(a, b, out_ref, n);
+         check_close_f32("gelu_mul_f32_vec", out_vsx, out_ref, n, 1e-4f);
+     }
++
++    // Activations far outside the exp approximation's range must saturate,
++    // not wrap the float exponent.
++    for (int n : {64, 1024}) {
++        fill_random(rng, a, n, 200.0f);
++        fill_random(rng, b, n, 5.0f);
++        forge::cpu::silu_mul_f32_vec(a, b, out_vsx, n);
++        ref_silu_mul_f32_vec(a, b, out_ref, n);
++        check_rel_f32("silu_mul_f32_vec (wide range)", out_vsx, out_ref, n, 1e-4f);
++        forge::cpu::gelu_mul_f32_vec(a, b, out_vsx, n);
++        ref_gelu_mul_f32_vec(a, b, out_ref, n);
++        check_rel_f32("gelu_mul_f32_vec (wide range)", out_vsx, out_ref, n, 1e-4f);
++    }
+ }
+ 
+ static void test_norm() {
+@@ -315,6 +328,15 @@ static void test_sampling() {
+         forge::cpu::scale_normalize_f32(out_vsx, n, 1.0f / st_vsx);
+         ref_scale_normalize_f32(out_ref, n, 1.0f / st_ref);
+         check_close_f32("scale_normalize", out_vsx, out_ref, n, 2e-2f);
++
++        // Logits spread far below the max (exp underflows to ~0) must not
++        // wrap the float exponent.
++        fill_random(rng, data, n, 300.0f);
++        mx = forge::cpu::max_f32(data, n);
++        st_vsx = forge::cpu::exp_and_sum_f32(data, out_vsx, n, mx, 1.0f);
++        st_ref = ref_exp_and_sum_f32(data, out_ref, n, mx, 1.0f);
++        check_close_f32_scalar("exp_and_sum (wide range, sum)", st_vsx, st_ref, 1e-1f);
++        check_close_f32("exp_and_sum (wide range, values)", out_vsx, out_ref, n, 2e-2f);
+     }
+ }
+ 
+-- 
+2.43.0
+

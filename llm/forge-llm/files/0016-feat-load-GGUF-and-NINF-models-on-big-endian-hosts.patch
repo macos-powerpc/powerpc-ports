@@ -1,0 +1,1429 @@
+From 0bbead60cad39890929e3381689e7e0df4038e63 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 04:11:21 +0000
+Subject: [PATCH 16/20] feat: load GGUF and NINF models on big-endian hosts
+
+GGUF is little-endian and the loaders read every header field, metadata
+value and tensor payload in host order, so on big-endian hosts (PowerPC
+Macs, ppc64 BE, s390x) the magic check failed and, past it, every value
+would have been byte-swapped.
+
+- GGUF loader, tokenizer metadata reader and the forge-inspect scanner:
+  compare the magic as bytes and read all multi-byte header fields in
+  file byte order. The order is taken from the version word (always
+  small), so big-endian GGUF files from llama.cpp's
+  gguf_convert_endian.py load too, without conversion, on big-endian
+  hosts.
+- Tensor data: when the file's byte order differs from the host's, make
+  the private mapping writable and convert every tensor in place once at
+  load (copy-on-write pages, the file is never modified); the tensors
+  are then used zero-copy as before. byteswap_tensor_data() knows the
+  multi-byte fields of each block type (fp16 scales, the uint16 arrays
+  of IQ2_XXS/IQ2_XS/IQ1_S/IQ4_XS) and leaves byte arrays alone; the
+  kernels that view byte arrays as words were made byte-order
+  independent earlier. Unknown types fail the load instead of producing
+  garbage.
+- NINF loader: convert the (little-endian) header, tensor table and
+  tensor copies on big-endian hosts.
+
+Little-endian hosts with little-endian files take exactly the old path.
+
+tests/test_gguf_byteorder.cpp writes one synthetic model as a little- and
+a big-endian GGUF (every metadata type, a tokenizer vocabulary, F32/F16/
+BF16 and all 19 quantized types) and checks metadata, tokenizer fields
+and per-tensor hashes of the dequantized data against values recorded
+on x86-64. It passes on x86-64 and on 32-bit big-endian PowerPC
+(qemu-ppc), where the dequantized output of the little-endian file is
+bit-identical to x86-64.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |   1 +
+ include/forge/gguf_model.h             |   3 +
+ include/forge/tensor_byteswap.h        |  23 ++
+ src/core/platform.h                    |  11 +
+ src/inspect/perf/gguf_scanner.cpp      |  99 +++---
+ src/model/gguf_model.cpp               | 108 +++++--
+ src/model/ninf_model.cpp               |  22 ++
+ src/model/tensor_byteswap.cpp          |  94 ++++++
+ src/tokenizer/tokenizer.cpp            |  31 +-
+ tests/CMakeLists.txt                   |   8 +
+ tests/test_gguf_byteorder.cpp          | 407 +++++++++++++++++++++++++
+ tests/test_gguf_byteorder_expected.inc |  22 ++
+ 12 files changed, 745 insertions(+), 84 deletions(-)
+ create mode 100644 include/forge/tensor_byteswap.h
+ create mode 100644 src/model/tensor_byteswap.cpp
+ create mode 100644 tests/test_gguf_byteorder.cpp
+ create mode 100644 tests/test_gguf_byteorder_expected.inc
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 332532b..4f4a1f4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -253,6 +253,7 @@ add_library(
+   src/model/model_loader.cpp
+   src/model/ninf_model.cpp
+   src/model/gguf_model.cpp
++  src/model/tensor_byteswap.cpp
+   src/model/arch_config_parser.cpp
+   src/model/arch_weight_init.cpp
+   src/model/arch_capability.cpp
+diff --git a/include/forge/gguf_model.h b/include/forge/gguf_model.h
+index 88fb827..341b943 100644
+--- a/include/forge/gguf_model.h
++++ b/include/forge/gguf_model.h
+@@ -107,6 +107,9 @@ private:
+     int fd_ = -1;
+     void* mapped_data_ = nullptr;
+     size_t mapped_size_ = 0;
++    // File byte order differs from the host's (a little-endian GGUF on a
++    // big-endian host, or vice versa); tensor data is converted at load.
++    bool file_swapped_ = false;
+ 
+     std::unordered_map<std::string, std::string> metadata_str_;
+     std::unordered_map<std::string, int64_t> metadata_int_;
+diff --git a/include/forge/tensor_byteswap.h b/include/forge/tensor_byteswap.h
+new file mode 100644
+index 0000000..69de3ae
+--- /dev/null
++++ b/include/forge/tensor_byteswap.h
+@@ -0,0 +1,23 @@
++#pragma once
++// Byte-order conversion of tensor payloads.
++//
++// GGUF tensor data is little-endian: plain tensors are arrays of LE scalars,
++// and quantization blocks mix byte arrays with LE fp16/uint16 fields. The CPU
++// kernels read those multi-byte fields in host order, so on a host whose byte
++// order differs from the file's, the loader converts the data once at load
++// time with byteswap_tensor_data(). Byte arrays inside blocks are left as-is;
++// kernels that view them as wider words do so through forge/byteorder.h.
++
++#include <cstddef>
++
++#include "forge/types.h"
++
++namespace forge {
++
++// Reverse the byte order of every multi-byte field in `nbytes` bytes of tensor
++// data of type `dtype`, in place. The operation is its own inverse. Returns
++// false (leaving the data untouched) for a dtype without a known layout, or if
++// `nbytes` is not a whole number of elements/blocks.
++bool byteswap_tensor_data(DataType dtype, void* data, size_t nbytes);
++
++}  // namespace forge
+diff --git a/src/core/platform.h b/src/core/platform.h
+index ba5d419..006cfbb 100644
+--- a/src/core/platform.h
++++ b/src/core/platform.h
+@@ -58,6 +58,12 @@ static inline int forge_munmap(void* addr, size_t) {
+     return UnmapViewOfFile(addr) ? 0 : -1;
+ }
+ 
++// Make a read-only file mapping privately writable (copy-on-write). Not
++// supported for the read-only views created above.
++static inline int forge_mprotect_rw(void*, size_t) {
++    return -1;
++}
++
+ // Eagerly pull the mapped range into memory (cold-cache readahead). No-op on
+ // Windows versions without PrefetchVirtualMemory (Win8+).
+ static inline void forge_prefetch(void* addr, size_t length) {
+@@ -91,6 +97,11 @@ static inline void* forge_mmap(void* a, size_t l, int p, int f, int fd, off_t o)
+ static inline int forge_munmap(void* a, size_t l) {
+     return munmap(a, l);
+ }
++// Make a MAP_PRIVATE file mapping writable; writes go to copy-on-write pages
++// and never reach the file.
++static inline int forge_mprotect_rw(void* a, size_t l) {
++    return mprotect(a, l, PROT_READ | PROT_WRITE);
++}
+ static inline void forge_prefetch(void* addr, size_t length) {
+     madvise(addr, length, MADV_WILLNEED);
+ }
+diff --git a/src/inspect/perf/gguf_scanner.cpp b/src/inspect/perf/gguf_scanner.cpp
+index 50c2474..0ca8146 100644
+--- a/src/inspect/perf/gguf_scanner.cpp
++++ b/src/inspect/perf/gguf_scanner.cpp
+@@ -8,13 +8,13 @@
+ #include <unordered_map>
+ 
+ #include "../core/platform.h"
++#include "forge/byteorder.h"
+ #include "perf/thread_pool.h"
+ 
+ namespace forge::inspect {
+ 
+ namespace {
+ 
+-constexpr uint32_t GGUF_MAGIC = 0x46554747;
+ 
+ // GGML tensor type -> human-readable name (superset of what Forge loads).
+ const char* ggml_dtype_name(GgmlDType dt) {
+@@ -107,12 +107,24 @@ int64_t packed_bytes_impl(GgmlDType dt, int64_t numel) {
+ 
+ bool is_quantized_dtype(GgmlDType dt) { return ggml_layout(dt).block_size > 0; }
+ 
++// Copy a scalar out of the file, reversing its bytes when the file's byte
++// order differs from the host's (GGUF is little-endian, but big-endian files
++// written by llama.cpp's gguf_convert_endian.py exist too).
++template <typename T>
++void read_field(T& out, const uint8_t* p, bool swap) {
++    std::memcpy(&out, p, sizeof(out));
++    if (swap && sizeof(out) > 1) {
++        uint8_t* b = reinterpret_cast<uint8_t*>(&out);
++        std::reverse(b, b + sizeof(out));
++    }
++}
++
+ // Read a length-prefixed GGUF string at [off]; returns "" on OOB.
+-std::string read_gguf_string(const uint8_t* data, size_t size, size_t& off) {
++std::string read_gguf_string(const uint8_t* data, size_t size, size_t& off, bool swap) {
+     if (off + 8 > size)
+         return "";
+     uint64_t len;
+-    std::memcpy(&len, data + off, 8);
++    read_field(len, data + off, swap);
+     off += 8;
+     if (len > size - off)
+         return "";
+@@ -123,13 +135,13 @@ std::string read_gguf_string(const uint8_t* data, size_t size, size_t& off) {
+ 
+ // Byte length of a KV value payload located at `off` (after the type tag).
+ // Pure arithmetic (no allocations), clamped so pass 1 can never walk past EOF.
+-size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
++size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype, bool swap) {
+     const size_t avail = off < size ? size - off : 0;
+     auto peek_u64 = [&](size_t at) -> uint64_t {
+         if (at + 8 > size)
+             return 0;
+         uint64_t v;
+-        std::memcpy(&v, data + at, 8);
++        read_field(v, data + at, swap);
+         return v;
+     };
+     switch (vtype) {
+@@ -148,7 +160,7 @@ size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
+             if (avail < 12)
+                 return 0;
+             uint32_t arr_type;
+-            std::memcpy(&arr_type, data + off, 4);
++            read_field(arr_type, data + off, swap);
+             const uint64_t n = peek_u64(off + 4);
+             size_t p = off + 12;
+             if (arr_type == 8) {                                // string array
+@@ -160,7 +172,7 @@ size_t kv_skip(const uint8_t* data, size_t size, size_t off, uint32_t vtype) {
+             if (arr_type == 9) {                                // array of arrays
+                 size_t cur = p;
+                 for (uint64_t i = 0; i < n; ++i) {
+-                    const size_t adv = kv_skip(data, size, cur, 9);
++                    const size_t adv = kv_skip(data, size, cur, 9, swap);
+                     if (adv == 0)
+                         return (size > off) ? (size - off) : 0;
+                     cur += adv;
+@@ -254,17 +266,22 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+         return fail(buf);
+     }
+ 
+-    uint32_t magic;
+-    std::memcpy(&magic, data, 4);
+-    if (magic != GGUF_MAGIC) {
++    // The magic bytes are the same in little- and big-endian files.
++    if (std::memcmp(data, "GGUF", 4) != 0) {
++        uint32_t magic;
++        read_field(magic, data, !kHostBigEndian);  // as a little-endian word
+         char buf[96];
+         std::snprintf(buf, sizeof(buf),
+                       "not a GGUF file (bad magic 0x%08x, expected 0x46554747)", magic);
+         return fail(buf);
+     }
+ 
++    // The version word is small, so its byte order identifies the file's.
+     uint32_t version;
+     std::memcpy(&version, data + 4, 4);
++    const bool swap = version > 0xFFFF && bswap32(version) <= 0xFFFF;
++    if (swap)
++        version = bswap32(version);
+     snap.version = version;
+ 
+     uint64_t tensor_count, metadata_count;
+@@ -285,9 +302,9 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+     }
+     if (offset + 16 > size)
+         return fail("truncated GGUF header (need 16 bytes for tensor/metadata counts)");
+-    std::memcpy(&tensor_count, data + offset, 8);
++    read_field(tensor_count, data + offset, swap);
+     offset += 8;
+-    std::memcpy(&metadata_count, data + offset, 8);
++    read_field(metadata_count, data + offset, swap);
+     offset += 8;
+     snap.tensor_count = tensor_count;
+     snap.metadata_count = metadata_count;
+@@ -304,7 +321,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+             if (off + 8 > size)
+                 break;
+             uint64_t klen;
+-            std::memcpy(&klen, data + off, 8);
++            read_field(klen, data + off, swap);
+             off += 8;
+             if (klen > size - off)
+                 break;
+@@ -312,9 +329,9 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+             if (off + 4 > size)
+                 break;
+             uint32_t vtype;
+-            std::memcpy(&vtype, data + off, 4);
++            read_field(vtype, data + off, swap);
+             off += 4;
+-            off += kv_skip(data, size, off, vtype);
++            off += kv_skip(data, size, off, vtype, swap);
+         }
+         if (i < metadata_count) {
+             char buf[128];
+@@ -347,35 +364,35 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+         size_t off = begin < metadata_count ? kv_offsets[begin] : 0;
+         for (size_t k = begin; k < end; ++k) {
+             size_t entry = off;
+-            std::string key = read_gguf_string(data, size, off);
++            std::string key = read_gguf_string(data, size, off, swap);
+             uint32_t vtype = 0;
+             if (off + 4 <= size) {
+-                std::memcpy(&vtype, data + off, 4);
++                read_field(vtype, data + off, swap);
+                 off += 4;
+             }
+             switch (vtype) {
+-            case 0: { uint8_t v; if (off + 1 > size) break; std::memcpy(&v, data + off, 1); off += 1; part.meta_int[key] = v; break; }
+-            case 1: { int8_t v; if (off + 1 > size) break; std::memcpy(&v, data + off, 1); off += 1; part.meta_int[key] = v; break; }
+-            case 2: { uint16_t v; if (off + 2 > size) break; std::memcpy(&v, data + off, 2); off += 2; part.meta_int[key] = v; break; }
+-            case 3: { int16_t v; if (off + 2 > size) break; std::memcpy(&v, data + off, 2); off += 2; part.meta_int[key] = v; break; }
+-            case 4: { uint32_t v; if (off + 4 > size) break; std::memcpy(&v, data + off, 4); off += 4; part.meta_int[key] = v; break; }
+-            case 5: { int32_t v; if (off + 4 > size) break; std::memcpy(&v, data + off, 4); off += 4; part.meta_int[key] = v; break; }
+-            case 6: { float v; if (off + 4 > size) break; std::memcpy(&v, data + off, 4); off += 4; part.meta_float[key] = v; break; }
+-            case 7: { uint8_t v; if (off + 1 > size) break; std::memcpy(&v, data + off, 1); off += 1; part.meta_int[key] = v ? 1 : 0; break; }
+-            case 8: { std::string v = read_gguf_string(data, size, off); part.meta_str[key] = v; break; }
++            case 0: { uint8_t v; if (off + 1 > size) break; read_field(v, data + off, swap); off += 1; part.meta_int[key] = v; break; }
++            case 1: { int8_t v; if (off + 1 > size) break; read_field(v, data + off, swap); off += 1; part.meta_int[key] = v; break; }
++            case 2: { uint16_t v; if (off + 2 > size) break; read_field(v, data + off, swap); off += 2; part.meta_int[key] = v; break; }
++            case 3: { int16_t v; if (off + 2 > size) break; read_field(v, data + off, swap); off += 2; part.meta_int[key] = v; break; }
++            case 4: { uint32_t v; if (off + 4 > size) break; read_field(v, data + off, swap); off += 4; part.meta_int[key] = v; break; }
++            case 5: { int32_t v; if (off + 4 > size) break; read_field(v, data + off, swap); off += 4; part.meta_int[key] = v; break; }
++            case 6: { float v; if (off + 4 > size) break; read_field(v, data + off, swap); off += 4; part.meta_float[key] = v; break; }
++            case 7: { uint8_t v; if (off + 1 > size) break; read_field(v, data + off, swap); off += 1; part.meta_int[key] = v ? 1 : 0; break; }
++            case 8: { std::string v = read_gguf_string(data, size, off, swap); part.meta_str[key] = v; break; }
+             case 9: {
+                 if (off + 12 > size) break;
+                 uint32_t arr_type;
+-                std::memcpy(&arr_type, data + off, 4);
++                read_field(arr_type, data + off, swap);
+                 off += 4;
+                 uint64_t arr_len;
+-                std::memcpy(&arr_len, data + off, 8);
++                read_field(arr_len, data + off, swap);
+                 off += 8;
+                 if (arr_type == 5) {
+                     std::vector<int32_t> arr(arr_len);
+                     for (uint64_t j = 0; j < arr_len; ++j) {
+                         if (off + 4 > size) break;
+-                        std::memcpy(&arr[j], data + off, 4);
++                        read_field(arr[j], data + off, swap);
+                         off += 4;
+                     }
+                     part.meta_int_array[key] = std::move(arr);
+@@ -384,7 +401,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+                     for (uint64_t j = 0; j < arr_len; ++j) {
+                         if (off + 1 > size) break;
+                         uint8_t v;
+-                        std::memcpy(&v, data + off, 1);
++                        read_field(v, data + off, swap);
+                         off += 1;
+                         arr[j] = v ? 1 : 0;
+                     }
+@@ -394,16 +411,16 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+                     // just to throw them away would dominate the parse time.
+                     part.meta_str_array_len[key] = arr_len;
+                     for (uint64_t j = 0; j < arr_len; ++j)
+-                        read_gguf_string(data, size, off);
++                        read_gguf_string(data, size, off, swap);
+                 } else {
+                     size_t elem = (arr_type <= 1) ? 1 : (arr_type <= 3) ? 2 : (arr_type <= 6) ? 4 : (arr_type <= 12) ? 8 : 4;
+                     off += static_cast<size_t>(arr_len) * elem;
+                 }
+                 break;
+             }
+-            case 10: { uint64_t v; if (off + 8 > size) break; std::memcpy(&v, data + off, 8); off += 8; part.meta_int[key] = static_cast<int64_t>(v); break; }
+-            case 11: { int64_t v; if (off + 8 > size) break; std::memcpy(&v, data + off, 8); off += 8; part.meta_int[key] = v; break; }
+-            case 12: { double v; if (off + 8 > size) break; std::memcpy(&v, data + off, 8); off += 8; part.meta_float[key] = v; break; }
++            case 10: { uint64_t v; if (off + 8 > size) break; read_field(v, data + off, swap); off += 8; part.meta_int[key] = static_cast<int64_t>(v); break; }
++            case 11: { int64_t v; if (off + 8 > size) break; read_field(v, data + off, swap); off += 8; part.meta_int[key] = v; break; }
++            case 12: { double v; if (off + 8 > size) break; read_field(v, data + off, swap); off += 8; part.meta_float[key] = v; break; }
+             default:
+                 off += 8;
+                 break;
+@@ -456,7 +473,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+                 return fail(buf);
+             }
+             uint64_t name_len = 0;
+-            std::memcpy(&name_len, data + off, 8);
++            read_field(name_len, data + off, swap);
+             off += 8;
+             if (name_len > size - off) {
+                 char buf[160];
+@@ -473,7 +490,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+                 return fail(buf);
+             }
+             uint32_t ndim = 0;
+-            std::memcpy(&ndim, data + off, 4);
++            read_field(ndim, data + off, swap);
+             off += 4;
+             // GGUF caps ndim at 4. Checking it here also bounds the multiplication
+             // below, and a nonsense ndim is the cheapest sign of a misparse.
+@@ -522,26 +539,26 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+     auto decode_one = [&](size_t i) {
+         GgufLoadedTensor& t = snap.tensors[i];
+         size_t off = record_offsets[i];
+-        std::string name = read_gguf_string(data, size, off);
++        std::string name = read_gguf_string(data, size, off, swap);
+         t.name = name;
+ 
+         uint32_t ndim = 0;
+         if (off + 4 <= size) {
+-            std::memcpy(&ndim, data + off, 4);
++            read_field(ndim, data + off, swap);
+             off += 4;
+         }
+         t.shape.resize(ndim);
+         for (uint32_t d = 0; d < ndim; ++d) {
+             uint64_t dim = 0;
+             if (off + 8 <= size) {
+-                std::memcpy(&dim, data + off, 8);
++                read_field(dim, data + off, swap);
+                 off += 8;
+             }
+             t.shape[d] = static_cast<int64_t>(dim);
+         }
+         uint32_t dtype_val = 0;
+         if (off + 4 <= size) {
+-            std::memcpy(&dtype_val, data + off, 4);
++            read_field(dtype_val, data + off, swap);
+             off += 4;
+         }
+         t.orig_dtype = static_cast<GgmlDType>(dtype_val);
+@@ -549,7 +566,7 @@ GgufSnapshot load_gguf(const std::string& path, int threads, ThreadPool* pool) {
+         t.dtype = DataType::FP32;
+         int64_t file_offset = 0;
+         if (off + 8 <= size) {
+-            std::memcpy(&file_offset, data + off, 8);
++            read_field(file_offset, data + off, swap);
+             off += 8;
+         }
+         t.file_offset = static_cast<int64_t>(data_start) + file_offset;
+diff --git a/src/model/gguf_model.cpp b/src/model/gguf_model.cpp
+index 9bfb39f..2171037 100644
+--- a/src/model/gguf_model.cpp
++++ b/src/model/gguf_model.cpp
+@@ -13,8 +13,10 @@
+ #include <vector>
+ 
+ #include "../core/platform.h"
++#include "forge/byteorder.h"
+ #include "forge/fp16_compat.h"
+ #include "forge/logger.h"
++#include "forge/tensor_byteswap.h"
+ 
+ #ifdef USE_CUDA
+ #    include <cuda_runtime.h>
+@@ -124,13 +126,12 @@ bool GgufModel::supports_format(const std::string& path) const {
+     if (fd < 0)
+         return false;
+ 
+-    uint32_t magic = 0;
+-    ssize_t n = forge_read(fd, &magic, 4);
++    char magic[4] = {};
++    ssize_t n = forge_read(fd, magic, 4);
+     forge_close(fd);
+ 
+-    if (n != 4)
+-        return false;
+-    return magic == 0x46554747;
++    // Compare bytes: the magic is the same in little- and big-endian files.
++    return n == 4 && std::memcmp(magic, "GGUF", 4) == 0;
+ }
+ 
+ bool GgufModel::load(const std::string& path) {
+@@ -160,29 +161,41 @@ bool GgufModel::load(const std::string& path) {
+ 
+     const uint8_t* data = static_cast<const uint8_t*>(mapped_data_);
+ 
+-    uint32_t magic;
+-    std::memcpy(&magic, data, 4);
+-    if (magic != 0x46554747) {
++    if (mapped_size_ < 24 || std::memcmp(data, "GGUF", 4) != 0) {
+         close();
+         return false;
+     }
+ 
++    // GGUF is little-endian, but big-endian files exist too (written by
++    // llama.cpp's gguf_convert_endian.py for s390x/ppc64 hosts). The version
++    // word is small, so its byte order tells which one this is. Read every
++    // header field in file order via rd().
+     uint32_t version;
+     std::memcpy(&version, data + 4, 4);
++    file_swapped_ = version > 0xFFFF && bswap32(version) <= 0xFFFF;
++    const bool swap = file_swapped_;
++    auto rd = [&](auto& out, size_t off) {
++        std::memcpy(&out, data + off, sizeof(out));
++        if (swap && sizeof(out) > 1) {
++            uint8_t* b = reinterpret_cast<uint8_t*>(&out);
++            std::reverse(b, b + sizeof(out));
++        }
++    };
++    rd(version, 4);
+ 
+     uint64_t tensor_count, metadata_kv_count;
+     size_t offset = 8;
+ 
+     if (version >= 3) {
+-        std::memcpy(&tensor_count, data + offset, 8);
++        rd(tensor_count, offset);
+         offset += 8;
+-        std::memcpy(&metadata_kv_count, data + offset, 8);
++        rd(metadata_kv_count, offset);
+         offset += 8;
+     } else {
+         uint32_t tc, mc;
+-        std::memcpy(&tc, data + offset, 4);
++        rd(tc, offset);
+         offset += 4;
+-        std::memcpy(&mc, data + offset, 4);
++        rd(mc, offset);
+         offset += 4;
+         tensor_count = tc;
+         metadata_kv_count = mc;
+@@ -204,7 +217,7 @@ bool GgufModel::load(const std::string& path) {
+ 
+     auto read_string = [&](size_t& off) -> std::string {
+         uint64_t len;
+-        std::memcpy(&len, data + off, 8);
++        rd(len, off);
+         off += 8;
+         LOG_DEBUG("read_string: len=" + std::to_string(len) + " off=" + std::to_string(off));
+         if (len > mapped_size_ - off) {
+@@ -221,7 +234,7 @@ bool GgufModel::load(const std::string& path) {
+         std::string key = read_string(offset);
+ 
+         uint32_t vtype;
+-        std::memcpy(&vtype, data + offset, 4);
++        rd(vtype, offset);
+         offset += 4;
+ 
+         LOG_DEBUG("metadata[" + std::to_string(i) + "] key=" + key +
+@@ -230,49 +243,49 @@ bool GgufModel::load(const std::string& path) {
+         switch (vtype) {
+         case 0: {
+             uint8_t val;
+-            std::memcpy(&val, data + offset, 1);
++            rd(val, offset);
+             offset += 1;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 1: {
+             int8_t val;
+-            std::memcpy(&val, data + offset, 1);
++            rd(val, offset);
+             offset += 1;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 2: {
+             uint16_t val;
+-            std::memcpy(&val, data + offset, 2);
++            rd(val, offset);
+             offset += 2;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 3: {
+             int16_t val;
+-            std::memcpy(&val, data + offset, 2);
++            rd(val, offset);
+             offset += 2;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 4: {
+             uint32_t val;
+-            std::memcpy(&val, data + offset, 4);
++            rd(val, offset);
+             offset += 4;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 5: {
+             int32_t val;
+-            std::memcpy(&val, data + offset, 4);
++            rd(val, offset);
+             offset += 4;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 6: {
+             float val;
+-            std::memcpy(&val, data + offset, 4);
++            rd(val, offset);
+             offset += 4;
+             metadata_float_[key] = static_cast<double>(val);
+             break;
+@@ -280,7 +293,7 @@ bool GgufModel::load(const std::string& path) {
+         case 7: {
+             // GGUF bools are one byte; sizeof(bool) is not (4 on PowerPC Darwin).
+             uint8_t val;
+-            std::memcpy(&val, data + offset, 1);
++            rd(val, offset);
+             offset += 1;
+             metadata_int_[key] = val ? 1 : 0;
+             break;
+@@ -292,10 +305,10 @@ bool GgufModel::load(const std::string& path) {
+         }
+         case 9: {
+             uint32_t arr_type;
+-            std::memcpy(&arr_type, data + offset, 4);
++            rd(arr_type, offset);
+             offset += 4;
+             uint64_t arr_len;
+-            std::memcpy(&arr_len, data + offset, 8);
++            rd(arr_len, offset);
+             offset += 8;
+             // Each element takes at least one byte; a longer array is corrupt
+             // (and would be truncated by std::vector's size_t on 32-bit).
+@@ -309,7 +322,7 @@ bool GgufModel::load(const std::string& path) {
+             if (arr_type == 5) {  // INT32 array
+                 std::vector<int32_t> arr(arr_len);
+                 for (uint64_t j = 0; j < arr_len; ++j) {
+-                    std::memcpy(&arr[j], data + offset, 4);
++                    rd(arr[j], offset);
+                     offset += 4;
+                 }
+                 metadata_int_arrays_[key] = std::move(arr);
+@@ -317,7 +330,7 @@ bool GgufModel::load(const std::string& path) {
+                 std::vector<int32_t> arr(arr_len);
+                 for (uint64_t j = 0; j < arr_len; ++j) {
+                     uint8_t val;
+-                    std::memcpy(&val, data + offset, 1);
++                    rd(val, offset);
+                     offset += 1;
+                     arr[j] = val ? 1 : 0;
+                 }
+@@ -371,21 +384,21 @@ bool GgufModel::load(const std::string& path) {
+         }
+         case 10: {
+             uint64_t val;
+-            std::memcpy(&val, data + offset, 8);
++            rd(val, offset);
+             offset += 8;
+             metadata_int_[key] = static_cast<int64_t>(val);
+             break;
+         }
+         case 11: {
+             int64_t val;
+-            std::memcpy(&val, data + offset, 8);
++            rd(val, offset);
+             offset += 8;
+             metadata_int_[key] = val;
+             break;
+         }
+         case 12: {
+             double val;
+-            std::memcpy(&val, data + offset, 8);
++            rd(val, offset);
+             offset += 8;
+             metadata_float_[key] = val;
+             break;
+@@ -403,23 +416,23 @@ bool GgufModel::load(const std::string& path) {
+         tensor_infos[i].name = read_string(offset);
+ 
+         uint32_t ndim;
+-        std::memcpy(&ndim, data + offset, 4);
++        rd(ndim, offset);
+         offset += 4;
+ 
+         tensor_infos[i].dims.resize(ndim);
+         for (uint32_t d = 0; d < ndim; ++d) {
+             uint64_t dim;
+-            std::memcpy(&dim, data + offset, 8);
++            rd(dim, offset);
+             offset += 8;
+             tensor_infos[i].dims[d] = static_cast<int64_t>(dim);
+         }
+ 
+         uint32_t dtype_val;
+-        std::memcpy(&dtype_val, data + offset, 4);
++        rd(dtype_val, offset);
+         offset += 4;
+         tensor_infos[i].dtype = static_cast<GgmlDType>(dtype_val);
+ 
+-        std::memcpy(&tensor_infos[i].offset, data + offset, 8);
++        rd(tensor_infos[i].offset, offset);
+         offset += 8;
+     }
+ 
+@@ -460,6 +473,34 @@ bool GgufModel::load(const std::string& path) {
+         name_index_[lt.name] = static_cast<size_t>(i);
+     }
+ 
++    // Bring the tensor payloads to host byte order. The mapping is private, so
++    // this only writes this process's copy-on-write pages, never the file; the
++    // tensors are then used zero-copy exactly as on a matching host.
++    if (file_swapped_) {
++        if (forge_mprotect_rw(mapped_data_, mapped_size_) != 0) {
++            LOG_ERROR("GGUF: cannot make the mapping writable to convert byte order: " + path);
++            close();
++            return false;
++        }
++        uint8_t* base = static_cast<uint8_t*>(mapped_data_);
++        uint64_t converted = 0;
++        for (const auto& lt : tensors_) {
++            const bool in_bounds = lt.file_offset >= 0 && lt.data_size >= 0 &&
++                                   static_cast<uint64_t>(lt.file_offset) +
++                                           static_cast<uint64_t>(lt.data_size) <= mapped_size_;
++            if (!in_bounds || !byteswap_tensor_data(lt.dtype, base + lt.file_offset,
++                                                    static_cast<size_t>(lt.data_size))) {
++                LOG_ERROR("GGUF: cannot convert tensor '" + lt.name + "' (" +
++                          dtype_name(lt.dtype) + ") to host byte order");
++                close();
++                return false;
++            }
++            converted += static_cast<uint64_t>(lt.data_size);
++        }
++        LOG_INFO("GGUF: converted " + std::to_string(converted / (1024 * 1024)) + " MB of " +
++                 (kHostBigEndian ? "little" : "big") + "-endian tensor data to host order");
++    }
++
+     LOG_INFO("GgufModel loaded: " + std::to_string(tensors_.size()) + " tensors from " + path);
+ 
+     // Log total tensor data size
+@@ -482,6 +523,7 @@ void GgufModel::close() {
+         fd_ = -1;
+     }
+     mapped_size_ = 0;
++    file_swapped_ = false;
+     tensors_.clear();
+     name_index_.clear();
+     metadata_str_.clear();
+diff --git a/src/model/ninf_model.cpp b/src/model/ninf_model.cpp
+index da2dde6..c8e935d 100644
+--- a/src/model/ninf_model.cpp
++++ b/src/model/ninf_model.cpp
+@@ -7,7 +7,9 @@
+ #include <stdexcept>
+ 
+ #include "../core/platform.h"
++#include "forge/byteorder.h"
+ #include "forge/logger.h"
++#include "forge/tensor_byteswap.h"
+ 
+ namespace forge {
+ 
+@@ -198,6 +200,15 @@ bool NinfModel::load(const std::string& path) {
+     }
+ 
+     std::memcpy(&header_, mapped_data_, sizeof(NinfHeader));
++    // tools/format.py writes host-order ("=") structs, i.e. little-endian on
++    // the x86/arm64 machines that produce these files.
++    if (kHostBigEndian) {
++        header_.version = bswap32(header_.version);
++        header_.meta_offset = bswap32(header_.meta_offset);
++        header_.meta_size = bswap32(header_.meta_size);
++        header_.tensor_count = bswap32(header_.tensor_count);
++        header_.total_data_size = bswap64(header_.total_data_size);
++    }
+ 
+     if (std::strncmp(header_.magic, "NINFMODL", 8) != 0) {
+         close();
+@@ -216,6 +227,14 @@ bool NinfModel::load(const std::string& path) {
+     for (uint32_t i = 0; i < header_.tensor_count; ++i) {
+         TensorInfo info;
+         std::memcpy(&info, base + tensor_info_offset + i * sizeof(TensorInfo), sizeof(TensorInfo));
++        if (kHostBigEndian) {
++            info.dtype = bswap32(info.dtype);
++            info.ndim = bswap32(info.ndim);
++            for (uint64_t& d : info.dims)
++                d = bswap64(d);
++            info.offset = bswap64(info.offset);
++            info.size = bswap64(info.size);
++        }
+ 
+         LoadedTensor& lt = tensors_[i];
+         lt.name = std::string(info.name, strnlen(info.name, 64));
+@@ -267,6 +286,9 @@ TensorPtr NinfModel::get_tensor(const std::string& name, DeviceType device) cons
+     if (tensor->data() && lt.data_size > 0) {
+         size_t copy_size = std::min(static_cast<size_t>(lt.data_size), tensor->nbytes());
+         std::memcpy(tensor->data(), src, copy_size);
++        // The file is little-endian; convert the copy to host order.
++        if (kHostBigEndian && !byteswap_tensor_data(lt.dtype, tensor->data(), copy_size))
++            LOG_WARN("NinfModel: cannot convert tensor '" + name + "' to host byte order");
+     }
+ 
+     if (device == DeviceType::CUDA) {
+diff --git a/src/model/tensor_byteswap.cpp b/src/model/tensor_byteswap.cpp
+new file mode 100644
+index 0000000..ad2f6d5
+--- /dev/null
++++ b/src/model/tensor_byteswap.cpp
+@@ -0,0 +1,94 @@
++#include "forge/tensor_byteswap.h"
++
++#include <cstdint>
++#include <cstring>
++
++#include "forge/byteorder.h"
++
++namespace forge {
++
++namespace {
++
++template <typename T, T (*Swap)(T)>
++void swap_fields(uint8_t* f, int count) {
++    for (int i = 0; i < count; ++i, f += sizeof(T)) {
++        T v;
++        std::memcpy(&v, f, sizeof(T));
++        v = Swap(v);
++        std::memcpy(f, &v, sizeof(T));
++    }
++}
++
++// A run of `count` consecutive `width`-byte fields at byte `offset` of a block.
++struct FieldRun {
++    uint16_t offset;
++    uint8_t width;
++    uint8_t count;
++};
++
++struct SwapLayout {
++    size_t block_bytes;  // element size for plain types, block size for quants
++    FieldRun runs[2];
++    int nruns;
++};
++
++// Multi-byte fields of each block type, following the ggml block structs.
++// Everything not listed is a byte array (or int8) and keeps its order.
++bool swap_layout(DataType dtype, SwapLayout& l) {
++    switch (dtype) {
++    // Plain arrays: one field per element.
++    case DataType::FP32:
++    case DataType::INT32:   l = {4, {{0, 4, 1}}, 1}; return true;
++    case DataType::FP16:
++    case DataType::BF16:    l = {2, {{0, 2, 1}}, 1}; return true;
++    case DataType::INT8:
++    case DataType::FP8_E4M3: l = {1, {}, 0}; return true;
++    // 32-element blocks: fp16 d (and m)
++    case DataType::Q4_0:    l = {18, {{0, 2, 1}}, 1}; return true;
++    case DataType::Q4_1:    l = {20, {{0, 2, 2}}, 1}; return true;
++    case DataType::Q5_0:    l = {22, {{0, 2, 1}}, 1}; return true;  // qh is uint8_t[4]
++    case DataType::Q5_1:    l = {24, {{0, 2, 2}}, 1}; return true;
++    case DataType::Q8_0:    l = {34, {{0, 2, 1}}, 1}; return true;
++    case DataType::IQ4_NL:  l = {18, {{0, 2, 1}}, 1}; return true;
++    // K-quants: fp16 d (and dmin)
++    case DataType::Q2_K:    l = {84, {{80, 2, 2}}, 1}; return true;
++    case DataType::Q3_K:    l = {110, {{108, 2, 1}}, 1}; return true;
++    case DataType::Q4_K:    l = {144, {{0, 2, 2}}, 1}; return true;
++    case DataType::Q5_K:    l = {176, {{0, 2, 2}}, 1}; return true;
++    case DataType::Q6_K:    l = {210, {{208, 2, 1}}, 1}; return true;
++    // I-quants
++    case DataType::IQ2_XXS: l = {66, {{0, 2, 33}}, 1}; return true;   // d + uint16_t qs[32]
++    case DataType::IQ2_XS:  l = {74, {{0, 2, 33}}, 1}; return true;   // d + uint16_t qs[32]
++    case DataType::IQ2_S:   l = {82, {{0, 2, 1}}, 1}; return true;
++    case DataType::IQ3_XXS: l = {98, {{0, 2, 1}}, 1}; return true;
++    case DataType::IQ3_S:   l = {110, {{0, 2, 1}}, 1}; return true;
++    case DataType::IQ4_XS:  l = {136, {{0, 2, 2}}, 1}; return true;   // d + scales_h
++    case DataType::IQ1_S:   l = {50, {{0, 2, 1}, {34, 2, 8}}, 2}; return true;  // d, qh[8]
++    case DataType::IQ1_M:   l = {56, {}, 0}; return true;  // bytes only
++    default:
++        return false;
++    }
++}
++
++}  // namespace
++
++bool byteswap_tensor_data(DataType dtype, void* data, size_t nbytes) {
++    SwapLayout l;
++    if (!swap_layout(dtype, l) || nbytes % l.block_bytes != 0)
++        return false;
++    uint8_t* p = static_cast<uint8_t*>(data);
++    const size_t nblocks = nbytes / l.block_bytes;
++    for (int r = 0; r < l.nruns; ++r) {
++        const FieldRun& run = l.runs[r];
++        for (size_t b = 0; b < nblocks; ++b) {
++            uint8_t* f = p + b * l.block_bytes + run.offset;
++            if (run.width == 2)
++                swap_fields<uint16_t, bswap16>(f, run.count);
++            else
++                swap_fields<uint32_t, bswap32>(f, run.count);
++        }
++    }
++    return true;
++}
++
++}  // namespace forge
+diff --git a/src/tokenizer/tokenizer.cpp b/src/tokenizer/tokenizer.cpp
+index b4d816b..87b10ed 100644
+--- a/src/tokenizer/tokenizer.cpp
++++ b/src/tokenizer/tokenizer.cpp
+@@ -9,6 +9,7 @@
+ #include <regex>
+ #include <sstream>
+ 
++#include "forge/byteorder.h"
+ #include "forge/logger.h"
+ 
+ namespace forge {
+@@ -93,6 +94,7 @@ struct GgufMetaReader {
+     const uint8_t* data;
+     size_t size;
+     size_t offset;
++    bool swap = false;  // file byte order differs from the host's
+ 
+     bool check(size_t n) const { return offset + n <= size; }
+ 
+@@ -101,6 +103,8 @@ struct GgufMetaReader {
+             return "";
+         uint64_t len;
+         std::memcpy(&len, data + offset, 8);
++        if (swap)
++            len = bswap64(len);
+         if (len > size - offset - 8)
+             return "";
+         offset += 8;
+@@ -115,7 +119,7 @@ struct GgufMetaReader {
+         uint32_t v;
+         std::memcpy(&v, data + offset, 4);
+         offset += 4;
+-        return v;
++        return swap ? bswap32(v) : v;
+     }
+ 
+     uint8_t read_u8() {
+@@ -129,10 +133,10 @@ struct GgufMetaReader {
+     int32_t read_i32() {
+         if (!check(4))
+             return 0;
+-        int32_t v;
++        uint32_t v;
+         std::memcpy(&v, data + offset, 4);
+         offset += 4;
+-        return v;
++        return static_cast<int32_t>(swap ? bswap32(v) : v);
+     }
+ 
+     uint64_t read_u64() {
+@@ -141,15 +145,19 @@ struct GgufMetaReader {
+         uint64_t v;
+         std::memcpy(&v, data + offset, 8);
+         offset += 8;
+-        return v;
++        return swap ? bswap64(v) : v;
+     }
+ 
+     float read_f32() {
+         if (!check(4))
+             return 0.0f;
+-        float v;
+-        std::memcpy(&v, data + offset, 4);
++        uint32_t bits;
++        std::memcpy(&bits, data + offset, 4);
+         offset += 4;
++        if (swap)
++            bits = bswap32(bits);
++        float v;
++        std::memcpy(&v, &bits, 4);
+         return v;
+     }
+ 
+@@ -224,17 +232,20 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
+         return false;
+     }
+ 
+-    uint32_t magic;
+-    std::memcpy(&magic, buf.data(), 4);
+-    if (magic != 0x46554747) {
++    if (std::memcmp(buf.data(), "GGUF", 4) != 0) {
+         LOG_ERROR("Tokenizer: Not a GGUF file: " + path);
+         return false;
+     }
+ 
++    // GGUF is little-endian; big-endian GGUF files also exist. The version
++    // word is small, so its byte order identifies the file's.
+     uint32_t version;
+     std::memcpy(&version, buf.data() + 4, 4);
++    const bool swap = version > 0xFFFF && bswap32(version) <= 0xFFFF;
++    if (swap)
++        version = bswap32(version);
+ 
+-    GgufMetaReader reader{buf.data(), buf.size(), 8};
++    GgufMetaReader reader{buf.data(), buf.size(), 8, swap};
+ 
+     uint64_t tensor_count, meta_count;
+     if (version >= 3) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index b0a403c..795fccf 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -77,6 +77,14 @@ add_executable(forge-args-test test_args.cpp)
+ forge_link_native(forge-args-test)
+ add_test(NAME args COMMAND forge-args-test)
+ 
++# GGUF byte order: the same synthetic model written little- and big-endian,
++# loaded with GgufModel and the tokenizer. Metadata must read back exactly and
++# every tensor, dequantized, must match hashes recorded on a little-endian host
++# -- on a big-endian host this checks the load-time conversion. Host-only.
++add_executable(forge-gguf-byteorder-test test_gguf_byteorder.cpp)
++forge_link_native(forge-gguf-byteorder-test)
++add_test(NAME gguf-byteorder COMMAND forge-gguf-byteorder-test)
++
+ # Server-side per-session state: seq allocation, per-session token mirrors and
+ # LRU eviction, so two conversations cannot clobber each other's KV prefix.
+ # Host-only.
+diff --git a/tests/test_gguf_byteorder.cpp b/tests/test_gguf_byteorder.cpp
+new file mode 100644
+index 0000000..ca9419b
+--- /dev/null
++++ b/tests/test_gguf_byteorder.cpp
+@@ -0,0 +1,407 @@
++// GGUF byte-order handling.
++//
++// Writes the same synthetic model as a little-endian and as a big-endian GGUF
++// (every metadata value type; F32/F16/BF16 and every quantized type the CPU
++// path supports) and loads both with GgufModel. Metadata must read back
++// exactly, and every tensor, dequantized row by row, must hash to the values
++// recorded on a little-endian host. A big-endian host loading the
++// little-endian file therefore checks the load-time conversion against kernels
++// that never needed one.
++//
++// Set FORGE_GGUF_BYTEORDER_PRINT=1 to print the hashes instead of checking them.
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "forge/byteorder.h"
++#include "forge/fp16_compat.h"
++#include "forge/gguf_model.h"
++#include "forge/quant_traits.h"
++#include "forge/tensor.h"
++#include "forge/tensor_byteswap.h"
++#include "forge/tokenizer.h"
++
++using namespace forge;
++
++namespace {
++
++int g_failures = 0;
++
++void check(bool ok, const std::string& what) {
++    if (!ok) {
++        std::printf("FAIL %s\n", what.c_str());
++        ++g_failures;
++    }
++}
++
++// ---- GGUF writer (explicit byte order) ----
++
++struct Writer {
++    bool big_endian;
++    std::vector<uint8_t> buf;
++
++    void bytes(const void* p, size_t n) {
++        const uint8_t* b = static_cast<const uint8_t*>(p);
++        buf.insert(buf.end(), b, b + n);
++    }
++    template <typename T>
++    void scalar(T v) {
++        uint8_t b[sizeof(T)];
++        std::memcpy(b, &v, sizeof(T));
++        if (big_endian != kHostBigEndian)
++            for (size_t i = 0; i < sizeof(T) / 2; ++i)
++                std::swap(b[i], b[sizeof(T) - 1 - i]);
++        bytes(b, sizeof(T));
++    }
++    void str(const std::string& s) {
++        scalar<uint64_t>(s.size());
++        bytes(s.data(), s.size());
++    }
++    void key(const std::string& k, uint32_t type) {
++        str(k);
++        scalar<uint32_t>(type);
++    }
++    void pad_to(size_t align) {
++        while (buf.size() % align)
++            buf.push_back(0);
++    }
++};
++
++struct TensorSpec {
++    const char* name;
++    GgmlDType ggml_type;
++    DataType dtype;
++    std::vector<uint8_t> le_data;  // canonical little-endian payload
++};
++
++constexpr int kRows = 3;
++constexpr int kCols = 512;
++
++uint64_t g_rng = 0x9E3779B97F4A7C15ull;
++uint32_t rnd() {
++    g_rng ^= g_rng << 13;
++    g_rng ^= g_rng >> 7;
++    g_rng ^= g_rng << 17;
++    return static_cast<uint32_t>(g_rng >> 11);
++}
++
++void put_le16(uint8_t* p, uint16_t v) {
++    p[0] = static_cast<uint8_t>(v);
++    p[1] = static_cast<uint8_t>(v >> 8);
++}
++
++// Positive, normal fp16 in roughly [2^-11, 1).
++uint16_t sane_half() {
++    return static_cast<uint16_t>(0x1000 + rnd() % 0x2800);
++}
++
++// Random little-endian payload for kRows x kCols elements of `dt`; fp16 scale
++// fields (listed by byte offset) get sane values so the dequantized output is
++// finite and meaningful.
++std::vector<uint8_t> make_payload(DataType dt, std::initializer_list<int> f16_fields) {
++    const size_t nbytes = compute_quantized_bytes(static_cast<int64_t>(kRows) * kCols, dt);
++    std::vector<uint8_t> d(nbytes);
++    if (dt == DataType::FP32) {
++        for (size_t i = 0; i < nbytes; i += 4) {
++            float f = static_cast<float>(static_cast<int>(rnd() % 20001) - 10000) / 1000.0f;
++            uint32_t u;
++            std::memcpy(&u, &f, 4);
++            for (int k = 0; k < 4; ++k)
++                d[i + k] = static_cast<uint8_t>(u >> (8 * k));
++        }
++        return d;
++    }
++    if (dt == DataType::FP16 || dt == DataType::BF16) {
++        for (size_t i = 0; i < nbytes; i += 2) {
++            const uint16_t sign = (rnd() & 1) ? 0x8000 : 0;
++            put_le16(&d[i], static_cast<uint16_t>(
++                                sign | (dt == DataType::FP16 ? sane_half() : 0x3C00 + rnd() % 0x0400)));
++        }
++        return d;
++    }
++    for (auto& b : d)
++        b = static_cast<uint8_t>(rnd());
++    const size_t block = dtype_block_size(dt);
++    for (size_t off = 0; off < nbytes; off += block)
++        for (int f : f16_fields)
++            put_le16(&d[off + f], sane_half());
++    return d;
++}
++
++std::vector<TensorSpec> make_tensors() {
++    std::vector<TensorSpec> t;
++    auto add = [&](const char* name, GgmlDType g, DataType dt, std::initializer_list<int> f16) {
++        t.push_back({name, g, dt, make_payload(dt, f16)});
++    };
++    add("t.f32", GgmlDType::F32, DataType::FP32, {});
++    add("t.f16", GgmlDType::F16, DataType::FP16, {});
++    add("t.bf16", GgmlDType::BF16, DataType::BF16, {});
++    add("t.q4_0", GgmlDType::Q4_0, DataType::Q4_0, {0});
++    add("t.q4_1", GgmlDType::Q4_1, DataType::Q4_1, {0, 2});
++    add("t.q5_0", GgmlDType::Q5_0, DataType::Q5_0, {0});
++    add("t.q5_1", GgmlDType::Q5_1, DataType::Q5_1, {0, 2});
++    add("t.q8_0", GgmlDType::Q8_0, DataType::Q8_0, {0});
++    add("t.q2_k", GgmlDType::Q2_K, DataType::Q2_K, {80, 82});
++    add("t.q3_k", GgmlDType::Q3_K, DataType::Q3_K, {108});
++    add("t.q4_k", GgmlDType::Q4_K, DataType::Q4_K, {0, 2});
++    add("t.q5_k", GgmlDType::Q5_K, DataType::Q5_K, {0, 2});
++    add("t.q6_k", GgmlDType::Q6_K, DataType::Q6_K, {208});
++    add("t.iq2_xxs", GgmlDType::IQ2_XXS, DataType::IQ2_XXS, {0});
++    add("t.iq2_xs", GgmlDType::IQ2_XS, DataType::IQ2_XS, {0});
++    add("t.iq2_s", GgmlDType::IQ2_S, DataType::IQ2_S, {0});
++    add("t.iq3_xxs", GgmlDType::IQ3_XXS, DataType::IQ3_XXS, {0});
++    add("t.iq3_s", GgmlDType::IQ3_S, DataType::IQ3_S, {0});
++    add("t.iq1_s", GgmlDType::IQ1_S, DataType::IQ1_S, {0});
++    add("t.iq1_m", GgmlDType::IQ1_M, DataType::IQ1_M, {});
++    add("t.iq4_nl", GgmlDType::IQ4_NL, DataType::IQ4_NL, {0});
++    add("t.iq4_xs", GgmlDType::IQ4_XS, DataType::IQ4_XS, {0});
++    return t;
++}
++
++std::vector<uint8_t> write_gguf(const std::vector<TensorSpec>& tensors, bool big_endian) {
++    Writer w{big_endian, {}};
++    w.bytes("GGUF", 4);
++    w.scalar<uint32_t>(3);
++    w.scalar<uint64_t>(tensors.size());
++    w.scalar<uint64_t>(25);  // KV count
++    w.key("general.architecture", 8);
++    w.str("llama");
++    w.key("general.alignment", 4);
++    w.scalar<uint32_t>(32);
++    w.key("t.u8", 0);
++    w.scalar<uint8_t>(200);
++    w.key("t.i8", 1);
++    w.scalar<int8_t>(-5);
++    w.key("t.u16", 2);
++    w.scalar<uint16_t>(60000);
++    w.key("t.i16", 3);
++    w.scalar<int16_t>(-30000);
++    w.key("t.u32", 4);
++    w.scalar<uint32_t>(4000000000u);
++    w.key("t.i32", 5);
++    w.scalar<int32_t>(-2000000000);
++    w.key("t.f32", 6);
++    w.scalar<float>(1.5f);
++    w.key("t.bool_true", 7);
++    w.scalar<uint8_t>(1);
++    w.key("t.bool_false", 7);
++    w.scalar<uint8_t>(0);
++    w.key("t.u64", 10);
++    w.scalar<uint64_t>(1ull << 40);
++    w.key("t.i64", 11);
++    w.scalar<int64_t>(-(1ll << 40));
++    w.key("t.f64", 12);
++    w.scalar<double>(2.25);
++    w.key("t.arr_i32", 9);
++    w.scalar<uint32_t>(5);
++    w.scalar<uint64_t>(3);
++    for (int32_t v : {1, -2, 300000})
++        w.scalar<int32_t>(v);
++    w.key("t.arr_bool", 9);
++    w.scalar<uint32_t>(7);
++    w.scalar<uint64_t>(3);
++    for (uint8_t v : {1, 0, 1})
++        w.scalar<uint8_t>(v);
++    w.key("t.arr_str", 9);
++    w.scalar<uint32_t>(8);
++    w.scalar<uint64_t>(2);
++    w.str("a");
++    w.str("bc");
++    // Minimal SentencePiece-style vocabulary for the tokenizer's own reader.
++    w.key("tokenizer.ggml.model", 8);
++    w.str("llama");
++    w.key("tokenizer.ggml.tokens", 9);
++    w.scalar<uint32_t>(8);
++    w.scalar<uint64_t>(5);
++    for (const char* tok : {"<unk>", "<s>", "</s>", "a", "b"})
++        w.str(tok);
++    w.key("tokenizer.ggml.scores", 9);
++    w.scalar<uint32_t>(6);
++    w.scalar<uint64_t>(5);
++    for (float v : {0.0f, 0.0f, 0.0f, -1.5f, -2.25f})
++        w.scalar<float>(v);
++    w.key("tokenizer.ggml.token_type", 9);
++    w.scalar<uint32_t>(5);
++    w.scalar<uint64_t>(5);
++    for (int32_t v : {2, 3, 3, 1, 1})
++        w.scalar<int32_t>(v);
++    w.key("tokenizer.ggml.bos_token_id", 4);
++    w.scalar<uint32_t>(1);
++    w.key("tokenizer.ggml.eos_token_id", 4);
++    w.scalar<uint32_t>(2);
++    w.key("tokenizer.ggml.add_bos_token", 7);
++    w.scalar<uint8_t>(1);
++    w.key("tokenizer.ggml.add_eos_token", 7);
++    w.scalar<uint8_t>(0);
++
++    uint64_t offset = 0;
++    std::vector<uint64_t> offsets;
++    for (const auto& t : tensors) {
++        w.str(t.name);
++        w.scalar<uint32_t>(2);
++        w.scalar<uint64_t>(kCols);  // ne0 (innermost)
++        w.scalar<uint64_t>(kRows);  // ne1
++        w.scalar<uint32_t>(static_cast<uint32_t>(t.ggml_type));
++        w.scalar<uint64_t>(offset);
++        offsets.push_back(offset);
++        offset += (t.le_data.size() + 31) / 32 * 32;
++    }
++    w.pad_to(32);
++    for (const auto& t : tensors) {
++        std::vector<uint8_t> payload = t.le_data;
++        if (big_endian)  // the field swap is its own inverse
++            check(byteswap_tensor_data(t.dtype, payload.data(), payload.size()),
++                  std::string("byteswap ") + t.name);
++        w.bytes(payload.data(), payload.size());
++        w.pad_to(32);
++    }
++    return w.buf;
++}
++
++uint64_t fnv1a(uint64_t h, const void* p, size_t n) {
++    const uint8_t* b = static_cast<const uint8_t*>(p);
++    for (size_t i = 0; i < n; ++i) {
++        h ^= b[i];
++        h *= 1099511628211ull;
++    }
++    return h;
++}
++
++// Hash of the tensor's values as little-endian float bit patterns, row by row.
++uint64_t hash_tensor(const Tensor& t) {
++    uint64_t h = 14695981039346656037ull;
++    std::vector<float> row(kCols);
++    for (int r = 0; r < kRows; ++r) {
++        const uint8_t* base = static_cast<const uint8_t*>(t.data());
++        switch (t.dtype()) {
++        case DataType::FP32:
++            std::memcpy(row.data(), base + static_cast<size_t>(r) * kCols * 4, kCols * 4);
++            break;
++        case DataType::FP16:
++        case DataType::BF16:
++            for (int c = 0; c < kCols; ++c) {
++                uint16_t v;
++                std::memcpy(&v, base + (static_cast<size_t>(r) * kCols + c) * 2, 2);
++                uint32_t bits = t.dtype() == DataType::BF16
++                                    ? static_cast<uint32_t>(v) << 16
++                                    : fp16_detail::half_to_float_bits(v);
++                std::memcpy(&row[c], &bits, 4);
++            }
++            break;
++        default:
++            get_dequant_row_fn(t.dtype())(base, row.data(), kCols, r);
++            break;
++        }
++        for (float f : row) {
++            uint8_t le[4];
++            store_le32(le, [&] {
++                uint32_t u;
++                std::memcpy(&u, &f, 4);
++                return u;
++            }());
++            h = fnv1a(h, le, 4);
++        }
++    }
++    return h;
++}
++
++struct Expected {
++    const char* name;
++    uint64_t hash;
++};
++
++// Recorded on x86-64 (FORGE_GGUF_BYTEORDER_PRINT=1).
++const Expected kExpected[] = {
++#include "test_gguf_byteorder_expected.inc"
++};
++
++void check_model(const std::string& path, const std::vector<TensorSpec>& tensors,
++                 const char* label, bool print) {
++    GgufModel m;
++    if (!m.load(path)) {
++        check(false, std::string(label) + ": load");
++        return;
++    }
++    const std::string L = std::string(label) + ": ";
++    check(m.get_metadata_str("general.architecture") == "llama", L + "string");
++    check(m.get_metadata_int("t.u8") == 200, L + "u8");
++    check(m.get_metadata_int("t.i8") == -5, L + "i8");
++    check(m.get_metadata_int("t.u16") == 60000, L + "u16");
++    check(m.get_metadata_int("t.i16") == -30000, L + "i16");
++    check(m.get_metadata_int("t.u32") == 4000000000ll, L + "u32");
++    check(m.get_metadata_int("t.i32") == -2000000000ll, L + "i32");
++    check(m.get_metadata_float("t.f32") == 1.5, L + "f32");
++    check(m.get_metadata_int("t.bool_true") == 1, L + "bool true");
++    check(m.get_metadata_int("t.bool_false", 7) == 0, L + "bool false");
++    check(m.get_metadata_int("t.u64") == (1ll << 40), L + "u64");
++    check(m.get_metadata_int("t.i64") == -(1ll << 40), L + "i64");
++    check(m.get_metadata_float("t.f64") == 2.25, L + "f64");
++    check(m.get_metadata_int_array("t.arr_i32") == std::vector<int32_t>({1, -2, 300000}),
++          L + "int32 array");
++    check(m.get_metadata_int_array("t.arr_bool") == std::vector<int32_t>({1, 0, 1}),
++          L + "bool array");
++
++    Tokenizer tok;
++    check(tok.load_from_gguf(path), L + "tokenizer load");
++    check(tok.vocab_size() == 5, L + "tokenizer vocab size");
++    check(tok.id_to_token(3) == "a", L + "tokenizer token text");
++    check(tok.token_score(3) == -1.5f && tok.token_score(4) == -2.25f, L + "tokenizer scores");
++    check(tok.token_type(0) == 2 && tok.token_type(4) == 1, L + "tokenizer token types");
++    check(tok.bos_token_id() == 1 && tok.eos_token_id() == 2, L + "tokenizer bos/eos");
++    check(tok.add_bos_token() && !tok.add_eos_token(), L + "tokenizer add_bos/add_eos");
++
++    for (const auto& spec : tensors) {
++        TensorPtr t = m.get_tensor(spec.name, DeviceType::CPU);
++        if (!t) {
++            check(false, L + "get_tensor " + spec.name);
++            continue;
++        }
++        const uint64_t h = hash_tensor(*t);
++        if (print) {
++            std::printf("    {\"%s\", 0x%016llxull},\n", spec.name,
++                        static_cast<unsigned long long>(h));
++            continue;
++        }
++        bool found = false;
++        for (const auto& e : kExpected)
++            if (spec.name == std::string(e.name)) {
++                found = true;
++                check(h == e.hash, L + "tensor " + spec.name);
++            }
++        check(found, L + "no expected hash for " + spec.name);
++    }
++}
++
++}  // namespace
++
++int main() {
++    const char* p = std::getenv("FORGE_GGUF_BYTEORDER_PRINT");
++    const bool print = p && p[0] == '1';
++    const std::vector<TensorSpec> tensors = make_tensors();
++
++    const char* tmp = std::getenv("TMPDIR");
++    const std::string dir = tmp && *tmp ? tmp : "/tmp";
++    for (bool be : {false, true}) {
++        const std::string path =
++            dir + "/forge_gguf_byteorder_" + (be ? "be" : "le") + ".gguf";
++        const std::vector<uint8_t> file = write_gguf(tensors, be);
++        FILE* f = std::fopen(path.c_str(), "wb");
++        if (!f || std::fwrite(file.data(), 1, file.size(), f) != file.size()) {
++            std::printf("FAIL cannot write %s\n", path.c_str());
++            return 1;
++        }
++        std::fclose(f);
++        if (print && be)
++            break;  // the little-endian file's hashes are the reference
++        check_model(path, tensors, be ? "big-endian file" : "little-endian file", print);
++        std::remove(path.c_str());
++    }
++    if (print)
++        return 0;
++    std::printf(g_failures ? "FAILED (%d)\n" : "ALL PASSED\n", g_failures);
++    return g_failures ? 1 : 0;
++}
+diff --git a/tests/test_gguf_byteorder_expected.inc b/tests/test_gguf_byteorder_expected.inc
+new file mode 100644
+index 0000000..571e64b
+--- /dev/null
++++ b/tests/test_gguf_byteorder_expected.inc
+@@ -0,0 +1,22 @@
++    {"t.f32", 0x7d1f2a468adb6a1bull},
++    {"t.f16", 0xac5d07222c9ed6c0ull},
++    {"t.bf16", 0x9869da00ea7451dbull},
++    {"t.q4_0", 0x7431b52955dea4a7ull},
++    {"t.q4_1", 0x14b6166af67ad246ull},
++    {"t.q5_0", 0x823b4e8a0cb2ba08ull},
++    {"t.q5_1", 0x2cbf233935e1ea89ull},
++    {"t.q8_0", 0xbed8f23c78009751ull},
++    {"t.q2_k", 0x0385ccf3a817d07dull},
++    {"t.q3_k", 0x9305b98ba111fb56ull},
++    {"t.q4_k", 0x5e1619450235f7afull},
++    {"t.q5_k", 0x5d9007cd64269e32ull},
++    {"t.q6_k", 0x66a7fbaeecd14b1dull},
++    {"t.iq2_xxs", 0x82418d44a560947cull},
++    {"t.iq2_xs", 0x16b903cbe331911dull},
++    {"t.iq2_s", 0xaf4bce401cbe29ceull},
++    {"t.iq3_xxs", 0x7130dc40f0705542ull},
++    {"t.iq3_s", 0xeefd259e19e014d1ull},
++    {"t.iq1_s", 0xe2ab695193553851ull},
++    {"t.iq1_m", 0xcb80efd19f45dd7eull},
++    {"t.iq4_nl", 0xf358ccae4462a3c1ull},
++    {"t.iq4_xs", 0x48d6fe25da07f458ull},
+-- 
+2.43.0
+

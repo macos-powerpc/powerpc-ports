@@ -1,0 +1,344 @@
+From 67e003dbfa90f13dd1e5bd03fae084908367edb4 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 03:53:32 +0000
+Subject: [PATCH 07/20] fix(cpu): make quant block decoding independent of host
+ byte order
+
+Several scalar dequant routines and the ppc64 kernels reinterpret byte
+arrays as wider words, or word tables as bytes, assuming a little-endian
+host. On a big-endian host they decode wrong values even when the
+multi-byte fields of a block are in host order:
+
+- Q5_0/Q5_1: qh is uint8_t[4] holding a little-endian 32-bit mask but was
+  memcpy'd into a host-order uint32.
+- IQ2_XXS: grid indices were read through a byte view of two host-order
+  uint32 words built from the qs uint16 values.
+- IQ3_XXS and IQ1_M read byte arrays as host-order uint32/uint16.
+- I-quant grids (iq2s/iq2xs/iq2xxs/iq1s as uint64_t, iq3s/iq3xxs as
+  uint32_t) hold one grid value per byte, least significant first, but
+  were read through byte pointers in memory order (scalar dequant and the
+  ppc64 IQ kernels).
+- ppc64 Q4_K: the kmask scale unpack memcpy'd the 12 scale bytes into
+  host-order words before extracting bytes by value.
+
+Add include/forge/byteorder.h with little-endian load/store helpers and
+use them at these sites. On little-endian hosts the helpers are plain
+loads/stores and the decoded values are unchanged: a dump of every scalar
+dequant routine over random blocks is bit-identical before and after on
+x86-64, and identical to that x86-64 dump on 32-bit big-endian PowerPC
+(qemu-ppc), where the old code got Q5_0/Q5_1, IQ1_S/IQ1_M, IQ2_*, IQ3_*
+wrong. (Q3_K's kmask trick is byte-local, so it needed no change.)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ include/forge/byteorder.h             | 77 +++++++++++++++++++++++++++
+ src/operators/cpu/arch/ppc64/gemm.h   |  6 ++-
+ src/operators/cpu/arch/ppc64/quants.h | 14 +++--
+ src/operators/cpu/common/dequant.cpp  | 53 ++++++++++--------
+ 4 files changed, 119 insertions(+), 31 deletions(-)
+ create mode 100644 include/forge/byteorder.h
+
+diff --git a/include/forge/byteorder.h b/include/forge/byteorder.h
+new file mode 100644
+index 0000000..4420d8d
+--- /dev/null
++++ b/include/forge/byteorder.h
+@@ -0,0 +1,77 @@
++#pragma once
++// Byte-order helpers.
++//
++// GGUF and the ggml quantization block formats are little-endian. Code that
++// reinterprets a byte array as wider words (or a word table as bytes) must go
++// through these helpers so it gives the same result on big-endian hosts. On
++// little-endian hosts every function here compiles to a plain load/store.
++
++#include <cstdint>
++#include <cstring>
++
++#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
++    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++#    define FORGE_BIG_ENDIAN 1
++#else
++#    define FORGE_BIG_ENDIAN 0
++#endif
++
++namespace forge {
++
++inline constexpr bool kHostBigEndian = FORGE_BIG_ENDIAN != 0;
++
++constexpr uint16_t bswap16(uint16_t v) {
++    return static_cast<uint16_t>((v >> 8) | (v << 8));
++}
++
++constexpr uint32_t bswap32(uint32_t v) {
++    return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
++}
++
++constexpr uint64_t bswap64(uint64_t v) {
++    return (static_cast<uint64_t>(bswap32(static_cast<uint32_t>(v))) << 32) |
++           bswap32(static_cast<uint32_t>(v >> 32));
++}
++
++// Little-endian loads from (possibly unaligned) memory.
++inline uint16_t load_le16(const void* p) {
++    uint16_t v;
++    std::memcpy(&v, p, sizeof(v));
++    return kHostBigEndian ? bswap16(v) : v;
++}
++
++inline uint32_t load_le32(const void* p) {
++    uint32_t v;
++    std::memcpy(&v, p, sizeof(v));
++    return kHostBigEndian ? bswap32(v) : v;
++}
++
++inline uint64_t load_le64(const void* p) {
++    uint64_t v;
++    std::memcpy(&v, p, sizeof(v));
++    return kHostBigEndian ? bswap64(v) : v;
++}
++
++// Little-endian stores to (possibly unaligned) memory. store_le64(dst, v)
++// writes v's least significant byte first, which is how the ggml I-quant grid
++// tables (uint64_t/uint32_t constants holding one grid value per byte) are
++// meant to be read.
++inline void store_le16(void* p, uint16_t v) {
++    if (kHostBigEndian)
++        v = bswap16(v);
++    std::memcpy(p, &v, sizeof(v));
++}
++
++inline void store_le32(void* p, uint32_t v) {
++    if (kHostBigEndian)
++        v = bswap32(v);
++    std::memcpy(p, &v, sizeof(v));
++}
++
++inline void store_le64(void* p, uint64_t v) {
++    if (kHostBigEndian)
++        v = bswap64(v);
++    std::memcpy(p, &v, sizeof(v));
++}
++
++}  // namespace forge
+diff --git a/src/operators/cpu/arch/ppc64/gemm.h b/src/operators/cpu/arch/ppc64/gemm.h
+index 719bf38..8f65d38 100644
+--- a/src/operators/cpu/arch/ppc64/gemm.h
++++ b/src/operators/cpu/arch/ppc64/gemm.h
+@@ -18,6 +18,7 @@
+ #include <vector>
+ #include <atomic>
+ 
++#include "forge/byteorder.h"
+ #include "forge/types.h"
+ #include "../../common/quant_helpers.h"
+ #include "../../common/scalar.h"
+@@ -38,8 +39,9 @@ static inline void decode_q4_k_scales_vsx(const uint8_t scales[12],
+     constexpr uint32_t kmask2 = 0x0f0f0f0f;
+     constexpr uint32_t kmask3 = 0x03030303;
+ 
+-    uint32_t utmp[4] = {0, 0, 0, 0};
+-    std::memcpy(utmp, scales, 12);
++    // The kmask trick treats the 12 scale bytes as little-endian words; the
++    // extraction below works on values, so only the loads need care.
++    uint32_t utmp[4] = {load_le32(scales), load_le32(scales + 4), load_le32(scales + 8), 0};
+ 
+     utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+     const uint32_t uaux = utmp[1] & kmask1;
+diff --git a/src/operators/cpu/arch/ppc64/quants.h b/src/operators/cpu/arch/ppc64/quants.h
+index cf3e2f9..a886015 100644
+--- a/src/operators/cpu/arch/ppc64/quants.h
++++ b/src/operators/cpu/arch/ppc64/quants.h
+@@ -23,6 +23,7 @@
+ #include "../../common/quant_tables.h"
+ #include "../../common/quant_helpers.h"
+ #include "../../common/scalar.h"
++#include "forge/byteorder.h"
+ #include "forge/types.h"
+ #include "vec_dot.h"
+ 
+@@ -166,8 +167,8 @@ static inline float dot_iq2_xs_q8_K_vsx(const uint8_t* iq2xs_row,
+             alignas(16) uint8_t sign_mask[32];
+             for (int l = 0; l < 4; ++l) {
+                 const uint16_t qs_u16 = qs[4 * ib32 + l];
+-                memcpy(grid_vals + l * 8,
+-                       &forge::ops::iq2xs_grid[qs_u16 & 511], 8);
++                // Grid tables hold one value per byte, least significant first.
++                store_le64(grid_vals + l * 8, forge::ops::iq2xs_grid[qs_u16 & 511]);
+                 const uint8_t signs_byte = forge::ops::ksigns_iq2xs[qs_u16 >> 9];
+                 for (int j = 0; j < 8; ++j)
+                     sign_mask[l * 8 + j] =
+@@ -276,10 +277,8 @@ static inline float dot_iq3_s_q8_K_vsx(const uint8_t* iq3s_row,
+                     const int idx2 = qs[2 * l + 1] |
+                         ((qh[half] << (7 - 2 * l)) & 256);
+                     // iq3s_grid entries are 4 bytes each
+-                    memcpy(grid_vals + l * 8 + 0,
+-                           &forge::ops::iq3s_grid[idx1], 4);
+-                    memcpy(grid_vals + l * 8 + 4,
+-                           &forge::ops::iq3s_grid[idx2], 4);
++                    store_le32(grid_vals + l * 8 + 0, forge::ops::iq3s_grid[idx1]);
++                    store_le32(grid_vals + l * 8 + 4, forge::ops::iq3s_grid[idx2]);
+                     const uint8_t s = signs[l];
+                     for (int j = 0; j < 8; ++j)
+                         sign_mask_arr[l * 8 + j] =
+@@ -386,8 +385,7 @@ static inline float dot_iq2_s_q8_K_vsx(const uint8_t* iq2s_row,
+                 const int grid_idx = qs[l] |
+                     ((qh[ib32] << (8 - 2 * l)) & 0x300);
+                 // iq2s_grid entries are 8 bytes each
+-                memcpy(grid_vals + l * 8,
+-                       &forge::ops::iq2s_grid[grid_idx], 8);
++                store_le64(grid_vals + l * 8, forge::ops::iq2s_grid[grid_idx]);
+                 const uint8_t s = signs[l];
+                 for (int j = 0; j < 8; ++j)
+                     sign_mask_arr[l * 8 + j] =
+diff --git a/src/operators/cpu/common/dequant.cpp b/src/operators/cpu/common/dequant.cpp
+index 7b079c5..8e08859 100644
+--- a/src/operators/cpu/common/dequant.cpp
++++ b/src/operators/cpu/common/dequant.cpp
+@@ -6,6 +6,7 @@
+ #include <cstring>
+ 
+ #include "dequant.h"
++#include "forge/byteorder.h"
+ #include "quant_helpers.h"
+ #include "quant_tables.h"
+ #include "quant_tables_iq13.h"
+@@ -90,8 +91,7 @@ void dequantize_q5_0_row(const uint8_t* q_data, float* out, int K, int row) {
+     for (int bi = 0; bi < blocks_per_row; ++bi) {
+         const uint8_t* block_ptr = row_ptr + bi * Q5_0_BLOCK_SIZE;
+         float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr));
+-        uint32_t qh;
+-        memcpy(&qh, block_ptr + 2, 4);
++        const uint32_t qh = load_le32(block_ptr + 2);  // uint8_t qh[4], little-endian
+         const uint8_t* qs = block_ptr + 6;
+ 
+         int base = bi * 32;
+@@ -122,8 +122,7 @@ void dequantize_q5_1_row(const uint8_t* q_data, float* out, int K, int row) {
+         const uint8_t* block_ptr = row_ptr + bi * Q5_1_BLOCK_SIZE;
+         float d = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr));
+         float m = fp16_to_fp32(*reinterpret_cast<const uint16_t*>(block_ptr + 2));
+-        uint32_t qh;
+-        memcpy(&qh, block_ptr + 4, 4);
++        const uint32_t qh = load_le32(block_ptr + 4);  // uint8_t qh[4], little-endian
+         const uint8_t* qs = block_ptr + 8;
+ 
+         int base = bi * 32;
+@@ -403,7 +402,8 @@ void dequantize_iq2_s_row(const uint8_t* q_data, float* out, int K, int row) {
+             for (int l = 0; l < 4; ++l) {
+                 float dl = db[l / 2];
+                 int grid_idx = qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+-                const uint8_t* grid = reinterpret_cast<const uint8_t*>(&iq2s_grid[grid_idx]);
++                uint8_t grid[8];
++                store_le64(grid, iq2s_grid[grid_idx]);
+                 for (int j = 0; j < 8; ++j) {
+                     y[j] = dl * static_cast<float>(grid[j]) *
+                            (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
+@@ -440,15 +440,17 @@ void dequantize_iq2_xxs_row(const uint8_t* q_data, float* out, int K, int row) {
+         float* y = out + bi * QK_K;
+ 
+         for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+-            // Each ib32 group uses 4 uint16_t from qs
++            // Each ib32 group uses 4 uint16_t from qs: the first two hold four
++            // 8-bit grid indices, the last two the signs and the scale (ggml
++            // reads them as two little-endian uint32 words).
+             const uint16_t* q2 = qs + 4 * ib32;
+-            uint32_t aux32[2];
+-            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+-            const uint8_t* aux8 = reinterpret_cast<const uint8_t*>(aux32);
++            const uint32_t aux32[2] = {q2[0] | (static_cast<uint32_t>(q2[1]) << 16),
++                                       q2[2] | (static_cast<uint32_t>(q2[3]) << 16)};
+             const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+ 
+             for (int l = 0; l < 4; ++l) {
+-                const uint8_t* grid = reinterpret_cast<const uint8_t*>(&iq2xxs_grid[aux8[l]]);
++                uint8_t grid[8];
++                store_le64(grid, iq2xxs_grid[(aux32[0] >> (8 * l)) & 0xFF]);
+                 const uint8_t signs = ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+                 for (int j = 0; j < 8; ++j) {
+                     y[j] = db * static_cast<float>(grid[j]) *
+@@ -535,7 +537,8 @@ void dequantize_iq2_xs_row(const uint8_t* q_data, float* out, int K, int row) {
+             db[0] = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+             db[1] = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+             for (int l = 0; l < 4; ++l) {
+-                const uint8_t* grid = reinterpret_cast<const uint8_t*>(&iq2xs_grid[qs[4 * ib32 + l] & 511]);
++                uint8_t grid[8];
++                store_le64(grid, iq2xs_grid[qs[4 * ib32 + l] & 511]);
+                 const uint8_t signs = ksigns_iq2xs[qs[4 * ib32 + l] >> 9];
+                 for (int j = 0; j < 8; ++j) {
+                     y[j] = db[l / 2] * static_cast<float>(grid[j]) *
+@@ -570,8 +573,9 @@ void dequantize_iq3_s_row(const uint8_t* q_data, float* out, int K, int row) {
+             const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+             const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+             for (int l = 0; l < 4; ++l) {
+-                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&iq3s_grid[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)]);
+-                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&iq3s_grid[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)]);
++                uint8_t grid1[4], grid2[4];
++                store_le32(grid1, iq3s_grid[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)]);
++                store_le32(grid2, iq3s_grid[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)]);
+                 for (int j = 0; j < 4; ++j) {
+                     y[j + 0] = db1 * static_cast<float>(grid1[j]) * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                     y[j + 4] = db1 * static_cast<float>(grid2[j]) * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+@@ -581,8 +585,9 @@ void dequantize_iq3_s_row(const uint8_t* q_data, float* out, int K, int row) {
+             qs += 8;
+             signs += 4;
+             for (int l = 0; l < 4; ++l) {
+-                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(&iq3s_grid[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)]);
+-                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(&iq3s_grid[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)]);
++                uint8_t grid1[4], grid2[4];
++                store_le32(grid1, iq3s_grid[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)]);
++                store_le32(grid2, iq3s_grid[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)]);
+                 for (int j = 0; j < 4; ++j) {
+                     y[j + 0] = db2 * static_cast<float>(grid1[j]) * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                     y[j + 4] = db2 * static_cast<float>(grid2[j]) * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+@@ -626,7 +631,8 @@ void dequantize_iq1_s_row(const uint8_t* q_data, float* out, int K, int row) {
+             const float delta = (qh[sib] & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
+             for (int l = 0; l < 4; ++l) {
+                 const int grid = qs[4 * sib + l] | (((qh[sib] >> (3 * l)) & 7) << 8);
+-                const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + grid);
++                int8_t g[8];
++                store_le64(g, iq1s_grid[grid]);
+                 for (int j = 0; j < 8; ++j) y[j] = dl * (g[j] + delta);
+                 y += 8;
+             }
+@@ -645,12 +651,13 @@ void dequantize_iq3_xxs_row(const uint8_t* q_data, float* out, int K, int row) {
+         const uint8_t* scales_and_signs = qs + QK_K / 4;         // bytes 64..96 (32 bytes)
+         float* y = out + bi * QK_K;
+         for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+-            const uint32_t aux32 = *reinterpret_cast<const uint32_t*>(scales_and_signs + 4 * ib32);
++            const uint32_t aux32 = load_le32(scales_and_signs + 4 * ib32);
+             const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+             const uint8_t* qp = qs + 8 * ib32;
+             for (int l = 0; l < 4; ++l) {
+-                const uint8_t* grid1 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + qp[2 * l + 0]);
+-                const uint8_t* grid2 = reinterpret_cast<const uint8_t*>(iq3xxs_grid + qp[2 * l + 1]);
++                uint8_t grid1[4], grid2[4];
++                store_le32(grid1, iq3xxs_grid[qp[2 * l + 0]]);
++                store_le32(grid2, iq3xxs_grid[qp[2 * l + 1]]);
+                 const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                 for (int j = 0; j < 4; ++j) {
+                     y[j + 0] = db * static_cast<float>(grid1[j]) * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+@@ -672,7 +679,10 @@ void dequantize_iq1_m_row(const uint8_t* q_data, float* out, int K, int row) {
+         const uint8_t* qh = block_ptr + 32;                // 16 bytes
+         const uint8_t* scales = block_ptr + 32 + 16;       // 8 bytes
+         float* y = out + bi * QK_K;
+-        const uint16_t* sc = reinterpret_cast<const uint16_t*>(scales);
++        // uint8_t scales[8] read as four little-endian uint16 words.
++        uint16_t sc[4];
++        for (int i = 0; i < 4; ++i)
++            sc[i] = load_le16(scales + 2 * i);
+         uint16_t scale_u16 = static_cast<uint16_t>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                                     ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+         const float d = fp16_to_fp32(scale_u16);
+@@ -693,7 +703,8 @@ void dequantize_iq1_m_row(const uint8_t* q_data, float* out, int K, int row) {
+             delta[3] = (b2 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+             for (int l = 0; l < 4; ++l) {
+                 const float dl = (l < 2) ? dl1 : dl2;
+-                const int8_t* g = reinterpret_cast<const int8_t*>(iq1s_grid + idx[l]);
++                int8_t g[8];
++                store_le64(g, iq1s_grid[idx[l]]);
+                 for (int j = 0; j < 8; ++j) y[j] = dl * (g[j] + delta[l]);
+                 y += 8;
+             }
+-- 
+2.43.0
+

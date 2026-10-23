@@ -1,0 +1,138 @@
+From b3174052ba716ced7be145137039fb0546419ded Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 03:46:30 +0000
+Subject: [PATCH 02/20] fix(scheduler): use a 64-bit prompt hash and compare
+ tokens on prefix-cache hit
+
+The legacy prefix cache keyed prompts by an FNV-1a hash held in size_t and
+treated a key match as a hit, sharing the cached sequence's KV cells
+without looking at the tokens. On 32-bit hosts the 64-bit offset basis and
+prime were truncated (the multiplier degenerates to 0x1B3), which makes
+collisions likely; a collision silently reuses another prompt's KV cache.
+
+- Compute the hash in uint64_t (RequestScheduler::hash_prompt and the
+  equivalent, currently unused, KVMemory::hash_tokens).
+- On lookup, require the stored tokens to equal the request's prompt
+  before reporting a hit.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ include/forge/kv_memory.h           |  2 +-
+ include/forge/request_scheduler.h   |  8 +++++---
+ src/inference/kv_memory.cpp         |  6 +++---
+ src/inference/request_scheduler.cpp | 18 +++++++++++-------
+ 4 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/include/forge/kv_memory.h b/include/forge/kv_memory.h
+index 4738b27..b665465 100644
+--- a/include/forge/kv_memory.h
++++ b/include/forge/kv_memory.h
+@@ -132,7 +132,7 @@ public:
+     // ---- Prefix cache ----
+     // Returns the hash of the given tokens for prefix cache lookup.
+     // The caller (RequestScheduler) uses this to manage its own prefix cache.
+-    static size_t hash_tokens(const std::vector<int32_t>& tokens);
++    static uint64_t hash_tokens(const std::vector<int32_t>& tokens);
+ 
+     // ---- KVMem tiered working set ----
+     // Tiered KV (bounded GPU working set + host-archived history + query-based
+diff --git a/include/forge/request_scheduler.h b/include/forge/request_scheduler.h
+index f8fbec2..4c5f300 100644
+--- a/include/forge/request_scheduler.h
++++ b/include/forge/request_scheduler.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstdint>
+ #include <functional>
+ #include <memory>
+ #include <mutex>
+@@ -163,7 +164,7 @@ private:
+     void update_swap_stats();
+ 
+     // Prefix cache helpers (contiguous mode: legacy prompt_cache_)
+-    static size_t hash_prompt(const std::vector<int32_t>& tokens);
++    static uint64_t hash_prompt(const std::vector<int32_t>& tokens);
+     bool try_prefix_cache(GenerateRequest& req);
+     void evict_prefix_cache(int seq_id);
+     void preserve_prefix_cache(int seq_id, int prompt_len);
+@@ -185,9 +186,10 @@ private:
+     int next_request_id_ = 0;
+     int max_num_seqs_ = 4;
+ 
+-    // Prefix cache: keyed by hash of prompt tokens
++    // Prefix cache: keyed by hash of prompt tokens. A hash match is only a
++    // candidate; the stored tokens are compared before the cache is used.
+     static constexpr int MIN_CACHE_PROMPT_LEN = 16;
+-    std::unordered_map<size_t, CachedPrompt> prompt_cache_;
++    std::unordered_map<uint64_t, CachedPrompt> prompt_cache_;
+     int prefix_cache_hits_ = 0;
+     int prefix_cache_misses_ = 0;
+ 
+diff --git a/src/inference/kv_memory.cpp b/src/inference/kv_memory.cpp
+index 6bc58d9..1454d0e 100644
+--- a/src/inference/kv_memory.cpp
++++ b/src/inference/kv_memory.cpp
+@@ -125,10 +125,10 @@ void KVMemory::set_working_set(std::unique_ptr<KVWorkingSetManager> ws) {
+ }
+ 
+ // FNV-1a 64-bit hash (same as RequestScheduler's hash_prompt)
+-size_t KVMemory::hash_tokens(const std::vector<int32_t>& tokens) {
+-    size_t h = 14695981039346656037ULL;
++uint64_t KVMemory::hash_tokens(const std::vector<int32_t>& tokens) {
++    uint64_t h = 14695981039346656037ULL;
+     for (int32_t t : tokens) {
+-        h ^= static_cast<size_t>(t);
++        h ^= static_cast<uint32_t>(t);
+         h *= 1099511628211ULL;
+     }
+     return h;
+diff --git a/src/inference/request_scheduler.cpp b/src/inference/request_scheduler.cpp
+index a283ee0..06d71cb 100644
+--- a/src/inference/request_scheduler.cpp
++++ b/src/inference/request_scheduler.cpp
+@@ -22,11 +22,12 @@ namespace forge {
+ 
+ // ---- Prompt hash (FNV-1a) ----
+ 
+-size_t RequestScheduler::hash_prompt(const std::vector<int32_t>& tokens) {
+-    // FNV-1a 64-bit hash
+-    size_t h = 14695981039346656037ULL;
++uint64_t RequestScheduler::hash_prompt(const std::vector<int32_t>& tokens) {
++    // FNV-1a 64-bit hash. Kept in uint64_t: in a 32-bit size_t the offset basis
++    // and prime are truncated and the multiplier degenerates to 0x1B3.
++    uint64_t h = 14695981039346656037ULL;
+     for (int32_t t : tokens) {
+-        h ^= static_cast<size_t>(t);
++        h ^= static_cast<uint32_t>(t);
+         h *= 1099511628211ULL;
+     }
+     return h;
+@@ -47,10 +48,13 @@ bool RequestScheduler::try_prefix_cache(GenerateRequest& req) {
+     if (!memory)
+         return false;
+ 
+-    size_t h = hash_prompt(req.prompt_tokens);
++    uint64_t h = hash_prompt(req.prompt_tokens);
+     auto it = prompt_cache_.find(h);
+ 
+-    if (it != prompt_cache_.end() && it->second.valid) {
++    // Compare the tokens too: a hash collision must not hand this request
++    // another prompt's KV cache.
++    if (it != prompt_cache_.end() && it->second.valid &&
++        it->second.tokens == req.prompt_tokens) {
+         auto& cached = it->second;
+ 
+         // Verify the cached seq_id still has cells in the KV cache
+@@ -529,7 +533,7 @@ bool RequestScheduler::step() {
+             // Paged mode registers on request finish via finish_request_paged().
+             if (!paged_mode_ && prefix_cache_enabled_ && !req.from_cache &&
+                 static_cast<int>(req.prompt_tokens.size()) >= MIN_CACHE_PROMPT_LEN && memory) {
+-                size_t h = hash_prompt(req.prompt_tokens);
++                uint64_t h = hash_prompt(req.prompt_tokens);
+                 // Only register if not already cached
+                 if (prompt_cache_.find(h) == prompt_cache_.end()) {
+                     prompt_cache_[h] = {req.prompt_tokens, rid, true};
+-- 
+2.43.0
+

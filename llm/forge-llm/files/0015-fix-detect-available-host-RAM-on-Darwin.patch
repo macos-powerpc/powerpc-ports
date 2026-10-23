@@ -1,0 +1,230 @@
+From b6f4e9369cec8576b5f56c69eba8462257023cc6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 06:17:51 +0000
+Subject: [PATCH 15/20] fix: detect available host RAM on Darwin
+
+The CPU KV-cache sizing reads available RAM to pick the context length,
+but only Linux was implemented (/proc/meminfo MemAvailable); everywhere
+else it reported "Host RAM unknown" and capped the context at 4096
+tokens regardless of the machine.
+
+Move the helper, duplicated in transformer_engine.cpp and
+gemma4_engine.cpp, to host_mem::available_system_bytes() and add Darwin:
+free + inactive pages from host_statistics(HOST_VM_INFO) times the page
+size, about what MemAvailable counts. The 32-bit vm_statistics form is
+used because it exists on every Darwin release (host_statistics64 needs
+10.6), and the result is clamped to size_t for 32-bit processes. Linux
+behaviour is unchanged; other platforms still report 0 (unknown).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ include/forge/host_mem_pool.h                |  5 ++
+ src/core/host_mem_pool.cpp                   | 51 +++++++++++++++++++-
+ src/inference/engines/gemma4_engine.cpp      | 32 +-----------
+ src/inference/engines/transformer_engine.cpp | 27 +----------
+ 4 files changed, 59 insertions(+), 56 deletions(-)
+
+diff --git a/include/forge/host_mem_pool.h b/include/forge/host_mem_pool.h
+index 4ebafde..5fef30c 100644
+--- a/include/forge/host_mem_pool.h
++++ b/include/forge/host_mem_pool.h
+@@ -24,6 +24,11 @@ void deallocate(void* ptr);
+ // Free every cached block back to the OS.
+ void clear_cache();
+ 
++// RAM the system could give this process without paging anything out, in
++// bytes: MemAvailable on Linux, free + inactive pages on Darwin. 0 when it
++// cannot be determined (callers then fall back instead of guessing).
++size_t available_system_bytes();
++
+ // Diagnostics.
+ size_t cached_bytes();
+ size_t alloc_count();   // total allocate() calls
+diff --git a/src/core/host_mem_pool.cpp b/src/core/host_mem_pool.cpp
+index 92dce21..9524700 100644
+--- a/src/core/host_mem_pool.cpp
++++ b/src/core/host_mem_pool.cpp
+@@ -1,14 +1,22 @@
+ #include "forge/host_mem_pool.h"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
++#include <limits>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ #if defined(_MSC_VER)
+ #include <malloc.h>
+ #endif
++#if defined(__linux__)
++#include <fstream>
++#include <string>
++#elif defined(__APPLE__)
++#include <mach/mach.h>
++#endif
+ 
+ namespace forge {
+ namespace host_mem {
+@@ -183,5 +191,46 @@ void print_stats() {
+                  p.allocs, p.hits, hit_pct, p.cached / 1024, p.sizes.size());
+ }
+ 
++size_t available_system_bytes() {
++#if defined(__linux__)
++    std::ifstream in("/proc/meminfo");
++    if (!in)
++        return 0;
++    std::string key;
++    unsigned long long kb = 0;
++    std::string unit;
++    while (in >> key >> kb >> unit) {
++        if (key == "MemAvailable:")
++            return static_cast<size_t>(
++                std::min<unsigned long long>(kb * 1024ull, std::numeric_limits<size_t>::max()));
++        std::string rest;
++        std::getline(in, rest);  // consume the remainder of this line
++    }
++    return 0;
++#elif defined(__APPLE__)
++    // Free plus inactive pages: inactive pages are reclaimed without paging
++    // anything out, which is about what Linux reports as MemAvailable. The
++    // 32-bit vm_statistics form exists on every Darwin release
++    // (host_statistics64 needs 10.6).
++    mach_port_t host = mach_host_self();
++    vm_statistics_data_t vm;
++    mach_msg_type_number_t count = HOST_VM_INFO_COUNT;
++    vm_size_t page = 0;
++    const bool ok = host_page_size(host, &page) == KERN_SUCCESS &&
++                    host_statistics(host, HOST_VM_INFO, reinterpret_cast<host_info_t>(&vm),
++                                    &count) == KERN_SUCCESS;
++    mach_port_deallocate(mach_task_self(), host);
++    if (!ok || page == 0)
++        return 0;
++    const uint64_t bytes =
++        (static_cast<uint64_t>(vm.free_count) + static_cast<uint64_t>(vm.inactive_count)) *
++        static_cast<uint64_t>(page);
++    // A 32-bit process cannot use more than size_t anyway.
++    return static_cast<size_t>(std::min<uint64_t>(bytes, std::numeric_limits<size_t>::max()));
++#else
++    return 0;
++#endif
++}
++
+ }  // namespace host_mem
+-}  // namespace forge
+\ No newline at end of file
++}  // namespace forge
+diff --git a/src/inference/engines/gemma4_engine.cpp b/src/inference/engines/gemma4_engine.cpp
+index 4ec88c1..31821f1 100644
+--- a/src/inference/engines/gemma4_engine.cpp
++++ b/src/inference/engines/gemma4_engine.cpp
+@@ -12,6 +12,7 @@
+ #include "forge/inference/tensor_device_utils.h"
+ #include "forge/inference_batch.h"
+ #include "forge/kv_cache_dtype.h"
++#include "forge/host_mem_pool.h"
+ #include "forge/logger.h"
+ #include "forge/operators.h"
+ #include "forge/perf_profiler.h"
+@@ -22,35 +23,6 @@
+ 
+ namespace forge {
+ 
+-namespace {
+-
+-// Available host RAM in bytes (Linux: /proc/meminfo "MemAvailable").
+-// Returns 0 when it cannot be determined, so the caller keeps the requested
+-// context rather than guessing: a wrong guess means either a needlessly short
+-// context or an OOM kill of the whole process. Mirrors the identically named
+-// helper in transformer_engine.cpp.
+-size_t available_system_memory_bytes() {
+-#if defined(__linux__)
+-    std::ifstream in("/proc/meminfo");
+-    if (!in)
+-        return 0;
+-    std::string key;
+-    unsigned long long kb = 0;
+-    std::string unit;
+-    while (in >> key >> kb >> unit) {
+-        if (key == "MemAvailable:")
+-            return static_cast<size_t>(kb) * 1024ull;
+-        std::string rest;
+-        std::getline(in, rest);  // consume the remainder of this line
+-    }
+-    return 0;
+-#else
+-    return 0;
+-#endif
+-}
+-
+-}  // namespace
+-
+ Gemma4Engine::Gemma4Engine(Model& model, InferenceContext& ctx)
+     : TransformerEngine(model, ctx), attention_(kv_cache_) {
+     if (!init_weights()) {
+@@ -239,7 +211,7 @@ void Gemma4Engine::init_kv_cache(const ModelConfig& cfg) {
+ #endif
+         } else {
+             // Host KV competes with the page cache and every other process.
+-            const size_t host_ram = available_system_memory_bytes();
++            const size_t host_ram = host_mem::available_system_bytes();
+             if (host_ram > 0)
+                 usable_mem = host_ram / 2;
+         }
+diff --git a/src/inference/engines/transformer_engine.cpp b/src/inference/engines/transformer_engine.cpp
+index fe3427f..957f496 100644
+--- a/src/inference/engines/transformer_engine.cpp
++++ b/src/inference/engines/transformer_engine.cpp
+@@ -20,6 +20,7 @@
+ #include "forge/kv_memory.h"
+ #include "forge/kernel_selector.h"
+ #include "forge/kv_sizing.h"
++#include "forge/host_mem_pool.h"
+ #include "forge/logger.h"
+ #include "forge/operators.h"
+ #include "forge/perf_profiler.h"
+@@ -55,30 +56,6 @@ size_t file_size_bytes(const std::string& path) {
+     return static_cast<size_t>(end);
+ }
+ 
+-// Available host RAM in bytes (Linux: /proc/meminfo "MemAvailable").
+-// Returns 0 when it cannot be determined, so callers fall back rather than
+-// guess -- a wrong guess means either a needlessly short context or an OOM
+-// kill of the whole process.
+-size_t available_system_memory_bytes() {
+-#if defined(__linux__)
+-    std::ifstream in("/proc/meminfo");
+-    if (!in)
+-        return 0;
+-    std::string key;
+-    unsigned long long kb = 0;
+-    std::string unit;
+-    while (in >> key >> kb >> unit) {
+-        if (key == "MemAvailable:")
+-            return static_cast<size_t>(kb) * 1024ull;
+-        std::string rest;
+-        std::getline(in, rest);  // consume the remainder of this line
+-    }
+-    return 0;
+-#else
+-    return 0;
+-#endif
+-}
+-
+ }  // namespace
+ 
+ TransformerEngine::TransformerEngine(Model& model, InferenceContext& ctx)
+@@ -1124,7 +1101,7 @@ void TransformerEngine::init_kv_cache(const ModelConfig& cfg) {
+         } else {
+             // Host KV competes with the OS page cache and every other process,
+             // so only claim a fraction of what is actually available.
+-            const size_t host_ram = available_system_memory_bytes();
++            const size_t host_ram = host_mem::available_system_bytes();
+             if (host_ram > 0)
+                 usable_mem = host_ram / 2;
+         }
+-- 
+2.43.0
+

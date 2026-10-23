@@ -1,0 +1,83 @@
+From 0cadc5e34366f8bc65c1bdb3b90d70df46ac7f41 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 03:47:04 +0000
+Subject: [PATCH 03/20] fix(gguf): reject sizes that do not fit size_t on
+ 32-bit hosts
+
+Three uint64 quantities from the file were narrowed to size_t without a
+check, which only matters where size_t is 32-bit:
+
+- st_size: a file over 4 GiB was mapped as (size mod 4 GiB) bytes.
+- tensor_count / metadata_kv_count: used as std::vector sizes.
+- array lengths: std::vector<int32_t> arr(arr_len) was truncated while the
+  fill loop still ran arr_len times, writing past the allocation.
+
+Refuse files that cannot be mapped in one piece, and reject counts or
+array lengths larger than the bytes that remain in the file (every
+element takes at least one byte, so such files are corrupt anyway).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/model/gguf_model.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/model/gguf_model.cpp b/src/model/gguf_model.cpp
+index d697fdd..9bfb39f 100644
+--- a/src/model/gguf_model.cpp
++++ b/src/model/gguf_model.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <numeric>
+ #include <stdexcept>
+ #include <thread>
+@@ -142,6 +143,13 @@ bool GgufModel::load(const std::string& path) {
+         close();
+         return false;
+     }
++    // The whole file is mapped at once, so it must fit in size_t (a 32-bit
++    // host would otherwise silently map only st_size mod 4 GiB bytes).
++    if (static_cast<uint64_t>(sb.st_size) > std::numeric_limits<size_t>::max()) {
++        LOG_ERROR("GGUF file is too large to map in this process's address space: " + path);
++        close();
++        return false;
++    }
+     mapped_size_ = static_cast<size_t>(sb.st_size);
+ 
+     mapped_data_ = forge_mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+@@ -180,6 +188,16 @@ bool GgufModel::load(const std::string& path) {
+         metadata_kv_count = mc;
+     }
+ 
++    // Every tensor and KV entry takes at least one byte of the file, so larger
++    // counts are corrupt. Checking here also keeps them from being truncated
++    // when used as container sizes on 32-bit hosts.
++    if (tensor_count > mapped_size_ || metadata_kv_count > mapped_size_) {
++        LOG_ERROR("GGUF header has implausible counts: tensors=" + std::to_string(tensor_count) +
++                  " kv=" + std::to_string(metadata_kv_count));
++        close();
++        return false;
++    }
++
+     LOG_INFO("GGUF version=" + std::to_string(version) +
+              " tensor_count=" + std::to_string(tensor_count) +
+              " metadata_kv_count=" + std::to_string(metadata_kv_count));
+@@ -279,6 +297,13 @@ bool GgufModel::load(const std::string& path) {
+             uint64_t arr_len;
+             std::memcpy(&arr_len, data + offset, 8);
+             offset += 8;
++            // Each element takes at least one byte; a longer array is corrupt
++            // (and would be truncated by std::vector's size_t on 32-bit).
++            if (offset > mapped_size_ || arr_len > mapped_size_ - offset) {
++                LOG_ERROR("GGUF array length out of range for key: " + key);
++                close();
++                return false;
++            }
+ 
+             // Store INT32 arrays for MRoPE sections etc.
+             if (arr_type == 5) {  // INT32 array
+-- 
+2.43.0
+
