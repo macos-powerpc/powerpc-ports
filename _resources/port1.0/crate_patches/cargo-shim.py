@@ -24,7 +24,9 @@ This script answers those calls:
 - `cargo build` / `cargo rustc`: minicargo, then the messages for the binaries
   and the cdylib it made (a `staticlib` is just left in the target directory,
   for makefiles: newsboat links `target/<triple>/release/libnewsboat.a`).
-  `--package` picks a member of the workspace. A cdylib is built with `--panic unwind` (rustc's
+  `--package` picks a member of the workspace. Global options before the
+  command apply to it (librsvg's Makefile: `cargo --locked build ...`).
+  A cdylib is built with `--panic unwind` (rustc's
   default; pyo3 turns panics into Python exceptions), MRUSTC_SHIM_PANIC
   overrides it. Linker arguments from `-C link-arg(s)` (after `--`, or in
   RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS) go to minicargo's `--link-arg`;
@@ -716,6 +718,15 @@ def cargo_build(command, opts):
 def cargo_main(args):
     if args and args[0].startswith("+"):
         args = args[1:]     # +toolchain
+    # Options before the command are cargo's global ones and apply to the command (librsvg's Makefile runs
+    # `cargo --locked build ...`)
+    global_args = []
+    while args and args[0].startswith("-") and args[0] not in ("-V", "--version"):
+        global_args.append(args[0])
+        if args[0] in ("--color", "--config") and len(args) > 1:
+            global_args.append(args[1])
+            args = args[1:]
+        args = args[1:]
     if not args:
         die("no command given")
     if args[0] in ("-V", "--version"):
@@ -725,7 +736,7 @@ def cargo_main(args):
         sys.stderr.write(f"{TOOL} (mrustc PortGroup stand-in): `cargo {args[0]}`: nothing to do, minicargo resolves "
                          "from the vendored crates (cargo.crates), not from Cargo.lock\n")
         return
-    command, opts = args[0], parse_options(args[1:])
+    command, opts = args[0], parse_options(global_args + args[1:])
     if command == "metadata":
         cargo_metadata(opts)
     elif command in ("build", "rustc"):
