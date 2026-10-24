@@ -1,0 +1,79 @@
+From e0bfc9ad61b07f109b70b976c280b8ba4fed9fd3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 24 Oct 2026 07:45:48 +0000
+Subject: [PATCH] mir/optimise: a reborrow whose destination has another writer
+ is not a useless reborrow
+
+gix-merge 0.23.0 (gitoxide 0.61.0) src/tree/function/resolve.rs:2127
+
+    fn pick_mut<'a, T: ?Sized>(side: ConflictMapping, ours: &'a mut T, theirs: &'a mut T) -> &'a mut T {
+        match side { Original => ours, Swapped => theirs }
+    }
+
+failed with `MIR ERROR: ::"gix_merge-0_23_0"::tree::function::resolve::pick_mut
+BB1/0: ensure_valid: Use of non-valid lvalue - a1` (every binary back to 0324,
+with and without -O).
+
+Each arm reborrows a different argument into the match result (`_5 = &mut *a1`
+/ `_5 = &mut *a2`, the reborrow coercion typeck inserts for `&mut` operands).
+MIR_Optimise_DeTemporary_ReborrowOfUnused replaces a reborrow's destination by
+its source when the source has no other use apart from drops, but it never
+checked that the reborrow is the destination's only writer: both reborrows
+qualified, every use of `_5` was rewritten to `a1` and the `Swapped` arm
+returned `ours`.  The crate's error is the MIR validator noticing the rewritten
+conditional drop `drop(a1 IF df$0)` between the arms before `retval = a1`; the
+same rewrite is a silent miscompile when no conditional drop separates the
+writers: `let r: &mut T; if c { r = ours; } else { r = theirs; } r` compiled to
+`if a0 { bb1 } else { bb1 }; retval = a1` and returned `ours` for both
+branches at run time (the loop-with-break deferred init too).
+
+A candidate whose destination is written anywhere else (an Assign, Asm output
+or SaveDropFlag in another statement, a Call return in a terminator; writes
+through the reference `(*_5) = x` are writes to the pointee and do not count)
+is now dropped from the list.  The single-reborrow rewrite is unchanged.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index 840c88be..f393504d 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -2460,7 +2460,14 @@ bool MIR_Optimise_DeTemporary_ReborrowOfUnused(::MIR::TypeResolve& state, ::MIR:
+         }
+     }
+ 
+-    // Must be the only use (apart from dropping) of the source lvalue
++    // Must be the only use (apart from dropping) of the source lvalue, and the reborrow must be the only write to
++    // the destination: every use of the destination is rewritten to the source, so a second writer (e.g. the other
++    // arm of `match side { A => ours, B => theirs }` reborrowing a different argument into the same slot) would make
++    // every path read the first source.
++    auto is_dst_write = [](const ::MIR::LValue& lv, ValUsage vu, const ::MIR::LValue::Storage& dst) {
++        // A write through the reference (`(*_5) = x`) is a write to the pointee, not to the slot.
++        return vu == ValUsage::Write && lv.m_root == dst && (lv.m_wrappers.empty() || !lv.m_wrappers[0].is_Deref());
++        };
+     for(const auto& blk : fcn.blocks)
+     {
+         for(const auto& stmt : blk.statements)
+@@ -2470,6 +2477,10 @@ bool MIR_Optimise_DeTemporary_ReborrowOfUnused(::MIR::TypeResolve& state, ::MIR:
+             for(auto& p : possible) {
+                 if( pos == p.pos )
+                     continue;
++                if( visit_mir_lvalues(stmt, [&](const ::MIR::LValue& lv, ValUsage vu) { return is_dst_write(lv, vu, p.replace); }) ) {
++                    DEBUG(state << p.replace << " Written - " << stmt);
++                    p.used = true;
++                }
+                 if( stmt.is_Drop() && stmt.as_Drop().slot.m_root == p.slot && stmt.as_Drop().slot.m_wrappers.empty() ) {
+                     DEBUG(state << p.slot << " Droped - " << stmt);
+                     continue;
+@@ -2481,6 +2492,10 @@ bool MIR_Optimise_DeTemporary_ReborrowOfUnused(::MIR::TypeResolve& state, ::MIR:
+             }
+         }
+         for(auto& p : possible) {
++            if( visit_mir_lvalues(blk.terminator, [&](const ::MIR::LValue& lv, ValUsage vu) { return is_dst_write(lv, vu, p.replace); }) ) {
++                DEBUG(state << p.replace << " Written - " << blk.terminator);
++                p.used = true;
++            }
+             if( visit_mir_lvalues(blk.terminator, [&](const ::MIR::LValue& lv, ValUsage /*vu*/) { return lv.m_root == p.slot; }) ) {
+                 DEBUG(state << p.slot << " Used - " << blk.terminator);
+                 p.used = true;

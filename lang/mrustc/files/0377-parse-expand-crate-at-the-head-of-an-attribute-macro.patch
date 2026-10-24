@@ -1,0 +1,148 @@
+From 2031a20d5b322d14446d2a64cef20be48b08461e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 24 Oct 2026 02:43:48 +0000
+Subject: [PATCH 377/377] parse/expand: `$crate` at the head of an attribute
+ macro path
+
+Found by the attr-path-crate-pm-test kit while fixing gix-protocol's `#[crate::bisync::only_async]`: the same
+attribute written through a macro_rules body, `#[$crate::bisync::only_async] $($t)*`, failed to parse,
+
+    MACRO<::"dollar"::drop_async> error:0: Unexpected token TOK_STRING"dollar"/**/, expected TOK_IDENT
+
+The macro_rules evaluator spells `$crate` as `::"<crate name>"::` (a string token after `::`), for the defining
+crate too: its `crate`-keyword branch never runs because the evaluator is always given a crate name. Parse_Path
+reads that spelling back; Parse_MetaItem read the leading `::` and then wanted an identifier, so an attribute
+macro named through `$crate` (a facade crate's convenience macro wrapping its re-exported proc macro, the
+gix-protocol `mod bisync` shape reached from another crate) could not be used from any macro_rules.
+
+AST::AttributeName gets `crate_name`: Parse_MetaItem fills it from `::"name"::` and from an interpolated
+absolute path to a named crate (`#[$p]` with `$p:path` holding another crate's `$crate`), Expand_LookupMacro
+starts the macro lookup at that crate's root (this crate's own name resolves to the local root, as for paths),
+and the three places that spell an attribute name print it back: the debug/DumpAST printer as `::"name"::`
+(what the lexer accepts), stringify!'s `$m:meta` the same, the proc-macro bridge's forwarded attributes as the
+one `$crate` ident visit_path sends (send_dollar_crate). ast/attrs.hpp changes: a wide rebuild, no rlib format
+change.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/ast/ast.cpp b/src/ast/ast.cpp
+index 8bce6536..ad51d6fd 100644
+--- a/src/ast/ast.cpp
++++ b/src/ast/ast.cpp
+@@ -65,6 +65,10 @@ const Attribute* AttributeList::get(const char *name) const
+     }
+     else
+     {
++        if( x.crate_name != "" )
++            os << "::\"" << x.crate_name << "\"::";
++        else if( x.has_leading )
++            os << "::";
+         for(const auto& i : x.elems)
+         {
+             if(&i != &x.elems.front())
+diff --git a/src/ast/attrs.hpp b/src/ast/attrs.hpp
+index 5c711cae..f13e40b2 100644
+--- a/src/ast/attrs.hpp
++++ b/src/ast/attrs.hpp
+@@ -65,6 +65,10 @@ TAGGED_UNION(AttributeData, None,
+ struct AttributeName
+ {
+     bool has_leading = false;
++    /// `::"name"::x` = `$crate::x` of crate `name` in a macro_rules body (macro_rules/eval.cpp spells `$crate` as
++    /// a string token after `::`, for the defining crate too): kept apart from the elements so the macro lookup starts
++    /// at that crate's root; `has_leading` is set with it
++    RcString    crate_name;
+     ::std::vector<RcString>   elems;
+ 
+     bool is_trivial() const { return elems.size() == 1; }
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index 4368ae83..ee3a2208 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -391,7 +391,11 @@ MacroRef Expand_LookupMacro(const Span& mi_span, const ::AST::Crate& crate, LLis
+         return AST::Path(::std::move(crate_name), ::std::vector<AST::PathNode>());
+     };
+     AST::Path   p;
+-    if( path.has_leading ) {
++    if( path.crate_name != "" ) {
++        // `::"name"::x` = `$crate::x` of crate `name` (a facade crate's macro_rules naming its re-exported proc macro)
++        p = crate_root(path.crate_name);
++    }
++    else if( path.has_leading ) {
+         if( elems.size() > 1 && elems[0] == "crate" ) {
+             // `::crate::x`
+             ofs = 1;
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index fa2b960b..f5833f81 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -1585,7 +1585,12 @@ namespace {
+         }
+         void visit_meta_item(const ::AST::Attribute& i)
+         {
+-            if( i.name().has_leading ) {
++            if( i.name().crate_name != "" ) {
++                // `$crate::x` (see visit_path's Absolute arm)
++                m_pmi.send_dollar_crate(i.name().crate_name.c_str());
++                m_pmi.send_symbol("::");
++            }
++            else if( i.name().has_leading ) {
+                 m_pmi.send_symbol("::");
+             }
+             for(const auto& e : i.name().elems)
+diff --git a/src/expand/stringify.cpp b/src/expand/stringify.cpp
+index 6d8f7b7c..ab4ac2c7 100644
+--- a/src/expand/stringify.cpp
++++ b/src/expand/stringify.cpp
+@@ -28,7 +28,13 @@ namespace {
+             // `$m:meta`: the attribute's path and arguments (`doc = "x"`, `inline`, `cfg(test)`)
+             case TOK_INTERPOLATED_META: {
+                 const auto& a = tok.frag_meta();
+-                if( a.name().has_leading )
++                if( a.name().crate_name != "" ) {
++                    // `$crate` as the macro_rules evaluator spells it (the token-tree case prints the same tokens)
++                    rv += "::\"";
++                    rv += a.name().crate_name.c_str();
++                    rv += "\"::";
++                }
++                else if( a.name().has_leading )
+                     rv += "::";
+                 for(const auto& e : a.name().elems)
+                 {
+diff --git a/src/parse/root.cpp b/src/parse/root.cpp
+index e3d27f7d..d16c972b 100644
+--- a/src/parse/root.cpp
++++ b/src/parse/root.cpp
+@@ -1247,7 +1247,7 @@ AST::Attribute Parse_MetaItem(TokenStream& lex)
+         }
+         // Record the path's head the way the written form below does (`Expand_LookupMacro` reads both back as
+         // a path): `crate::x` keeps `crate`, 2018's `::name::x` (the parser's `=name`) a leading `::` and `name`,
+-        // `self::`/`super::` their keywords
++        // `self::`/`super::` their keywords, a named crate (`$crate` of another crate) its name
+         TU_MATCH_HDRA( (path->m_class), {)
+         default: {
+             throw ParseError::Unexpected(lex, tok);
+@@ -1263,7 +1263,9 @@ AST::Attribute Parse_MetaItem(TokenStream& lex)
+                 name.elems.push_back( RcString::new_interned(e.crate.c_str() + 1) );
+             }
+             else {
++                // `$crate` of another crate inside the fragment
+                 name.has_leading = true;
++                name.crate_name = e.crate;
+             }
+             }
+         TU_ARMA(Self, e) {
+@@ -1297,6 +1299,12 @@ AST::Attribute Parse_MetaItem(TokenStream& lex)
+     else
+     {
+         name.has_leading = lex.getTokenIf(TOK_DOUBLE_COLON);
++        // `$crate` in a macro_rules body is `::"<crate name>"::` (Parse_Path reads the same; macro_rules/eval.cpp
++        // NAMEDVALUE_MAGIC_CRATE): `#[$crate::attrs::only_async]` was "Unexpected token TOK_STRING, expected TOK_IDENT"
++        if( name.has_leading && lex.getTokenIf(TOK_STRING, tok) ) {
++            name.crate_name = RcString::new_interned(tok.str());
++            GET_CHECK_TOK(tok, lex, TOK_DOUBLE_COLON);
++        }
+         do {
+             name.elems.push_back( get_tok_ident_rword(lex) );
+         } while(GET_TOK(tok, lex) == TOK_DOUBLE_COLON);

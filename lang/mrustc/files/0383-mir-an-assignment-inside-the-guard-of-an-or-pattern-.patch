@@ -1,0 +1,145 @@
+From 1beeeb43a19563c909bff1dcd933a582db3c561f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 24 Oct 2026 10:22:59 +0000
+Subject: [PATCH] mir: an assignment inside the guard of an or-pattern arm
+
+gix-tix 0.6.0 (gitoxide 0.61.0) src/lib.rs:3273 event_loop
+
+    ref_tree::Input::PinReferences { .. }
+    | ref_tree::Input::ResolveRemoteReferences(_)
+    | ref_tree::Input::DeleteLocalBranches { .. }
+    | ref_tree::Input::DeleteRemoteReferences { .. }
+        if {
+            pending_rebase_conflict.is_some() || pending_todo_rebase_conflict.is_some() || {
+                dirty |= refresh_rebase_session(&mut app, &repository_path, repository_is_bare);
+                app.rebase_continuation_pending()
+            }
+        } => { ..; continue; }
+
+failed with `error:0: Attempting to move/initialise a value where not
+allowed (across scope 4762)`; `dirty` is a local of the enclosing loop.
+
+A guard on an arm with several pattern alternatives is emitted once and
+cloned per alternative (from_hir_match.cpp code_save/insert_cloned), inside
+a frozen scope, and get_slot_state_mut's Freeze arm rejected every state
+change of a slot outside the guard, moves and assignments alike.  rustc
+allows assigning unrelated variables in a guard (moves and writes to
+scrutinee-borrowed places are the errors), and the Reference's match-guard
+note says an or-pattern arm's guard may run once per alternative with
+observable side effects.  The clones carry the same statements as the
+first copy (the old value's drop, the drop-flag updates), so an assignment
+leaves every copy in the same tracked state.
+
+get_val_state_mut_p/get_slot_state_mut take `for_assign`: mark_value_assigned
+passes it, and so does complete_scope's apply_end_state (the merged end
+state of a split or loop inside the guard, e.g. the `||` short-circuit,
+reaches the outer slot through the same walk; a move inside would already
+have failed at its own site, the walk visits the Freeze scope even when
+a Split captured the state).  Moves across a frozen scope still fail.
+Single-pattern guards were never frozen.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/mir/from_hir.hpp b/src/mir/from_hir.hpp
+index cabdb7dd..c2fd678d 100644
+--- a/src/mir/from_hir.hpp
++++ b/src/mir/from_hir.hpp
+@@ -445,9 +445,11 @@ private:
+         Argument
+     };
+     const VarState& get_slot_state(const Span& sp, unsigned int idx, SlotType type, const ScopeHandle* above_scope=nullptr) const;
+-    VarState& get_slot_state_mut(const Span& sp, unsigned int idx, SlotType type);
++    /// `for_assign`: the state is being set by an assignment (initialise/overwrite), which a frozen scope allows (see
++    /// the Freeze arm)
++    VarState& get_slot_state_mut(const Span& sp, unsigned int idx, SlotType type, bool for_assign=false);
+ 
+-    VarState* get_val_state_mut_p(const Span& sp, const ::MIR::LValue& lv, bool expect_valid=false);
++    VarState* get_val_state_mut_p(const Span& sp, const ::MIR::LValue& lv, bool expect_valid=false, bool for_assign=false);
+ 
+     void merge_split_lists(const Span& sp, const ScopeHandle& handle,
+         const ::std::map<unsigned int, VarState>& states, ::std::map<unsigned int, VarState>& end_states, MirBuilder::SlotType type
+diff --git a/src/mir/mir_builder.cpp b/src/mir/mir_builder.cpp
+index c76b7c22..984f7d9b 100644
+--- a/src/mir/mir_builder.cpp
++++ b/src/mir/mir_builder.cpp
+@@ -481,7 +481,7 @@ void MirBuilder::mark_value_assigned(const Span& sp, const ::MIR::LValue& dst)
+         ASSERT_BUG(sp, dst.m_wrappers.empty(), "Assignment to a component of the return value should be impossible.");
+         return ;
+     }
+-    VarState*   state_p = get_val_state_mut_p(sp, dst, /*expect_valid=*/true);
++    VarState*   state_p = get_val_state_mut_p(sp, dst, /*expect_valid=*/true, /*for_assign=*/true);
+ 
+     if( state_p )
+     {
+@@ -1757,7 +1757,9 @@ void MirBuilder::complete_scope(ScopeDef& sd)
+         {
+             for(auto& ent : end_state.states)
+             {
+-                auto& vs = builder.get_slot_state_mut(sp, ent.first, SlotType::Local);
++                // (a frozen guard scope lets this through: the merged state can only come from assignments, a move
++                //  already failed at its own site)
++                auto& vs = builder.get_slot_state_mut(sp, ent.first, SlotType::Local, /*for_assign=*/true);
+                 if( vs != ent.second )
+                 {
+                     DEBUG(::MIR::LValue::new_Local(ent.first) << " " << vs << " => " << ent.second);
+@@ -1766,7 +1768,7 @@ void MirBuilder::complete_scope(ScopeDef& sd)
+             }
+             for(auto& ent : end_state.arg_states)
+             {
+-                auto& vs = builder.get_slot_state_mut(sp, ent.first, SlotType::Argument);
++                auto& vs = builder.get_slot_state_mut(sp, ent.first, SlotType::Argument, /*for_assign=*/true);
+                 if( vs != ent.second )
+                 {
+                     DEBUG(::MIR::LValue::new_Argument(ent.first) << " " << vs << " => " << ent.second);
+@@ -2056,7 +2058,7 @@ const VarState& MirBuilder::get_slot_state(const Span& sp, unsigned int idx, Slo
+     }
+     throw "";
+ }
+-VarState& MirBuilder::get_slot_state_mut(const Span& sp, unsigned int idx, SlotType type)
++VarState& MirBuilder::get_slot_state_mut(const Span& sp, unsigned int idx, SlotType type, bool for_assign/*=false*/)
+ {
+     VarState* ret = nullptr;
+     for( auto scope_idx : ::reverse(m_scope_stack) )
+@@ -2109,7 +2111,15 @@ VarState& MirBuilder::get_slot_state_mut(const Span& sp, unsigned int idx, SlotT
+             }
+             }
+         TU_ARMA(Freeze, e) {
+-            if( !e.unfrozen ) {
++            // A frozen scope is a match guard on an arm with several pattern alternatives: the guard code is emitted
++            // once and cloned per alternative (from_hir_match.cpp insert_cloned), so the slot states tracked for the
++            // first copy must hold for every copy. A MOVE out of an outer slot stays an error (rustc rejects moves
++            // in guards too). An ASSIGNMENT is fine: the clones carry the same statements (the drop of the old
++            // value, the drop-flag updates) and leave the slot in the same state on every path, and rustc allows
++            // it - the Reference's match-guard note even has the guard counting its own executions.
++            // gix-tix 0.6.0 (gitoxide 0.61.0) lib.rs event_loop:
++            //   Input::PinReferences { .. } | Input::ResolveRemoteReferences(_) | .. if { .. || { dirty |= refresh_rebase_session(..); .. } } => ..
++            if( !e.unfrozen && !for_assign ) {
+                 // Prevent any mutation
+                 ERROR(sp, E0000, "Attempting to move/initialise a value where not allowed (across scope " << scope_idx << ")");
+             }
+@@ -2138,20 +2148,20 @@ out_of_loop:
+     return *ret;
+ }
+ 
+-VarState* MirBuilder::get_val_state_mut_p(const Span& sp, const ::MIR::LValue& lv, bool expect_valid/*=false*/)
++VarState* MirBuilder::get_val_state_mut_p(const Span& sp, const ::MIR::LValue& lv, bool expect_valid/*=false*/, bool for_assign/*=false*/)
+ {
+     TRACE_FUNCTION_F(lv);
+     VarState*   vs = nullptr;
+     TU_MATCHA( (lv.m_root), (e),
+     (Return,
+         BUG(sp, "Move of return value");
+-        vs = &get_slot_state_mut(sp, ~0u, SlotType::Local);
++        vs = &get_slot_state_mut(sp, ~0u, SlotType::Local, for_assign);
+         ),
+     (Argument,
+-        vs = &get_slot_state_mut(sp, e, SlotType::Argument);
++        vs = &get_slot_state_mut(sp, e, SlotType::Argument, for_assign);
+         ),
+     (Local,
+-        vs = &get_slot_state_mut(sp, e, SlotType::Local);
++        vs = &get_slot_state_mut(sp, e, SlotType::Local, for_assign);
+         ),
+     (Static,
+         return nullptr;

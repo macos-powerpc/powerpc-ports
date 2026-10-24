@@ -1,0 +1,158 @@
+From 20eb8a45995ed0eb7892103dfcdbdc01d6887ff8 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 24 Oct 2026 09:28:45 +0000
+Subject: [PATCH] hir_typeck: a trait object unsizes to one that adds an auto
+ trait implied by its data trait
+
+qh3 2.0.4 (py314-qh3) src/hpke.rs:49-50
+
+    pub struct HpkeContext { sealer: Box<dyn HpkeSealer + Send>, .. }
+    ..
+    let (enc, sealer) = match suite.setup_sealer(info.as_bytes(), &pk) { .. };
+    Ok(Self { sealer, enc })
+
+with rustls 0.23.45's `fn setup_sealer(..) -> Result<(EncapsulatedSecret,
+Box<dyn HpkeSealer + 'static>), Error>` and `pub trait HpkeSealer: Debug +
+Send + Sync + 'static` failed with `error:0: Type mismatch between dyn
+(HpkeSealer+Send) and dyn (HpkeSealer+'#omitted) - trait counts differ`.
+
+rustc's unsize coercion between trait objects may add auto traits that are
+supertraits of the data trait (1.90 rustc_trait_selection
+candidate_assembly.rs: "We may upcast to auto traits that are either
+explicitly listed in the object type's bounds, or implied by the principal
+trait ref's supertraits").  mrustc's three dyn->dyn unsize checks
+(expr_cs.cpp check_unsize_tys, helpers.cpp's TraitObject arm and
+static.cpp can_unsize, which MIR lowering also uses for pointer casts)
+required every destination marker to be listed on the source, so the
+coercion fell back to an equality and the types mismatched.  MIR cleanup
+already treats a same-data-trait unsize as a plain fat-pointer copy.
+
+HIR_TraitObject_ImpliesMarker (static.cpp) accepts a marker listed on the
+source or an auto trait among the data trait's flattened parent traits
+(so `Derived: Base: Send` works too); the three sites use it.  A trait
+without the supertrait is still rejected.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 0923553f..7dc7d16d 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -17,6 +17,7 @@
+ #include "expr_visit.hpp"
+ #include "expr_cs.hpp"
+ #include "hir_conv/main_bindings.hpp"
++extern bool HIR_TraitObject_ImpliesMarker(const ::HIR::TypeData::Data_TraitObject& src, const ::HIR::GenericPath& marker);   // static.cpp
+ 
+ namespace {
+     inline HIR::ExprNodeP mk_exprnodep(HIR::ExprNode* en, ::HIR::TypeRef ty){ en->m_res_type = mv$(ty); return HIR::ExprNodeP(en); }
+@@ -4739,18 +4740,11 @@ namespace {
+                     }
+                 }
+ 
+-                // 2. Destination markers must be a strict subset
++                // 2. Destination markers must be a subset of the source's markers and implied auto traits
+                 for(const auto& mt : dep->m_markers)
+                 {
+                     // TODO: Fuzzy match
+-                    bool found = false;
+-                    for(const auto& omt : sep->m_markers) {
+-                        if( omt == mt ) {
+-                            found = true;
+-                            break;
+-                        }
+-                    }
+-                    if( !found ) {
++                    if( !HIR_TraitObject_ImpliesMarker(*sep, mt) ) {
+                         // Return early.
+                         return CoerceResult::Equality;
+                     }
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index f32c4898..04a9093c 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -8,6 +8,7 @@
+ #include "helpers.hpp"
+ #include <hir_conv/main_bindings.hpp>
+ #include <algorithm>
++extern bool HIR_TraitObject_ImpliesMarker(const ::HIR::TypeData::Data_TraitObject& src, const ::HIR::GenericPath& marker);   // static.cpp
+ 
+ namespace {
+     // TODO: De-duplicate this with `static.cpp`
+@@ -4875,18 +4876,11 @@ bool TraitResolution::trait_contains_type(const Span& sp, const ::HIR::GenericPa
+                 return ::HIR::Compare::Unequal;
+             }
+ 
+-            // 2. Destination markers must be a strict subset
++            // 2. Destination markers must be a subset of the source's markers and implied auto traits
+             for(const auto& mt : de->m_markers)
+             {
+                 // TODO: Fuzzy match
+-                bool found = false;
+-                for(const auto& omt : se->m_markers) {
+-                    if( omt == mt ) {
+-                        found = true;
+-                        break;
+-                    }
+-                }
+-                if( !found ) {
++                if( !HIR_TraitObject_ImpliesMarker(*se, mt) ) {
+                     // Return early.
+                     return ::HIR::Compare::Unequal;
+                 }
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index cd5c169e..616a9f4d 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -2792,6 +2792,29 @@ bool StaticTraitResolve::type_is_impossible(const Span& sp, const ::HIR::TypeRef
+     throw "";
+ }
+ 
++// A trait object's markers plus the auto traits implied by its data trait's supertraits: `dyn Tr + 'a` unsizes to
++// `dyn Tr + Send` when `Tr: Send` (rustc 1.90 candidate_assembly.rs, "We may upcast to auto traits that are either
++// explicitly listed in the object type's bounds, or implied by the principal trait ref's supertraits"; qh3 2.0.4
++// hpke.rs stores rustls' `Box<dyn HpkeSealer + 'static>` in a `Box<dyn HpkeSealer + Send>` field, `HpkeSealer: Send + Sync`)
++bool HIR_TraitObject_ImpliesMarker(const ::HIR::TypeData::Data_TraitObject& src, const ::HIR::GenericPath& marker)
++{
++    for(const auto& omt : src.m_markers) {
++        if( omt == marker ) {
++            return true;
++        }
++    }
++    if( src.m_trait.m_path.m_path != ::HIR::SimplePath() && src.m_trait.m_trait_ptr )
++    {
++        // (auto traits have no parameters, the path is the identity)
++        for(const auto& pt : src.m_trait.m_trait_ptr->m_all_parent_traits) {
++            if( pt.m_path.m_path == marker.m_path && pt.m_trait_ptr && pt.m_trait_ptr->m_is_marker ) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ bool StaticTraitResolve::can_unsize(const Span& sp, const ::HIR::TypeRef& dst_ty, const ::HIR::TypeRef& src_ty) const
+ {
+     TRACE_FUNCTION_F(dst_ty << " <- " << src_ty);
+@@ -2915,17 +2938,11 @@ bool StaticTraitResolve::can_unsize(const Span& sp, const ::HIR::TypeRef& dst_ty
+                     return false;
+                 }
+             }
+-            // 2. Destination markers must be a strict subset
++            // 2. Destination markers must be a subset of the source's markers and implied auto traits
+             for(const auto& mt : de->m_markers)
+             {
+-                bool found = false;
+-                for(const auto& omt : se->m_markers) {
+-                    if( omt == mt ) {
+-                        found = true;
+-                        break;
+-                    }
+-                }
+-                if( !found ) {
++                if( !HIR_TraitObject_ImpliesMarker(*se, mt) ) {
++                    DEBUG("Marker " << mt << " not in source");
+                     // Return early.
+                     return false;
+                 }

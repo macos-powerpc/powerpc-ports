@@ -1,0 +1,284 @@
+From a066622d303069db253fcfd4da51d85d2d5f951d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 23 Oct 2026 23:17:25 +0000
+Subject: [PATCH] expand/hir/trans: `#[repr(align(N))]` and
+ `#[repr(packed(N))]` on unions
+
+wide 0.7.15 (librsvg 2.58.5, via nalgebra/simba) src/lib.rs:268:
+
+    #[repr(C, align(16))]
+    union ConstUnionHack128bit { f32a4: [f32; 4], f64a2: [f64; 2], .., f32x4: f32x4, .. }
+
+    error:0: Unknown union repr 'align'
+
+The `#[repr]` handler knew only `C` and `transparent` for unions: `align(N)`
+was rejected, and `packed`/`packed(N)` was parsed and then dropped, so a packed
+union kept its natural alignment (a silent layout mismatch with C; bindgen
+emits `#[repr(C, packed)] pub union` for packed C unions). The Reference lets
+both alignment modifiers apply to unions as they do to structs.
+
+Carry both through, mirroring the struct handling:
+- AST::Union::Markings gains align_value/max_field_align; the repr handler
+  parses `align(N)` and `packed(N)` for unions with the struct checks.
+- HIR::Union gains m_forced_alignment/m_max_field_alignment, lowered from the
+  AST and serialised after the fields (RLIB FORMAT CHANGE: every rlib must be
+  rebuilt).
+- make_type_repr_union caps members at packed(N) (after the Darwin ppc32 cap),
+  raises the union's alignment to align(N), and skips the Darwin first-member
+  bump for packed unions as it does for packed structs.
+  darwin_ppc32_type_has_c_user_align treats an align(N) union as carrying
+  a user alignment (it propagates upward, like an aligned struct) and a packed
+  one as not.
+- emit_union emits `__attribute__((__aligned__(N)))` (`__declspec(align(N))`
+  for MSVC) and `#pragma pack(push, N)`..`pop`, plus the alignof assert that
+  structs already had.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/ast/ast.hpp b/src/ast/ast.hpp
+index f4050f93..01efb36a 100644
+--- a/src/ast/ast.hpp
++++ b/src/ast/ast.hpp
+@@ -523,6 +523,10 @@ public:
+             C,
+             Transparent,
+         } repr = Repr::Rust;
++        // `#[repr(align(N))]`
++        uint64_t align_value = 0;
++        // `#[repr(packed)]`/`#[repr(packed(N))]`
++        uint64_t max_field_align = 0;
+     } m_markings;
+ 
+     Union( GenericParams params, ::std::vector<StructItem> fields )
+diff --git a/src/expand/codegen.cpp b/src/expand/codegen.cpp
+index 17ba3f9b..464693a1 100644
+--- a/src/expand/codegen.cpp
++++ b/src/expand/codegen.cpp
+@@ -259,18 +259,8 @@ class CHandler_Repr:
+                     e->m_markings.repr = ::AST::Union::Markings::Repr::Transparent;
+                 }
+                 else if(repr_str == "packed") {
+-                    //switch( e->m_markings.repr )
+-                    //{
+-                    //case AST::Struct::Markings::Repr::C:
+-                    //case AST::Struct::Markings::Repr::Rust:
+-                    //    break;
+-                    //default:
+-                    //    // TODO: Error
+-                    //    break;
+-                    //}
+-                    //if( e->m_markings.max_field_align != 0 ) {
+-                    //    // TODO: Error
+-                    //}
++                    // The alignment modifiers apply to unions as they do to structs (the Reference,
++                    // "The alignment modifiers"): `packed(N)` caps the members' alignment at N
+                     if( lex.getTokenIf(TOK_PAREN_OPEN) )
+                     {
+                         auto n = Expand_ParseAndExpand_ExprVal(crate, mod, lex);
+@@ -279,16 +269,29 @@ class CHandler_Repr:
+                         auto v = val->m_value;
+                         ASSERT_BUG(lex.point_span(), v > U128(0), "#[repr(packed(" << v << "))] - alignment must be non-zero");
+                         ASSERT_BUG(lex.point_span(), (v & (v-1)) == U128(0), "#[repr(packed(" << v << "))] - alignment must be a power of two");
+-                        //ASSERT_BUG(lex.point_span(), e->m_markings.align_value == 0, "#[repr(packed(" << v << "))] - conflicts with previous alignment");
+-                        // TODO: I believe this should change the internal aligment too?
+-                        //e->m_markings.max_field_align = v.truncate_u64();
++                        ASSERT_BUG(lex.point_span(), e->m_markings.align_value == 0, "#[repr(packed(" << v << "))] - conflicts with previous alignment");
++                        e->m_markings.max_field_align = v.truncate_u64();
+                         lex.getTokenCheck(TOK_PAREN_CLOSE);
+                     }
+                     else
+                     {
+-                        //e->m_markings.max_field_align = 1;
++                        e->m_markings.max_field_align = 1;
+                     }
+                 }
++                else if(repr_str == "align") {
++                    // `align(N)` raises the union's alignment (wide 0.7.15 `#[repr(C, align(16))] union ConstUnionHack128bit`)
++                    lex.getTokenCheck(TOK_PAREN_OPEN);
++                    auto n = Expand_ParseAndExpand_ExprVal(crate, mod, lex);
++                    auto* val = dynamic_cast<AST::ExprNode_Integer*>(&*n);
++                    ASSERT_BUG(n->span(), val, "#[repr(align(...))] - alignment must be an integer");
++                    auto v = val->m_value;
++                    ASSERT_BUG(lex.point_span(), v > U128(0), "#[repr(align(" << v << "))] - alignment must be non-zero");
++                    ASSERT_BUG(lex.point_span(), (v & (v-1)) == U128(0), "#[repr(align(" << v << "))] - alignment must be a power of two");
++                    ASSERT_BUG(lex.point_span(), e->m_markings.align_value == 0, "#[repr(align(" << v << "))] - conflicts with previous alignment");
++                    ASSERT_BUG(lex.point_span(), e->m_markings.max_field_align == 0, "#[repr(align(" << v << "))] - conflicts with repr(packed)");
++                    e->m_markings.align_value = v.truncate_u64();
++                    lex.getTokenCheck(TOK_PAREN_CLOSE);
++                }
+                 else {
+                     ERROR(lex.point_span(), E0000, "Unknown union repr '" << repr_str << "'");
+                 }
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index c3832fe4..41ad08d5 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -1382,11 +1382,16 @@ namespace {
+         auto params = deserialise_genericparams();
+         auto repr = static_cast< ::HIR::Union::Repr>( m_in.read_tag() );
+         auto variants = deserialise_vec<HIR::StructField>();
++        unsigned forced_alignment = m_in.read_count();
++        unsigned max_field_alignment = m_in.read_count();
+         auto markings = deserialise_markings();
+ 
+-        return ::HIR::Union {
++        auto rv = ::HIR::Union {
+             mv$(params), repr, mv$(variants), mv$(markings)
+             };
++        rv.m_forced_alignment = forced_alignment;
++        rv.m_max_field_alignment = max_field_alignment;
++        return rv;
+     }
+     ::HIR::Struct HirDeserialiser::deserialise_struct()
+     {
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index eb8f7214..2d4711be 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -1597,11 +1597,14 @@ namespace {
+         variants.push_back(HIR::StructField { field.m_name, get_vis(field.m_vis), LowerHIR_Type(field.m_type), {} });
+     }
+ 
+-    return ::HIR::Union {
++    auto rv = ::HIR::Union {
+         LowerHIR_GenericParams(f.m_params, nullptr),
+         repr,
+         mv$(variants)
+         };
++    rv.m_forced_alignment = f.m_markings.align_value;
++    rv.m_max_field_alignment = f.m_markings.max_field_align;
++    return rv;
+ }
+ ::HIR::Trait LowerHIR_Trait(::HIR::SimplePath trait_path, const ::AST::Trait& f)
+ {
+diff --git a/src/hir/hir.hpp b/src/hir/hir.hpp
+index 65bc190f..3e23fc32 100644
+--- a/src/hir/hir.hpp
++++ b/src/hir/hir.hpp
+@@ -461,6 +461,10 @@ public:
+     t_struct_fields m_variants;
+ 
+     TraitMarkings   m_markings;
++
++    // `#[repr(align(N))]` and `#[repr(packed(N))]` (0 = not set), as for `Struct`
++    unsigned    m_forced_alignment = 0;
++    unsigned    m_max_field_alignment = 0;
+ };
+ 
+ struct AssociatedType
+diff --git a/src/hir/serialise.cpp b/src/hir/serialise.cpp
+index 9c6094d2..fc9fe131 100644
+--- a/src/hir/serialise.cpp
++++ b/src/hir/serialise.cpp
+@@ -1407,6 +1407,8 @@
+ 
+             serialise_vec(item.m_variants);
+ 
++            m_out.write_count(item.m_forced_alignment);
++            m_out.write_count(item.m_max_field_alignment);
+             serialise(item.m_markings);
+         }
+         void serialise(const ::HIR::ExternType& item)
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index d3b37387..dc783553 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -2782,17 +2782,39 @@ namespace {
+             const auto* repr = Target_GetTypeRepr(sp, m_resolve, item_ty);
+             MIR_ASSERT(*m_mir_res, repr != nullptr, "No repr for union " << item_ty);
+ 
++            // repr(packed(N)): cap the members' alignment with `#pragma pack`, as emit_struct_inner does
++            if( item.m_max_field_alignment > 0 )
++            {
++                m_of << "#pragma pack(push, " << item.m_max_field_alignment << ")\n";
++            }
++            // repr(align(N)): always an explicit alignment attribute - the C compiler can't derive
++            // a user alignment from the member list. Mirrored by `darwin_ppc32_type_has_c_user_align`.
++            bool has_manual_align = (item.m_forced_alignment > 0);
++            if( has_manual_align && m_compiler == Compiler::Msvc )
++            {
++                m_of << "__declspec(align(" << repr->align << "))\n";
++            }
+             m_of << "union u_" << Trans_Mangle(p) << " {\n";
+             for(unsigned int i = 0; i < repr->fields.size(); i ++)
+             {
+                 assert(repr->fields[i].offset == 0);
+                 m_of << "\t"; emit_ctype( repr->fields[i].ty, FMT_CB(ss, ss << "var_" << i;) ); m_of << ";\n";
+             }
+-            m_of << "};\n";
++            m_of << "}";
++            if( has_manual_align && m_compiler == Compiler::Gcc )
++            {
++                m_of << " __attribute__((__aligned__(" << repr->align << ")))";
++            }
++            m_of << ";\n";
++            if( item.m_max_field_alignment > 0 )
++            {
++                m_of << "#pragma pack(pop)\n";
++            }
+             if( true && repr->size > 0 )
+             {
+                 m_of << "typedef char sizeof_assert_" << Trans_Mangle(p) << "[ (sizeof(union u_" << Trans_Mangle(p) << ") == " << repr->size << ") ? 1 : -1 ];\n";
+             }
++            m_of << "typedef char alignof_assert_" << Trans_Mangle(p) << "[ (ALIGNOF(union u_" << Trans_Mangle(p) << ") == " << repr->align << ") ? 1 : -1 ];\n";
+ 
+             m_mir_res = nullptr;
+         }
+diff --git a/src/trans/target.cpp b/src/trans/target.cpp
+index 0b5eda02..0a12074e 100644
+--- a/src/trans/target.cpp
++++ b/src/trans/target.cpp
+@@ -1137,7 +1137,8 @@ namespace {
+         // Which checks apply to this aggregate:
+         // - structs/tuples can carry the attribute themselves (ZST-carrier or align
+         //   mismatch - the emit_struct_inner conditions)
+-        // - unions/enums never carry an attribute, but propagation from members applies
++        // - unions carry the attribute for repr(align) only (emit_union); enums never do, but
++        //   propagation from members applies to both
+         // - ZST struct fields are not emitted in the C source, so they can't propagate;
+         //   union members are all emitted (see emit_union), enum DATA unions skip ZST
+         //   variants
+@@ -1163,6 +1164,13 @@ namespace {
+         }
+         else if( t.data().is_Path() && t.data().as_Path().binding.is_Union() )
+         {
++            const auto& unn = *t.data().as_Path().binding.as_Union();
++            // repr(align(N)) is emitted as an explicit alignment attribute
++            if( unn.m_forced_alignment > 0 )
++                return true;
++            // Packed unions are emitted with `#pragma pack` instead (see the struct case above)
++            if( unn.m_max_field_alignment > 0 )
++                return false;
+             zst_members = true;
+         }
+         else if( t.data().is_Path() && t.data().as_Path().binding.is_Enum() )
+@@ -2550,15 +2558,26 @@ namespace {
+                     align = 4;
+                 }
+             }
++            // repr(packed(N)): members are placed with at most N alignment (as struct fields)
++            if( unn.m_max_field_alignment > 0 )
++            {
++                align = ::std::min<size_t>(align, unn.m_max_field_alignment);
++            }
+             rv.size  = ::std::max(rv.size , size );
+             rv.align = ::std::max(rv.align, align);
+         }
+         // Darwin PowerPC 32-bit: a union's alignment is raised to the natural alignment of its
+-        // innermost first member (GCC `darwin_rs6000_special_round_type_align` covers unions too)
+-        if( Target_IsDarwinPPC32() && !rv.fields.empty() )
++        // innermost first member (GCC `darwin_rs6000_special_round_type_align` covers unions too).
++        // Not applied to packed unions (as for structs).
++        if( Target_IsDarwinPPC32() && !rv.fields.empty() && unn.m_max_field_alignment == 0 )
+         {
+             rv.align = ::std::max(rv.align, darwin_ppc32_first_field_align(sp, resolve, rv.fields[0].ty));
+         }
++        // repr(align(N)): the alignment is raised to N (emit_union emits the attribute)
++        if( unn.m_forced_alignment > 0 )
++        {
++            rv.align = ::std::max<size_t>(rv.align, unn.m_forced_alignment);
++        }
+         // Round the size to be a multiple of align
+         if( rv.size % rv.align != 0 )
+         {

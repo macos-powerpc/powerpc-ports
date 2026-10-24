@@ -1,0 +1,259 @@
+From f3f03b2035bec4bc1c8a80288789ea3c7d54f383 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 24 Oct 2026 05:41:18 +0000
+Subject: [PATCH] hir/from_ast: a bound associated type defined in a parent
+ trait reached through an omitted default parameter
+
+simba 0.8.1 (librsvg 2.58.5, nalgebra) src/scalar/real.rs:24-25
+`pub trait RealField: ComplexField<RealField = Self> + RelativeEq<Epsilon = Self> + UlpsEq<Epsilon = Self> + ..`:
+"BUG: ASSERT FAIL: src/hir_typeck/common.cpp:685: Type param Rhs/*I:0*/ out of range for (max 0)".
+
+approx 0.5.1 defines `Epsilon` in `AbsDiffEq<Rhs = Self>`; `RelativeEq<Rhs = Self>: AbsDiffEq<Rhs>` and
+`UlpsEq<Rhs = Self>: AbsDiffEq<Rhs>` reach it through their own parameter, and the bindings omit `Rhs`.
+LowerHIR_TraitPath records which trait a bound's associated type belongs to (find_source_trait) by
+monomorphising the parent's path with the parameters as written - none here - while defaults are only
+filled in by Resolve Bind, so the `Rhs` of `AbsDiffEq<Rhs>` had nothing to map to.
+
+The omitted parameters now take the trait's defaults (`Rhs = Self`), monomorphised with the type the path
+bounds as `Self`: LowerHIR_TraitPath gets a `self_ty` argument (a generic bound's type, `Self` for a
+supertrait, the erased self of `dyn`/`impl Trait`), which is also what a `Self` named by the parent path
+itself now means. `trait RealField: RelativeEq<Epsilon = Self>` records `AbsDiffEq<Self>`,
+`fn f<T: RelativeEq<Epsilon = T>>` records `AbsDiffEq<T>`, and `T: Child2<Self, Out2 = T>` in a trait
+method (written `Self` next to the omitted default) records `Parent2<Self, T>`. The HIR and AST walks and
+the two trait-alias branches share the filling; the external trait-alias branch mapped the alias's traits
+with the caller's monomorphiser instead of the alias path's own parameters, fixed in passing.
+
+`fn mk() -> impl RelativeEq<Epsilon = F>` now reaches an older, separate bug: every `impl Trait` return
+whose trait has a `Self` default (`-> impl PartialEq`) fails at its first call site with "Generic binding
+out of total range (ErasedSelf)" (C228).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 2d4711be..d4543dd2 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -29,7 +29,10 @@
+ ::HIR::ValueItem LowerHIR_Static(::HIR::ItemPath p, const ::AST::AttributeList& attrs, const ::AST::Static& e, const Span& sp, const RcString& name);
+ ::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc);
+ ::HIR::ConstGeneric LowerHIR_ConstGeneric(const ::AST::ExprNode& node_ref);
+-::HIR::TraitPath LowerHIR_TraitPath(const Span& sp, const ::AST::Path& path, const AST::HigherRankedBounds& hrbs, bool allow_bounds=false);
++// `self_ty` = the type the trait path bounds (a generic bound's type, `Self` for a supertrait, the erased self of
++// `dyn`/`impl Trait`): omitted trait parameters take the trait's defaults (`Rhs = Self`) in terms of it when a bound
++// associated type is looked up in a parent trait
++::HIR::TraitPath LowerHIR_TraitPath(const Span& sp, const ::AST::Path& path, const AST::HigherRankedBounds& hrbs, bool allow_bounds=false, const ::HIR::TypeRef* self_ty=nullptr);
+ ::HIR::GenericParams LowerHIR_HigherRankedBounds(const AST::HigherRankedBounds& hrbs);
+ 
+ ::HIR::SimplePath path_Sized;
+@@ -42,6 +45,8 @@ const ::AST::Crate* g_ast_crate_ptr;
+ 
+ namespace {
+     const ::HIR::TypeRef ty_Self = HIR::TypeRef::new_self();
++    // The self type of a `dyn`/`impl Trait` path (what `Resolve Bind` fills their defaults with)
++    const ::HIR::TypeRef ty_ErasedSelf { "ErasedSelf", GENERIC_ErasedSelf };
+ }
+ 
+ // --------------------------------------------------------------------
+@@ -120,7 +125,7 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+                 TODO(bound.span, "Handle two layers of HRBs in a bound");
+             }
+ 
+-            auto bound_trait_path = LowerHIR_TraitPath(bound.span, e.trait, e.inner_hrbs, /*allow_bounds=*/true);
++            auto bound_trait_path = LowerHIR_TraitPath(bound.span, e.trait, e.inner_hrbs, /*allow_bounds=*/true, &type);
+             ::std::map<RcString, ::HIR::TraitPath::AtyBound>    tp_bounds;
+             if( !keep_aty_bounds ) {
+                 tp_bounds = mv$(bound_trait_path.m_trait_bounds);
+@@ -725,9 +730,10 @@ namespace {
+         params.m_lifetimes.push_back(HIR::LifetimeDef { lft_def.name().name });
+     return params;
+ }
+-::HIR::TraitPath LowerHIR_TraitPath(const Span& sp, const ::AST::Path& path, const AST::HigherRankedBounds& hrbs, bool ignore_bounds/*=false*/)
++::HIR::TraitPath LowerHIR_TraitPath(const Span& sp, const ::AST::Path& path, const AST::HigherRankedBounds& hrbs, bool ignore_bounds/*=false*/, const ::HIR::TypeRef* self_ty/*=nullptr*/)
+ {
+     DEBUG(hrbs << " " << path);
++    const ::HIR::TypeRef& bound_self = self_ty ? *self_ty : ty_Self;
+     ::HIR::TraitPath    rv {
+         hrbs.empty() ? nullptr : box$(LowerHIR_HigherRankedBounds(hrbs)), // m_hrtbs
+         LowerHIR_GenericPath(sp, path, FromAST_PathClass::Type, /*allow_assoc=*/true),
+@@ -753,17 +759,57 @@ namespace {
+     }
+ 
+     struct H {
++        // The trait's parameters as the path writes them, the omitted ones taken from the trait's defaults: a parent
++        // trait's path is spelled in terms of all of them (`RelativeEq<Rhs = Self>: AbsDiffEq<Rhs>`, approx 0.5.1).
++        // A default names the bound's own type as `Self` (simba 0.8.1 `trait RealField: RelativeEq<Epsilon = Self>`,
++        // `fn f<T: RelativeEq<Epsilon = T>>`); `Resolve Bind` fills the bound's own path the same way, later.
++        static ::HIR::PathParams fill_defaults(
++            const Span& sp, const ::HIR::TypeRef& self_ty, const ::HIR::PathParams& params,
++            const ::std::function<::HIR::TypeRef(size_t)>& get_default, size_t n_params
++            )
++        {
++            auto rv = params.clone();
++            while( rv.m_types.size() < n_params )
++            {
++                auto def = get_default(rv.m_types.size());
++                if( def.data().is_Infer() ) {
++                    // No default: a rustc error, and the monomorphiser's "out of range" below if the parent uses it
++                    break;
++                }
++                auto ms = MonomorphStatePtr(&self_ty, &rv, nullptr);
++                auto ty = ms.monomorph_type(sp, def, /*allow_infer=*/false);
++                rv.m_types.push_back( mv$(ty) );
++            }
++            return rv;
++        }
++        static ::HIR::PathParams fill_defaults_hir(const Span& sp, const ::HIR::TypeRef& self_ty, const ::HIR::PathParams& params, const ::HIR::GenericParams& defs)
++        {
++            return fill_defaults(sp, self_ty, params, [&](size_t i){ return defs.m_types[i].m_default.clone(); }, defs.m_types.size());
++        }
++        static ::HIR::PathParams fill_defaults_ast(const Span& sp, const ::HIR::TypeRef& self_ty, const ::HIR::PathParams& params, const ::AST::GenericParams& defs)
++        {
++            ::std::vector<const ::AST::TypeParam*>  tps;
++            for(const auto& p : defs.m_params) {
++                if( const auto* tp = p.opt_Type() ) {
++                    tps.push_back(tp);
++                }
++            }
++            return fill_defaults(sp, self_ty, params, [&](size_t i){ return LowerHIR_Type(tps[i]->get_default()); }, tps.size());
++        }
++        // `path` names a trait in the terms of some scope; `self_ty` is the type the path bounds in that scope; `ms`
++        // maps that scope to the caller's. Returns the (monomorphised) path of the trait defining `name`, or empty.
+         static ::HIR::GenericPath find_source_trait_hir(
+             const Span& sp,
+             const ::HIR::GenericPath& path, const HIR::Trait& trait, const RcString& name,
+-            const Monomorphiser& ms
++            const ::HIR::TypeRef& self_ty, const Monomorphiser& ms
+             )
+         {
+             auto it = trait.m_types.find(name);
+             if(it != trait.m_types.end()) {
+                 return ms.monomorph_genericpath(sp, path, /*allow_infer=*/false);
+             }
+-            auto cb = MonomorphStatePtr(&ty_Self, &path.m_params, nullptr);
++            auto params = fill_defaults_hir(sp, self_ty, path.m_params, trait.m_params);
++            auto cb = MonomorphStatePtr(&self_ty, &params, nullptr);
+             for(const auto& st : trait.m_all_parent_traits)
+             {
+                 // NOTE: st.m_trait_ptr isn't populated yet
+@@ -781,7 +827,7 @@ namespace {
+         static ::HIR::GenericPath find_source_trait_ast(
+             const Span& sp,
+             const ::HIR::GenericPath& path, const AST::Trait& trait, const RcString& name,
+-            const Monomorphiser& ms
++            const ::HIR::TypeRef& self_ty, const Monomorphiser& ms
+             )
+         {
+             for(const auto& i : trait.items())
+@@ -792,12 +838,14 @@ namespace {
+                 }
+             }
+ 
+-            auto cb = MonomorphStatePtr(&ty_Self, &path.m_params, nullptr);
++            auto params = fill_defaults_ast(sp, self_ty, path.m_params, trait.params());
++            auto cb = MonomorphStatePtr(&self_ty, &params, nullptr);
+             for( const auto& st : trait.supertraits() )
+             {
++                // The supertrait path is in the trait's own terms: its bounded type is the trait's `Self`
+                 auto b = LowerHIR_TraitPath(sp, *st.ent.path, st.ent.hrbs, true);
+                 ASSERT_BUG(sp, st.ent.path->m_bindings.type.binding.is_Trait(), "Not a trait: " << *st.ent.path);
+-                auto rv = H::find_source_trait(sp, b.m_path, st.ent.path->m_bindings.type.binding.as_Trait(), name, cb);
++                auto rv = H::find_source_trait(sp, b.m_path, st.ent.path->m_bindings.type.binding.as_Trait(), name, ty_Self, cb);
+                 if(rv != HIR::GenericPath())
+                     return ms.monomorph_genericpath(sp, rv, /*allow_infer=*/false);
+             }
+@@ -806,19 +854,19 @@ namespace {
+         static ::HIR::GenericPath find_source_trait(
+             const Span& sp,
+             const ::HIR::GenericPath& path, const AST::PathBinding_Type& pb, const RcString& name,
+-            const Monomorphiser& ms
++            const ::HIR::TypeRef& self_ty, const Monomorphiser& ms
+         )
+         {
+-            TRACE_FUNCTION_F(path);
++            TRACE_FUNCTION_F(path << " self=" << self_ty);
+             if( pb.is_Trait() ) {
+                 const auto& pbe = pb.as_Trait();
+                 if( pbe.hir ) {
+                     assert(pbe.hir);
+-                    return find_source_trait_hir(sp, path, *pbe.hir, name, ms);
++                    return find_source_trait_hir(sp, path, *pbe.hir, name, self_ty, ms);
+                 }
+                 else if( pbe.trait_ ) {
+                     assert(pbe.trait_);
+-                    return find_source_trait_ast(sp, path, *pbe.trait_, name, ms);
++                    return find_source_trait_ast(sp, path, *pbe.trait_, name, self_ty, ms);
+                 }
+                 else {
+                     BUG(sp, "Unbound path");
+@@ -827,10 +875,13 @@ namespace {
+             else if( pb.is_TraitAlias() ) {
+                 const auto& pbe = pb.as_TraitAlias();
+                 if( pbe.hir ) {
++                    // The alias's traits are in the alias's own terms: into the path's scope first, then the caller's
++                    auto params = fill_defaults_hir(sp, self_ty, path.m_params, pbe.hir->m_params);
++                    auto cb = MonomorphStatePtr(&self_ty, &params, nullptr);
+                     for(const auto& sub_trait : pbe.hir->m_traits) {
+-                        auto p = ms.monomorph_genericpath(sp, sub_trait.m_path);
++                        auto p = cb.monomorph_genericpath(sp, sub_trait.m_path, /*allow_infer=*/false);
+                         const auto& t = g_crate_ptr->get_trait_by_path(sp, p.m_path);
+-                        auto rv = find_source_trait_hir(sp, p, t, name, MonomorphStatePtr(&ty_Self, &p.m_params, nullptr));
++                        auto rv = find_source_trait_hir(sp, p, t, name, self_ty, ms);
+                         if( rv != HIR::GenericPath() ) {
+                             return rv;
+                         }
+@@ -838,10 +889,11 @@ namespace {
+                     return HIR::GenericPath();
+                 }
+                 else if( pbe.trait_ ) {
+-                    auto cb = MonomorphStatePtr(&ty_Self, &path.m_params, nullptr);
++                    auto params = fill_defaults_ast(sp, self_ty, path.m_params, pbe.trait_->params);
++                    auto cb = MonomorphStatePtr(&self_ty, &params, nullptr);
+                     for(const auto& st : pbe.trait_->traits ) {
+                         auto b = LowerHIR_TraitPath(sp, *st.ent.path, st.ent.hrbs, true);
+-                        auto rv = H::find_source_trait(sp, b.m_path, st.ent.path->m_bindings.type.binding, name, cb);
++                        auto rv = H::find_source_trait(sp, b.m_path, st.ent.path->m_bindings.type.binding, name, ty_Self, cb);
+                         if( rv != HIR::GenericPath() ) {
+                             return ms.monomorph_genericpath(sp, rv, /*allow_infer=*/false);
+                         }
+@@ -874,7 +926,7 @@ namespace {
+         TU_ARMA(Value, _) {}
+         TU_ARMA(AssociatedTyEqual, assoc) {
+             auto name_args = H::get_aty_node(sp, assoc.first);
+-            auto src_trait = H::find_source_trait(sp, rv.m_path, path.m_bindings.type.binding, name_args.first, MonomorphiserNop());
++            auto src_trait = H::find_source_trait(sp, rv.m_path, path.m_bindings.type.binding, name_args.first, bound_self, MonomorphiserNop());
+             DEBUG("src_trait = " << src_trait << " for " << assoc.first);
+             rv.m_type_bounds.insert(::std::make_pair( name_args.first, ::HIR::TraitPath::AtyEqual {
+                 std::move(src_trait), std::move(name_args.second), LowerHIR_Type(assoc.second)
+@@ -888,7 +940,7 @@ namespace {
+             else
+             {
+                 auto name_args = H::get_aty_node(sp, assoc.first);
+-                auto src_trait = H::find_source_trait(sp, rv.m_path, path.m_bindings.type.binding, name_args.first, MonomorphiserNop());
++                auto src_trait = H::find_source_trait(sp, rv.m_path, path.m_bindings.type.binding, name_args.first, bound_self, MonomorphiserNop());
+                 DEBUG("src_trait = " << src_trait << " for " << assoc.first);
+                 //if(src_trait == ::HIR::GenericPath())
+                 //    ERROR(sp, E0000, "Unable to find source trait for " << b->first << " in " << bound_trait_path.m_path);
+@@ -1137,7 +1189,7 @@ namespace {
+                 if( !v.m_trait.m_path.m_path.components().empty() ) {
+                     ERROR(ty.span(), E0000, "Multiple data traits in trait object - " << ty);
+                 }
+-                v.m_trait = LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs);
++                v.m_trait = LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs, false, &ty_ErasedSelf);
+             }
+         }
+         // Sort markers so downstream can compare properly
+@@ -1154,11 +1206,11 @@ namespace {
+         {
+             DEBUG("t = " << *t.path);
+             // TODO: Handle ATY bounds
+-            traits.push_back( LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs, /*allow_aty_trait_bounds=*/true) );
++            traits.push_back( LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs, /*allow_aty_trait_bounds=*/true, &ty_ErasedSelf) );
+         }
+         bool is_sized = true;
+         for(const auto& t : e->maybe_traits) {
+-            auto tp = LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs, /*allow_aty_trait_bounds=*/true);
++            auto tp = LowerHIR_TraitPath(ty.span(), *t.path, t.hrbs, /*allow_aty_trait_bounds=*/true, &ty_ErasedSelf);
+             if( tp.m_path.m_path == path_Sized ) {
+                 is_sized = false;
+             }
