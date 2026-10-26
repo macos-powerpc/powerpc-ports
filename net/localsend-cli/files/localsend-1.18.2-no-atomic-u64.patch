@@ -1,0 +1,158 @@
+localsend-cli: no `AtomicU64` on targets without 64-bit atomics (32-bit PowerPC)
+
+mrustc on powerpc-apple-darwin, building the `localsend` core crate for localsend-cli 1.18.2:
+
+    packages/core/src/discovery/mod.rs:17:5-58 error:0: Unable to resolve `use` target ::"std"::sync::atomic::AtomicU64
+
+32-bit PowerPC, MIPS and older ARM have no 64-bit atomics, so `std::sync::atomic::AtomicU64`
+does not exist there (`cfg(target_has_atomic = "64")` is unset). Two kinds of use in the tree:
+
+- packages/core `DiscoveryState::confirmations`: a count of confirmations that
+  `discover_staged` compares with an earlier value of itself to see whether any arrived.
+  `AtomicUsize` is enough (identical on 64-bit targets).
+- cli `send_task` / `app::receive` / `app::sending` progress counters: cumulative bytes,
+  read by `app::status` and `done_bytes`. A narrower atomic would truncate transfers over
+  4 GiB, so a new `cli/src/atomic64.rs` keeps them `u64`: `std`'s `AtomicU64` where the
+  target has 64-bit atomics, else a `Mutex<u64>` with the same `new`/`load`/`store`
+  surface (the only operations used). Other targets compile exactly the code they did.
+
+packages/core/tests/v2_server.rs and v2_tls_pinning.rs use `AtomicU64` too; they are not
+built by the port and are left alone. `server` and `packages/localsend_isolates/rust` have none.
+
+--- a/packages/core/src/discovery/mod.rs	2026-10-25 23:24:05.446510823 +0000
+--- a/packages/core/src/discovery/mod.rs	2026-10-25 23:24:05.446510823 +0000
++++ b/packages/core/src/discovery/mod.rs	2026-10-25 23:24:05.491511958 +0000
+@@ -14,7 +14,7 @@
+ use futures_util::StreamExt;
+ use std::collections::HashSet;
+ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::Arc;
+ use std::time::{Duration, SystemTime};
+ use store::DeviceStore;
+@@ -122,7 +122,10 @@
+ 
+     /// Number of confirmations in this run, on which
+     /// [`DiscoveryHandle::discover_staged`] decides whether to escalate.
+-    confirmations: AtomicU64,
++    /// `AtomicUsize`: 32-bit targets (PowerPC, MIPS, older ARM) have no
++    /// `AtomicU64`, and the count is only ever compared with an earlier
++    /// value of itself to see whether a confirmation arrived.
++    confirmations: AtomicUsize,
+ }
+ 
+ impl DiscoveryState {
+@@ -464,7 +467,7 @@
+         event_tx: config.event_tx,
+         answering: AtomicBool::new(true),
+         scanning: std::sync::Mutex::new(HashSet::new()),
+-        confirmations: AtomicU64::new(0),
++        confirmations: AtomicUsize::new(0),
+     });
+ 
+     // Ends once discovery is stopped: the multicast side then drops its
+--- a/cli/src/atomic64.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/cli/src/atomic64.rs	2026-10-25 23:24:05.491511958 +0000
+@@ -0,0 +1,39 @@
++//! `AtomicU64` for targets without 64-bit atomics.
++//!
++//! 32-bit PowerPC, MIPS and older ARM have no `std::sync::atomic::AtomicU64`.
++//! The transfer progress counters are byte counts, so a narrower atomic would
++//! truncate files over 4 GiB; those targets get a mutex with the same
++//! `new`/`load`/`store` surface.
++
++#[cfg(target_has_atomic = "64")]
++pub(crate) use std::sync::atomic::AtomicU64;
++
++#[cfg(not(target_has_atomic = "64"))]
++pub(crate) use fallback::AtomicU64;
++
++#[cfg(not(target_has_atomic = "64"))]
++mod fallback {
++    use std::sync::Mutex;
++    use std::sync::atomic::Ordering;
++
++    #[derive(Debug)]
++    pub(crate) struct AtomicU64(Mutex<u64>);
++
++    impl AtomicU64 {
++        pub(crate) const fn new(value: u64) -> Self {
++            Self(Mutex::new(value))
++        }
++
++        fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
++            self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++        }
++
++        pub(crate) fn load(&self, _order: Ordering) -> u64 {
++            *self.lock()
++        }
++
++        pub(crate) fn store(&self, value: u64, _order: Ordering) {
++            *self.lock() = value;
++        }
++    }
++}
+--- a/cli/src/main.rs	2026-10-25 23:24:05.376509057 +0000
++++ b/cli/src/main.rs	2026-10-25 23:24:05.491511958 +0000
+@@ -1,4 +1,5 @@
+ mod app;
++mod atomic64;
+ mod banner;
+ mod device_list;
+ mod picker;
+--- a/cli/src/send_task.rs	2026-10-25 23:24:05.393509486 +0000
++++ b/cli/src/send_task.rs	2026-10-25 23:24:43.228463964 +0000
+@@ -1,4 +1,5 @@
+ use crate::app::AppEvent;
++use crate::atomic64::AtomicU64;
+ use crate::storage::Identity;
+ use crate::ui::Category;
+ use crate::util;
+@@ -14,7 +15,7 @@
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Instant;
+ use tokio::sync::mpsc;
+ use tokio_stream::wrappers::ReceiverStream;
+--- a/cli/src/app/receive.rs	2026-10-25 23:24:05.411509940 +0000
++++ b/cli/src/app/receive.rs	2026-10-25 23:25:08.982113799 +0000
+@@ -3,6 +3,7 @@
+ 
+ use super::App;
+ use super::web_link::WebMode;
++use crate::atomic64::AtomicU64;
+ use crate::ui::Category;
+ use crate::util::{self, SpeedMeter};
+ use localsend::http::client::v2::LsHttpClientV2;
+@@ -12,7 +13,7 @@
+ use localsend::model::transfer::FileDto;
+ use std::collections::{HashMap, HashSet};
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
+ use std::time::{Duration, Instant};
+ use tokio::sync::{mpsc, oneshot};
+ 
+--- a/cli/src/app/sending.rs	2026-10-25 23:24:05.428510369 +0000
++++ b/cli/src/app/sending.rs	2026-10-25 23:25:08.984113850 +0000
+@@ -2,6 +2,7 @@
+ //! transfer driven by the [`crate::send_task`].
+ 
+ use super::App;
++use crate::atomic64::AtomicU64;
+ use crate::picker::{Picker, PickerOutcome, PickerTarget};
+ use crate::send_task;
+ use crate::ui::Category;
+@@ -11,7 +12,6 @@
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+-use std::sync::atomic::AtomicU64;
+ use uuid::Uuid;
+ 
+ /// An outgoing transfer driven by the send task.
