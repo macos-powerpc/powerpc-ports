@@ -1,0 +1,210 @@
+From 7aa7c08f6b99235f781b219832ebaab6da6ca1bf Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 26 Oct 2026 03:58:05 +0000
+Subject: [PATCH] trans: a trait object tail sits at the end of the sized
+ fields rounded up to the vtable's alignment
+
+Found while fixing 0407 (size_of_val of nested DSTs), no crate report yet. In
+
+    struct W<T: ?Sized> { a: u8, t: T }
+    let v = W { a: 3, t: Foo { v: 0x11223344 } };   // Foo { v: u32 }
+    let r: &W<dyn Tr> = &v;
+    r.t.get()
+
+the tail of `W<Foo>` is at offset 4, but codegen_c accessed the tail of `W<dyn Tr>` at the static
+offset of the last field of the unsized struct, which is the end of the sized fields (1): the method
+call got a pointer into the middle of the value (0x44000000), and `&r.t`, the drop glue,
+size_of_val and align_of_val were wrong with it. rustc places a trait object tail at
+`round_up(end of the sized fields, align)` with the alignment of the concrete type read from the
+vtable, at every level of a nested unsized struct.
+
+A field access to the trait object tail of an unsized struct (or to the struct holding it, nested)
+at a non-zero static offset now computes the address as `base + ALIGN_TO(offset, alignment)` from
+the metadata of the fat pointer; borrows (make_traitobjptr) and the drop glue go through the same
+lvalue code. size_of_val and align_of_val of such types follow rustc's size_and_align_of_dst with
+the vtable's size and alignment at each level. On Darwin ppc32 the alignment a value gets as
+a non-first field is capped at 4 unless it is 16 (GCC ADJUST_FIELD_ALIGN; the emitted
+mrustc_dyn_field_align), which is what the sized struct's C layout does; a concrete type with
+repr(align(8)) is exempt from the cap in GCC but the vtable can't tell that one apart.
+
+In practice the access changes only when the sized fields end misaligned for the concrete type:
+a u8/u16/bool prefix (`W<dyn Tr>` above), or on ppc32 a 4-byte prefix (RefCell<dyn T>) with an
+8-aligned concrete type on non-Darwin targets. ArcInner/RcInner (two words) and Mutex<dyn T> get
+the same offsets as before; their size_of_val now rounds to the alignment as rustc does.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 57ff684b..08de2793 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -530,6 +530,11 @@ namespace {
+                 << "static inline size_t ALIGN_TO(size_t s, size_t a) { return (s + a-1) / a * a; }\n"
+                 << "\n"
+                 ;
++            if( Target_IsDarwinPPC32() )
++            {
++                // Placement of a field of alignment `a` (GCC's ADJUST_FIELD_ALIGN), for trait object tails
++                m_of << "static inline size_t mrustc_dyn_field_align(size_t a) { return a > 4 && a != 16 ? 4 : a; }\n";
++            }
+             switch(m_compiler)
+             {
+             case Compiler::Gcc:
+@@ -7195,17 +7200,8 @@ namespace {
+                     m_of << size;
+                 }
+                 else {
+-                    // The unsized tail can sit several structs deep (servo_arc's `ArcInner<HeaderSlice<H, [T]>>`): collect
+-                    // the offset of the last field and the alignment of every wrapper, outermost first.
+-                    struct Level { size_t ofs; size_t align; };
+-                    ::std::vector<Level>    levels;
+-                    for(::HIR::TypeRef cur = ty.clone(); cur.data().is_Path(); )
+-                    {
+-                        const auto* repr = Target_GetTypeRepr(sp, m_resolve, cur);
+-                        MIR_ASSERT(mir_res, repr, "Can't get repr of " << cur);
+-                        levels.push_back(Level { repr->fields.back().offset, repr->align });
+-                        cur = repr->fields.back().ty.clone();
+-                    }
++                    // The unsized tail can sit several structs deep (servo_arc's `ArcInner<HeaderSlice<H, [T]>>`)
++                    const auto levels = get_dst_levels(ty);
+                     // slice metadata (`[T]` and `str`)
+                     if( inner_ty.data().is_Slice() || inner_ty == ::HIR::CoreType::Str ) {
+                         size_t item_size = 0;
+@@ -7247,20 +7243,9 @@ namespace {
+                                 m_of << ", " << levels[i].align << ")";
+                         }
+                     }
+-                    // Trait object metadata.
++                    // Trait object metadata: the tail offset and the rounding depend on the vtable's alignment
+                     else if( inner_ty.data().is_TraitObject() ) {
+-                        // TODO: Handle aligning the size if the wrapper's alignment is greater than the object
+-                        // - Also, how is the final field aligned?
+-                        size_t ofs = 0;
+-                        for(const auto& l : levels)
+-                            ofs += l.ofs;
+-                        if( ofs != 0 ) {
+-                            m_of << ofs << " + ";
+-                        }
+-                        //auto vtable_path = inner_ty.data().as_TraitObject().m_trait.m_path.clone();
+-                        //vtable_path.m_path.m_components.back() += "#vtable";
+-                        //auto vtable_ty = ::HIR::TypeRef
+-                        m_of << "((VTABLE_HDR*)"; emit_param(e.args.at(0)); m_of << ".META)->size";
++                        emit_dyn_size(levels, 0, [&]{ emit_param(e.args.at(0)); });
+                     }
+                     else {
+                         MIR_BUG(mir_res, "Unknown inner unsized type " << inner_ty << " for " << ty);
+@@ -7293,13 +7278,7 @@ namespace {
+                     }
+                 }
+                 else if( inner_ty.data().is_TraitObject() ) {
+-                    if( ! ty.data().is_TraitObject() ) {
+-                        m_of << "mrustc_max( ALIGNOF("; emit_ctype(ty); m_of << "), ";
+-                    }
+-                    m_of << "((VTABLE_HDR*)"; emit_param(e.args.at(0)); m_of << ".META)->align";
+-                    if( ! ty.data().is_TraitObject() ) {
+-                        m_of << " )";
+-                    }
++                    emit_dyn_align(get_dst_levels(ty), 0, [&]{ emit_param(e.args.at(0)); });
+                 }
+                 else {
+                     MIR_BUG(mir_res, "Unknown inner unsized type " << inner_ty << " for " << ty);
+@@ -9068,6 +9047,24 @@ namespace {
+                     emit_lvalue(inner);
+                     m_of << ".DATA[" << field_index << "]";
+                 }
++                else if( const auto* repr = this->dyn_tail_field_repr(ty, field_index) ) {
++                    // The trait object tail (or the struct holding it) of an unsized struct: its offset is the end of
++                    // the sized fields rounded up to the concrete type's alignment, which only the vtable knows.
++                    auto base = inner;
++                    while(base.is_Field())
++                        base.try_unwrap();
++                    MIR_ASSERT(*m_mir_res, base.is_Deref(), "DST access must be via a deref - " << val);
++                    const auto meta_ptr = base.inner_ref();
++                    const auto& fld_ty = repr->fields.back().ty;
++                    m_of << "(*(";
++                    if( fld_ty.data().is_TraitObject() )
++                        m_of << "uint8_t";
++                    else
++                        emit_ctype(fld_ty);
++                    m_of << "*)((uint8_t*)&"; emit_lvalue(inner); m_of << " + ALIGN_TO(" << repr->fields.back().offset << ", ";
++                    emit_dyn_field_align(get_dst_levels(fld_ty), 0, [&]{ emit_lvalue(meta_ptr); });
++                    m_of << ")))";
++                }
+                 else if( inner.is_Deref() ) {
+                     auto dst_type = metadata_type(ty);
+                     if( dst_type != MetadataType::None )
+@@ -9479,6 +9476,73 @@ namespace {
+             }
+         }
+ 
++        // The structs from `ty` down to its unsized tail: the offset of the last field and the alignment of each, outermost first
++        struct DstLevel { size_t ofs; size_t align; };
++        ::std::vector<DstLevel> get_dst_levels(const ::HIR::TypeRef& ty)
++        {
++            ::std::vector<DstLevel> levels;
++            for(::HIR::TypeRef cur = ty.clone(); cur.data().is_Path(); )
++            {
++                const auto* repr = Target_GetTypeRepr(sp, m_resolve, cur);
++                MIR_ASSERT(*m_mir_res, repr, "Can't get repr of " << cur);
++                levels.push_back(DstLevel { repr->fields.back().offset, repr->align });
++                cur = repr->fields.back().ty.clone();
++            }
++            return levels;
++        }
++        // A trait object tail isn't at the static offset of the last field (the end of the sized fields): rustc rounds that
++        // up to the alignment of the concrete type, from the vtable. These emit the alignment and size of the value at
++        // `levels[i]` (`i == levels.size()` is the trait object itself) for a trait object tail with the metadata from `meta`.
++        void emit_dyn_align(const ::std::vector<DstLevel>& levels, size_t i, const ::std::function<void()>& meta)
++        {
++            if( i == levels.size() ) {
++                m_of << "((VTABLE_HDR*)"; meta(); m_of << ".META)->align";
++                return ;
++            }
++            m_of << "mrustc_max(" << levels[i].align << ", ";
++            // At offset 0 the tail is the first field, which on Darwin ppc32 raises the struct's alignment to its own
++            if( levels[i].ofs == 0 )
++                emit_dyn_align(levels, i+1, meta);
++            else
++                emit_dyn_field_align(levels, i+1, meta);
++            m_of << ")";
++        }
++        // The alignment the value gets as a (non-first) field: GCC caps it at 4 on Darwin ppc32 (ADJUST_FIELD_ALIGN), see
++        // the `mrustc_dyn_field_align` helper. NOTE: a concrete type with `repr(align(8))` is exempt from the cap in GCC,
++        // which the vtable can't tell.
++        void emit_dyn_field_align(const ::std::vector<DstLevel>& levels, size_t i, const ::std::function<void()>& meta)
++        {
++            if( Target_IsDarwinPPC32() ) {
++                m_of << "mrustc_dyn_field_align("; emit_dyn_align(levels, i, meta); m_of << ")";
++            }
++            else {
++                emit_dyn_align(levels, i, meta);
++            }
++        }
++        // The repr of `ty` when its field `idx` is a trait object tail (or the struct holding one) at a non-zero static offset
++        const TypeRepr* dyn_tail_field_repr(const ::HIR::TypeRef& ty, unsigned idx)
++        {
++            if( !ty.data().is_Path() || metadata_type(ty) != MetadataType::TraitObject )
++                return nullptr;
++            const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
++            if( !repr || idx + 1 != repr->fields.size() || repr->fields.back().offset == 0 )
++                return nullptr;
++            return repr;
++        }
++        void emit_dyn_size(const ::std::vector<DstLevel>& levels, size_t i, const ::std::function<void()>& meta)
++        {
++            if( i == levels.size() ) {
++                m_of << "((VTABLE_HDR*)"; meta(); m_of << ".META)->size";
++                return ;
++            }
++            m_of << "ALIGN_TO(";
++            if( levels[i].ofs != 0 ) {
++                m_of << "ALIGN_TO(" << levels[i].ofs << ", "; emit_dyn_field_align(levels, i+1, meta); m_of << ") + ";
++            }
++            emit_dyn_size(levels, i+1, meta);
++            m_of << ", "; emit_dyn_align(levels, i, meta); m_of << ")";
++        }
++
+         MetadataType metadata_type(const ::HIR::TypeRef& ty) const {
+             return m_resolve.metadata_type(m_mir_res ? m_mir_res->sp : sp, ty);
+         }

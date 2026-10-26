@@ -1,0 +1,161 @@
+From bd605eaf288d6732625f71c9943fff1d5a21f0fb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 26 Oct 2026 03:47:07 +0000
+Subject: [PATCH] trans: size_of_val of a nested DST adds the offsets of every
+ wrapper level, rounding each one
+
+librsvg 2.58.5 (the Rust librsvg port), rsvg-convert at run time, while parsing the first CSS rule:
+
+    thread 'main' panicked at :0:0:
+    assertion failed: ((((buffer).add(size,) as usize) - ((current as *mut u8) as usize)) < inner_align)
+
+servo_arc 0.3.0 lib.rs:760, `Arc::<HeaderSlice<HeaderWithLength<SpecificityAndFlags>,
+[Component<Impl>]>>::from_header_and_iter_alloc` (selectors 0.25.0 parse_selector, from rsvg's
+css.rs Stylesheet::add_rules_from_string).  servo_arc sizes the allocation with
+
+    mem::size_of_val(&*(slice::from_raw_parts(..) as *const [T] as *const ArcInner<HeaderSlice<H, [T]>>))
+
+where `ArcInner<T: ?Sized> { count: AtomicUsize, data: T }` and `HeaderSlice<H, T: ?Sized>
+{ header: H, slice: T }`: the unsized tail is two structs deep.  The size_of_val intrinsic took
+the last-field offset of the outermost struct only (`ALIGN_TO(4 + n * size, align)` on ppc32), so
+the header (HeaderWithLength<SpecificityAndFlags>, 12 bytes) was missing: the allocation was 12
+bytes short (a heap overflow when the items are written) and servo_arc's debug check of the slack
+`buffer + size - end of the last item` wrapped around.
+
+size_of_val now walks the chain of last fields down to the slice/str/trait object and computes
+rustc's size_and_align_of_dst: at each level `offset of the tail + size of the inner level`, rounded
+up to that level's alignment, which is size_of of the same type with a `[T; N]` tail (also under the
+Darwin ppc32 field-alignment cap, where an inner level can be more aligned than the outer one).  The
+rounding is only emitted where it can change the value, so single-level types (Arc<str>, Rc<[T]>,
+Path/OsStr/CStr) produce the same C as before.  A trait object tail gets the offsets of all levels
+summed (it had the outermost one only); its alignment rules are unchanged here.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index dc783553..57ff684b 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -7194,54 +7194,78 @@ namespace {
+                     MIR_ASSERT(mir_res, Target_GetSizeOf(sp, m_resolve, ty, size), "Can't get size of " << ty);
+                     m_of << size;
+                 }
+-                // slice metadata (`[T]` and `str`)
+-                else if( inner_ty.data().is_Slice() || inner_ty == ::HIR::CoreType::Str ) {
+-                    bool align_needed = false;
+-                    size_t item_size = 0;
+-                    size_t item_align = 0;
+-                    if(const auto* te = inner_ty.data().opt_Slice() ) {
+-                        MIR_ASSERT(mir_res, Target_GetSizeAndAlignOf(sp, m_resolve, te->inner, item_size, item_align), "Can't get size of " << te->inner);
+-                    }
+-                    else {
+-                        assert(inner_ty == ::HIR::CoreType::Str);
+-                        item_size = 1;
+-                        item_align = 1;
+-                    }
+-                    if( ! ty.data().is_Slice() && !ty.data().is_Primitive() ) {
+-                        // TODO: What if the wrapper has no other fields?
+-                        // Get the alignment and check if it's higher than the item alignment
+-                        size_t wrapper_align = 0, wrapper_size_ignore = 0;
+-                        MIR_ASSERT(mir_res, Target_GetSizeAndAlignOf(sp, m_resolve, ty, wrapper_size_ignore, wrapper_align), "Can't get align of " << ty);
+-                        if(wrapper_align > item_align) {
+-                            item_align = wrapper_align;
+-                            align_needed = true;
+-                            m_of << "ALIGN_TO(";
++                else {
++                    // The unsized tail can sit several structs deep (servo_arc's `ArcInner<HeaderSlice<H, [T]>>`): collect
++                    // the offset of the last field and the alignment of every wrapper, outermost first.
++                    struct Level { size_t ofs; size_t align; };
++                    ::std::vector<Level>    levels;
++                    for(::HIR::TypeRef cur = ty.clone(); cur.data().is_Path(); )
++                    {
++                        const auto* repr = Target_GetTypeRepr(sp, m_resolve, cur);
++                        MIR_ASSERT(mir_res, repr, "Can't get repr of " << cur);
++                        levels.push_back(Level { repr->fields.back().offset, repr->align });
++                        cur = repr->fields.back().ty.clone();
++                    }
++                    // slice metadata (`[T]` and `str`)
++                    if( inner_ty.data().is_Slice() || inner_ty == ::HIR::CoreType::Str ) {
++                        size_t item_size = 0;
++                        size_t item_align = 0;
++                        if(const auto* te = inner_ty.data().opt_Slice() ) {
++                            MIR_ASSERT(mir_res, Target_GetSizeAndAlignOf(sp, m_resolve, te->inner, item_size, item_align), "Can't get size of " << te->inner);
++                        }
++                        else {
++                            assert(inner_ty == ::HIR::CoreType::Str);
++                            item_size = 1;
++                            item_align = 1;
++                        }
++                        // Each level is `offset + size of the inner level`, rounded up to the level's alignment (= size_of of
++                        // the type with a `[T; N]` tail). `known` tracks the alignment the expression already has, so the
++                        // rounding is only emitted where it can change the value.
++                        auto lowbit = [](size_t v) { return v & (~v + 1); };
++                        size_t known = item_size == 0 ? SIZE_MAX : lowbit(item_size);
++                        ::std::vector<bool> round_up(levels.size());
++                        for(size_t i = levels.size(); i --; )
++                        {
++                            if( levels[i].ofs != 0 )
++                                known = ::std::min(known, lowbit(levels[i].ofs));
++                            if( levels[i].align > 1 && known < levels[i].align ) {
++                                round_up[i] = true;
++                                known = levels[i].align;
++                            }
++                        }
++                        for(size_t i = 0; i < levels.size(); i ++)
++                        {
++                            if( round_up[i] )
++                                m_of << "ALIGN_TO(";
++                            if( levels[i].ofs != 0 )
++                                m_of << levels[i].ofs << " + ";
++                        }
++                        emit_param(e.args.at(0)); m_of << ".META * " << item_size;
++                        for(size_t i = levels.size(); i --; )
++                        {
++                            if( round_up[i] )
++                                m_of << ", " << levels[i].align << ")";
+                         }
+-                        const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
+-                        m_of << repr->fields.back().offset << " + ";
+                     }
+-                    emit_param(e.args.at(0)); m_of << ".META * " << item_size;
+-                    if(align_needed) {
+-                        m_of << ", " << item_align << ")";
++                    // Trait object metadata.
++                    else if( inner_ty.data().is_TraitObject() ) {
++                        // TODO: Handle aligning the size if the wrapper's alignment is greater than the object
++                        // - Also, how is the final field aligned?
++                        size_t ofs = 0;
++                        for(const auto& l : levels)
++                            ofs += l.ofs;
++                        if( ofs != 0 ) {
++                            m_of << ofs << " + ";
++                        }
++                        //auto vtable_path = inner_ty.data().as_TraitObject().m_trait.m_path.clone();
++                        //vtable_path.m_path.m_components.back() += "#vtable";
++                        //auto vtable_ty = ::HIR::TypeRef
++                        m_of << "((VTABLE_HDR*)"; emit_param(e.args.at(0)); m_of << ".META)->size";
+                     }
+-                }
+-                // Trait object metadata.
+-                else if( inner_ty.data().is_TraitObject() ) {
+-                    // TODO: Handle aligning the size if the wrapper's alignment is greater than the object
+-                    // - Also, how is the final field aligned?
+-                    if( ! ty.data().is_TraitObject() ) {
+-                        const auto* repr = Target_GetTypeRepr(sp, m_resolve, ty);
+-                        m_of << repr->fields.back().offset << " + ";
++                    else {
++                        MIR_BUG(mir_res, "Unknown inner unsized type " << inner_ty << " for " << ty);
+                     }
+-                    //auto vtable_path = inner_ty.data().as_TraitObject().m_trait.m_path.clone();
+-                    //vtable_path.m_path.m_components.back() += "#vtable";
+-                    //auto vtable_ty = ::HIR::TypeRef
+-                    m_of << "((VTABLE_HDR*)"; emit_param(e.args.at(0)); m_of << ".META)->size";
+-                }
+-                else {
+-                    MIR_BUG(mir_res, "Unknown inner unsized type " << inner_ty << " for " << ty);
+                 }
+-                // TODO: Align up
+             }
+             else if( name == "min_align_of_val" || name == "align_of_val" ) {
+                 emit_lvalue(e.ret_val); m_of << " = ";
