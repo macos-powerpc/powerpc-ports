@@ -1,0 +1,78 @@
+From 398f988795db6da7cb9a043c2c17ada61b20bc68 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 14:36:25 +0000
+Subject: [PATCH] mir: the optimiser's lvalue visitor and the validator see
+ borrow call parameters
+
+webrtc-sctp 0.13.0 (localsend-cli 1.18.2, tokio 1.53.1) src/timer/ack_timer.rs:34,
+the `tokio::spawn(async move { .. })` block of AckTimer<T>::start:
+
+    tokio::select! {
+        _ = timer.as_mut() => {
+            if let Some(observer) = timeout_observer.upgrade() {
+                let mut observer = observer.lock().await;
+                observer.on_ack_timeout().await;
+            }
+        }
+        _ = close_rx.recv() => {},
+    }
+
+    MIR ERROR: <future#I_start_182<AssociationInternal> as Future>::poll
+      BB11/2: ensure_valid: Use of non-valid lvalue - a1*
+
+`a1` is the generated poll's `cx`.  The `.await` lowering hands `&mut *cx` to
+the awaited `poll` as a borrow call parameter (Param::Borrow, 0130).
+mir/optimise.cpp has its own lvalue visitor family, and its Param case only
+knew LValue parameters, so every optimisation pass built on it was blind to
+those borrows.  Here core's `PollFn::poll` (the `select!` closure's driver)
+had been inlined before monomorphisation, leaving `_n = &mut *cx; (f)(_n)`;
+the reborrow elimination (MIR_Optimise_DeTemporary_ReborrowOfUnused) found
+no other use of `cx` - the two later awaits only mention it in borrow
+parameters - and rewrote the call to `(f)(cx)`, a move of the coroutine's
+`cx`.  The validator's move_val(Param) had the same blind spot, so nothing
+complained until the post-monomorphisation inlining of core's
+`impl Future for Pin<Box<dyn Future>>` turned one of the later borrow
+parameters into the statement `_50 = &mut *a1`.
+
+The visitor now reports a borrow parameter's lvalue as a Borrow use, and the
+validator checks that a borrowed parameter is valid.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/mir/check.cpp b/src/mir/check.cpp
+index 01d3a149..f26365e4 100644
+--- a/src/mir/check.cpp
++++ b/src/mir/check.cpp
+@@ -348,6 +348,11 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+             {
+                 move_val(state, *e);
+             }
++            else if( const auto* e = p.opt_Borrow() )
++            {
++                // The borrowed value has to be valid (it isn't moved)
++                ensure_valid(state, e->val);
++            }
+         }
+     private:
+         static bool merge_state(State& a, State b)
+diff --git a/src/mir/optimise.cpp b/src/mir/optimise.cpp
+index f393504d..f8fee394 100644
+--- a/src/mir/optimise.cpp
++++ b/src/mir/optimise.cpp
+@@ -508,6 +508,15 @@ namespace
+         {
+             return visit_mir_lvalue_raw_mut(*e, u, cb);
+         }
++        else if( auto* e = p.opt_Borrow() )
++        {
++            // A borrow parameter (`&mut *cx`, passed straight to `Future::poll` by the `.await` lowering) borrows its
++            // lvalue: a use of the root that must be seen by every pass. Skipped, `cx` looked unused to the
++            // reborrow elimination, which turned the inlined `PollFn::poll`'s `_n = &mut *cx; (f)(_n)` into
++            // `(f)(cx)`, moving the coroutine's `cx` (webrtc-sctp 0.13.0 timer/ack_timer.rs `select!` + two more
++            // awaits: "Use of non-valid lvalue - a1*" once a later await's poll was inlined after monomorphisation).
++            return visit_mir_lvalue_raw_mut(e->val, ValUsage::Borrow, cb);
++        }
+         else
+         {
+             return false;

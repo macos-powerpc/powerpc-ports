@@ -1,0 +1,232 @@
+From 5f4c30bcda541b3aadfd3cdcb29a34902ec09ce6 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 11:56:53 +0000
+Subject: [PATCH 396/397] hir_typeck: autoderef waits when several Deref impls
+ fit a type that still holds ivars
+
+nalgebra 0.32.3 (librsvg 2.58.5) src/geometry/rotation_specialization.rs:490,
+Rotation3::face_towards:
+
+    let zaxis = dir.normalize();
+    let xaxis = up.cross(&zaxis).normalize();
+    ..
+    xaxis.y.clone(),
+
+    error: Couldn't find the field y in Matrix<T, <ShapeConstraint as
+      SameNumberOfRows<Const<3>, _>>::Representative, <ShapeConstraint as
+      SameNumberOfColumns<Const<1>, _>>::Representative, <DefaultAllocator as
+      Allocator<T, .., ..>>::Buffer>
+
+`cross<R2, C2, SB>(&self, b: &Matrix<T, R2, C2, SB>)` returns
+`MatrixCross<T, R, C, R2, C2>`, whose shape is a projection over R2/C2.
+The field access was visited while those were still unbound (the `&zaxis`
+argument coercion that binds them runs in a later stage), so autoderef
+searched `Deref` impls of a Matrix whose shape is an unresolved projection:
+every coordinate impl of base/coordinates.rs (`Matrix<T, U1, U1, S>` -> X,
+`U2` -> XY, `U3` -> XYZ, ...) matched fuzzily and the first one, `X<T>`, was
+taken (with a concrete scalar the same shape ended in "Associated type on
+Deref for Matrix<u32, Const<3>, Const<1>, ArrayStorage<..>> doesn't match -
+X<u32> != XYZ<u32>" from the validation pass).
+
+TraitResolution::autoderef now counts the fuzzy Deref impls when the type
+still holds unbound ivars: an exact match or a single fuzzy impl (Box<_>,
+Rc<_>, ..) is taken as before, several with different targets are reported
+through a new out-flag as not decidable yet. The field-access and
+call-value visitors, autoderef_find_field, the method probe (returns ~0u =
+revisit) and the deref-coercion walk in check_unsize_tys (returns Unknown)
+wait for the ivars instead of failing or committing. Other callers keep
+getting null for such a type (they treated the first impl as the deref
+target before; null is the conservative answer in those heuristics).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index f4fa1f90..8f49834f 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1060,7 +1060,8 @@ namespace {
+                                 break; // leaves TU_MATCH
+                             }
+                         }
+-                        if( const auto* next_ty_p = this->context.m_resolve.autoderef(node.span(), ty, tmp_type) )
++                        bool deref_ambiguous = false;
++                        if( const auto* next_ty_p = this->context.m_resolve.autoderef(node.span(), ty, tmp_type, &deref_ambiguous) )
+                         {
+                             DEBUG("Deref (autoderef) " << ty << " -> " << *next_ty_p);
+                             deref_count++;
+@@ -1068,6 +1069,11 @@ namespace {
+                             keep_looping = true;
+                             continue;
+                         }
++                        if( deref_ambiguous )
++                        {
++                            DEBUG("Deref impl not decidable yet, returning early");
++                            return ;
++                        }
+ 
+                         // Didn't find anything. Error?
+                         ERROR(node.span(), E0000, "Unable to find an implementation of Fn*" << trait_pp << " for " << this->context.m_ivars.fmt_type(ty));
+@@ -1430,7 +1436,13 @@ namespace {
+                 }
+ 
+                 deref_count += 1;
+-                current_ty = this->context.m_resolve.autoderef(node.span(), ty,  tmp_type);
++                bool deref_ambiguous = false;
++                current_ty = this->context.m_resolve.autoderef(node.span(), ty,  tmp_type, &deref_ambiguous);
++                if( !current_ty && deref_ambiguous ) {
++                    // Several Deref impls fit until the type's ivars are known: revisit later
++                    DEBUG("Deref impl not decidable yet, returning early");
++                    return ;
++                }
+                 if( current_ty )
+                     deref_res_types.push_back( current_ty->clone() );
+             } while(current_ty);
+@@ -4526,7 +4538,8 @@ namespace {
+             // The shallowest source level that could unify with the destination (rustc unifies before it
+             // deref-coerces), for pairing an ivar found below with the right destination level
+             unsigned int first_unifiable = (src.compare_with_placeholders(sp, dst, context.m_ivars.callback_resolve_infer()) != ::HIR::Compare::Unequal ? 0 : UINT_MAX);
+-            while( (out_ty_p = context.m_resolve.autoderef(sp, *out_ty_p, tmp_ty)) )
++            bool deref_ambiguous = false;
++            while( (out_ty_p = context.m_resolve.autoderef(sp, *out_ty_p, tmp_ty, &deref_ambiguous)) )
+             {
+                 const auto& out_ty = context.m_ivars.get_type(*out_ty_p);
+                 DEBUG("From? " << out_ty);
+@@ -4698,6 +4711,12 @@ namespace {
+ 
+                 return CoerceResult::Custom;
+             }
++            if( deref_ambiguous )
++            {
++                // The source's Deref impl can't be chosen until its ivars are known (several fit)
++                DEBUG("Src deref impl not decidable yet, return Unknown");
++                return CoerceResult::Unknown;
++            }
+             // Either ran out of deref, or hit a _
+             DEBUG("No applicable deref coercions");
+         }
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 0d65d159..5191db5e 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -5033,7 +5033,10 @@ const ::HIR::TypeRef* TraitResolution::type_is_owned_box(const Span& sp, const :
+ // -------------------------------------------------------------------------------------------------------------------
+ //
+ // -------------------------------------------------------------------------------------------------------------------
+-const ::HIR::TypeRef* TraitResolution::autoderef(const Span& sp, const ::HIR::TypeRef& ty_in,  ::HIR::TypeRef& tmp_type) const
++namespace {
++    bool type_contains_unbounded_ivars(const HMTypeInferrence& ivars, const ::HIR::TypeRef& ty);
++}
++const ::HIR::TypeRef* TraitResolution::autoderef(const Span& sp, const ::HIR::TypeRef& ty_in,  ::HIR::TypeRef& tmp_type, bool* out_ambiguous) const
+ {
+     const auto& ty = this->m_ivars.get_type(ty_in);
+     if( ty.data().is_Infer() ) {
+@@ -5063,21 +5066,60 @@ const ::HIR::TypeRef* TraitResolution::autoderef(const Span& sp, const ::HIR::Ty
+         }
+ #endif
+ 
++        // A type that still holds inference variables can match several `Deref` impls fuzzily, each with its own
++        // target (nalgebra's coordinate impls `Deref for Matrix<T, U1, U1, S>` -> `X<T>`, `Matrix<T, U3, U1, S>` ->
++        // `XYZ<T>`, ...): no impl can be chosen until the variables are known, so report the ambiguity instead of
++        // taking the first impl. nalgebra 0.32.3 (librsvg 2.58.5) rotation_specialization.rs:490 `xaxis.y` with
++        // `let xaxis = up.cross(&zaxis).normalize();`: the field access ran while `cross`'s shape parameters
++        // `R2`/`C2` were still unbound (the argument coercion binds them later), took the `U1` impl's `X<T>` and
++        // failed with "Couldn't find the field y" / "Associated type on Deref for Matrix<..> doesn't match - X != XYZ".
++        // A single fuzzy impl is still taken (`Box<_>`, `Rc<_>`, ...), as is any exact match.
++        unsigned int n_fuzzy = 0;
++        bool fuzzy_targets_differ = false;
++        ::HIR::TypeRef  fuzzy_target;
++        const bool has_ivars = type_contains_unbounded_ivars(this->m_ivars, ty);
+         bool succ = this->find_trait_impls(sp, m_lang_Deref, ::HIR::PathParams {}, ty, [&](auto impls, auto match) {
+-            tmp_type = impls.get_type("Target", {});
+-            if( tmp_type == ::HIR::TypeRef() )
++            ::HIR::TypeRef  target = impls.get_type("Target", {});
++            if( target == ::HIR::TypeRef() )
+             {
+-                tmp_type = ::HIR::TypeRef::new_path(
++                target = ::HIR::TypeRef::new_path(
+                     ::HIR::Path( ty.clone(), m_lang_Deref, RcString::new_interned("Target") ),
+                     ::HIR::TypePathBinding::make_Opaque({})
+                     );
+             }
+             else
+             {
+-                this->expand_associated_types_inplace(sp, tmp_type, {});
++                this->expand_associated_types_inplace(sp, target, {});
+             }
++            if( match == ::HIR::Compare::Fuzzy && has_ivars )
++            {
++                DEBUG("Fuzzy Deref impl " << impls << " -> " << target);
++                if( n_fuzzy == 0 ) {
++                    fuzzy_target = mv$(target);
++                }
++                else if( !(fuzzy_target == target) ) {
++                    fuzzy_targets_differ = true;
++                }
++                n_fuzzy += 1;
++                // Keep looking for an exact match (or more candidates)
++                return false;
++            }
++            tmp_type = mv$(target);
+             return true;
+             });
++        if( !succ && n_fuzzy > 0 )
++        {
++            if( fuzzy_targets_differ )
++            {
++                DEBUG("Deref " << ty << " ambiguous: " << n_fuzzy << " fuzzy impls with different targets");
++                if( out_ambiguous ) {
++                    *out_ambiguous = true;
++                }
++                return nullptr;
++            }
++            tmp_type = mv$(fuzzy_target);
++            succ = true;
++        }
+         if( succ ) {
+             DEBUG("Deref " << ty << " into " << tmp_type);
+             return &tmp_type;
+@@ -5210,7 +5252,13 @@ unsigned int TraitResolution::autoderef_find_method_probe(const Span& sp,
+         else
+         {
+             // TODO: Update `cur_access` based on the avaliable Deref impls
+-            current_ty = this->autoderef(sp, ty,  tmp_type);
++            bool deref_ambiguous = false;
++            current_ty = this->autoderef(sp, ty,  tmp_type, &deref_ambiguous);
++            if( !current_ty && deref_ambiguous )
++            {
++                DEBUG("Deref impl not decidable yet, deferring");
++                return ~0u;
++            }
+         }
+     } while(current_ty);
+ 
+@@ -5927,7 +5975,11 @@ unsigned int TraitResolution::autoderef_find_field(const Span& sp, const ::HIR::
+ 
+         // 3. Dereference and try again
+         deref_count += 1;
+-        current_ty = this->autoderef(sp, ty,  tmp_type);
++        bool deref_ambiguous = false;
++        current_ty = this->autoderef(sp, ty,  tmp_type, &deref_ambiguous);
++        if( !current_ty && deref_ambiguous ) {
++            return ~0u;
++        }
+     } while( current_ty );
+ 
+     if(/*const auto* e =*/ this->m_ivars.get_type(top_ty).data().opt_Borrow()) {
+diff --git a/src/hir_typeck/helpers.hpp b/src/hir_typeck/helpers.hpp
+index 767a39ca..b97e7965 100644
+--- a/src/hir_typeck/helpers.hpp
++++ b/src/hir_typeck/helpers.hpp
+@@ -310,7 +310,10 @@ public:
+     unsigned int autoderef_find_field(const Span& sp, const ::HIR::TypeRef& top_ty, const RcString& name,  /* Out -> */::HIR::TypeRef& field_type) const;
+ 
+     /// Apply an automatic dereference
+-    const ::HIR::TypeRef* autoderef(const Span& sp, const ::HIR::TypeRef& ty,  ::HIR::TypeRef& tmp_type) const;
++    /// Dereference `ty` once (through `Deref` for non-pointers). Returns null when it can't be dereferenced, or when
++    /// several `Deref` impls (with different targets) match only fuzzily because `ty` still holds inference variables;
++    /// the latter also sets `*out_ambiguous` so the caller can wait instead of failing.
++    const ::HIR::TypeRef* autoderef(const Span& sp, const ::HIR::TypeRef& ty,  ::HIR::TypeRef& tmp_type, bool* out_ambiguous = nullptr) const;
+ 
+     bool find_field(const Span& sp, const ::HIR::TypeRef& ty, const RcString& name,  /* Out -> */::HIR::TypeRef& field_type) const;
+ 

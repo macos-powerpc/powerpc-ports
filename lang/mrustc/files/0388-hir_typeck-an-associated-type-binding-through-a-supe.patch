@@ -1,0 +1,100 @@
+From 827915afc207112da571cf162865ceaa4f53b67c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 03:22:44 +0000
+Subject: [PATCH] hir_typeck: an associated-type binding through a supertrait
+ keeps that supertrait's `for<..>` binder
+
+der 0.8.1 (localsend-cli 1.18.2) src/decode.rs:164
+`impl<T: DecodeOwned<Error = Error> + PemLabel> DecodePem for T { fn from_pem(..) { .. T::decode(&mut reader) } }`
+with `pub trait DecodeOwned: for<'a> Decode<'a> {}`:
+    <null> BUG: ASSERT FAIL: src/hir_typeck/helpers.cpp:42:g.idx() < hrls.m_lifetimes.size():
+    HRL index out of range - /*H:0*/ with
+and, at a call `Byte::from_pem(..)`:
+    BUG: ASSERT FAIL: src/hir_typeck/helpers.cpp:4075:g.binding < 256: Generic lifetime binding in
+    /*H:0*/ out of range (>=256)
+
+The binding `Error = Error` names the supertrait's path `Decode<'H0>`, whose
+lifetime belongs to the supertrait path's own `for<'a>` binder. Two places
+lost that binder:
+
+- The bound cache (resolve_common.cpp prep_indexes__add_trait_bound) registered
+  the bound `T: Decode<'H0>` from the binding BEFORE the parent walk, with no
+  binder, and the parent walk's later attempt found the entry and left it. The
+  typeck of the body then matched `Decode<'_>` against `Decode<'H0>` with
+  an empty lifetime list. Now the binding looks the supertrait up in
+  m_all_parent_traits for its binder, and an entry made without one adopts the
+  binder when it arrives.
+- The typeck impl matcher (helpers.cpp find_impl__check_crate_raw's Matcher)
+  resolved every lifetime through the impl's parameters; a higher-ranked one
+  no pushed binder declares (the binding's `Decode<'H0>` in the impl's
+  where-clause) is bound elsewhere and is left as it is, as the static
+  resolver's twin matcher already did. Lifetimes don't select impls.
+
+The bare shape (`fn f<T: DecodeOwned>(..) { T::decode(..) }`, no binding)
+already worked.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 04a9093c..8ef2be66 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -4072,6 +4072,12 @@ namespace {
+             return placeholders.m_values.at(val.binding).clone();
+         }
+         ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
++            // A higher-ranked lifetime no pushed binder declares is bound elsewhere, not by the impl: the `for<'a>`
++            // of a supertrait path named through an associated-type binding (`T: DecodeOwned<Error = E>` with
++            // `trait DecodeOwned: for<'a> Decode<'a>`, der 0.8.1 decode.rs:164). Lifetimes don't select impls: leave it.
++            if( g.group() == ::HIR::GENERIC_Hrtb ) {
++                return ::HIR::LifetimeRef(g.binding);
++            }
+             ASSERT_BUG(sp, g.binding < 256, "Generic lifetime binding in " << g << " out of range (>=256)");
+             ASSERT_BUG(sp, g.binding < impl_params.m_lifetimes.size(), "Generic lifetime binding in " << g << " out of range (>= " << impl_params.m_lifetimes.size() << ")");
+             return impl_params.m_lifetimes.at(g.binding);
+diff --git a/src/hir_typeck/resolve_common.cpp b/src/hir_typeck/resolve_common.cpp
+index f3e9fc7f..6caf89a7 100644
+--- a/src/hir_typeck/resolve_common.cpp
++++ b/src/hir_typeck/resolve_common.cpp
+@@ -59,6 +59,11 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+         auto it = m_trait_bounds.find(std::make_pair(std::ref(type), std::ref(trait_path)));
+         if( it != m_trait_bounds.end() ) {
+             DEBUG("[get_or_add_trait_bound] Existing " << FMT_CB(os, if(hrbs) os << "for" << hrbs->fmt_args() << " ";) << trait_path);
++            // An entry made without its binder (an associated-type binding naming a supertrait, below) takes the binder
++            // when the parent walk brings it
++            if( it->second.hrbs.is_empty() && hrbs && !hrbs->is_empty() ) {
++                it->second.hrbs = hrbs->clone();
++            }
+             return it->second;
+         }
+         DEBUG("[get_or_add_trait_bound] Add " << FMT_CB(os, if(outer_hrtbs) os << "for" << outer_hrtbs->fmt_args() << " ";) << " ?: " << FMT_CB(os, if(hrbs) os << "for" << hrbs->fmt_args() << " ";) << trait_path);
+@@ -72,7 +77,20 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+         rv.trait_ptr = &m_crate.get_trait_by_path(sp, trait_path.m_path);
+         return rv;
+     };
++    const auto& trait = m_crate.get_trait_by_path(sp, trait_path.m_path.m_path);
+     auto push_type = [&](const RcString& name, const HIR::GenericParams* hrbs, const HIR::TraitPath::AtyEqual& atye) {
++        // A binding whose associated type comes from a SUPERTRAIT (`DecodeOwned<Error = E>` with
++        // `trait DecodeOwned: for<'a> Decode<'a>`, der 0.8.1) names that supertrait's path, whose HRLs belong to the
++        // supertrait path's own `for<'a>` binder: cache the bound under that binder, or `Decode<'H0>` for `T` has no
++        // lifetime list to match against (helpers.cpp "HRL index out of range" in find_trait_impls_bound)
++        if( atye.source_trait.m_path != trait_path.m_path.m_path && !(hrbs && !hrbs->is_empty()) ) {
++            for(const auto& pt : trait.m_all_parent_traits) {
++                if( pt.m_path.m_path == atye.source_trait.m_path && pt.m_hrtbs && !pt.m_hrtbs->is_empty() ) {
++                    hrbs = pt.m_hrtbs.get();
++                    break;
++                }
++            }
++        }
+         auto& b = get_or_add_trait_bound(hrbs, atye.source_trait);
+         b.assoc.insert(std::make_pair(name, atye.clone()));
+     };
+@@ -80,7 +98,6 @@ void TraitResolveCommon::prep_indexes__add_trait_bound(const Span& sp, const ::H
+     auto& trait_params = trait_path.m_path.m_params;
+     auto monomorph = MonomorphStatePtr(&type, &trait_params, nullptr);
+ 
+-    const auto& trait = m_crate.get_trait_by_path(sp, trait_path.m_path.m_path);
+ #if 1
+     while(trait_params.m_types.size() < trait.m_params.m_types.size()) {
+         trait_params.m_types.push_back(monomorph.monomorph_type(sp, trait.m_params.m_types[trait_params.m_types.size()].m_default));

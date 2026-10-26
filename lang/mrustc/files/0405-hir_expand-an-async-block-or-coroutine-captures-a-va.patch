@@ -1,0 +1,575 @@
+From 3775bdc9d3585ef5f5469d4a8ecc9384283e6139 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Mon, 26 Oct 2026 00:12:34 +0000
+Subject: [PATCH] hir_expand: an async block or coroutine captures a variable's
+ fields separately (edition 2021), as a closure does
+
+localsend 0.1.0 (localsend-cli 1.18.2), compiling the core crate (-O):
+
+    MIR ERROR: <localsend::webrtc::signaling::SignalingConnection>::start_listener BB17/2:
+      ensure_valid: Use of non-valid lvalue - a0.0
+
+webrtc/signaling.rs:282:
+
+    pub fn start_listener(mut self) -> (ManagedSignalingConnection, mpsc::Receiver<..>) {
+        ..
+        tokio::spawn(async move {
+            while let Some(message) = self.rx.recv().await { .. }
+        });
+        (ManagedSignalingConnection { client: self.client, tx: self.tx, on_answer }, rx)
+    }
+
+Since edition 2021 a closure captures the fields of a variable it uses
+separately (RFC 2229), and rustc applies the same analysis to async blocks and
+coroutines (they are closures to its upvar analysis).  mrustc's usage pass
+already recorded field paths for closures but only whole variables for
+coroutines, so the block above captured all of `self`; `self.client` then read
+a moved value (a0.0 = the first field of the `self` argument).
+
+The coroutine capture cache now holds the same `Capture { root_slot, fields,
+usage }` entries as the closure cache:
+
+- annotate_value_usage.cpp: a coroutine scope records the places used per
+  variable, merged by the closure rule (a path below an existing capture folds
+  into it, a path above replaces those below; the merge moved into a shared
+  `merge_capture`).  `apply_coroutine` emits one capture per place; a `move`
+  coroutine truncates a place reached through a reference to the reference,
+  which moves in (as the closure code does, and as rustc does), and the
+  shared-borrow upgrade and the propagation to an enclosing closure/coroutine
+  use the place's type and path.
+- closures.cpp: `coroutine_vars` gives a captured field path its own local
+  and state field (typed by the path, the capture expression built as for
+  closures); `ExprVisitor_GeneratorRewrite` rewrites a matching field chain in
+  the body to that local, and a bare variable that was captured only by field
+  paths is a BUG instead of an out_of_range.
+- lifetime_infer.cpp: the capture-lifetime visit passes the path.
+
+A by-value capture of a non-Copy place cannot move a field out of a type with
+a Drop impl, so rustc truncates such a place to that type and captures it
+whole (restrict_precision_for_drop_types; the common case is a `move`
+block/closure that only borrows the field).  Closures never did this either:
+`move || peek(&g.p)` with `g: Guard2` (Drop) moved `g.p` out of `g`.  The
+truncation (and a re-merge of the shortened paths, also after the existing
+deref truncation of move closures) now applies to closures and coroutines.
+
+Editions before 2021 never record field paths, so their captures are the
+whole-variable entries they were.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index 6c318c18..e33fcd45 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -922,7 +922,8 @@ struct ExprNode_Generator:
+     // AnnotateValueUsage cache/information
+     struct AvuCache {
+         ::std::vector<unsigned int> local_vars;
+-        ::std::vector< ::std::pair<unsigned int, ::HIR::ValueUsage> > captured_vars;
++        // Captured places: a variable, or (edition 2021) a field path of one, as for closures
++        ::std::vector<ExprNode_Closure::AvuCache::Capture> captured_vars;
+     } m_avu_cache;
+ 
+     // Generated type information
+diff --git a/src/hir_expand/annotate_value_usage.cpp b/src/hir_expand/annotate_value_usage.cpp
+index 2dd9aab6..8887ed2a 100644
+--- a/src/hir_expand/annotate_value_usage.cpp
++++ b/src/hir_expand/annotate_value_usage.cpp
+@@ -52,6 +52,9 @@ namespace {
+                 std::vector<unsigned>   defined_stack;
+                 std::vector<unsigned>   last_used_stack;
+                 ::HIR::ValueUsage   usage;
++                // The places used (the variable, or field paths of it in edition 2021), merged as for a closure.
++                // Only meaningful for a variable defined outside the coroutine: those are its captures.
++                std::vector<HIR::ExprNode_Closure::AvuCache::Capture>   captures;
+             };
+             std::map<unsigned, Var> used_variables;
+ 
+@@ -819,15 +822,21 @@ namespace {
+             if( node.m_is_move )
+             {
+                 DEBUG("> Tagged with `move` - upgrading all usage to `Move`");
++                bool truncated = false;
+                 for(auto& cap : scope.captured_vars)
+                 {
+                     if( cap.fields.size() > 0 && cap.fields[0] == "" ) {
+                         // Derefs stay as-is?
+                         // TODO: Only clear if the value isn't `Copy`
+                         cap.fields.clear();
++                        truncated = true;
+                     }
+                     cap.usage = ::HIR::ValueUsage::Move;
+                 }
++                if( truncated ) {
++                    // Two fields through the same reference are now the one reference
++                    remerge_captures(node.span(), scope.captured_vars);
++                }
+             }
+             else
+             {
+@@ -849,6 +858,8 @@ namespace {
+                 }
+             }
+ 
++            truncate_captures_for_drop_types(node.span(), scope.captured_vars);
++
+             // Determine if the closure is `Copy`
+             {
+                 node.m_is_copy = true;
+@@ -1220,25 +1231,12 @@ namespace {
+             }
+             return usage;
+         }
+-        void mark_used_variable_closure(const Span& sp, ClosureScope& closure_rec, unsigned slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed)
++        /// Record a captured place in a sorted capture list: a path below an existing capture folds into it, a path
++        /// above existing ones replaces them (the closure rule, shared with coroutines)
++        static void merge_capture(const Span& sp, std::vector<HIR::ExprNode_Closure::AvuCache::Capture>& captured_vars, HIR::ExprNode_Closure::AvuCache::Capture new_ent)
+         {
+-            DEBUG("(" << slot << ", [" << fields << "], usage=" << usage << ")");
+-            const auto& closure_defs = closure_rec.local_vars;
+-            auto& closure = closure_rec.node;
+-
+-            if( ::std::binary_search(closure_defs.begin(), closure_defs.end(), slot) ) {
+-                // Ignore, this is local to the current closure
+-                return ;
+-            }
+-            usage = get_real_usage(sp, slot, fields, usage, reborrowed);
+-
+-            HIR::ExprNode_Closure::AvuCache::Capture    new_ent;
+-            new_ent.root_slot = slot;
+-            new_ent.fields = std::move(fields);
+-            new_ent.usage = usage;
+-
+             // `equal_range` considering one being a prefix of the other as equal
+-            auto its = ::std::equal_range(closure_rec.captured_vars.begin(), closure_rec.captured_vars.end(), new_ent,
++            auto its = ::std::equal_range(captured_vars.begin(), captured_vars.end(), new_ent,
+                 [](const HIR::ExprNode_Closure::AvuCache::Capture& a, const HIR::ExprNode_Closure::AvuCache::Capture& b)->bool {
+                     if( a.root_slot < b.root_slot ) {
+                         return true;
+@@ -1264,7 +1262,7 @@ namespace {
+             if( its.first == its.second ) {
+                 // Doesn't exist yet
+                 DEBUG("Insert");
+-                closure_rec.captured_vars.insert(its.first, new_ent);
++                captured_vars.insert(its.first, new_ent);
+             }
+             else if( its.first->fields.size() <= new_ent.fields.size() ) {
+                 DEBUG("new longer");
+@@ -1292,7 +1290,7 @@ namespace {
+                     for(auto it = its.first + 1; it != its.second; ++it) {
+                         its.first->usage = std::max(its.first->usage, it->usage);
+                     }
+-                    closure_rec.captured_vars.erase(its.first + 1, its.second);
++                    captured_vars.erase(its.first + 1, its.second);
+                 }
+                 its.first->usage = std::max(its.first->usage, new_ent.usage);
+                 if( its.first->fields.size() != new_ent.fields.size() ) {
+@@ -1300,6 +1298,83 @@ namespace {
+                 }
+             }
+ 
++        }
++        /// Re-sort and re-merge a capture list whose paths were shortened
++        static void remerge_captures(const Span& sp, std::vector<HIR::ExprNode_Closure::AvuCache::Capture>& captures)
++        {
++            std::vector<HIR::ExprNode_Closure::AvuCache::Capture>  merged;
++            for(auto& c : captures) {
++                merge_capture(sp, merged, std::move(c));
++            }
++            captures = std::move(merged);
++        }
++        static bool type_has_drop_impl(const HIR::TypeRef& ty)
++        {
++            if( const auto* te = ty.data().opt_Path() ) {
++                TU_MATCH_HDRA( (te->binding), {)
++                default:
++                    return false;
++                TU_ARMA(Struct, pbe) { return pbe->m_markings.has_drop_impl; }
++                TU_ARMA(Enum, pbe) { return pbe->m_markings.has_drop_impl; }
++                TU_ARMA(Union, pbe) { return pbe->m_markings.has_drop_impl; }
++                }
++            }
++            return false;
++        }
++        /// A by-value capture of a non-`Copy` place can't move a field out of a type with a `Drop` impl: the place is
++        /// truncated to that type, which is captured whole (rustc's `restrict_precision_for_drop_types`; a `move`
++        /// closure/block that only borrows such a field in its body is the common case). Closures and coroutines alike.
++        void truncate_captures_for_drop_types(const Span& sp, std::vector<HIR::ExprNode_Closure::AvuCache::Capture>& captures)
++        {
++            bool changed = false;
++            for(auto& c : captures)
++            {
++                if( c.usage != ::HIR::ValueUsage::Move || c.fields.empty() )
++                    continue;
++                ::std::vector<HIR::TypeRef> prefix_tys;
++                HIR::TypeRef    tmp_ty;
++                const auto* ty_p = &m_variable_types.at(c.root_slot);
++                for(const auto& n : c.fields) {
++                    prefix_tys.push_back(ty_p->clone());
++                    tmp_ty = m_resolve.get_field_type(sp, *ty_p, n);
++                    m_resolve.expand_associated_types(sp, tmp_ty);
++                    ty_p = &tmp_ty;
++                }
++                if( m_resolve.type_is_copy(sp, *ty_p) )
++                    continue;
++                for(size_t i = 0; i < prefix_tys.size(); i ++)
++                {
++                    if( type_has_drop_impl(prefix_tys[i]) ) {
++                        DEBUG("Truncate capture " << c << " to " << i << " fields: " << prefix_tys[i] << " has a Drop impl");
++                        c.fields.resize(i);
++                        changed = true;
++                        break;
++                    }
++                }
++            }
++            if( changed ) {
++                remerge_captures(sp, captures);
++            }
++        }
++        void mark_used_variable_closure(const Span& sp, ClosureScope& closure_rec, unsigned slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed)
++        {
++            DEBUG("(" << slot << ", [" << fields << "], usage=" << usage << ")");
++            const auto& closure_defs = closure_rec.local_vars;
++            auto& closure = closure_rec.node;
++
++            if( ::std::binary_search(closure_defs.begin(), closure_defs.end(), slot) ) {
++                // Ignore, this is local to the current closure
++                return ;
++            }
++            usage = get_real_usage(sp, slot, fields, usage, reborrowed);
++
++            HIR::ExprNode_Closure::AvuCache::Capture    new_ent;
++            new_ent.root_slot = slot;
++            new_ent.fields = std::move(fields);
++            new_ent.usage = usage;
++
++            merge_capture(sp, closure_rec.captured_vars, new_ent);
++
+             const char* cap_type_name = "?";
+             switch( usage )
+             {
+@@ -1331,8 +1406,14 @@ namespace {
+         {
+             auto& e = scope.used_variables[slot];
+             e.last_used_stack = scope.yield_stack;
+-            e.usage = std::max(e.usage, get_real_usage(sp, slot, fields, usage, reborrowed));
+-            DEBUG("Used #" << slot << " :: stack=[" << e.last_used_stack << "]");
++            usage = get_real_usage(sp, slot, fields, usage, reborrowed);
++            e.usage = std::max(e.usage, usage);
++            DEBUG("Used #" << slot << " [" << fields << "] :: stack=[" << e.last_used_stack << "]");
++            HIR::ExprNode_Closure::AvuCache::Capture    new_ent;
++            new_ent.root_slot = slot;
++            new_ent.fields = std::move(fields);
++            new_ent.usage = usage;
++            merge_capture(sp, e.captures, std::move(new_ent));
+         }
+         void mark_used_variable(const Span& sp, unsigned int slot, std::vector<RcString> fields, ::HIR::ValueUsage usage, bool reborrowed=true)
+         {
+@@ -1351,35 +1432,57 @@ namespace {
+ 
+         void apply_coroutine(const Span& sp, bool is_move, ::HIR::ExprNode_Generator::AvuCache& avu_cache, std::map<unsigned, CoroutineScope::Var>& used_variables)
+         {
+-            // If this closure is a move closure, mutate `captured_vars` such that all captures are tagged with ValueUsage::Move
+-            if( is_move )
++            // Captures are the places recorded for the variables defined outside: in edition 2021 a variable used only
++            // through fields is captured field by field, as a closure captures it (rustc's precise capture applies to
++            // async blocks and coroutines as to closures)
++            // - localsend 0.1.0 (localsend-cli 1.18.2) webrtc/signaling.rs:282 `start_listener(mut self)`:
++            //   `tokio::spawn(async move { while let Some(m) = self.rx.recv().await { .. } })` and then `self.client`,
++            //   `self.tx` -> the whole `self` went into the future: "MIR ERROR: <..SignalingConnection>::start_listener
++            //   BB17/2: ensure_valid: Use of non-valid lvalue - a0.0"
++            for(auto& cap : used_variables)
+             {
+-                for(auto& cap : used_variables)
++                if( !cap.second.defined_stack.empty() )
++                    continue;
++                if( cap.second.captures.empty() ) {
++                    // Defined outside, no use recorded: the whole variable
++                    cap.second.captures.push_back(HIR::ExprNode_Closure::AvuCache::Capture { cap.first, {}, cap.second.usage });
++                }
++                // If this is a move coroutine, all captures are tagged with ValueUsage::Move; a place reached through
++                // a reference is truncated to the reference, which moves in (as for closures, and as rustc does)
++                if( is_move )
+                 {
+-                    if(cap.second.defined_stack.empty())
++                    std::vector<HIR::ExprNode_Closure::AvuCache::Capture>  merged;
++                    for(auto& c : cap.second.captures)
+                     {
+-                        cap.second.usage = ::HIR::ValueUsage::Move;
++                        if( !c.fields.empty() && c.fields[0] == "" ) {
++                            c.fields.clear();
++                        }
++                        c.usage = ::HIR::ValueUsage::Move;
++                        merge_capture(sp, merged, std::move(c));
+                     }
++                    cap.second.captures = std::move(merged);
+                 }
+-            }
+-            else
+-            {
+-                for(auto& cap : used_variables)
++                for(auto& c : cap.second.captures)
+                 {
+-                    if( cap.second.usage == ::HIR::ValueUsage::Borrow ) {
++                    if( is_move )
++                    {
++                    }
++                    else if( c.usage == ::HIR::ValueUsage::Borrow )
++                    {
+                         ::HIR::TypeRef  tmp_ty;
+-                        const auto* cap_ty_p = &m_variable_types.at(cap.first);
+-                        //for(const auto& n : cap.fields) {
+-                        //    tmp_ty = m_resolve.get_field_type(node.span(), *cap_ty_p, n);
+-                        //    m_resolve.expand_associated_types(node.span(), tmp_ty);
+-                        //    cap_ty_p = &tmp_ty;
+-                        //}
++                        const auto* cap_ty_p = &m_variable_types.at(c.root_slot);
++                        for(const auto& n : c.fields) {
++                            tmp_ty = m_resolve.get_field_type(sp, *cap_ty_p, n);
++                            m_resolve.expand_associated_types(sp, tmp_ty);
++                            cap_ty_p = &tmp_ty;
++                        }
+                         if( cap_ty_p->data().is_Borrow() && cap_ty_p->data().as_Borrow().type == ::HIR::BorrowType::Shared ) {
+-                            DEBUG("> Upgrade capture #" << cap.first<< " to Move, as it's a shared borrow");
+-                            cap.second.usage = ::HIR::ValueUsage::Move;
++                            DEBUG("> Upgrade capture " << c << " to Move, as it's a shared borrow");
++                            c.usage = ::HIR::ValueUsage::Move;
+                         }
+                     }
+                 }
++                truncate_captures_for_drop_types(sp, cap.second.captures);
+             }
+ 
+             // - Apply into the parent stack
+@@ -1391,7 +1494,9 @@ namespace {
+                     // Only apply already-defined variables (ones without a set `defined_stack`)
+                     if(cap.second.defined_stack.empty())
+                     {
+-                        mark_used_variable(sp, cap.first, {}, cap.second.usage);
++                        for(const auto& c : cap.second.captures) {
++                            mark_used_variable(sp, c.root_slot, c.fields, c.usage);
++                        }
+                     }
+                 }
+             }
+@@ -1403,7 +1508,7 @@ namespace {
+                 for(const auto& cap : used_variables)
+                 {
+                     if( cap.second.defined_stack.empty() ) {
+-                        n_caps += 1;
++                        n_caps += cap.second.captures.size();
+                     }
+                     else {
+                         n_locals += 1;
+@@ -1415,7 +1520,10 @@ namespace {
+             for(const auto& cap : used_variables)
+             {
+                 if( cap.second.defined_stack.empty() ) {
+-                    avu_cache.captured_vars.push_back(std::make_pair(cap.first, cap.second.usage));
++                    for(const auto& c : cap.second.captures) {
++                        DEBUG("Capture " << c);
++                        avu_cache.captured_vars.push_back(c);
++                    }
+                 }
+                 else {
+                     avu_cache.local_vars.push_back(cap.first);
+diff --git a/src/hir_expand/closures.cpp b/src/hir_expand/closures.cpp
+index 6263a459..bc87602d 100644
+--- a/src/hir_expand/closures.cpp
++++ b/src/hir_expand/closures.cpp
+@@ -1570,18 +1570,27 @@ namespace {
+         }
+ 
+ 
++        /// A field path captured on its own (edition 2021): the chain `root_slot`.`fields` in the body is local `index`
++        struct FieldCaptureRewrite {
++            unsigned    root_slot;
++            std::vector<RcString>   fields;
++            unsigned    index;
++        };
++
+         // So, re-write all variable references into either a capture or a local.
+         class ExprVisitor_GeneratorRewrite:
+             public ::HIR::ExprVisitorDef
+         {
+             const Monomorph& m_monomorph;
+             const std::map<unsigned, unsigned>&   m_variable_rewrites;
++            const std::vector<FieldCaptureRewrite>&   m_field_rewrites;
+ 
+             ::HIR::ExprNodeP    m_replacement;
+         public:
+-            ExprVisitor_GeneratorRewrite(const Monomorph& monomorph, const std::map<unsigned, unsigned>& rewrites)
++            ExprVisitor_GeneratorRewrite(const Monomorph& monomorph, const std::map<unsigned, unsigned>& rewrites, const std::vector<FieldCaptureRewrite>& field_rewrites)
+                 : m_monomorph(monomorph)
+                 , m_variable_rewrites(rewrites)
++                , m_field_rewrites(field_rewrites)
+             {
+             }
+ 
+@@ -1592,19 +1601,55 @@ namespace {
+                 pp = m_monomorph.monomorph_path_params(Span(), pp, /*allow_infer=*/true);
+             }
+ 
+-            /// Support replacing nodes
++            /// Support replacing nodes (the replacement's type is the one monomorphised)
+             void visit_node_ptr(::HIR::ExprNodeP& node_ptr) override
+             {
+-                ::HIR::ExprVisitorDef::visit_node_ptr(node_ptr);
++                assert(node_ptr);
++                node_ptr->visit(*this);
+                 if( m_replacement ) {
+                     node_ptr = std::move(m_replacement);
+                 }
++                visit_type(node_ptr->m_res_type);
+             }
+ 
+             /// Rewrite variable references into either a different slot or a field access
+             void visit(::HIR::ExprNode_Variable& node) override
+             {
+-                node.m_slot = m_variable_rewrites.at(node.m_slot);
++                auto it = m_variable_rewrites.find(node.m_slot);
++                ASSERT_BUG(node.span(), it != m_variable_rewrites.end(), "Variable #" << node.m_slot << " is neither a local nor a whole-variable capture of the coroutine");
++                node.m_slot = it->second;
++            }
++            /// A field chain of a variable captured by that path (edition 2021) is the capture's local
++            void visit(::HIR::ExprNode_Field& node) override
++            {
++                // NOTE: The chain extraction matches `annotate_value_usage.cpp`
++                ::std::vector<RcString> fields;
++                fields.push_back(node.m_field);
++                auto* inner = node.m_value.get();
++                while( auto* inner_field = dynamic_cast<::HIR::ExprNode_Field*>(inner) ) {
++                    fields.push_back(inner_field->m_field);
++                    inner = inner_field->m_value.get();
++                }
++                if( auto* inner_deref = dynamic_cast<::HIR::ExprNode_Deref*>(inner) ) {
++                    if( inner_deref->m_value->m_res_type.data().is_Borrow() ) {
++                        fields.push_back(RcString());
++                        inner = inner_deref->m_value.get();
++                    }
++                }
++                if( auto* inner_var = dynamic_cast<::HIR::ExprNode_Variable*>(inner) )
++                {
++                    std::reverse(fields.begin(), fields.end());
++                    auto it = ::std::find_if(m_field_rewrites.begin(), m_field_rewrites.end(),
++                        [&](const FieldCaptureRewrite& x){ return x.root_slot == inner_var->m_slot && x.fields == fields; });
++                    if( it != m_field_rewrites.end() )
++                    {
++                        DEBUG("_Field: #" << inner_var->m_slot << fields << " -> local #" << it->index);
++                        m_replacement = NEWNODE(node.m_res_type.clone(), Variable, node.span(), "", it->index);
++                        m_replacement->m_usage = node.m_usage;
++                        return ;
++                    }
++                }
++                ::HIR::ExprVisitorDef::visit(node);
+             }
+             void visit(HIR::ExprNode_ConstParam& node) override {
+                 node.m_binding = m_monomorph.get_value(node.span(), HIR::GenericRef("", node.m_binding)).as_Generic().binding;
+@@ -1674,6 +1719,7 @@ namespace {
+ 
+         struct CrVars {
+             ::std::map<unsigned, unsigned> variable_rewrites;
++            ::std::vector<FieldCaptureRewrite>  field_rewrites;
+             ::std::vector<HIR::ValueUsage> capture_usages;
+             ::std::vector<HIR::TypeRef>   new_locals;
+             // NOTE: The first entry in this is the state, but that isn't know yet - so is just `MaybeUninit<_>`
+@@ -1728,13 +1774,36 @@ namespace {
+             });
+ 
+             // Add captures to the locals list first
++            // - A capture is a variable, or (edition 2021) a field path of one. A field path is a local of its own,
++            //   reached from the body through the rewrite of that field chain; the variable itself is not captured.
+             for(const auto& cap : avu_cache.captured_vars)
+             {
+                 unsigned index = rv.new_locals.size();
+-                rv.variable_rewrites.insert(std::make_pair( cap.first, index ));
+-                rv.new_locals.push_back( monomorph_cb.monomorph_type(sp, m_variable_types.at(cap.first)) );
++                if( cap.fields.empty() ) {
++                    rv.variable_rewrites.insert(std::make_pair( cap.root_slot, index ));
++                }
++                else {
++                    rv.field_rewrites.push_back(FieldCaptureRewrite { cap.root_slot, cap.fields, index });
++                }
++                // The captured place's type, and the expression reaching it in the enclosing function (as for closures)
++                HIR::TypeRef    tmp_ty;
++                const auto* cap_ty_p = &m_variable_types.at(cap.root_slot);
++                auto val_node = NEWNODE(cap_ty_p->clone(), Variable,  sp, "", cap.root_slot);
++                for(const auto& n : cap.fields) {
++                    tmp_ty = m_resolve.get_field_type(sp, *cap_ty_p, n);
++                    m_resolve.expand_associated_types(sp, tmp_ty);
++                    cap_ty_p = &tmp_ty;
++                    if( n == "" ) {
++                        val_node = NEWNODE(cap_ty_p->clone(), Deref,  sp, std::move(val_node));
++                    }
++                    else {
++                        val_node = NEWNODE(cap_ty_p->clone(), Field,  sp, std::move(val_node), n);
++                    }
++                }
++                DEBUG("Capture " << cap << " : " << *cap_ty_p);
++                rv.new_locals.push_back( monomorph_cb.monomorph_type(sp, *cap_ty_p) );
+ 
+-                rv.capture_usages.push_back(cap.second);
++                rv.capture_usages.push_back(cap.usage);
+                 // Two views of the captured variable's type:
+                 // - `cap_ty`: as seen from the ENCLOSING function (its own generic space). Used for the
+                 //   capture expressions, which stay in the enclosing function's body.
+@@ -1744,14 +1813,14 @@ namespace {
+                 // the enclosing function's MIR: cc 1.2.67 `run_commands_in_parallel(.., cmds: &mut dyn
+                 // Iterator<..>)` captures `cmds` in an `async` block, and MIR validation then died with
+                 // "Impl lifetime parameters were not expected (got /*I:1*/)".
+-                auto cap_ty = m_variable_types.at(cap.first).clone();
++                auto cap_ty = cap_ty_p->clone();
+                 auto ty_mono = monomorph_cb.monomorph_type(sp, cap_ty);
+                 rv.struct_ents.push_back(HIR::VisEnt<HIR::TypeRef> { HIR::Publicity::new_none(), ty_mono.clone() });
+-                rv.capture_nodes.push_back(HIR::ExprNodeP(new ::HIR::ExprNode_Variable(sp, "", cap.first)));
+-                switch(cap.second)
++                rv.capture_nodes.push_back(std::move(val_node));
++                switch(cap.usage)
+                 {
+                 case ::HIR::ValueUsage::Unknown:
+-                    BUG(sp, "Unexpected ValueUsage::Unknown on #" << cap.first);
++                    BUG(sp, "Unexpected ValueUsage::Unknown on " << cap);
+                 case ::HIR::ValueUsage::Move: {
+                     // No wrapping needed (drop handled by custom drop glue)
+                     } break;
+@@ -1813,7 +1882,7 @@ namespace {
+ 
+             {
+                 TRACE_FUNCTION_F("-- Rewrite variables");
+-                ExprVisitor_GeneratorRewrite visitor_rewrite(monomorph_cb, cr_vars.variable_rewrites);
++                ExprVisitor_GeneratorRewrite visitor_rewrite(monomorph_cb, cr_vars.variable_rewrites, cr_vars.field_rewrites);
+                 visitor_rewrite.visit_node_ptr(node.m_code);
+             }
+ 
+@@ -1978,7 +2047,7 @@ namespace {
+             fix_coroutine_var_types(cr_vars, monomorph_cb);
+ 
+             {
+-                ExprVisitor_GeneratorRewrite visitor_rewrite(monomorph_cb, cr_vars.variable_rewrites);
++                ExprVisitor_GeneratorRewrite visitor_rewrite(monomorph_cb, cr_vars.variable_rewrites, cr_vars.field_rewrites);
+                 visitor_rewrite.visit_node_ptr(node.m_code);
+             }
+ 
+diff --git a/src/hir_expand/lifetime_infer.cpp b/src/hir_expand/lifetime_infer.cpp
+index cb7db94e..0fb83882 100644
+--- a/src/hir_expand/lifetime_infer.cpp
++++ b/src/hir_expand/lifetime_infer.cpp
+@@ -2548,7 +2548,7 @@ namespace {
+                                     DEBUG("- " << p->m_capture_lifetime);
+                                     equate_lifetime(p->m_capture_lifetime);
+                                     for(const auto& cap : p->m_avu_cache.captured_vars) {
+-                                        visit_capture(p->m_capture_lifetime, cap.second, cap.first, {});
++                                        visit_capture(p->m_capture_lifetime, cap.usage, cap.root_slot, cap.fields);
+                                     }
+                                     }
+                                 TU_ARMA(Closure, p) {
+@@ -2562,7 +2562,7 @@ namespace {
+                                     DEBUG("- " << p->m_capture_lifetime);
+                                     equate_lifetime(p->m_capture_lifetime);
+                                     for(const auto& cap : p->m_avu_cache.captured_vars) {
+-                                        visit_capture(p->m_capture_lifetime, cap.second, cap.first, {});
++                                        visit_capture(p->m_capture_lifetime, cap.usage, cap.root_slot, cap.fields);
+                                     }
+                                     }
+                                 }

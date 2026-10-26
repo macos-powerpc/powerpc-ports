@@ -1,0 +1,138 @@
+From f2b1c31117034c123e17fab92beaace1d9cd659c Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 09:25:52 +0000
+Subject: [PATCH] hir_typeck: an ivar candidate fails when its equality
+ fallback would make a Sized ivar unsized
+
+asyncgit 0.28.1 (gitui 0.28.1) src/sync/commit_filter.rs:
+
+    pub type SharedCommitFilterFn =
+        Arc<Box<dyn Fn(&Repository, &CommitId) -> Result<bool> + Send + Sync>>;
+    pub fn diff_contains_file(file_path: String) -> SharedCommitFilterFn {
+        Arc::new(Box::new(move |repo: &Repository, commit_id: &CommitId| -> Result<bool> { .. }))
+    }
+
+    <null> error:0: Unsized type not valid here - dyn (for<..> Fn<(&Repository, &CommitId)> .. + Send + Sync)
+
+With std's `impl CoerceUnsized<Arc<U, A>> for Arc<T, A>`, the return coercion
+`Arc<Box<dyn Fn..>> := Arc<_1>` only records that `_1` (`Arc::new`'s `T`) may
+unsize to `Box<dyn Fn..>`.  check_ivar_poss then saw a coercion source
+`Box<_3>` (`Box::new`'s result, `_3` its Sized `T`) and that destination, and
+took the source ("Picking .. as the only source").  `Box<_3>` reaches
+`Box<dyn Fn..>` only by equality, so `_3` became the trait object.  rustc
+coerces `Arc::new`'s argument to the type expected from the return
+(`Box<dyn Fn..>`), which unsizes the closure at the inner Box.
+
+check_ivar_poss__fails_bounds did test that candidate against the return
+coercion, but the equality fallback was compared with
+compare_with_placeholders, where an ivar matches anything.  Both equality
+checks there now also reject a candidate whose equality would bind an ivar
+marked Sized (m_ivars_sized) to a type that is not Sized; the source is
+removed and `_1 = Box<dyn Fn..>` is picked.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 7dc7d16d..f4fa1f90 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -6397,6 +6397,74 @@ namespace {
+ // check_ivar_poss (and helpers)
+ namespace
+ {
++    // Would equating `a_` and `b_` bind an inference variable that has to be Sized (Context::m_ivars_sized) to
++    // an unsized type? `compare_with_placeholders` lets an ivar match anything, so a coercion that falls back to equality
++    // accepted candidates that can only work out as `_ = dyn Trait`.
++    // - asyncgit 0.28.1 sync/commit_filter.rs `Arc::new(Box::new(closure))` returned as `Arc<Box<dyn Fn(..)>>`: with
++    //   `Arc::new`'s `T` = `Box<_>`, the return coercion needs `Box<_>` -> `Box<dyn Fn(..)>`, i.e. `Box::new`'s `T` = `dyn ..`
++    bool equality_binds_sized_ivar_to_unsized(const Span& sp, const Context& context, const ::HIR::TypeRef& a_, const ::HIR::TypeRef& b_)
++    {
++        const auto& a = context.get_type(a_);
++        const auto& b = context.get_type(b_);
++        auto check_ivar = [&](const ::HIR::TypeRef& iv, const ::HIR::TypeRef& other)->bool {
++            const auto& e = iv.data().as_Infer();
++            if( e.ty_class != ::HIR::InferClass::None || other.data().is_Infer() )
++                return false;
++            if( !(e.index < context.m_ivars_sized.size() && context.m_ivars_sized[e.index]) )
++                return false;
++            if( context.m_resolve.type_is_sized(sp, other) != ::HIR::Compare::Unequal )
++                return false;
++            DEBUG("Equating " << iv << " (Sized) with unsized " << other);
++            return true;
++            };
++        if( a.data().is_Infer() )
++            return check_ivar(a, b);
++        if( b.data().is_Infer() )
++            return check_ivar(b, a);
++        auto rec = [&](const ::HIR::TypeRef& x, const ::HIR::TypeRef& y) {
++            return equality_binds_sized_ivar_to_unsized(sp, context, x, y);
++            };
++        if( const auto* ae = a.data().opt_Path() ) {
++            const auto* be = b.data().opt_Path();
++            if( !be || !ae->path.m_data.is_Generic() || !be->path.m_data.is_Generic() )
++                return false;
++            const auto& ap = ae->path.m_data.as_Generic();
++            const auto& bp = be->path.m_data.as_Generic();
++            if( ap.m_path != bp.m_path || ap.m_params.m_types.size() != bp.m_params.m_types.size() )
++                return false;
++            for(size_t i = 0; i < ap.m_params.m_types.size(); i ++)
++                if( rec(ap.m_params.m_types[i], bp.m_params.m_types[i]) )
++                    return true;
++            return false;
++        }
++        if( const auto* ae = a.data().opt_Borrow() ) {
++            const auto* be = b.data().opt_Borrow();
++            return be && rec(ae->inner, be->inner);
++        }
++        if( const auto* ae = a.data().opt_Pointer() ) {
++            const auto* be = b.data().opt_Pointer();
++            return be && rec(ae->inner, be->inner);
++        }
++        if( const auto* ae = a.data().opt_Array() ) {
++            const auto* be = b.data().opt_Array();
++            return be && rec(ae->inner, be->inner);
++        }
++        if( const auto* ae = a.data().opt_Slice() ) {
++            const auto* be = b.data().opt_Slice();
++            return be && rec(ae->inner, be->inner);
++        }
++        if( const auto* ae = a.data().opt_Tuple() ) {
++            const auto* be = b.data().opt_Tuple();
++            if( !be || ae->size() != be->size() )
++                return false;
++            for(size_t i = 0; i < ae->size(); i ++)
++                if( rec((*ae)[i], (*be)[i]) )
++                    return true;
++            return false;
++        }
++        return false;
++    }
++
+     bool check_ivar_poss__fails_bounds(const Span& sp, Context& context, const ::HIR::TypeRef& ty_l, const ::HIR::TypeRef& new_ty)
+     {
+         TRACE_FUNCTION_F(ty_l << " <- " << new_ty);
+@@ -6470,6 +6538,11 @@ namespace
+                     DEBUG("- Bound failed");
+                     return true;
+                 }
++                if( equality_binds_sized_ivar_to_unsized(sp, context, t_l, t_r) )
++                {
++                    DEBUG("- Bound failed (a Sized ivar would become unsized)");
++                    return true;
++                }
+                 break;
+             }
+         }
+@@ -6513,6 +6586,11 @@ namespace
+                     DEBUG("- Bound failed");
+                     return true;
+                 }
++                if( equality_binds_sized_ivar_to_unsized(sp, context, pty.ty, new_ty) )
++                {
++                    DEBUG("- Bound failed (a Sized ivar would become unsized)");
++                    return true;
++                }
+                 break;
+             }
+         }

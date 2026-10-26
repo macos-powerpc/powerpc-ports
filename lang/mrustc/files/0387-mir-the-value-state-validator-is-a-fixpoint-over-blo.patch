@@ -1,0 +1,302 @@
+From cf0ff3ec5422a1b266d52042db1a90473e17fe54 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 02:57:15 +0000
+Subject: [PATCH] mir: the value-state validator is a fixpoint over block start states
+
+gix-tix 0.6.0 (gitoxide 0.61.0) src/lib.rs `event_loop` (4044 lines:
+a `loop { match input { .. } }` with or-pattern arms with guards, inner guarded
+matches and closures), on the G5 where mrustc is a 32-bit process:
+    mrustc(45566) malloc: *** mmap(size=16777216) failed (error code=12)
+    terminate called after throwing an instance of 'std::bad_alloc'
+in Lower MIR.
+
+MIR_Validate_ValState (mir/check.cpp; run on every function after lowering, in
+MIR cleanup and after every optimiser pass) kept a worklist of (block, path,
+state) entries: one copy of the full value state and of the whole block path
+walked so far per edge, and every push scanned the whole queue comparing
+states. That is O(depth x edges) memory and O(edges^2) time: a 25-arm event
+loop of that shape needs more than 300MB here, a 50-arm one took minutes per
+validation.
+
+Now the per-block start states are the only state: an edge merges the outgoing
+state into the target's start state (without touching the outgoing state,
+which goes to several targets) and queues the target's index only when that
+changed; a popped block is processed from a copy of its merged start state.
+`merge` already mutated the incoming state into the merged one, so the
+processed states are what they were. The worklist is a min-heap on the
+reverse post-order index of the blocks, so a join is processed after its
+pending predecessors instead of once per arm (the LIFO order re-propagated
+every change through the rest of the enclosing loop: block visits grew with
+arms^2).
+
+50-arm synthetic function, Lower MIR / MIR Validate / MIR Cleanup:
+17 s / 17 s / 16.5 s -> 1.9 s / 1.5 s / 1.5 s, peak RSS 40MB where the old
+validator died at a 300MB cap. MIR Optimise's DeTemporary_SingleSetAndUse is
+a separate, time-only super-linear pass (TODO).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/mir/check.cpp b/src/mir/check.cpp
+index 4039d0bf..01d3a149 100644
+--- a/src/mir/check.cpp
++++ b/src/mir/check.cpp
+@@ -196,11 +196,15 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+         State ret_state = State::Invalid;
+         StateVec args;
+         StateVec locals;
++        /// Set once a state has reached this block: a function without arguments and locals has an empty state
++        /// everywhere, so emptiness can't stand in for "never visited"
++        bool initialised = false;
+ 
+         ValStates() {}
+         ValStates(size_t n_args, size_t n_locals):
+             args(n_args, State::Valid),
+-            locals(n_locals)
++            locals(n_locals),
++            initialised(true)
+         {
+         }
+ 
+@@ -209,7 +213,7 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+         ValStates& operator=(const ValStates& v) = delete;
+         ValStates& operator=(ValStates&& v) = default;
+ 
+-        void fmt(::std::ostream& os) {
++        void fmt(::std::ostream& os) const {
+             os << "ValStates { ";
+             switch(ret_state.v)
+             {
+@@ -252,11 +256,12 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+             return locals.empty() && args.empty();
+         }
+ 
+-        // NOTE: Moves if this state is empty
+-        bool merge(unsigned bb_idx, ValStates& other)
++        /// Merge the state arriving along an edge into this (the start state of block `bb_idx`), returning whether
++        /// anything changed. `other` is left untouched: the same outgoing state is merged into every target.
++        bool merge_from(unsigned bb_idx, const ValStates& other)
+         {
+             DEBUG("bb" << bb_idx << " this=" << FMT_CB(ss,this->fmt(ss);) << ", other=" << FMT_CB(ss,other.fmt(ss);));
+-            if( this->empty() )
++            if( !this->initialised )
+             {
+                 *this = ValStates(other);
+                 return true;
+@@ -345,79 +350,116 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+             }
+         }
+     private:
+-        static bool merge_state(State& a, State& b)
++        static bool merge_state(State& a, State b)
+         {
+-            bool rv = false;
+-            if( a != b )
++            if( a == b )
+             {
+-                // NOTE: This is an attempted optimisation to avoid re-running a block when it's not a new state.
+-                if( a == State::Either /*|| b == State::Either*/ ) {
+-                }
+-                else {
+-                    rv = true;
+-                }
+-                a = State::Either;
+-                b = State::Either;
++                return false;
+             }
++            // NOTE: This is an attempted optimisation to avoid re-running a block when it's not a new state.
++            bool rv = (a != State::Either);
++            a = State::Either;
+             return rv;
+         }
+-        static bool merge_lists(StateVec& a, StateVec& b)
++        static bool merge_lists(StateVec& a, const StateVec& b)
+         {
+             bool rv = false;
+             assert( a.size() == b.size() );
+-            // TODO: This is a really hot bit of code (according to valgrind), need to find a way of cooling it
+-            for(unsigned int i = 0; i < a.size(); i++)
++            // Hot: compare a byte (four states) at a time, most of them are equal
++            const size_t n = a.size();
++            for(size_t j = 0; j < a.v.size(); j++)
+             {
+-                rv |= merge_state(a[i].get(), b[i].get());
++                if( a.v[j] == b.v[j] )
++                    continue ;
++                for(unsigned k = 0; k < 4 && j*4 + k < n; k++)
++                {
++                    size_t i = j*4 + k;
++                    rv |= merge_state(a[i].get(), b[i]);
++                }
+             }
+             return rv;
+         }
+     };
++    // A fixpoint over the per-block start states: an edge merges the outgoing state into the target's start state and
++    // queues the target (by index) only when that changed. The previous form queued one full state copy per edge,
++    // each carrying the whole block path walked so far, and compared every push against the whole queue: O(depth x
++    // edges) memory and O(edges^2) time. gix-tix 0.6.0's 4000-line `event_loop` (gitoxide 0.61.0) exhausted a 32-bit
++    // address space here (`std::bad_alloc` in Lower MIR), and a 500-line match took minutes.
+     ::std::vector< ValStates>   block_start_states( fcn.blocks.size() );
+-    struct ToVisit {
+-        unsigned int bb;
+-        ::std::vector<unsigned int> path;
+-        ValStates   state;
+-    };
+-    // TODO: Remove this? The path is useful, but the cloned states are really expensive
+-    // - Option: Keep the paths, but only ever use the pre-set entry state?
+-    ::std::vector<ToVisit> to_visit_blocks;
++
++    // Reverse post-order of the reachable blocks: a pending block is processed only after the pending blocks before it
++    // in that order (its non-loop predecessors), so the state at a join is complete before the code after the join is
++    // walked. A plain LIFO worklist re-processed the join of a `match` once per arm and re-propagated every change
++    // through the rest of the enclosing loop: block visits grew with arms^2 (minutes per validation on gix-tix's
++    // event_loop, and the validator runs after every optimiser pass).
++    ::std::vector<unsigned int> rpo_index( fcn.blocks.size(), ~0u );
++    {
++        auto successors = [&](unsigned int bb) {
++            ::std::vector<unsigned int> rv;
++            ::MIR::visit::visit_terminator_target(fcn.blocks[bb].terminator, [&](const ::MIR::BasicBlockId& t){ rv.push_back(t); });
++            return rv;
++            };
++        struct Frame { unsigned int bb; ::std::vector<unsigned int> succ; size_t next; };
++        ::std::vector<bool> seen( fcn.blocks.size(), false );
++        ::std::vector<Frame> stack;
++        ::std::vector<unsigned int> postorder;
++        seen[0] = true;
++        stack.push_back(Frame { 0, successors(0), 0 });
++        while( !stack.empty() )
++        {
++            auto& f = stack.back();
++            if( f.next < f.succ.size() )
++            {
++                auto t = f.succ[f.next++];
++                // Out-of-range targets were rejected by the control-flow check before this pass
++                if( t < fcn.blocks.size() && !seen[t] ) {
++                    seen[t] = true;
++                    stack.push_back(Frame { t, successors(t), 0 });
++                }
++            }
++            else
++            {
++                postorder.push_back(f.bb);
++                stack.pop_back();
++            }
++        }
++        for(size_t i = 0; i < postorder.size(); i++)
++        {
++            rpo_index[ postorder[postorder.size() - 1 - i] ] = i;
++        }
++    }
++    // The worklist is a min-heap on the reverse post-order index
++    auto rpo_after = [&](unsigned int a, unsigned int b) { return rpo_index[a] > rpo_index[b]; };
++    ::std::vector<bool> queued( fcn.blocks.size(), false );
++    ::std::vector<unsigned int> to_visit_blocks;
+ 
+     // TODO: Check that all used locals are also set (anywhere at all)
+ 
+-    auto add_to_visit = [&](unsigned int idx, ::std::vector<unsigned int> src_path, ValStates& vs, bool can_move) {
+-        for(const auto& b : to_visit_blocks)
+-            if( b.bb == idx && b.state == vs)
+-                return ;
+-        if( block_start_states.at(idx) == vs )
++    auto add_to_visit = [&](unsigned int idx, const ValStates& vs) {
++        assert(idx < fcn.blocks.size());
++        if( ! block_start_states[idx].merge_from(idx, vs) ) {
++            DEBUG("BB" << idx << " nochange");
+             return ;
+-        src_path.push_back(idx);
+-        // TODO: Update the target block, and only visit if we've induced a change
+-        to_visit_blocks.push_back( ToVisit { idx, mv$(src_path), (can_move ? mv$(vs) : ValStates(vs)) } );
+-        };
+-    auto add_to_visit_move = [&](unsigned int idx, ::std::vector<unsigned int> src_path, ValStates vs) {
+-        add_to_visit(idx, mv$(src_path), vs, true);
+-        };
+-    auto add_to_visit_copy = [&](unsigned int idx, ::std::vector<unsigned int> src_path, ValStates& vs) {
+-        add_to_visit(idx, mv$(src_path), vs, false);
++        }
++        if( !queued[idx] ) {
++            queued[idx] = true;
++            to_visit_blocks.push_back(idx);
++            ::std::push_heap(to_visit_blocks.begin(), to_visit_blocks.end(), rpo_after);
++        }
+         };
+-    add_to_visit_move( 0, {}, ValStates { state.m_args.size(), fcn.locals.size() } );
++    add_to_visit( 0, ValStates { state.m_args.size(), fcn.locals.size() } );
+     while( to_visit_blocks.size() > 0 )
+     {
+-        auto block = to_visit_blocks.back().bb;
+-        auto path = mv$(to_visit_blocks.back().path);
+-        auto val_state = mv$( to_visit_blocks.back().state );
++        ::std::pop_heap(to_visit_blocks.begin(), to_visit_blocks.end(), rpo_after);
++        auto block = to_visit_blocks.back();
+         to_visit_blocks.pop_back();
+         assert(block < fcn.blocks.size());
++        queued[block] = false;
+ 
+-        // 1. Apply current state to `block_start_states` (merging if needed)
+-        // - If no change happened, skip.
+-        if( ! block_start_states.at(block).merge(block, val_state) ) {
+-            DEBUG("BB" << block << " via [" << path << "] nochange " << FMT_CB(ss,val_state.fmt(ss);));
+-            continue ;
+-        }
++        // Work on a copy of the merged start state of this block
++        auto val_state = ValStates( block_start_states[block] );
+         ASSERT_BUG(Span(), val_state.locals.size() == fcn.locals.size(), "");
+-        DEBUG("BB" << block << " via [" << path << "] " << FMT_CB(ss,val_state.fmt(ss);));
++        DEBUG("BB" << block << " " << FMT_CB(ss,val_state.fmt(ss);));
+ 
+         // 2. Using the newly merged state, iterate statements checking the usage and updating state.
+         const auto& bb = fcn.blocks[block];
+@@ -591,7 +633,7 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+             }
+         TU_ARMA(Goto, e) {
+             // Push block with the new state
+-            add_to_visit_move( e, mv$(path), mv$(val_state) );
++            add_to_visit( e, val_state );
+             }
+         TU_ARMA(Panic, e) {
+             // What should be done here?
+@@ -599,23 +641,23 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+         TU_ARMA(If, e) {
+             // Push blocks
+             val_state.ensure_valid( state, e.cond );
+-            add_to_visit_copy( e.bb_true , path, val_state );
+-            add_to_visit_move( e.bb_false, mv$(path), mv$(val_state) );
++            add_to_visit( e.bb_true , val_state );
++            add_to_visit( e.bb_false, val_state );
+             }
+         TU_ARMA(Switch, e) {
+             val_state.ensure_valid( state, e.val );
+             for(const auto& tgt : e.targets)
+             {
+-                add_to_visit( tgt, path, val_state, (&tgt == &e.targets.back()) );
++                add_to_visit( tgt, val_state );
+             }
+             }
+         TU_ARMA(SwitchValue, e) {
+             val_state.ensure_valid( state, e.val );
+             for(const auto& tgt : e.targets)
+             {
+-                add_to_visit_copy( tgt, path, val_state );
++                add_to_visit( tgt, val_state );
+             }
+-            add_to_visit_move( e.def_target, path, mv$(val_state) );
++            add_to_visit( e.def_target, val_state );
+             }
+         TU_ARMA(Call, e) {
+             if( e.fcn.is_Value() )
+@@ -623,11 +665,11 @@ void MIR_Validate_ValState(::MIR::TypeResolve& state, const ::MIR::Function& fcn
+             for(const auto& arg : e.args)
+                 val_state.move_val( state, arg );
+             // Push blocks (with return valid only in one)
+-            add_to_visit_copy(e.panic_block, path, val_state);
++            add_to_visit(e.panic_block, val_state);
+ 
+             // TODO: If the function returns !, don't follow the ret_block
+             val_state.mark_validity( state, e.ret_val, true );
+-            add_to_visit_move(e.ret_block, mv$(path), mv$(val_state));
++            add_to_visit(e.ret_block, val_state);
+             }
+         }
+     }

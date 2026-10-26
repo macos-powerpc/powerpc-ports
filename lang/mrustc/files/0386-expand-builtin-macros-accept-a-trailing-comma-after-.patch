@@ -1,0 +1,188 @@
+From a872be8fa64576a72ef07bacb66c7a75ff7a0093 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 01:44:50 +0000
+Subject: [PATCH] expand: builtin macros accept a trailing comma after their
+ argument
+
+two-face 0.4.5 (gitui 0.28.1) src/acknowledgement/mod.rs:20
+`syntect::dumps::from_binary(include_bytes!("../../generated/acknowledgements_full.bin",))`:
+    error:0: Unexpected token TOK_COMMA, expected TOK_EOF
+
+The include!/include_str!/include_bytes! expanders demanded EOF right after the
+path string, but rustc's single-argument builtins (`get_single_expr_from_tts`)
+eat an optional trailing comma. env!/option_env! had the same check (and env!
+lacked rustc's optional second argument, the message for an undefined
+variable), cfg! too (rustc's `parse_cfg` eats a comma), and `#[cfg_attr(p, a,)]`
+ran the meta-item parser on the closing paren. `#[cfg(p,)]`, concat!,
+format_args! and assert! already accepted it.
+
+Now all of them accept the trailing comma; argument counts are still checked.
+env! takes `("NAME", "message")` and reports the message when the variable is
+unset.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/expand/cfg.cpp b/src/expand/cfg.cpp
+index 08c8ce79..afea30e6 100644
+--- a/src/expand/cfg.cpp
++++ b/src/expand/cfg.cpp
+@@ -194,6 +194,10 @@ std::vector<AST::Attribute> check_cfg_attr(const ::AST::Attribute& mi)
+     while( lex.lookahead(0) == TOK_COMMA )
+     {
+         lex.getTokenCheck(TOK_COMMA);
++        // A trailing comma after the last attribute (rustc's `parse_cfg_attr` loops until the closing paren)
++        if( lex.lookahead(0) == TOK_PAREN_CLOSE ) {
++            break;
++        }
+         rv.push_back( Parse_MetaItem(lex) );
+     }
+     lex.getTokenCheck(TOK_PAREN_CLOSE);
+@@ -214,6 +218,8 @@ class CCfgExpander:
+         DEBUG("cfg!() - " << tt);
+         auto lex = TTStream(sp, ParseState(), tt);
+         bool rv = check_cfg_inner(lex);
++        // An optional trailing comma, as rustc's `parse_cfg` (`cfg!(unix,)`)
++        lex.getTokenIf(TOK_COMMA);
+         lex.getTokenCheck(TOK_EOF);
+ 
+         return box$( TTStreamO(sp, ParseState(), TokenTree(AST::Edition::Rust2015,{}, rv ? TOK_RWORD_TRUE : TOK_RWORD_FALSE )) );
+diff --git a/src/expand/env.cpp b/src/expand/env.cpp
+index 59c20a4a..e9fc08bc 100644
+--- a/src/expand/env.cpp
++++ b/src/expand/env.cpp
+@@ -13,22 +13,33 @@
+ #include <synext.hpp>   // for Expand_BareExpr
+ 
+ namespace {
+-    // Read a string out of the input stream
+-    ::std::string get_string(const Span& sp, const AST::Crate& crate, AST::Module& mod, const TokenTree& tt) {
++    // Read the string literal arguments out of the input stream: `env!("NAME")`, `env!("NAME", "message")` and
++    // `option_env!("NAME")`, each with an optional trailing comma (rustc's `get_exprs_from_tts` /
++    // `get_single_expr_from_tts`; two-face 0.4.5 has the same shape on include_bytes!)
++    ::std::vector< ::std::string> get_strings(const Span& sp, const AST::Crate& crate, AST::Module& mod, const TokenTree& tt, const char* macro_name, size_t max_count) {
+         auto lex = TTStream(sp, ParseState(), tt);
++        ::std::vector< ::std::string>   rv;
+ 
+-        auto n = Parse_ExprVal(lex);
+-        ASSERT_BUG(sp, n, "No expression returned");
+-        if( lex.lookahead(0) != TOK_EOF ) {
+-            ERROR(sp, E0000, "Unexpected token after string literal - " << lex.getToken());
+-        }
+-        Expand_BareExpr(crate, mod, n);
++        while( lex.lookahead(0) != TOK_EOF )
++        {
++            auto n = Parse_ExprVal(lex);
++            ASSERT_BUG(sp, n, "No expression returned");
++            Expand_BareExpr(crate, mod, n);
+ 
+-        auto* string_np = dynamic_cast<AST::ExprNode_String*>(&*n);
+-        if( !string_np ) {
+-            ERROR(sp, E0000, "Expected a string literal - got " << *n);
++            auto* string_np = dynamic_cast<AST::ExprNode_String*>(&*n);
++            if( !string_np ) {
++                ERROR(sp, E0000, macro_name << "! expected a string literal - got " << *n);
++            }
++            rv.push_back( mv$( string_np->m_value ) );
++            if( lex.lookahead(0) == TOK_EOF ) {
++                break;
++            }
++            lex.getTokenCheck(TOK_COMMA);
++        }
++        if( rv.size() == 0 || rv.size() > max_count ) {
++            ERROR(sp, E0000, macro_name << "! takes " << (max_count == 1 ? "1 argument" : "1 or 2 arguments") << " - got " << rv.size());
+         }
+-        return mv$( string_np->m_value );
++        return rv;
+     }
+ }
+ 
+@@ -37,10 +48,15 @@ class CExpanderEnv:
+ {
+     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
+     {
+-        ::std::string   varname = get_string(sp, crate, mod,  tt);
++        auto args = get_strings(sp, crate, mod, tt, "env", 2);
++        const auto& varname = args[0];
+ 
+         const char* var_val_cstr = getenv(varname.c_str());
+         if( !var_val_cstr ) {
++            // The second argument is the message for an undefined variable (rustc: `custom_msg`)
++            if( args.size() == 2 ) {
++                ERROR(sp, E0000, args[1]);
++            }
+             ERROR(sp, E0000, "Environment variable '" << varname << "' not defined");
+         }
+         return box$( TTStreamO(sp, ParseState(), TokenTree(Token(TOK_STRING, ::std::string(var_val_cstr), {}))) );
+@@ -52,7 +68,8 @@ class CExpanderOptionEnv:
+ {
+     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
+     {
+-        ::std::string   varname = get_string(sp, crate, mod,  tt);
++        auto args = get_strings(sp, crate, mod, tt, "option_env", 1);
++        const auto& varname = args[0];
+         ::std::vector< TokenTree>   rv;
+ 
+         const char* var_val_cstr = getenv(varname.c_str());
+diff --git a/src/expand/include.cpp b/src/expand/include.cpp
+index 93ff0605..5c7aa474 100644
+--- a/src/expand/include.cpp
++++ b/src/expand/include.cpp
+@@ -16,8 +16,12 @@
+ 
+ namespace {
+ 
++    /// The single string argument of `include!`/`include_str!`/`include_bytes!`, with the optional trailing comma rustc's
++    /// single-argument builtins accept (`get_single_expr_from_tts`): two-face 0.4.5 acknowledgement/mod.rs:20
++    /// `include_bytes!("../../generated/acknowledgements_full.bin",)` (gitui 0.28.1).
+     ::std::string get_string(const Span& sp, TokenStream& lex, const ::AST::Crate& crate, AST::Module& mod)
+     {
++        Token   tok;
+         auto n = Parse_ExprVal(lex);
+         ASSERT_BUG(sp, n, "No expression returned");
+         Expand_BareExpr(crate, mod, n);
+@@ -26,6 +30,8 @@ namespace {
+         if( !string_np ) {
+             ERROR(sp, E0000, "include! requires a string literal - got " << *n);
+         }
++        lex.getTokenIf(TOK_COMMA);
++        GET_CHECK_TOK(tok, lex, TOK_EOF);
+         return mv$( string_np->m_value );
+     }
+ 
+@@ -94,11 +100,9 @@ class CIncludeExpander:
+ {
+     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
+     {
+-        Token   tok;
+         auto lex = TTStream(sp, ParseState(), tt);
+ 
+         auto path = get_string(sp, lex, crate, mod);
+-        GET_CHECK_TOK(tok, lex, TOK_EOF);
+ 
+         ::std::string file_path = get_path_relative_to(include_base(sp, mod), mv$(path));
+         crate.m_extra_files.push_back(file_path);
+@@ -121,11 +125,9 @@ class CIncludeBytesExpander:
+ {
+     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
+     {
+-        Token   tok;
+         auto lex = TTStream(sp, ParseState(), tt);
+ 
+         auto path = get_string(sp, lex, crate, mod);
+-        GET_CHECK_TOK(tok, lex, TOK_EOF);
+ 
+         ::std::string file_path = get_path_relative_to(include_base(sp, mod), mv$(path));
+         crate.m_extra_files.push_back(file_path);
+@@ -148,11 +150,9 @@ class CIncludeStrExpander:
+ {
+     ::std::unique_ptr<TokenStream> expand(const Span& sp, const AST::Crate& crate, const TokenTree& tt, AST::Module& mod) override
+     {
+-        Token   tok;
+         auto lex = TTStream(sp, ParseState(), tt);
+ 
+         auto path = get_string(sp, lex, crate, mod);
+-        GET_CHECK_TOK(tok, lex, TOK_EOF);
+ 
+         ::std::string file_path = get_path_relative_to(include_base(sp, mod), mv$(path));
+         crate.m_extra_files.push_back(file_path);

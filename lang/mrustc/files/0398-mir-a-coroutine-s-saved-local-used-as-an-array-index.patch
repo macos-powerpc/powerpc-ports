@@ -1,0 +1,77 @@
+From 27bcef8f9db2e125577fbe4dad5bff6a700e04a2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 12:38:00 +0000
+Subject: [PATCH] mir: a coroutine's saved local used as an array index is
+ loaded into a temporary first
+
+webrtc-util 0.12.0 (localsend-cli 1.18.2) src/conn/conn_bridge.rs:
+
+    pub async fn push(&self, b: &[u8], id: usize) -> Result<usize> {
+        tokio::time::sleep(TICK_WAIT).await;
+        ..
+        let mut queue = self.queue[id].lock().await;
+
+    <null> BUG: src/mir/from_hir.cpp:3438: TODO: visit_lvalue -
+
+Lowering an async fn moves every local that lives across an await into the
+coroutine's state struct and rewrites its uses to `(*self.pin.0).<field>`.
+An Index wrapper can only name a plain local, and the case of the INDEX
+local itself being saved (`id`, an argument used after the await) was
+a bare TODO.
+
+The rewriter now loads the saved value into a new `usize` local with
+an Assign queued before the statement (or before the terminator, through
+the existing m_new_statements mechanism) and points the wrapper at it.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/mir/from_hir.cpp b/src/mir/from_hir.cpp
+index 0f00e67d..1a83d5c6 100644
+--- a/src/mir/from_hir.cpp
++++ b/src/mir/from_hir.cpp
+@@ -3397,6 +3397,8 @@ namespace {
+                 const ::std::map<unsigned,unsigned>& m_drop_flag_mapping;
+                 /// Index of the drop flags bitset (array of u8) in the state (field 0 of top structure)
+                 unsigned    m_drop_flags_field;
++                /// The function being rewritten (for new temporaries)
++                ::MIR::Function*    m_fcn = nullptr;
+                 
+                 ::std::vector< ::MIR::Statement>    m_new_statements;
+                 unsigned bb_idx = 0;
+@@ -3434,8 +3436,25 @@ namespace {
+                         {
+                             auto it = m_mappings.find(w.as_Index());
+                             if( it != m_mappings.end() ) {
+-                                // Allocate a new temporary, assign it before this statement, use that
+-                                TODO(Span(), "");
++                                // The index local lives in the coroutine state, but an Index wrapper can only name a plain
++                                // local: load the saved value into a new temporary just before this statement and index
++                                // by that. webrtc-util 0.12.0 conn/conn_bridge.rs ConnBridge::push (localsend-cli):
++                                // `tokio::time::sleep(..).await; .. self.queue[id].lock()` with the `id` argument saved
++                                // across the await (was `TODO: visit_lvalue`).
++                                ::MIR::LValue   src = ::MIR::LValue::new_Argument(0);
++                                src.m_wrappers.push_back(::MIR::LValue::Wrapper::new_Field(0));  // Pin.ptr
++                                src.m_wrappers.push_back(::MIR::LValue::Wrapper::new_Deref());   // *
++                                src.m_wrappers.insert(src.m_wrappers.end(), it->second.begin(), it->second.end());
++                                auto tmp_idx = static_cast<unsigned>(m_fcn->locals.size());
++                                m_fcn->locals.push_back( ::HIR::TypeRef(::HIR::CoreType::Usize) );
++                                m_new_statements.push_back(::MIR::Statement::make_Assign({
++                                    ::MIR::LValue::new_Local(tmp_idx),
++                                    ::MIR::RValue::make_Use( ::std::move(src) )
++                                    }));
++                                DEBUG(
++                                    "BB" << bb_idx << "/" << FMT_CB(os, if(stmt_idx == ~0u) { os << "TERM"; } else { os << stmt_idx; })
++                                    << " > index local " << w.as_Index() << " saved in the state: _" << tmp_idx << " = " << m_new_statements.back());
++                                w = ::MIR::LValue::Wrapper::new_Index(tmp_idx);
+                             }
+                         }
+                     }
+@@ -3510,6 +3529,7 @@ namespace {
+ 
+                 void rewrite_fcn(::MIR::Function& f)
+                 {
++                    m_fcn = &f;
+                     for(auto& bb : f.blocks)
+                     {
+                         this->bb_idx = &bb - f.blocks.data();

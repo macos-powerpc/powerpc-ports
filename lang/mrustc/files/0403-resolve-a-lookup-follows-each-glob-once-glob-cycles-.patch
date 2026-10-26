@@ -1,0 +1,303 @@
+From 4db15dd498110d0fef4683a08dbb9937b6ed41b2 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 20:06:00 +0000
+Subject: [PATCH] resolve: a lookup follows each glob once (glob cycles were
+ searched along every path)
+
+localsend-cli 1.18.2: dtls 0.13.0 sat in Expand for over 1.5 hours with no
+output; a sample of the mrustc process showed all of the time in
+(anonymous namespace)::ResolveState::find_item / get_module (resolve/common.cpp).
+
+dtls's modules glob-import each other: 336 `use super::*;` / `use crate::x::*;`
+over 93 files (flight/flightN.rs `use super::*;` + `use crate::{conn, content,
+handshake, ..}::*`, flight/mod.rs `use crate::handshaker::*`, handshaker.rs
+`use crate::conn::*`, ...).  Three lookups walk globs with only a stack against
+cycles, so they follow every simple path of the glob graph - exponential:
+
+- Expand_Mod's `Use` arm asks Resolve_Lookup_Macro for a macro named like every
+  named `use` (macros can be imported by `use`).  None of dtls's are macros, so
+  each is a failing find_item search of the whole graph (its antirecurse stack
+  only stops at a module already on the stack).
+- Resolve Use's Resolve_Use_GetBinding_Mod merges the bindings of every glob it
+  reaches (s_use_glob_mod_stack).
+- Resolve Index's Resolve_Index_Module_Wildcard__submod copies a module's index
+  into the importer and follows its globs (`pub use` globs; static `stack`).
+
+Reproduced here: a skeleton of dtls (its module tree and top-level `use` items,
+no code, no dependencies) is still in Expand after 5 minutes with the 0402
+binary (and with 0324).  gen.py graphs of N modules that all glob each other:
+Expand 0.12 s (N=6), 0.9 s (7), 9.5 s (8), 97 s (9); Resolve Use 0.18 / 1.5 /
+15.6 s and Resolve Index 0.67 / 4.9 / 36 s for N = 6 / 7 / 8.
+
+Each lookup now keeps a set of what it already searched:
+- find_item: the (module, name, namespace) lookups that came up empty.  A glob,
+  a named `use` and an anonymous module's parent continue the search they came
+  from; a path walk (get_module) starts its own.
+- Resolve_Use_GetBinding_Mod: the (importing module, imported module) globs it
+  followed.  A glob that the cycle stack blocked isn't marked, so it can still
+  be followed later, as before.
+- Resolve_Index_Module_Wildcard: per destination module, the (source module,
+  visibility given to the copies) pairs it copied.
+
+A second visit only repeated work (first found / first bound wins): HIR dumps
+are identical between the old and new binaries on the N=6 and N=7 graphs and on
+the dtls skeleton with stub items.  Now: dtls skeleton Expand 3.6 s with all its
+`use` items (0.09 s without the unresolvable extern ones), N=14 under 0.2 s per
+phase.
+
+Assisted-By: Claude Opus 5.5 (1M context)
+---
+
+diff --git a/src/resolve/common.cpp b/src/resolve/common.cpp
+index 772fb17f..99c5621d 100644
+--- a/src/resolve/common.cpp
++++ b/src/resolve/common.cpp
+@@ -13,6 +13,8 @@
+ #include <ast/expr.hpp>
+ #include <hir/hir.hpp>
+ #include <stdspan.hpp>  // std::span
++#include <set>
++#include <tuple>
+ #include <expand/cfg.hpp>
+ #include <synext_macro.hpp>
+ 
+@@ -521,8 +523,35 @@ namespace {
+             throw "";
+         }
+ 
+-        ResolveItemRef find_item(const AST::Module& mod, const RcString& name, ResolveNamespace ns, ::AST::AbsolutePath* out_path=nullptr)
+-        //ResolveModuleRef get_source_module_for_name(const AST::Module& mod, const RcString& name, ResolveNamespace ns, ::AST::AbsolutePath* out_path=nullptr)
++        /// Lookups of one search that came up empty: (module, name, namespace)
++        typedef std::set< std::tuple<const AST::Module*, RcString, ResolveNamespace> >  failed_lookups_t;
++
++        /// Look for `name` in `mod`, through its `use` items and globs.
++        /// `searched` is the set of the search this lookup belongs to (null starts a new search): a glob, a `use` and
++        /// the parent of an anonymous module continue the search they came from, while a path walk (`get_module`) starts
++        /// its own. Each (module, name, namespace) is looked at once per search: without that, a crate whose modules
++        /// glob-import each other (`use super::*;`, `use crate::x::*;`) was searched along every simple path of its glob
++        /// graph for each name it does not define - exponential. dtls 0.13.0 (localsend-cli, 336 globs over 93 files)
++        /// sat in Expand for hours: every named `use` asks for a macro of that name (Expand_Mod's `Use` arm), which
++        /// no module defines.
++        ResolveItemRef find_item(const AST::Module& mod, const RcString& name, ResolveNamespace ns, ::AST::AbsolutePath* out_path=nullptr, failed_lookups_t* searched=nullptr)
++        {
++            failed_lookups_t    new_search;
++            if( !searched ) {
++                searched = &new_search;
++            }
++            auto key = std::make_tuple(&mod, name, ns);
++            if( searched->count(key) > 0 ) {
++                DEBUG("Already searched for " << name << " in " << mod.path() << " (ns=" << ns << ")");
++                return ResolveItemRef::make_None({});
++            }
++            auto rv = find_item_inner(mod, name, ns, out_path, *searched);
++            if( rv.is_None() ) {
++                searched->insert(std::move(key));
++            }
++            return rv;
++        }
++        ResolveItemRef find_item_inner(const AST::Module& mod, const RcString& name, ResolveNamespace ns, ::AST::AbsolutePath* out_path, failed_lookups_t& searched)
+         {
+             TRACE_FUNCTION_F("Looking for " << name << " in " << mod.path() << " (ns=" << ns << ")");
+             if( mod.m_index_populated )
+@@ -692,7 +721,7 @@ namespace {
+                             TU_MATCH_HDRA( (tgt_mod), {)
+                             TU_ARMA(Ast, mod_ptr) {
+                                 // NOTE: Recursion
+-                                auto rv = this->find_item(*mod_ptr, item_name, ns, out_path);
++                                auto rv = this->find_item(*mod_ptr, item_name, ns, out_path, &searched);
+                                 if(!rv.is_None())
+                                 {
+                                     DEBUG("Found in AST use");
+@@ -758,7 +787,7 @@ namespace {
+                                 TODO(sp, "ImplicitPrelude? " << e.path);
+                                 }
+                             TU_ARMA(Ast, sm) {
+-                                auto rv = find_item(*sm, name, ns, out_path);
++                                auto rv = find_item(*sm, name, ns, out_path, &searched);
+                                 if( !rv.is_None() )
+                                 {
+                                     DEBUG("Found in AST glob");
+@@ -795,7 +824,7 @@ namespace {
+                         m = &as_Namespace(this->find_item(*m, tgt_name, ResolveNamespace::Namespace)).as_Ast()->as_Module();
+                     }
+                 }
+-                return find_item(*m, name, ns, out_path);
++                return find_item(*m, name, ns, out_path, &searched);
+             }
+             DEBUG("Not found");
+             return ResolveItemRef::make_None({});
+diff --git a/src/resolve/index.cpp b/src/resolve/index.cpp
+index cca3713e..3c892349 100644
+--- a/src/resolve/index.cpp
++++ b/src/resolve/index.cpp
+@@ -19,7 +19,10 @@ enum class IndexName
+     Macro,
+ };
+ 
+-void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst_mod, const AST::UseItem::Ent& i_data, const AST::Visibility& vis);
++/// The modules whose index one module's glob imports already copied: (source module, visibility given to the copies,
++/// null for `pub`)
++typedef ::std::set< ::std::pair<const AST::Module*, const AST::Visibility*> >    index_glob_search_t;
++void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst_mod, const AST::UseItem::Ent& i_data, const AST::Visibility& vis, index_glob_search_t& search);
+ extern bool Resolve_Use_HirStructCtorVisible(const ::HIR::Struct& str);   // use.cpp
+ 
+ ::std::ostream& operator<<(::std::ostream& os, const IndexName& loc)
+@@ -530,7 +533,7 @@ void Resolve_Index_Module_Wildcard__glob_in_hir_mod(
+     }
+ }
+ 
+-void Resolve_Index_Module_Wildcard__submod(AST::Crate& crate, AST::Module& dst_mod, const AST::Module& src_mod, const AST::Visibility& dst_vis)
++void Resolve_Index_Module_Wildcard__submod(AST::Crate& crate, AST::Module& dst_mod, const AST::Module& src_mod, const AST::Visibility& dst_vis, index_glob_search_t& search)
+ {
+     static Span sp;
+     TRACE_FUNCTION_F(dst_mod.path() << " <= " << src_mod.path());
+@@ -540,6 +543,16 @@ void Resolve_Index_Module_Wildcard__submod(AST::Crate& crate, AST::Module& dst_m
+         DEBUG("- Avoided recursion");
+         return ;
+     }
++    // Copy each module (and follow its globs) once per destination and visibility: a second copy adds nothing, and
++    // the stack above only stops cycles, so modules that `pub use` each other's globs were copied along every simple
++    // path of their glob graph (see resolve/common.cpp's find_item)
++    // - The key is the visibility object (a `use` item's), so equal restrictions from two `use` items count twice
++    if( ! search.insert( ::std::make_pair(&src_mod, dst_vis.is_global() ? nullptr : &dst_vis) ).second )
++    {
++        DEBUG("- Already copied");
++        stack.erase(&src_mod);
++        return ;
++    }
+ 
+     // A glob re-export can't make an item more visible than it is: `pub use crate::*` imports the crate's private
+     // items (e.g. the implicit `extern crate std`) for local use only. (value-trait 0.12.2's prelude, seen from simd-json)
+@@ -579,7 +592,7 @@ void Resolve_Index_Module_Wildcard__submod(AST::Crate& crate, AST::Module& dst_m
+             {
+                 if( e.name != "" )
+                     continue ;
+-                Resolve_Index_Module_Wildcard__use_stmt(crate, dst_mod, e, glob_vis(i->vis));
++                Resolve_Index_Module_Wildcard__use_stmt(crate, dst_mod, e, glob_vis(i->vis), search);
+             }
+         }
+     }
+@@ -587,7 +600,7 @@ void Resolve_Index_Module_Wildcard__submod(AST::Crate& crate, AST::Module& dst_m
+     stack.erase(&src_mod);
+ }
+ 
+-void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst_mod, const AST::UseItem::Ent& i_data, const AST::Visibility& vis)
++void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst_mod, const AST::UseItem::Ent& i_data, const AST::Visibility& vis, index_glob_search_t& search)
+ {
+     const auto& sp = i_data.sp;
+     const auto& b = i_data.path.m_bindings.type;
+@@ -609,7 +622,7 @@ void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst
+         }
+         else
+         {
+-            Resolve_Index_Module_Wildcard__submod(crate, dst_mod, *e->module_, vis);
++            Resolve_Index_Module_Wildcard__submod(crate, dst_mod, *e->module_, vis, search);
+         }
+     }
+     else if( const auto* ep = b.binding.opt_Enum() )
+@@ -694,6 +707,7 @@ void Resolve_Index_Module_Wildcard__use_stmt(AST::Crate& crate, AST::Module& dst
+ void Resolve_Index_Module_Wildcard(AST::Crate& crate, AST::Module& mod)
+ {
+     TRACE_FUNCTION_F("mod = " << mod.path());
++    index_glob_search_t search;
+     for( const auto& i : mod.m_items )
+     {
+         if( ! i->data.is_Use() )
+@@ -702,7 +716,7 @@ void Resolve_Index_Module_Wildcard(AST::Crate& crate, AST::Module& mod)
+         {
+             if( e.name != "" )
+                 continue ;
+-            Resolve_Index_Module_Wildcard__use_stmt(crate, mod, e, i->vis);
++            Resolve_Index_Module_Wildcard__use_stmt(crate, mod, e, i->vis, search);
+         }
+     }
+ 
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index f3a07053..f7641f4d 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -13,6 +13,7 @@
+ #include <stdspan.hpp>  // std::span
+ #include <pop_on_drop.hpp>
+ #include <algorithm>   // std::reverse
++#include <set>
+ 
+ enum class Lookup
+ {
+@@ -51,6 +52,8 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+     bool types_only=false, bool soft_fail=false
+     );
+ 
++/// The glob imports one lookup of a name already followed: (importing module, imported module)
++typedef ::std::set< ::std::pair<const ::AST::Module*, const ::AST::Module*> >    use_glob_search_t;
+ ::AST::Path::Bindings Resolve_Use_GetBinding_Mod(
+     const Span& span,
+     const ::AST::Crate& crate, const ::AST::AbsolutePath& source_mod_path, const ::AST::Module& mod,
+@@ -58,7 +61,9 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+     ::std::span< const ::AST::Module* > parent_modules,
+     bool types_only = false,
+     /// A lookup on behalf of a glob import from `source_mod_path`: only items visible from there
+-    bool glob_vis = false
++    bool glob_vis = false,
++    /// The lookup this one continues (a glob, an anonymous module's parent); null starts a new one
++    use_glob_search_t* glob_search = nullptr
+     );
+ ::AST::Path::Bindings Resolve_Use_GetBinding__ext(const Span& span, const ::AST::Crate& crate, const AST::ExternCrate& ec, const ::HIR::Module& hmodr, const ::AST::Path& path, unsigned int start, AST::AbsolutePath ap={});
+ ::AST::Path::Bindings Resolve_Use_GetBinding__ext(const Span& span, const ::AST::Crate& crate, const ::AST::Path& path,  const AST::ExternCrate& ec, unsigned int start);
+@@ -572,11 +577,16 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+         const RcString& des_item_name,
+         ::std::span< const ::AST::Module* > parent_modules,
+         bool types_only,// = false
+-        bool glob_vis// = false
++        bool glob_vis,// = false
++        use_glob_search_t* glob_search// = nullptr
+     )
+ {
+     ::AST::Path::Bindings   rv;
+     TRACE_FUNCTION_F(mod.path() << ", des_item_name=" << des_item_name);
++    use_glob_search_t   new_glob_search;
++    if( !glob_search ) {
++        glob_search = &new_glob_search;
++    }
+ 
+     static ::std::vector<std::pair<const AST::Module*,const char*>>  s_recurse_stack;
+     auto recurse_ent = std::make_pair(&mod, des_item_name.c_str());
+@@ -874,17 +884,23 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+                     }
+                 TU_ARMA(Module, e) {
+                     if( e.module_ ) {
+-                        // TODO: Prevent infinite recursion?
++                        // Follow each glob once per lookup: a second visit only merges bindings again (first wins).
++                        // The stack only stops cycles, so modules that glob-import each other were searched along
++                        // every simple path of their glob graph (the blow-up of resolve/common.cpp's find_item)
+                         static ::std::vector<const AST::Module*>  s_use_glob_mod_stack;
+-                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), &*e.module_) == s_use_glob_mod_stack.end() )
++                        if( ::std::find(s_use_glob_mod_stack.begin(), s_use_glob_mod_stack.end(), &*e.module_) != s_use_glob_mod_stack.end() )
+                         {
+-                            s_use_glob_mod_stack.push_back( &*e.module_ );
+-                            rv.merge_from( Resolve_Use_GetBinding_Mod(span, crate, mod.path(), *e.module_, des_item_name, {}, /*types_only=*/false, /*glob_vis=*/true) );
+-                            s_use_glob_mod_stack.pop_back();
++                            DEBUG("Recursion prevented of " << e.module_->path());
++                        }
++                        else if( !glob_search->insert(::std::make_pair(&mod, &*e.module_)).second )
++                        {
++                            DEBUG("Already searched glob of " << e.module_->path() << " in " << mod.path());
+                         }
+                         else
+                         {
+-                            DEBUG("Recursion prevented of " << e.module_->path());
++                            s_use_glob_mod_stack.push_back( &*e.module_ );
++                            rv.merge_from( Resolve_Use_GetBinding_Mod(span, crate, mod.path(), *e.module_, des_item_name, {}, /*types_only=*/false, /*glob_vis=*/true, glob_search) );
++                            s_use_glob_mod_stack.pop_back();
+                         }
+                     }
+                     else if( e.hir.mod ) {
+@@ -944,7 +960,7 @@ void Resolve_Use_Mod(const ::AST::Crate& crate, ::AST::Module& mod, ::AST::Path
+ 
+     if( mod.path().nodes.size() > 0 && mod.path().nodes.back().c_str()[0] == '#' ) {
+         ASSERT_BUG(span, parent_modules.size() > 0, "Anon module with no parent modules - " << mod.path() );
+-        return Resolve_Use_GetBinding_Mod(span, crate, source_mod_path, *parent_modules.back(), des_item_name, parent_modules.subspan(0, parent_modules.size()-1));
++        return Resolve_Use_GetBinding_Mod(span, crate, source_mod_path, *parent_modules.back(), des_item_name, parent_modules.subspan(0, parent_modules.size()-1), /*types_only=*/false, /*glob_vis=*/false, glob_search);
+     }
+     else {
+         //if( allow == Lookup::Any )

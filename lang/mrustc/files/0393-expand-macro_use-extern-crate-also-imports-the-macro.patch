@@ -1,0 +1,197 @@
+From bd915f98aa2b417c2b99fd52c022d1aa2cdce225 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 06:35:12 +0000
+Subject: [PATCH 393/393] expand: `#[macro_use] extern crate` also imports the macros
+ the crate root imported privately
+
+num-bigint-dig 0.8.4 (gitui 0.28.1) src/biguint.rs:490 `BigUint::new(vec![1])`:
+
+    error: Unknown macro vec
+
+The crate is `#![no_std]` with a plain `extern crate alloc;` and still uses `vec!`. rustc
+accepts it because `#[macro_use] extern crate smallvec;` imports every macro-namespace
+child of smallvec's root module, private imports included: smallvec 1.15.1 has
+`use alloc::{vec, vec::Vec};` at its root (build_reduced_graph_for_extern_crate's
+for_each_child; the `private_macro_use` future-incompat lint of 1.78 only warns).
+mrustc's CMacroUseHandler imported the exported names only.
+
+- expand/macro_rules.cpp: after the exported names, the handler walks the crate root's
+  non-global `Import` macro items, follows the import chain with a null-returning walker
+  (a private import may name anything; never BUG on it), skips builtins, unloaded crates
+  and non-macros, dedups through `exists` and honours a `#[macro_use(name)]` filter.
+  A private `macro_rules!` of the dependency is not in its HIR and stays unreachable.
+- hir/from_ast.cpp: the prelude glob that expand inserts into every module
+  (`use <std>::prelude::<edition>::*`) indexed the prelude's macros as private imports of
+  every module, so a dependency's rlib root listed `assert`, `derive`, `test`, .. as its
+  children. rustc keeps the prelude out of a module's children, so LowerHIR_Module leaves
+  out a private macro import whose name and path match an entry of the crate's prelude
+  module (g_prelude_macros, filled in LowerHIR_FromAST from rv.m_ext_crates, following the
+  entry's re-export chain since the index normalises one level). The HIR format is
+  unchanged; rlibs built earlier still carry those entries, which resolve to the same core
+  macros a consumer already imports (deduplicated) or to builtins (skipped).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/expand/macro_rules.cpp b/src/expand/macro_rules.cpp
+index 77cd87c6..fd7797d3 100644
+--- a/src/expand/macro_rules.cpp
++++ b/src/expand/macro_rules.cpp
+@@ -153,6 +153,68 @@ class CMacroUseHandler:
+                     mod.m_macro_imports.push_back(mv$(mi));
+                 }
+             }
++
++            // rustc's `#[macro_use]` takes every macro-namespace child of the crate root, including macros the root
++            // merely imported with a private `use` (the `private_macro_use` future-incompat lint of 1.78 warns, the
++            // import still works): num-bigint-dig 0.8.4 (gitui 0.28.1) is `#![no_std]` with a plain `extern crate
++            // alloc;` and reaches `vec!` only through `#[macro_use] extern crate smallvec;` - smallvec's root has
++            // `use alloc::{vec, vec::Vec};`.
++            // - The prelude glob's entries are left out of the HIR (hir/from_ast.cpp LowerHIR_Module), so this sees
++            //   written imports only; a private `macro_rules!` of the crate is not in its HIR and stays unreachable.
++            // Walks to the macro item a path names; null when it leads nowhere (a private import may name anything,
++            // never BUG on one)
++            auto find_macro_item = [&](const ::HIR::SimplePath& p) -> const ::HIR::VisEnt< ::HIR::MacroItem>* {
++                if( p.crate_name() == CRATE_BUILTINS || p.components().empty() )
++                    return nullptr;
++                auto it_c = crate.m_extern_crates.find(p.crate_name());
++                if( it_c == crate.m_extern_crates.end() )
++                    return nullptr;
++                const ::HIR::Module* m = &it_c->second.m_hir->m_root_module;
++                for(size_t i = 0; i + 1 < p.components().size(); i ++)
++                {
++                    auto it = m->m_mod_items.find(p.components()[i]);
++                    if( it == m->m_mod_items.end() || !it->second->ent.is_Module() )
++                        return nullptr;
++                    m = &it->second->ent.as_Module();
++                }
++                auto it = m->m_macro_items.find(p.components().back());
++                return it != m->m_macro_items.end() ? &*it->second : nullptr;
++                };
++            for(const auto& ent : ec.m_hir->m_root_module.m_macro_items)
++            {
++                const auto& name = ent.first;
++                const auto* e = &*ent.second;
++                if( e->publicity.is_global() )
++                    continue ;  // An exported name, handled above
++                if( !e->ent.is_Import() )
++                    continue ;
++                if( !filter_valid(name) )
++                    continue ;
++                AST::AbsolutePath   path;
++                for(unsigned depth = 0; e && e->ent.is_Import() && depth < 8; depth ++)
++                {
++                    const auto& ip = e->ent.as_Import().path;
++                    path = AST::AbsolutePath(ip.crate_name(), ip.components().to_vec());
++                    e = find_macro_item(ip);
++                }
++                if( !e || e->ent.is_Import() ) {
++                    DEBUG("Private import " << name << " = " << ent.second->ent.as_Import().path << ": no macro found");
++                    continue ;
++                }
++
++                MacroRef    mr;
++                TU_MATCH_HDRA( (e->ent), { )
++                TU_ARMA(Import, imp) { continue ; }
++                TU_ARMA(MacroRules, mac_ptr) { mr = &*mac_ptr; }
++                TU_ARMA(ProcMacro, p) { mr = &p; }
++                }
++                if(!exists(name, mr))
++                {
++                    auto mi = AST::Module::MacroImport{ false, name, std::move(path), std::move(mr) };
++                    DEBUG("Import macro (private import of the crate root) " << name << " = " << mi.path);
++                    mod.m_macro_imports.push_back(mv$(mi));
++                }
++            }
+         }
+         else if( const auto* submod_p = i.opt_Module() )
+         {
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index d4543dd2..65272e81 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -42,6 +42,9 @@ RcString    g_core_crate;
+ RcString    g_crate_name;
+ ::HIR::Crate*   g_crate_ptr = nullptr;
+ const ::AST::Crate* g_ast_crate_ptr;
++/// Macro-namespace entries of the crate's prelude: name -> the paths the module index can record for it (filled by
++/// LowerHIR_FromAST, read by LowerHIR_Module)
++::std::map<RcString, ::std::vector< ::HIR::SimplePath>>  g_prelude_macros;
+ 
+ namespace {
+     const ::HIR::TypeRef ty_Self = HIR::TypeRef::new_self();
+@@ -2407,6 +2410,19 @@ void _add_mod_mac_item(::HIR::Module& mod, RcString name, ::HIR::Publicity is_pu
+             assert(!hir_path.components().empty());
+             assert(hir_path.components().back() != "");
+ 
++            // The prelude glob (expand inserts `use <std>::prelude::<edition>::*` into every module) indexed this name
++            // as a private import of the module. rustc keeps the prelude out of a module's children, and `#[macro_use]
++            // extern crate` reads the crate root's children (expand/macro_rules.cpp): leave the entry out of the HIR.
++            if( !get_vis(ie.second.vis).is_global() )
++            {
++                auto it = g_prelude_macros.find(ie.first);
++                if( it != g_prelude_macros.end() && ::std::find(it->second.begin(), it->second.end(), hir_path) != it->second.end() )
++                {
++                    DEBUG("Skip prelude MACRO " << ie.first << " = " << hir_path);
++                    continue ;
++                }
++            }
++
+             DEBUG("Import MACRO " << ie.first << " = " << hir_path);
+             auto mi = ::HIR::MacroItem::make_Import({ mv$(hir_path) });
+             _add_mod_mac_item( mod, ie.first, get_vis(ie.second.vis), mv$(mi) );
+@@ -2852,6 +2868,54 @@ public:
+     path_PointeeSized = rv.get_lang_item_path_opt("pointee_sized");
+     path_MetadataSized = rv.get_lang_item_path_opt("metadata_sized");
+ 
++    // Record the prelude's macro entries (and what they import), so LowerHIR_Module can tell the prelude glob's index
++    // entries from written imports (see there). The loaded crates live in `rv.m_ext_crates` by now.
++    g_prelude_macros.clear();
++    if( crate.m_prelude_path.m_class.is_Absolute() )
++    {
++        const auto& info = crate.m_prelude_path.m_class.as_Absolute();
++        auto it_c = rv.m_ext_crates.find(info.crate);
++        if( it_c != rv.m_ext_crates.end() )
++        {
++            ::std::vector<RcString> nodes;
++            for(const auto& n : info.nodes)
++                nodes.push_back(n.name());
++            ::HIR::SimplePath   pmod_path(info.crate, nodes);
++            const auto& pmod = it_c->second.m_data->get_mod_by_path(Span(), pmod_path, /*ignore_last_node*/false, /*ignore_crate_name*/true);
++            for(const auto& me : pmod.m_macro_items)
++            {
++                auto& paths = g_prelude_macros[me.first];
++                paths.push_back(pmod_path + me.first);
++                // Follow the re-export chain: the index records the target of an import (resolve/index.cpp
++                // Resolve_Index_Module_Normalise_Path), one level at a time. A plain walk, never BUG on a path here.
++                const auto* e = &*me.second;
++                for(unsigned depth = 0; e && e->ent.is_Import() && depth < 8; depth ++)
++                {
++                    const auto& ip = e->ent.as_Import().path;
++                    paths.push_back(ip.clone());
++                    e = nullptr;
++                    if( ip.crate_name() == CRATE_BUILTINS || ip.components().empty() )
++                        break;
++                    auto it_c2 = rv.m_ext_crates.find(ip.crate_name());
++                    if( it_c2 == rv.m_ext_crates.end() )
++                        break;
++                    const ::HIR::Module* m = &it_c2->second.m_data->m_root_module;
++                    for(size_t i = 0; m && i + 1 < ip.components().size(); i ++)
++                    {
++                        auto it = m->m_mod_items.find(ip.components()[i]);
++                        m = (it != m->m_mod_items.end() && it->second->ent.is_Module()) ? &it->second->ent.as_Module() : nullptr;
++                    }
++                    if( !m )
++                        break;
++                    auto it_m = m->m_macro_items.find(ip.components().back());
++                    if( it_m != m->m_macro_items.end() )
++                        e = &*it_m->second;
++                }
++                DEBUG("Prelude macro " << me.first << " = " << paths);
++            }
++        }
++    }
++
+     rv.m_root_module = LowerHIR_Module( crate.m_root_module, ::HIR::ItemPath(rv.m_crate_name) );
+     for(auto& e : macros)
+     {

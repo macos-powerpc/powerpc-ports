@@ -1,0 +1,163 @@
+From f0963307837088fbd76a62931f75f1b5fc9dab86 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 04:42:55 +0000
+Subject: [PATCH] resolve: a `use` inside a block sees the enclosing module's
+ items and imports before the extern prelude
+
+gitoxide 0.61.0 src/plumbing/main.rs (edition 2024) has `use gitoxide_core as core;` at the module root
+and, inside a match-arm block,
+
+    use core::repository::branch::list;
+    ...
+    prepare_and_run(.., move |_progress, out, _err| {
+        core::repository::branch::list(repository(Mode::Lenient)?, out, format, options)
+    })
+
+which died with
+
+    error:0: Unable to find path component repository in ::"core-0_0_0"::repository::branch::list
+
+A 2018+ `use` path's first segment yields to the enclosing module's type items and named imports
+(the async-compression fix), but both shadow checks walked `base_path` with a helper that returned
+null on any `#N` (anonymous block module) segment: a `use` inside a block always fell through to the
+extern prelude, so `core` was libcore. The matching negative (`core::Option` through such an import)
+was silently accepted for the same reason.
+
+rustc: a block module's lexical parent is its enclosing module, a named module's is not, so the
+block's own items/imports, every enclosing block's and the nearest named module's all come before the
+extern prelude. Resolve_Use_LexicalModules walks `#N` segments through anon_mods() (as the resolver's
+own anon-module walk does) and returns that chain innermost first; both shadow checks iterate it, and
+a not-yet-resolved import found in an enclosing module is absolutised against its own module path.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/resolve/use.cpp b/src/resolve/use.cpp
+index 64792a35..f3a07053 100644
+--- a/src/resolve/use.cpp
++++ b/src/resolve/use.cpp
+@@ -12,6 +12,7 @@
+ #include <hir/hir.hpp>
+ #include <stdspan.hpp>  // std::span
+ #include <pop_on_drop.hpp>
++#include <algorithm>   // std::reverse
+ 
+ enum class Lookup
+ {
+@@ -67,31 +68,48 @@ void Resolve_Use(::AST::Crate& crate)
+     Resolve_Use_Mod(crate, crate.m_root_module, ::AST::Path("", {}));
+ }
+ 
+-// The module containing a `use` (found by walking `base_path` from the crate root), or nullptr if the walk fails
+-// (anon modules aren't indexed by name)
+-static const AST::Module* Resolve_Use_WalkToModule(const AST::Crate& crate, const ::AST::Path& base_path)
++// The modules whose items and imports a `use` at `base_path` sees before the extern prelude, innermost first (found by
++// walking `base_path` from the crate root): the module itself and, for a `use` inside a block, every enclosing
++// anonymous (block) module up to and including the nearest named module. rustc: a block module's lexical parent is its
++// enclosing module, a named module's is not.
++// - gitoxide 0.61.0 src/plumbing/main.rs:462 (edition 2024) `use gitoxide_core as core;` at the root and, in a match-arm
++//   block, `use core::repository::branch::list;`: the walk gave up on the `#N` segment, so the extern prelude's `core`
++//   won -> "Unable to find path component repository in ::"core-0_0_0"::repository::branch::list"
++// Empty if the walk fails for any reason (the callers then keep the extern-prelude-wins behaviour).
++static ::std::vector<const AST::Module*> Resolve_Use_LexicalModules(const AST::Crate& crate, const ::AST::Path& base_path)
+ {
++    ::std::vector<const AST::Module*>   rv;
+     const AST::Module* cur_mod = &crate.m_root_module;
++    rv.push_back(cur_mod);
+     for( unsigned int i = 0; i < base_path.nodes().size(); i ++ )
+     {
+         const auto& seg_name = base_path.nodes()[i].name();
+-        if( seg_name.size() > 0 && seg_name.c_str()[0] == '#' ) {
+-            // Anon modules aren't indexed by name - can't safely continue the walk.
+-            return nullptr;
+-        }
+         const AST::Module* next_mod = nullptr;
+-        for(const auto& item : cur_mod->m_items) {
+-            if( item->name == seg_name && item->data.is_Module() ) {
+-                next_mod = &item->data.as_Module();
+-                break;
++        if( seg_name.size() > 0 && seg_name.c_str()[0] == '#' ) {
++            unsigned int idx = 0;
++            if( ::std::sscanf(seg_name.c_str(), "#%u", &idx) != 1 || idx >= cur_mod->anon_mods().size() || !cur_mod->anon_mods()[idx] ) {
++                return {};
+             }
++            next_mod = &*cur_mod->anon_mods()[idx];
+         }
+-        if( !next_mod ) {
+-            return nullptr;
++        else {
++            for(const auto& item : cur_mod->m_items) {
++                if( item->name == seg_name && item->data.is_Module() ) {
++                    next_mod = &item->data.as_Module();
++                    break;
++                }
++            }
++            if( !next_mod ) {
++                return {};
++            }
++            // A named module starts the chain over
++            rv.clear();
+         }
+         cur_mod = next_mod;
++        rv.push_back(cur_mod);
+     }
+-    return cur_mod;
++    ::std::reverse(rv.begin(), rv.end());
++    return rv;
+ }
+ 
+ // The implicit `extern crate std;` (`core` for `#![no_std]`) at the root: from 2018 no path can name it (def-site
+@@ -101,15 +119,16 @@ static bool Resolve_Use_IsHiddenStdInjection(const AST::Crate& crate, const AST:
+     return crate.m_edition >= AST::Edition::Rust2018 && item.data.is_Crate() && item.attrs.has("#std_injection");
+ }
+ 
+-// Does the module containing this `use` have a local type-namespace item with this name? Such an item shadows
+-// the extern prelude (2018+) and the builtin types.
++// Does the module containing this `use` (or an enclosing module a block sees, see Resolve_Use_LexicalModules) have
++// a local type-namespace item with this name? Such an item shadows the extern prelude (2018+) and the builtin types.
+ // Conservative: if the walk fails for any reason, say no.
+ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name)
+ {
+     bool has_local_shadow = false;
+-    const AST::Module* cur_mod = Resolve_Use_WalkToModule(crate, base_path);
+-    if( cur_mod )
++    for(const AST::Module* cur_mod : Resolve_Use_LexicalModules(crate, base_path))
+     {
++        if( has_local_shadow )
++            break;
+         for(const auto& item : cur_mod->m_items) {
+             if( item->name != name || Resolve_Use_IsHiddenStdInjection(crate, *item) )
+                 continue;
+@@ -143,9 +162,12 @@ static bool Resolve_Use_LocalTypeItemShadows(const AST::Crate& crate, const ::AS
+ // Conservative: if the walk or the import's resolution fails, say no.
+ static bool Resolve_Use_LocalImportShadows(const AST::Crate& crate, const ::AST::Path& base_path, const RcString& name, const AST::ExternCrate* prelude_crate)
+ {
+-    const AST::Module* cur_mod = Resolve_Use_WalkToModule(crate, base_path);
+-    if( !cur_mod )
+-        return false;
++    for(const AST::Module* cur_mod : Resolve_Use_LexicalModules(crate, base_path))
++    {
++    // The import's own path is relative to the module holding it (an enclosing one, for a `use` inside a block)
++    ::AST::Path mod_path("", {});
++    for(const auto& n : cur_mod->path().nodes)
++        mod_path.nodes().push_back( n );
+     for(const auto& item : cur_mod->m_items)
+     {
+         if( !item->data.is_Use() )
+@@ -169,7 +191,7 @@ static bool Resolve_Use_LocalImportShadows(const AST::Crate& crate, const ::AST:
+                     continue;
+                 }
+                 s_stack.push_back(&ent.path);
+-                b = Resolve_Use_GetBinding(ent.sp, crate, cur_mod->path(), Resolve_Use_AbsolutisePath(ent.sp, crate, base_path, ent.path), {}, /*types_only=*/true, /*soft_fail=*/true);
++                b = Resolve_Use_GetBinding(ent.sp, crate, cur_mod->path(), Resolve_Use_AbsolutisePath(ent.sp, crate, mod_path, ent.path), {}, /*types_only=*/true, /*soft_fail=*/true);
+                 s_stack.pop_back();
+             }
+             DEBUG("Import " << ent.name << " = " << ent.path << " - type " << b.type.binding.tag_str());
+@@ -187,6 +209,7 @@ static bool Resolve_Use_LocalImportShadows(const AST::Crate& crate, const ::AST:
+             return true;
+         }
+     }
++    }
+     return false;
+ }
+ 

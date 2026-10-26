@@ -1,0 +1,178 @@
+From aa9aa3d05b8d7f283cfa2f07c648359f6da41193 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 17:18:10 +0000
+Subject: [PATCH 401/402] hir: an array size compare reads a bound value ivar
+ as its value
+
+nalgebra 0.32.3 (librsvg 2.58.5) src/base/array_storage.rs:71, right after 0400:
+
+    impl<T: Default, const R: usize, const C: usize> Default for ArrayStorage<T, R, C>
+    where [[T; R]; C]: Default
+    { fn default() -> Self { Self(Default::default()) } }
+
+    warn: Spare Rule - [[T; Infer(0)]; Infer(1)] : Default
+    BUG: src/hir_typeck/expr_cs.cpp:8923: Spare rules left after typecheck stabilised
+
+The same happens for a plain `ArrayStorage(Default::default())` returned as
+`ArrayStorage<u8, 2, 3>`: the tuple-struct constructor's path gets fresh value
+ivars for R and C, the return type binds them (`Set ValIVar 0 = 2`, `.. 1 = 3`),
+but the `: Default` lookup still sees `[[u8; Infer(0)]; Infer(1)]`.  Path
+parameters resolve a value ivar through the placeholder callback's `get_val`;
+neither array-size compare did:
+
+- match_test_generics_fuzz (hir/type.cpp) answered Fuzzy for any `Infer` on the
+  matched side.  Before 0400 the Array arm dropped the size verdict, so the first
+  per-length `impl Default for [T; N]` of libcore counted as an EXACT match and
+  the rule was consumed (the impl choice is irrelevant at that point, trans
+  looks the impl up again).  With the verdict kept, every one of the 33 impls is
+  a fuzzy candidate, "Multiple impls", and the rule never resolves.
+
+- compare_with_placeholders (the ftic_check_params re-check of a fuzzy match)
+  had the same blind spot: `[[u8; Infer(0)]; 4]` vs `[[u8; Infer(0)]; Infer(1)]`
+  with Infer(1) = 3 was Fuzzy, not Unequal.
+
+Both arms now go through resolve_array_size: a bound value ivar is its value,
+a `Known` size becomes its evaluated literal so the two spellings compare equal
+(a known size against a resolved `Evaluated` was an assertion TODO before);
+an unbound ivar, an unevaluated expression (sha1's Resolve UFCS case) and an impl
+placeholder stay Fuzzy, a rigid const param against a literal is Unequal.
+match_values no longer falls through to `throw "Unreachable"` for two different
+unevaluated expressions (Fuzzy, they may evaluate equal).
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/type.cpp b/src/hir/type.cpp
+index 2a33ea67..869d0e60 100644
+--- a/src/hir/type.cpp
++++ b/src/hir/type.cpp
+@@ -743,6 +743,8 @@ namespace {
+             if(te == xe) {
+                 return ::HIR::Compare::Equal;
+             }
++            // Two different expressions may still evaluate to the same value (this fell through to the throw below)
++            return ::HIR::Compare::Fuzzy;
+             }
+         TU_ARMA(Generic, te,xe) throw "Unreachable";
+         TU_ARMA(Evaluated, te, xe)
+@@ -750,6 +752,23 @@ namespace {
+         }
+         throw "Unreachable";
+     }
++    /// An array size as a value: a bound value ivar is replaced by its value through the placeholder callback (as
++    /// path parameters do, `PathParams::match_test_generics_fuzz` / `compare_with_placeholders`), and a `Known` size
++    /// becomes the evaluated literal (held in `tmp`) so that both spellings of a known size compare equal.
++    const ::HIR::ConstGeneric& resolve_array_size(const Span& sp, const ::HIR::ArraySize& s, ::HIR::t_cb_resolve_type resolve_placeholder, ::HIR::ConstGeneric& tmp)
++    {
++        if( const auto* k = s.opt_Known() ) {
++            tmp = ::HIR::ConstGeneric( ::HIR::EncodedLiteralPtr( EncodedLiteral::make_usize(*k) ) );
++            return tmp;
++        }
++        const auto& v = s.as_Unevaluated();
++        if( const auto* ie = v.opt_Infer() ) {
++            if( ie->index != ~0u ) {
++                return resolve_placeholder.get_val(sp, v);
++            }
++        }
++        return v;
++    }
+ }
+ 
+ bool ::HIR::TypeRef::match_test_generics(const Span& sp, const ::HIR::TypeRef& x_in, t_cb_resolve_type resolve_placeholder, ::HIR::MatchGenerics& callback) const
+@@ -1117,38 +1136,46 @@ const HIR::GenericParams* HIR::TrackHrbStack::hrb_declaring_lifetime(unsigned id
+         }
+     TU_ARMA(Array, te, xe) {
+         auto rv = Compare::Equal;
+-        if( const auto* tse = te.size.opt_Unevaluated() )
++        // A bound value ivar in either size is its value (path parameters resolve theirs through `get_val`): read as
++        // unknown, the sizes of `[[_; Infer(0)]; Infer(1)]` - the argument of `ArrayStorage(Default::default())`,
++        // already set by the return type `ArrayStorage<u8, 2, 3>` - made every per-length `impl Default for [T; N]`
++        // of libcore a fuzzy candidate and the rule never resolved: nalgebra 0.32.3 (librsvg 2.58.5)
++        // base/array_storage.rs:71, "Spare Rule - [[T; Infer(0)]; Infer(1)] : Default" (hidden until 0400 stopped
++        // dropping the size verdict, when the first candidate counted as exact).
++        ::HIR::ConstGeneric tmp_t, tmp_x;
++        const auto& ts = resolve_array_size(sp, te.size, resolve_placeholder, tmp_t);
++        const auto& xs = resolve_array_size(sp, xe.size, resolve_placeholder, tmp_x);
++        if( te.size.is_Unevaluated() && !ts.is_Evaluated() )
+         {
+-            HIR::ConstGeneric   v;
+-            if( xe.size.opt_Known() ) {
+-                rv &= match_values(sp, *tse, EncodedLiteralPtr( EncodedLiteral::make_usize(xe.size.as_Known()) ), *this);
+-            }
+-            else {
+-                rv &= match_values(sp, *tse, xe.size.as_Unevaluated(), *this );
+-            }
++            // A generic (the callback binds or checks the impl's parameter), an unbound ivar, or an expression
++            rv &= match_values(sp, ts, xs, *this);
+         }
+-        else if( const auto* xse = xe.size.opt_Unevaluated() )
++        else
+         {
+-            // `te.size` must be known here, all we need to handle is `Infer`?
+-            if( xse->is_Infer() ) {
++            // `ts` is a literal: a known size, or a bound value ivar
++            if( xs.is_Infer() ) {
+                 rv &= Compare::Fuzzy;
+             }
+             // A size expression not evaluated yet (a named constant before "Constant Evaluate") may well be equal
+             // - sha1 0.11.0: `State::default()` with `type State = [u32; STATE_LEN];`, in Resolve UFCS against
+             //   libcore's per-length `impl Default for [T; N]`s
+-            else if( xse->is_Unevaluated() ) {
++            else if( xs.is_Unevaluated() ) {
+                 rv &= Compare::Fuzzy;
+             }
+-            else {
+-                ASSERT_BUG(sp, !xse->is_Evaluated(), "TODO: Handle " << te.size << " ?= " << xe.size);
+-                // - Evaluated? (TODO - could use `EncodedLiteralPtr( EncodedLiteral::make_usize(te.size.as_Known()) )`)
+-                // - Generic - could only match with another generic, i.e. `tse` must have been `Unevaluated,Generic`
+-                // - Unevaluated - could only match with another Unevaluated, i.e. `tse` must have been `Unevaluated,Unevaluated`
++            else if( xs.is_Generic() ) {
++                // A value placeholder (an impl's const param left to its bounds) is as unknown as an ivar (as
++                // compare_with_placeholders and GetParams::match_val treat it); a rigid const param is no literal.
++                if( !xs.as_Generic().is_placeholder() ) {
++                    return Compare::Unequal;
++                }
++                rv &= Compare::Fuzzy;
++            }
++            else if( !(ts == xs) ) {
+                 return Compare::Unequal;
+             }
+-        }
+-        else if( te.size != xe.size ) {
+-            return Compare::Unequal;
++            else {
++                // Sizes equal
++            }
+         }
+         // The size verdict used to be dropped here (`return cmp_type(inner)`, upstream 2caf7d65 kept `rv` only in the
+         // compare_with_placeholders twin): a Fuzzy size counted as an exact match, and a mismatching bound const param
+@@ -1612,20 +1639,20 @@ HIR::TypeData_NamedFunction_Ty HIR::TypeData_NamedFunction_Ty::clone() const {
+         }
+     TU_ARMA(Array, le, re) {
+         auto rv = Compare::Equal;
+-        if( le.size.is_Unevaluated() && le.size.as_Unevaluated().is_Infer() ) {
+-            rv &= Compare::Fuzzy;
+-        }
+-        else if( re.size.is_Unevaluated() && re.size.as_Unevaluated().is_Infer() ) {
++        // A bound value ivar is its value, a known size and its evaluated literal are the same size (see the
++        // match_test_generics_fuzz twin): `[[u8; Infer(0)]; 4]` vs `[[u8; Infer(0)]; Infer(1)]` with Infer(1) = 3 was
++        // Fuzzy, not Unequal.
++        ::HIR::ConstGeneric tmp_l, tmp_r;
++        const auto& ls = resolve_array_size(sp, le.size, resolve_placeholder, tmp_l);
++        const auto& rs = resolve_array_size(sp, re.size, resolve_placeholder, tmp_r);
++        if( ls.is_Infer() || rs.is_Infer() ) {
+             rv &= Compare::Fuzzy;
+         }
+         // A value placeholder (an impl's const param left to its bounds) is as unknown as an ivar
+-        else if( le.size.is_Unevaluated() && TU_TEST1(le.size.as_Unevaluated(), Generic, .is_placeholder()) ) {
+-            rv &= Compare::Fuzzy;
+-        }
+-        else if( re.size.is_Unevaluated() && TU_TEST1(re.size.as_Unevaluated(), Generic, .is_placeholder()) ) {
++        else if( TU_TEST1(ls, Generic, .is_placeholder()) || TU_TEST1(rs, Generic, .is_placeholder()) ) {
+             rv &= Compare::Fuzzy;
+         }
+-        else if( le.size != re.size ) {
++        else if( ls != rs ) {
+             return Compare::Unequal;
+         }
+         else {

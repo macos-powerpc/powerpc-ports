@@ -1,0 +1,84 @@
+From 3ea102b58cd40c2c5a828cbc9c327afac33c2364 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 06:35:12 +0000
+Subject: [PATCH 392/393] hir_typeck: a projection holding inference variables
+ is not expanded through a fuzzy impl unless it is the only candidate
+
+nalgebra 0.32.3 (librsvg 2.58.5) src/linalg/schur.rs:448, in
+`decompose_2x2<T, D: Dim>(..) where DefaultAllocator: Allocator<T, D, D>`:
+
+    q = Some(OMatrix::identity_generic(dim, dim));
+
+    error: Failed to find an impl of Allocator<T,D,D> for DefaultAllocator
+           with Buffer = ArrayStorage<T,Infer(2),Infer(3)>
+
+`OMatrix<_,_,_>` is `Matrix<_,_,_,<DefaultAllocator as Allocator<_,_,_>>::Buffer>`.
+The static associated-type expansion run by Resolve UFCS (expand_associated_types__UfcsKnown)
+compared that projection with every `Allocator for DefaultAllocator` impl; the
+`impl<T, const R: usize, const C: usize> Allocator<T, Const<R>, Const<C>>` one matched fuzzily
+(`_` against `Const<_>`), the re-check accepted it ("Fuzzy - Actually matches") and the
+path type became `Matrix<_,_,_,ArrayStorage<_,{Infer},{Infer}>>` before typeck ever ran,
+although the two `Dyn` impls and the function's own bound were candidates as well. Typeck
+then held `ArrayStorage<T,_,_>` against `Allocator<T, D, D>`, which no impl satisfies.
+
+An impl that matches only through inference variables in the projection itself (its trait
+parameters or self type contain `_` or an inferred const) is now counted like the existing
+unevaluated-const case (zerocopy, n_fuzzy_const) and taken only when it is the sole candidate;
+otherwise the projection stays unbound and typeck resolves it once the variables are known.
+Fuzziness caused by opaque types or placeholders is handled as before.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index 36599635..d68e7d29 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -2204,6 +2204,36 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+     auto has_unevaluated = [](const ::HIR::PathParams& pp) {
+         return ::std::any_of(pp.m_values.begin(), pp.m_values.end(), [](const ::HIR::ConstGeneric& v){ return v.is_Unevaluated(); });
+         };
++    // The same when the projection itself still holds inference variables (an expression path such as
++    // `OMatrix::identity_generic(dim, dim)` = `Matrix<_,_,_,<DefaultAllocator as Allocator<_,_,_>>::Buffer>`, seen here
++    // before typeck knows `_`): every impl matches `_` fuzzily, so the first one is a guess too.
++    // - nalgebra 0.32.3 linalg/schur.rs:448: the `Const<R>, Const<C>` impl was taken over the `Dyn` impls and the
++    //   function's own `DefaultAllocator: Allocator<T, D, D>` bound -> `Buffer = ArrayStorage<T, _, _>` -> typeck
++    //   "Failed to find an impl of Allocator<T,D,D> for DefaultAllocator with Buffer = ArrayStorage<T,Infer,Infer>"
++    auto type_has_ivars = [](const ::HIR::TypeRef& ty)->bool {
++        return visit_ty_with(ty, [](const ::HIR::TypeRef& t)->bool {
++            if( t.data().is_Infer() )
++                return true;
++            if( const auto* te = t.data().opt_Path() ) {
++                if( const auto* gp = te->path.m_data.opt_Generic() ) {
++                    for(const auto& v : gp->m_params.m_values)
++                        if( v.is_Infer() )
++                            return true;
++                }
++            }
++            return false;
++            });
++        };
++    auto params_have_ivars = [&](const ::HIR::PathParams& pp)->bool {
++        for(const auto& v : pp.m_values)
++            if( v.is_Infer() )
++                return true;
++        for(const auto& t : pp.m_types)
++            if( type_has_ivars(t) )
++                return true;
++        return false;
++        };
++    const bool projection_has_ivars = params_have_ivars(trait_path.m_params) || type_has_ivars(e2.type);
+     unsigned n_fuzzy_const = 0;
+     bool accept_fuzzy_const = false;
+     auto cb_impl = [&](ImplRef impl, bool fuzzy)->bool {
+@@ -2231,8 +2261,8 @@ bool StaticTraitResolve::expand_associated_types__UfcsKnown(const Span& sp, ::HI
+                 DEBUG("[expand_associated_types] - Fuzzy - params don't match: " << pp << " != " << trait_path.m_params);
+                 return false;
+             }
+-            if( cmp == HIR::Compare::Fuzzy && !accept_fuzzy_const && (has_unevaluated(pp) || has_unevaluated(trait_path.m_params)) ) {
+-                DEBUG("[expand_associated_types] - Fuzzy on unevaluated const arguments, counted");
++            if( cmp == HIR::Compare::Fuzzy && !accept_fuzzy_const && (has_unevaluated(pp) || has_unevaluated(trait_path.m_params) || projection_has_ivars) ) {
++                DEBUG("[expand_associated_types] - Fuzzy on unevaluated const arguments or inference variables, counted");
+                 n_fuzzy_const += 1;
+                 return false;
+             }

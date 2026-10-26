@@ -1,0 +1,85 @@
+From dcef1ee2d08b27a3a4e70f6dba2409157bb4f647 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 15:28:29 +0000
+Subject: [PATCH] hir_typeck: a bound const param differing from a literal
+ rejects the impl, and an array size verdict reaches the caller
+
+nalgebra 0.32.3 (librsvg 2.58.5) src/geometry/isometry_conversion.rs:242, inside
+`impl<T, R, const D: usize> From<[Isometry<T::Element, R::Element, D>; 2]>
+for Isometry<T, R, D>`:
+
+    let tra = Translation::from([arr[0].translation, arr[1].translation]);
+
+    <null> BUG: src/hir_typeck/helpers.cpp:3850: TODO: match_val -
+    PtrImplMatcher::match_val D/*I:0*/(Generic(D/*I:0*/)) with Evaluated(00000002{})
+
+The call asks `Translation<T, D>: From<[_; 2]>` (the array's element type is
+still an ivar before the coercion stage). The candidate
+`impl<T: Scalar, const D: usize> From<[T; D]> for Translation<T, D>`
+(translation_conversion.rs:203) binds the impl's D to the function's own D
+through the Self type, then meets the literal 2 of `[T; D]` against `[_; 2]`:
+ftic_check_params' GetParams::match_val only handled an already-bound param
+meeting an ivar (0226), a known value differing from a known value was a TODO.
+
+Two changes:
+
+- GetParams::match_val: two different known values are Unequal; an unevaluated
+  expression or an impl placeholder on either side stays Fuzzy (as the
+  placeholder compare in cb_match).
+
+- hir/type.cpp match_test_generics_fuzz, Array arm: the size verdict was
+  dropped (`return cmp_type(inner)`; upstream 2caf7d65 kept `rv` only in the
+  compare_with_placeholders twin), so a Fuzzy size counted as an exact match
+  and the new Unequal never reached the caller: with D = 3 the impl was taken
+  and `[i32; 2]` equated with `[i32; 3]` ("Type mismatch .. sizes differ").
+  The verdict now propagates, Unequal returns early.
+
+Assisted-By: Claude Fable 5.1
+---
+
+diff --git a/src/hir/type.cpp b/src/hir/type.cpp
+index 8a9d51d1..2a33ea67 100644
+--- a/src/hir/type.cpp
++++ b/src/hir/type.cpp
+@@ -1150,7 +1150,15 @@ const HIR::GenericParams* HIR::TrackHrbStack::hrb_declaring_lifetime(unsigned id
+         else if( te.size != xe.size ) {
+             return Compare::Unequal;
+         }
+-        return this->cmp_type(sp, te.inner, xe.inner, resolve_placeholder);
++        // The size verdict used to be dropped here (`return cmp_type(inner)`, upstream 2caf7d65 kept `rv` only in the
++        // compare_with_placeholders twin): a Fuzzy size counted as an exact match, and a mismatching bound const param
++        // (GetParams::match_val, 0400) still let the impl through - `impl<T, const D: usize> From<[T; D]> for
++        // Translation<T, D>` for `Translation<i32, 3>: From<[i32; 2]>` equated `[i32; 2]` with `[i32; 3]`.
++        if( rv == Compare::Unequal ) {
++            return Compare::Unequal;
++        }
++        rv &= this->cmp_type(sp, te.inner, xe.inner, resolve_placeholder);
++        return rv;
+         }
+     TU_ARMA(Slice, te, xe) {
+         return this->cmp_type(sp, te.inner, xe.inner, resolve_placeholder);
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 5191db5e..2aa413ec 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -3847,7 +3847,19 @@ namespace {
+                 if( sz.is_Infer() ) {
+                     return ::HIR::Compare::Fuzzy;
+                 }
+-                TODO(Span(), "PtrImplMatcher::match_val " << g << "(" << out_impl_params.m_values[g.binding] << ") with " << sz);
++                // Two known values that differ: an unevaluated expression or an impl placeholder on either side might
++                // still equal the other (as cb_match's placeholder compare), a literal or a rigid const param can't.
++                // `impl<T, const D: usize> From<[T; D]> for Translation<T, D>` asked for `Translation<T, D>: From<[_; 2]>`
++                // bound D to the function's own D through the Self type, then met `2` - nalgebra 0.32.3 (librsvg)
++                // geometry/isometry_conversion.rs:242 `Translation::from([arr[0].translation, arr[1].translation])`,
++                // "TODO: match_val - PtrImplMatcher::match_val D/*I:0*/(Generic(D/*I:0*/)) with Evaluated(00000002{})".
++                if( out_impl_params.m_values[g.binding].is_Unevaluated() || sz.is_Unevaluated()
++                 || TU_TEST1(out_impl_params.m_values[g.binding], Generic, .is_placeholder()) || TU_TEST1(sz, Generic, .is_placeholder()) ) {
++                    DEBUG("[ftic_check_params] Value param " << g.binding << " " << out_impl_params.m_values[g.binding] << " ?= " << sz << " (fuzzy)");
++                    return ::HIR::Compare::Fuzzy;
++                }
++                DEBUG("[ftic_check_params] Value param " << g.binding << " " << out_impl_params.m_values[g.binding] << " != " << sz);
++                return ::HIR::Compare::Unequal;
+             }
+         }
+     };
