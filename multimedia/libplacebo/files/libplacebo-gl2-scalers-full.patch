@@ -1,0 +1,455 @@
+Scalers and float LUT textures on GL 2.0 / GLSL 1.20. Two parts:
+
+=== 1 ===
+opengl/formats: add GL_ARB_texture_float 16-bit and luminance formats on GL 2.0
+
+Without GL_ARB_texture_rg the GL 2.0 path only registered rgb32f and
+rgba32f as float texture formats. Every float LUT with one or two
+components therefore had no texture to live in: sh_lut() fell through
+to "Can't generate LUT: no compatible methods!" for the 64x64 blue-noise
+dither matrix (too large for uniforms), so mpv's default dither silently
+degraded to white noise, and the 1-component polar scaler LUT had no
+texture either.
+
+GL_ARB_texture_float, which these drivers do advertise, also defines
+GL_LUMINANCE(_ALPHA){16,32}F_ARB, so register those as sampleable-only
+formats next to rgb16f/rgba16f (uploaded from 32-bit floats like
+upstream's formats_float16). The 32-bit luminance variants come first so
+LUTs that only need nearest sampling get full precision; they carry no
+linear flag since the GPUs of that era (NV4x/G7x, R5xx) filter 16-bit
+floats at most. None of them are renderable, matching the existing
+rgb(a)32f entries.
+
+On a GeForce 6600 (GL 2.0 NVIDIA-1.5.48) this lets the dither LUT use a
+luminance32f texture through the texelFetch() emulation.
+
+=== 2 ===
+shaders/sampling: run the scalers on GLSL < 130
+
+The bicubic, hermite, gaussian, oversample, polar and separated (ortho)
+samplers and the bicubic distortion mode were disabled on GLSL < 130
+because they query the source size with textureSize(). On a GL 2.x
+context mpv's default lanczos chroma and luma scaling therefore fell
+back to the sampler's bilinear filter ("Failed dispatching scaler..
+disabling").
+
+The texture dimensions are known when the shader is generated, so on
+GLSL < 130 pass them in as a vec2 uniform (sh_tex_size) instead; GLSL
+>= 130 keeps textureSize(). On top of that:
+
+- ortho: the convolution loop uses uint, integer modulo and dynamic
+  vector indexing, none of which GLSL 1.20 has, and the GPUs of that era
+  cannot loop at run time in fragment shaders anyway. On GLSL < 130 emit
+  the loop unrolled from C with constant .xyzw indices; the GLSL >= 130
+  loop is unchanged.
+- polar: the fragment path only needs the size and a 1-component linear
+  LUT (luminance16f on GL 2.0 without GL_ARB_texture_rg); wrap the
+  antiring mix() selector in float() like the other GLSL 1.20 fixes.
+- oversample: wrap the lessThan()/greaterThan() mix() selectors in vec2().
+- distort: drop the GLSL < 130 bicubic override.
+
+Shader length is the remaining limit: NV4x/G7x handle the unrolled
+lanczos kernels, while R3xx/R4xx fragment programs (64 ALU / 32 TEX
+instructions) may still fail to compile larger kernels, in which case
+the renderer falls back to bilinear exactly as before.
+
+diff --git a/src/opengl/formats.c b/src/opengl/formats.c
+index 0dd554f0..ad7648a4 100644
+--- a/src/opengl/formats.c
++++ b/src/opengl/formats.c
+@@ -33,6 +33,19 @@
+ #ifndef GL_LUMINANCE16_ALPHA16
+ #define GL_LUMINANCE16_ALPHA16 0x8048
+ #endif
++// GL_ARB_texture_float luminance variants (not in GLAD's core enum set)
++#ifndef GL_LUMINANCE32F_ARB
++#define GL_LUMINANCE32F_ARB 0x8818
++#endif
++#ifndef GL_LUMINANCE_ALPHA32F_ARB
++#define GL_LUMINANCE_ALPHA32F_ARB 0x8819
++#endif
++#ifndef GL_LUMINANCE16F_ARB
++#define GL_LUMINANCE16F_ARB 0x881E
++#endif
++#ifndef GL_LUMINANCE_ALPHA16F_ARB
++#define GL_LUMINANCE_ALPHA16F_ARB 0x881F
++#endif
+ 
+ #ifdef PL_HAVE_UNIX
+ static bool supported_fourcc(struct pl_gl *p, EGLint fourcc)
+@@ -179,6 +192,27 @@ static const struct gl_format formats_float32_gl2[] = {
+     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|V)},
+ };
+ 
++// 16-bit float RGB/RGBA formats for GL 2.0 (GL_ARB_texture_float), uploaded
++// from 32-bit floats like upstream's rgb16f/rgba16f. Not renderable either.
++static const struct gl_format formats_float16_gl2[] = {
++    {GL_RGB16F,         RGB,   FLT, FMT("rgb16f",  16, FLOAT, S|L)},
++    {GL_RGBA16F,        RGBA,  FLT, FMT("rgba16f", 16, FLOAT, S|L)},
++};
++
++// 1/2-component float formats for GL 2.0 without GL_ARB_texture_rg, through
++// the legacy GL_LUMINANCE(_ALPHA) layouts of GL_ARB_texture_float. These give
++// float LUTs (dither matrix, scaler weights, ...) a texture to live in.
++// Sampleable only. The 32-bit variants are registered first so that LUTs
++// which only need nearest sampling get full precision, and without the
++// linear flag because the GPUs of that era (NV4x/G7x, R5xx) filter 16-bit
++// floats at most.
++static const struct gl_format formats_luminance_float_gl2[] = {
++    {GL_LUMINANCE32F_ARB,       GL_LUMINANCE,       FLT, FMT("luminance32f",       32, FLOAT, S)},
++    {GL_LUMINANCE_ALPHA32F_ARB, GL_LUMINANCE_ALPHA, FLT, FMT("luminance_alpha32f", 32, FLOAT, S)},
++    {GL_LUMINANCE16F_ARB,       GL_LUMINANCE,       FLT, FMT("luminance16f",       16, FLOAT, S|L)},
++    {GL_LUMINANCE_ALPHA16F_ARB, GL_LUMINANCE_ALPHA, FLT, FMT("luminance_alpha16f", 16, FLOAT, S|L)},
++};
++
+ // 16-bit floating point texture formats
+ static const struct gl_format formats_float16[] = {
+     {GL_R16F,           R,     FLT,  FMT("r16f",    16, FLOAT, S|L|F)},
+@@ -661,8 +695,11 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+             if (has_texture_rg) {
+                 DO_FORMATS(formats_float32);
+             } else {
+-                // Only RGB/RGBA float textures
++                // RGB/RGBA float textures
+                 DO_FORMATS(formats_float32_gl2);
++                DO_FORMATS(formats_float16_gl2);
++                // 1/2-component float textures through GL_LUMINANCE(_ALPHA)
++                DO_FORMATS(formats_luminance_float_gl2);
+                 // Plus vertex-only 1/2 component formats for vertex attributes
+                 DO_FORMATS(formats_vertex_gl2_1_2comp);
+             }
+diff --git a/src/shaders/sampling.c b/src/shaders/sampling.c
+index fb549f1f..1c604966 100644
+--- a/src/shaders/sampling.c
++++ b/src/shaders/sampling.c
+@@ -180,6 +180,26 @@ static bool setup_src(pl_shader sh, const struct pl_sample_src *src,
+     return true;
+ }
+ 
++// textureSize() requires GLSL 130. On older targets the texture dimensions
++// are known when the shader is generated, so pass them in as a uniform
++// instead. Returns NULL_IDENT when textureSize() is available.
++static ident_t sh_tex_size_wh(pl_shader sh, int w, int h)
++{
++    if (sh_glsl(sh).version >= 130)
++        return NULL_IDENT;
++
++    return sh_var(sh, (struct pl_shader_var) {
++        .var  = pl_var_vec2("tex_size"),
++        .data = &(float[2]) { w, h },
++    });
++}
++
++static ident_t sh_tex_size(pl_shader sh, const struct pl_sample_src *src)
++{
++    const struct pl_tex_params params = src_params(src);
++    return sh_tex_size_wh(sh, params.w, params.h);
++}
++
+ void pl_shader_deband(pl_shader sh, const struct pl_sample_src *src,
+                       const struct pl_deband_params *params)
+ {
+@@ -318,12 +338,6 @@ bool pl_shader_sample_bilinear(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src)
+ {
+-    // GLSL < 130 doesn't support textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: bicubic sampling unavailable, using fallback");
+-        return false;
+-    }
+-
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -338,12 +352,16 @@ bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src)
+     //   http://www.mate.tue.nl/mate/pdfs/10318.pdf
+     //   'Efficient GPU-Based Texture Interpolation using Uniform B-Splines'
+ 
++    ident_t tex_size = sh_tex_size(sh, src);
+     sh_describe(sh, "bicubic");
+ #pragma GLSL /* pl_shader_sample_bicubic */         \
+     vec4 color;                                     \
+     {                                               \
+     vec2 pos = $pos;                                \
+-    vec2 size = vec2(textureSize($tex, 0));         \
++    @if (tex_size != NULL_IDENT)                    \
++        vec2 size = $tex_size;                      \
++    @else                                           \
++        vec2 size = vec2(textureSize($tex, 0));     \
+     vec2 frac  = fract(pos * size + vec2(0.5));     \
+     vec2 frac2 = frac * frac;                       \
+     vec2 inv   = vec2(1.0) - frac;                  \
+@@ -372,12 +390,6 @@ bool pl_shader_sample_bicubic(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src)
+ {
+-    // GLSL < 130 doesn't support textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: hermite sampling unavailable, using fallback");
+-        return false;
+-    }
+-
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -388,12 +400,16 @@ bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src)
+                  "will most likely result in nasty aliasing!");
+     }
+ 
++    ident_t tex_size = sh_tex_size(sh, src);
+     sh_describe(sh, "hermite");
+ #pragma GLSL /* pl_shader_sample_hermite */              \
+     vec4 color;                                          \
+     {                                                    \
+     vec2 pos  = $pos;                                    \
+-    vec2 size = vec2(textureSize($tex, 0));              \
++    @if (tex_size != NULL_IDENT)                         \
++        vec2 size = $tex_size;                           \
++    @else                                                \
++        vec2 size = vec2(textureSize($tex, 0));          \
+     vec2 frac = fract(pos * size + vec2(0.5));           \
+     pos += $pt * (smoothstep(0.0, 1.0, frac) - frac);    \
+     color = ${float:scale} * textureLod($tex, pos, 0.0); \
+@@ -404,12 +420,6 @@ bool pl_shader_sample_hermite(pl_shader sh, const struct pl_sample_src *src)
+ 
+ bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src)
+ {
+-    // GLSL < 130 doesn't support textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: gaussian sampling unavailable, using fallback");
+-        return false;
+-    }
+-
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+@@ -420,12 +430,16 @@ bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src)
+                  "will most likely result in nasty aliasing!");
+     }
+ 
++    ident_t tex_size = sh_tex_size(sh, src);
+     sh_describe(sh, "gaussian");
+ #pragma GLSL /* pl_shader_sample_gaussian */        \
+     vec4 color;                                     \
+     {                                               \
+     vec2 pos  = $pos;                               \
+-    vec2 size = vec2(textureSize($tex, 0));         \
++    @if (tex_size != NULL_IDENT)                    \
++        vec2 size = $tex_size;                      \
++    @else                                           \
++        vec2 size = vec2(textureSize($tex, 0));     \
+     vec2 off  = -fract(pos * size + vec2(0.5));     \
+     vec2 off2 = -2.0 * off * off;                   \
+     /* compute gaussian weights */                  \
+@@ -455,24 +469,22 @@ bool pl_shader_sample_gaussian(pl_shader sh, const struct pl_sample_src *src)
+ bool pl_shader_sample_oversample(pl_shader sh, const struct pl_sample_src *src,
+                                  float threshold)
+ {
+-    // GLSL < 130 doesn't support textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: oversample unavailable, using fallback");
+-        return false;
+-    }
+-
+     ident_t tex, pos, pt;
+     float rx, ry, scale;
+     if (!setup_src(sh, src, &tex, &pos, &pt, &rx, &ry, NULL, &scale, true, LINEAR))
+         return false;
+ 
+     threshold = PL_CLAMP(threshold, 0.0f, 0.5f);
++    ident_t tex_size = sh_tex_size(sh, src);
+     sh_describe(sh, "oversample");
+     #pragma GLSL /* pl_shader_sample_oversample */       \
+     vec4 color;                                          \
+     {                                                    \
+     vec2 pos = $pos;                                     \
+-    vec2 size = vec2(textureSize($tex, 0));              \
++    @if (tex_size != NULL_IDENT)                         \
++        vec2 size = $tex_size;                           \
++    @else                                                \
++        vec2 size = vec2(textureSize($tex, 0));          \
+     /* Round the position to the nearest pixel */        \
+     vec2 fcoord = fract(pos * size - vec2(0.5));         \
+     float rx = ${dynamic float:rx};                      \
+@@ -482,9 +494,9 @@ bool pl_shader_sample_oversample(pl_shader sh, const struct pl_sample_src *src,
+     @if (threshold > 0) {                                \
+         float thresh = ${float:threshold};               \
+         coeff = mix(coeff, vec2(0.0),                    \
+-            lessThan(coeff, vec2(thresh)));              \
++            vec2(lessThan(coeff, vec2(thresh))));        \
+         coeff = mix(coeff, vec2(1.0),                    \
+-            greaterThan(coeff, vec2(1.0 - thresh)));     \
++            vec2(greaterThan(coeff, vec2(1.0 - thresh)))); \
+     @}                                                   \
+                                                          \
+     /* Compute the right output blend of colors */       \
+@@ -618,12 +630,6 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+         return false;
+     }
+ 
+-    // GLSL < 130 doesn't support textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: polar sampling unavailable, using fallback");
+-        return false;
+-    }
+-
+     uint8_t cmask;
+     float rx, ry, scalef;
+     ident_t src_tex, pos, pt, scale;
+@@ -661,20 +667,25 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+         }
+     }
+ 
++    ident_t tex_size = sh_tex_size(sh, src);
+     describe_filter(sh, &cfg, "polar", rx, ry);
+     GLSL("// pl_shader_sample_polar                     \n"
+          "vec4 color = vec4(0.0);                       \n"
+          "{                                             \n"
+-         "vec2 pos = "$", pt = "$";                     \n"
+-         "vec2 size = vec2(textureSize("$", 0));        \n"
+-         "vec2 fcoord = fract(pos * size - vec2(0.5));  \n"
++         "vec2 pos = "$", pt = "$";                     \n",
++         pos, pt);
++    if (tex_size != NULL_IDENT) {
++        GLSL("vec2 size = "$";                          \n", tex_size);
++    } else {
++        GLSL("vec2 size = vec2(textureSize("$", 0));    \n", src_tex);
++    }
++    GLSL("vec2 fcoord = fract(pos * size - vec2(0.5));  \n"
+          "vec2 base = pos - pt * fcoord;                \n"
+          "vec2 center = base + pt * vec2(0.5);          \n"
+          "ivec2 offset;                                 \n"
+          "float w, d, wsum = 0.0;                       \n"
+          "int idx;                                      \n"
+-         "vec4 c;                                       \n",
+-         pos, pt, src_tex);
++         "vec4 c;                                       \n");
+ 
+     bool use_ar = cfg.antiring > 0;
+     if (use_ar) {
+@@ -931,7 +942,7 @@ bool pl_shader_sample_polar(pl_shader sh, const struct pl_sample_src *src,
+             ww = ar@c / wwsum@c;                                                \
+             ww.x = 1.0 - ww.x;                                                  \
+             w = clamp(color[@c], ww.x, ww.y);                                   \
+-            w = mix(w, dot(ww, vec2(0.5)), ww.x > ww.y);                        \
++            w = mix(w, dot(ww, vec2(0.5)), float(ww.x > ww.y));                 \
+             color[@c] = mix(color[@c], w, ${float:cfg.antiring});               \
+         @}                                                                      \
+     @}                                                                          \
+@@ -987,12 +998,6 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+         return false;
+     }
+ 
+-    // GLSL < 130 doesn't support uint types and textureSize() needed by this shader
+-    if (sh_glsl(sh).version < 130) {
+-        PL_DEBUG(sh, "GLSL < 130: ortho sampling unavailable, using fallback");
+-        return false;
+-    }
+-
+     pl_gpu gpu = SH_GPU(sh);
+     pl_assert(gpu);
+ 
+@@ -1092,6 +1097,7 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+         [SEP_VERT]  = "ortho (vert)",
+     };
+ 
++    ident_t tex_size = sh_tex_size(sh, src);
+     describe_filter(sh, &cfg, names[pass], ratio[pass], ratio[pass]);
+ 
+     float denom = PL_MAX(1, width - 1); // avoid division by zero
+@@ -1103,7 +1109,10 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+     vec4 color = vec4(0.0, 0.0, 0.0, 1.0);                                      \
+     {                                                                           \
+     vec2 pos = $pos, pt = $pt;                                                  \
+-    vec2 size = vec2(textureSize($src_tex, 0));                                 \
++    @if (tex_size != NULL_IDENT)                                                \
++        vec2 size = $tex_size;                                                  \
++    @else                                                                       \
++        vec2 size = vec2(textureSize($src_tex, 0));                             \
+     vec2 dir = vec2(${const float:dir[pass][0]}, ${const float: dir[pass][1]}); \
+     pt *= dir;                                                                  \
+     vec2 fcoord2 = fract(pos * size - vec2(0.5));                               \
+@@ -1118,7 +1127,32 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+     @if (use_ar) {                                                              \
+         ${vecType: comps} hi = ${vecType: comps}(0.0);                          \
+         ${vecType: comps} lo = ${vecType: comps}(1e9);                          \
+-    @}                                                                          \
++    @}
++
++    if (sh_glsl(sh).version < 130) {
++        // GLSL 1.20 has no uint and no integer modulo, and the hardware of
++        // that era offers neither dynamic vector indexing nor run-time loops
++        // in fragment shaders, so emit the convolution unrolled with
++        // constant indices instead
++        static const char swz[] = "xyzw";
++        for (int n = 0; n < N; n += use_linear ? 2 : 1) {
++            if (n % 4 == 0) {
++                GLSL("ws = "$"(vec2("$", fcoord)); \n",
++                     lut, SH_FLOAT((n / 4) / denom));
++            }
++            GLSL("off = %d.0; \n", n);
++            if (use_linear)
++                GLSL("off += ws.%c; \n", swz[n % 4 + 1]);
++            GLSL("c = textureLod("$", base + pt * off, 0.0).%s; \n",
++                 src_tex, sh_swizzle(comps));
++            if (use_ar && (n == N / 2 - 1 || n == N / 2))
++                GLSL("lo = min(lo, c); hi = max(hi, c); \n");
++            GLSL("ca += ws.%c * c; \n"
++                 "wsum += ws.%c;   \n",
++                 swz[n % 4], swz[n % 4]);
++        }
++    } else {
++#pragma GLSL                                                                    \
+     #pragma unroll 4                                                            \
+     for (uint n = 0u; n < ${uint: N}; n += ${const uint: use_linear ? 2u : 1u}) { \
+         if (n % 4u == 0u)                                                        \
+@@ -1135,7 +1169,10 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+         @}                                                                      \
+         ca += ws[n % 4u] * c;                                                   \
+         wsum += ws[n % 4u];                                                     \
+-    }                                                                           \
++    }
++    }
++
++#pragma GLSL                                                                    \
+     /* Renormalize by the actual sum of weights. */                             \
+     ca /= wsum;                                                                 \
+     @if (use_ar)                                                                \
+@@ -1155,15 +1192,6 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
+     if (!sh_require(sh, PL_SHADER_SIG_NONE, out_w, out_h))
+         return;
+ 
+-    // GLSL < 130: Disable bicubic mode (needs textureSize()), fall back to bilinear
+-    struct pl_distort_params compat_params;
+-    if (sh_glsl(sh).version < 130 && params->bicubic) {
+-        PL_DEBUG(sh, "GLSL < 130: distort bicubic unavailable, using bilinear");
+-        compat_params = *params;
+-        compat_params.bicubic = false;
+-        params = &compat_params;
+-    }
+-
+     const int src_w = src_tex->params.w, src_h = src_tex->params.h;
+     float rx = 1.0f, ry = 1.0f;
+     if (src_w > src_h) {
+@@ -1213,6 +1241,8 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
+     ident_t pos = sh_attr_vec2(sh, "pos", &canvas);
+     ident_t pt, tex = sh_bind(sh, src_tex, params->address_mode,
+                               PL_TEX_SAMPLE_LINEAR, "tex", NULL, NULL, &pt);
++    ident_t tex_size = params->bicubic ? sh_tex_size_wh(sh, src_w, src_h)
++                                       : NULL_IDENT;
+ 
+     // Bind the inverse of the tex2canvas transform (i.e. canvas2tex)
+     pl_transform2x2_invert(&transform);
+@@ -1234,7 +1264,10 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
+     vec2 pos = $tf * $pos + $tf_c;                          \
+     vec2 pt = $pt;                                          \
+     @if (params->bicubic) {                                 \
+-        vec2 size = vec2(textureSize($tex, 0));             \
++        @if (tex_size != NULL_IDENT)                        \
++            vec2 size = $tex_size;                          \
++        @else                                               \
++            vec2 size = vec2(textureSize($tex, 0));         \
+         vec2 frac  = fract(pos * size + vec2(0.5));         \
+         vec2 frac2 = frac * frac;                           \
+         vec2 inv   = vec2(1.0) - frac;                      \
