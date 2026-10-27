@@ -1,10 +1,169 @@
+Backport of libplacebo's OpenGL backend to OpenGL 2.x / GLSL 1.10-1.20,
+for the macOS PowerPC drivers. Rebased onto v7.387.0. Five parts:
+
+=== 1 ===
+opengl: backport the GPU backend and shaders to OpenGL 2.x / GLSL 1.10-1.20
+
+Lower the OpenGL requirement from 3.0/GLSL 130 to 2.0/GLSL 110 so that
+libplacebo (and mpv's vo=gpu-next) can run on legacy desktop GL drivers,
+in particular the macOS PowerPC ones (Radeon 9xxx/X1xxx, GeForce FX/6/7).
+
+opengl:
+- Generate the GLAD loader for gl:compatibility=2.0 (GL 3+/4+ entry points
+  come via the merged gles2 API and the listed ARB/EXT extensions); add
+  GL_ARB_texture_rectangle, GL_EXT_framebuffer_object and
+  GL_EXT_framebuffer_blit; drop GL_ARB_compute_shader.
+- Alias GL_EXT_framebuffer_object/_blit entry points onto the core names
+  when a driver only provides the EXT variants (NVIDIA on Mac OS X 10.6).
+- Only use glGetStringi() when it exists; accept GL 2.0.
+- Track has_fbos / has_separate_fbo_bindings / has_stride /
+  has_unpack_image_height and route every framebuffer bind through
+  gl_{read,draw}_fb_target(), which falls back to GL_FRAMEBUFFER on
+  EXT-only drivers. Row/image stride uploads fall back to per-row copies
+  without GL_EXT_unpack_subimage / GL_UNPACK_IMAGE_HEIGHT.
+- Define the GL enums that GLAD no longer emits for a 2.0 profile.
+- Formats: a GL 2.0 path, r8/rg8 only through GL_ARB_texture_rg, else
+  GL_LUMINANCE(_ALPHA) sampleable-only formats for video planes; RGB(A)
+  float formats without the renderable flag (ARB_texture_float does not
+  imply FBO support); vertex-only fallbacks; mask RENDERABLE/BLITTABLE
+  when there are no FBOs.
+- Reject passes with SSBO descriptors instead of calling into NULL entry
+  points.
+
+shaders/dispatch (GLSL < 130):
+- attribute/varying/gl_FragColor instead of in/out/out_color; texture()
+  and textureLod() mapped onto texture2D(); uint constants emitted as int.
+- Float-based PRNG instead of the uvec3 pcg3d.
+- Disable paths that need textureSize() or integer types: bicubic/hermite/
+  gaussian/oversample/polar/ortho sampling, deinterlacing, contrast
+  recovery, bicubic distortion, ordered-fixed dithering (falls back to
+  white noise); custom_mpv passes _size through a uniform.
+- Keep headroom when deciding whether a LUT fits in uniforms.
+
+renderer: prefer the 4-component FBO format when a narrower one is
+missing; log the selected FBO formats.
+
+meson: define PL_HAVE_BIG_ENDIAN from host_machine.endian().
+
+Rebase of the first part of our libplacebo-gl2-complete.patch
+(7.360.1) onto v7.387.0. Adaptations to the new base:
+- dispatch.c: sits after the new PRECISE macro block (4c426e46).
+- shaders.c sh_prng(): keeps upstream's GLSLG prelude buffer (bb4d5a48)
+  and the 24-bit result scaling (debb22e7) in the GLSL >= 130 branch.
+- renderer.c: upstream already iterates c=3..1 (7c759b93); only
+  the fbofmt[4] preference and the logging remain from the patch.
+- opengl/gpu.c: inserted after the two-line has_storage test
+  (GL_ARB_texture_storage); opengl/meson.build keeps
+  GL_ARB_texture_storage and GL_KHR_shader_subgroup.
+- opengl/formats.c: new tables are static like the rest (4f7127e2).
+- colorspace.c: the GLSL < 130 contrast-recovery guard now feeds use_cr.
+
+=== 2 ===
+gl2: fix OSD/subtitle crashes, letterbox clears and GLSL 1.20 mix() overloads
+
+Second part of our libplacebo-gl2-complete.patch, rebased onto
+v7.387.0 (all hunks apply, with offsets):
+
+- gpu: pl_tex_recreate() fails cleanly instead of dereferencing a NULL
+  format when no suitable texture format exists (mpv OSD on GL 2.0).
+- gpu: pl_tex_clear_ex() also accepts renderable targets. The GL backend
+  clears via glClear() on a bound FBO and needs no blit support; on GL 2.x
+  without ARB_framebuffer_object gl_fb_query() cannot query the wrapped
+  default framebuffer, so PL_FMT_CAP_BLITTABLE / blit_dst was never set
+  and every letterbox clear failed (garbage bars around the video).
+- opengl/formats: register bgra8 on both GL 2.x paths (GL_BGRA as
+  an external format is core since GL 1.2; the internal format is GL_RGBA8),
+  needed for mpv image subtitles / OSD.
+- shaders/colorspace, shaders/dithering: GLSL 1.20 has no mix() overload
+  taking a bvec selector (that arrived in GLSL 1.30), so wrap
+  the lessThan()/lessThanEqual()/greaterThan() results in vecN().
+- shaders/lut: record the parameters of a failed LUT attempt so the
+  `update` check does not re-attempt and re-log the error every frame.
+
+=== 3 ===
+opengl/formats: add 16-bit luminance texture formats to the GL2 fallback paths
+
+Fixes broken colors (green image, orange blow-outs) with 10-bit video
+(HEVC Main 10 etc.) on vo=gpu-next / big-endian PowerPC.
+
+Without any 16-bit 1/2-component texture format, mpv's vo_gpu_next
+rejects every >8-bit YUV format (pl_plane_find_fmt finds no fmt with
+texel_size 2 / host_bits {16}), so the player converts the frame with
+libswscale first (FFmpeg's format scoring picks rgb48). That conversion
+path mangles the frame on big-endian hosts. mpv's vo=gpu is unaffected
+because its own ra_gl GL2 table has "l16"/"la16" (GL_LUMINANCE16) and
+uploads 10-bit planes natively.
+
+This gives vo_gpu_next the same native path: GL_UNSIGNED_SHORT client
+data is interpreted in host byte order, so big-endian planes upload
+correctly with no CPU conversion (also a sizeable perf win for 4K
+10-bit on G4/G5). Old GPUs may internally store these at 8 bits per
+component; that costs precision only, not correctness - identical to
+what vo=gpu already does on the same driver.
+
+Third part of our libplacebo-gl2-complete.patch, rebased onto
+v7.387.0.
+
+=== 4 ===
+gl2: wrap the dither black-clamp mix() selector for GLSL 1.20
+
+Upstream ef14f120 ("shaders/dithering: don't let the dither pattern lift
+true black off zero", between 7.360.1 and 7.387.0) added to sh_dither():
+
+    color = mix(color, vec4(0.0), lessThan(abs(color), vec4(1e-5)));
+
+which runs unconditionally in every dithered pass. GLSL 1.20 has no mix()
+overload with a bvec selector (that arrived in GLSL 1.30), so on a GL 2.x
+context every render pass would fail to compile. Wrap the comparison in
+vec4() like the other selectors fixed in the GL2 patchset.
+
+Adaptation for the v7.387.0 rebase; not part of the 7.360.1 patchset.
+
+=== 5 ===
+gl2: polyfill round() for GLSL 1.20
+
+Upstream 431c3170 ("renderer: dither onto the sample grid of the target",
+between 7.360.1 and 7.387.0) snaps the output of every pass that renders
+into a non-float target onto that texture's sample grid:
+
+    color.rgba = round(color.rgba * 255.0) * 0.0039215688;
+
+round() only exists from GLSL 1.30 on, so on a GL 2.x context the final
+output pass of every frame fails to compile and mpv shows nothing but
+a solid-colour window:
+
+    ERROR: 0:90: 'round' : no matching overloaded function found
+    ERROR: 0:90: 'assign' :  cannot convert from 'const float' to '4-component vector of float'
+    Failed compiling/linking GLSL program
+    Failed creating pass
+    Failed rendering image!
+
+Rather than patching this one call site, add round() to the GLSL < 130
+compatibility prelude in dispatch.c, next to the texture()/textureLod()
+mappings:
+
+    #define round(x) floor((x) + 0.5)
+
+floor(x + 0.5) rounds to nearest with ties going up, which the round()
+specification permits, and floor() is overloaded for every genType just
+like round(). This also covers the other round() users that can reach
+a GLSL 1.20 target: the Dolby Vision NLQ enhancement-layer merge
+(shaders/colorspace.c) and user shaders loaded through
+pl_mpv_user_shader_parse(). GLSL >= 130 output is unchanged.
+
+Observed on a GeForce 6600 (GL 2.0 NVIDIA-1.5.48, GLSL 1.20) with mpv
+vo=gpu-next: solid magenta window, "Failed rendering frame!" on every
+frame.
+
+Adaptation for the v7.387.0 rebase; not part of the 7.360.1 patchset.
+
 diff --git a/src/dispatch.c b/src/dispatch.c
-index a593f256..7a2f9577 100644
+index 4bae988a..85c1eaac 100644
 --- a/src/dispatch.c
 +++ b/src/dispatch.c
-@@ -398,17 +398,27 @@ static void generate_shaders(pl_dispatch dp,
-         ADD(pre, "precision highp int; \n");
-     }
+@@ -410,17 +410,31 @@ static void generate_shaders(pl_dispatch dp,
+     else
+         ADD(pre, "#define PRECISE \n");
  
 -    // textureLod() doesn't work on external/rect samplers, simply disable
 -    // LOD sampling in this case. We don't currently support mipmaps anyway.
@@ -25,6 +184,10 @@ index a593f256..7a2f9577 100644
 +        // For LOD sampling, use texture2DLod if available, otherwise just texture2D
 +        ADD(pre, "#define textureLod(t, p, b) texture2D(t, p)\n");
 +        ADD(pre, "#define textureLodOffset(t, p, b, o) texture2D(t, p)\n");
++        // round() only exists from GLSL 130 on. floor(x + 0.5) rounds to
++        // nearest with ties going up, which the round() spec permits, and
++        // the floor() overloads cover every genType just like round() does.
++        ADD(pre, "#define round(x) floor((x) + 0.5)\n");
 +    } else {
 +        // textureLod() doesn't work on external/rect samplers, simply disable
 +        // LOD sampling in this case. We don't currently support mipmaps anyway.
@@ -41,7 +204,7 @@ index a593f256..7a2f9577 100644
          }
      }
  
-@@ -620,6 +630,9 @@ static void generate_shaders(pl_dispatch dp,
+@@ -632,6 +646,9 @@ static void generate_shaders(pl_dispatch dp,
              if (has_loc) {
                  ADD(vert_head, "layout(location=%d) in %s "$";\n",
                      va->location, type, sh_ident_unpack(va->name));
@@ -51,7 +214,7 @@ index a593f256..7a2f9577 100644
              } else {
                  ADD(vert_head, "in %s "$";\n", type, sh_ident_unpack(va->name));
              }
-@@ -639,6 +652,10 @@ static void generate_shaders(pl_dispatch dp,
+@@ -651,6 +668,10 @@ static void generate_shaders(pl_dispatch dp,
                          va->location, type, id);
                      ADD(glsl, "layout(location=%d) in %s "$";\n",
                          va->location, type, id);
@@ -62,7 +225,7 @@ index a593f256..7a2f9577 100644
                  } else {
                      ADD(vert_head, "out %s "$";\n", type, id);
                      ADD(glsl, "in %s "$";\n", type, id);
-@@ -652,7 +669,10 @@ static void generate_shaders(pl_dispatch dp,
+@@ -664,7 +685,10 @@ static void generate_shaders(pl_dispatch dp,
          pl_hash_merge(&pass->signature, pl_str_builder_hash(vert_head));
          *out_vert_builder = vert_head;
  
@@ -74,7 +237,7 @@ index a593f256..7a2f9577 100644
              ADD(glsl, "layout(location=0) out vec4 out_color;\n");
          } else {
              ADD(glsl, "out vec4 out_color;\n");
-@@ -676,7 +696,12 @@ static void generate_shaders(pl_dispatch dp,
+@@ -688,7 +712,12 @@ static void generate_shaders(pl_dispatch dp,
      switch (pass_params->type) {
      case PL_PASS_RASTER:
          pl_assert(sh->output == PL_SHADER_SIG_COLOR);
@@ -88,11 +251,42 @@ index a593f256..7a2f9577 100644
          break;
      case PL_PASS_COMPUTE:
          ADD(glsl, $"();\n", sh->name);
+diff --git a/src/gpu.c b/src/gpu.c
+index e5a320e0..23a7a543 100644
+--- a/src/gpu.c
++++ b/src/gpu.c
+@@ -303,6 +303,11 @@ bool pl_tex_recreate(pl_gpu gpu, pl_tex *tex, const struct pl_tex_params *params
+         return true;
+     }
+ 
++    if (!params->format) {
++        PL_ERR(gpu, "pl_tex_recreate: no texture format specified!");
++        return false;
++    }
++
+     PL_DEBUG(gpu, "(Re)creating %dx%dx%d texture with format %s: %s",
+              params->w, params->h, params->d, params->format->name,
+              PL_DEF(params->debug_tag, "unknown"));
+@@ -315,7 +320,13 @@ bool pl_tex_recreate(pl_gpu gpu, pl_tex *tex, const struct pl_tex_params *params
+ 
+ void pl_tex_clear_ex(pl_gpu gpu, pl_tex dst, const union pl_clear_color color)
+ {
+-    require(dst->params.blit_dst);
++    // Also accept renderable targets: the GL backend clears via glClear()
++    // on a bound FBO, which needs no blit support. Required for the wrapped
++    // default framebuffer on GL 2.x, where gl_fb_query() cannot query the
++    // format (no ARB_framebuffer_object) and thus never sets
++    // PL_FMT_CAP_BLITTABLE, leaving blit_dst unset on the swapchain -- which
++    // made every letterbox clear fail (garbage bars around the video).
++    require(dst->params.blit_dst || dst->params.renderable);
+ 
+     const struct pl_gpu_fns *impl = PL_PRIV(gpu);
+     if (impl->tex_invalidate)
 diff --git a/src/meson.build b/src/meson.build
-index e93e800f..0ce5d847 100644
+index 7357427a..32e9d7b4 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -206,6 +206,14 @@ endif
+@@ -211,6 +211,14 @@ endif
  defs = ''
  pc_vars = []
  
@@ -108,10 +302,10 @@ index e93e800f..0ce5d847 100644
    found = components.get(comp)
    varname = comp.underscorify().to_upper()
 diff --git a/src/opengl/context.c b/src/opengl/context.c
-index 8b38e652..1f126ff6 100644
+index 3bbd87e1..3cbb1730 100644
 --- a/src/opengl/context.c
 +++ b/src/opengl/context.c
-@@ -179,6 +179,39 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+@@ -180,6 +180,39 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
          goto error;
      }
  
@@ -151,7 +345,7 @@ index 8b38e652..1f126ff6 100644
      const char *version = (const char *) gl->GetString(GL_VERSION);
      if (version) {
          const char *ver = version;
-@@ -202,7 +235,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+@@ -203,7 +236,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
      PL_INFO(p, "    GL_RENDERER: %s", (char *) gl->GetString(GL_RENDERER));
  
      ext_arr_t exts = {0};
@@ -160,7 +354,7 @@ index 8b38e652..1f126ff6 100644
          gl->GetIntegerv(GL_NUM_EXTENSIONS, &exts.num);
          PL_ARRAY_RESIZE(pl_gl, exts, exts.num);
          for (int i = 0; i < exts.num; i++)
-@@ -217,7 +250,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
+@@ -218,7 +251,7 @@ pl_opengl pl_opengl_create(pl_log log, const struct pl_opengl_params *params)
              PL_DEBUG(p, "        %s", exts.elem[i]);
      }
  
@@ -170,10 +364,10 @@ index 8b38e652..1f126ff6 100644
          PL_FATAL(p, "OpenGL version too old (%d < %d), please use a newer "
                   "OpenGL implementation or downgrade libplacebo!",
 diff --git a/src/opengl/formats.c b/src/opengl/formats.c
-index 94154448..7419b810 100644
+index 9f24cae6..34906b78 100644
 --- a/src/opengl/formats.c
 +++ b/src/opengl/formats.c
-@@ -20,6 +20,14 @@
+@@ -20,6 +20,20 @@
  #include "formats.h"
  #include "utils.h"
  
@@ -184,40 +378,46 @@ index 94154448..7419b810 100644
 +#ifndef GL_LUMINANCE_ALPHA
 +#define GL_LUMINANCE_ALPHA 0x190A
 +#endif
++#ifndef GL_LUMINANCE16
++#define GL_LUMINANCE16 0x8042
++#endif
++#ifndef GL_LUMINANCE16_ALPHA16
++#define GL_LUMINANCE16_ALPHA16 0x8048
++#endif
 +
  #ifdef PL_HAVE_UNIX
  static bool supported_fourcc(struct pl_gl *p, EGLint fourcc)
  {
-@@ -77,6 +85,12 @@ const struct gl_format formats_norm8[] = {
+@@ -77,6 +91,12 @@ static const struct gl_format formats_norm8[] = {
      {GL_RGBA8,          RGBA,  U8,  FMT("rgba8",    8, UNORM, S|L|F|V)},
  };
  
 +// GL 2.0: Only r8/rg8 from ARB_texture_rg (rgb8/rgba8 already in legacy formats)
-+const struct gl_format formats_norm8_rg[] = {
++static const struct gl_format formats_norm8_rg[] = {
 +    {GL_R8,             R,     U8,  FMT("r8",       8, UNORM, S|L|F|V)},
 +    {GL_RG8,            RG,    U8,  FMT("rg8",      8, UNORM, S|L|F|V)},
 +};
 +
  // Signed variants
  /* TODO: these are broken in mesa
- const struct gl_format formats_snorm8[] = {
-@@ -133,6 +147,15 @@ const struct gl_format formats_float32[] = {
-     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|F|V)},
+ static const struct gl_format formats_snorm8[] = {
+@@ -150,6 +170,15 @@ static const struct gl_format formats_float32_gles_fbo[] = {
+     {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|F|V)},
  };
  
 +// 32-bit float formats for GL 2.0 without GL_ARB_texture_rg (only RGB/RGBA)
 +// Note: NOT marked as renderable (F flag) because GL_ARB_texture_float does NOT
 +// guarantee FBO support. GL_EXT_color_buffer_float/GL_ARB_color_buffer_float
 +// would be needed for that, which old drivers typically don't have.
-+const struct gl_format formats_float32_gl2[] = {
++static const struct gl_format formats_float32_gl2[] = {
 +    {GL_RGB32F,         RGB,   FLT, FMT("rgb32f",  32, FLOAT, S|L|V)},
 +    {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, S|L|V)},
 +};
 +
  // 16-bit floating point texture formats
- const struct gl_format formats_float16[] = {
+ static const struct gl_format formats_float16[] = {
      {GL_R16F,           R,     FLT,  FMT("r16f",    16, FLOAT, S|L|F)},
-@@ -205,12 +228,26 @@ const struct gl_format formats_uint[] = {
+@@ -222,12 +251,33 @@ static const struct gl_format formats_uint[] = {
      {GL_RGBA32I,        RGBAI, I32, FMT("rgba32i", 32, SINT)},
  */
  
@@ -227,7 +427,7 @@ index 94154448..7419b810 100644
 +// unsized formats that cannot be used as FBO attachments and are not blittable.
 +// libplacebo requires formats that are renderable and blittable for proper operation.
 +// Use rgba8/rgb8 for all texture operations on GL 2.0.
- const struct gl_format formats_legacy_gl2[] = {
+ static const struct gl_format formats_legacy_gl2[] = {
 -    {GL_RGB8,           RGB,   U8,  FMT("rgb8",     8, UNORM, S|L|V)},
 -    {GL_RGBA8,          RGBA,  U8,  FMT("rgba8",    8, UNORM, S|L|V)},
 -    {GL_RGB16,          RGB,   U16, FMT("rgb16",   16, UNORM, S|L|V)},
@@ -242,14 +442,21 @@ index 94154448..7419b810 100644
 +// These are needed for video plane uploads when GL_ARB_texture_rg is unavailable.
 +// Note: GL_LUMINANCE swizzles to (L,L,L,1) and GL_LUMINANCE_ALPHA to (L,L,L,A)
 +// in the shader, but libplacebo's component_mapping handles this correctly.
-+const struct gl_format formats_luminance_gl2[] = {
++static const struct gl_format formats_luminance_gl2[] = {
 +    // Note: NO 'F' flag - these cannot be FBO attachments
 +    {GL_LUMINANCE,      GL_LUMINANCE,      GL_UNSIGNED_BYTE,  FMT("luminance",       8, UNORM, S|L|V)},
 +    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_UNSIGNED_BYTE,  FMT("luminance_alpha", 8, UNORM, S|L|V)},
++    // 16-bit variants: needed for native upload of >8-bit video planes
++    // (yuv420p10 = HEVC Main 10, etc.). Without them mpv vo_gpu_next
++    // rejects 10-bit YUV and falls back to a libswscale conversion that
++    // is broken on big-endian hosts. GL_UNSIGNED_SHORT is host-byte-order,
++    // and this is the same internal format mpv vo_gpu uses ("l16"/"la16").
++    {GL_LUMINANCE16,    GL_LUMINANCE,      GL_UNSIGNED_SHORT, FMT("luminance16",       16, UNORM, S|L|V)},
++    {GL_LUMINANCE16_ALPHA16,GL_LUMINANCE_ALPHA,GL_UNSIGNED_SHORT, FMT("luminance_alpha16", 16, UNORM, S|L|V)},
  };
  
  // GLES2 legacy formats
-@@ -238,6 +275,25 @@ const struct gl_format formats_basic_vertex[] = {
+@@ -255,6 +305,25 @@ static const struct gl_format formats_basic_vertex[] = {
      {GL_RGBA32F,        RGBA,  FLT, FMT("rgba32f", 32, FLOAT, V)},
  };
  
@@ -258,14 +465,14 @@ index 94154448..7419b810 100644
 +// since they're only used for glVertexAttribPointer which only cares about
 +// the type (GL_FLOAT) and num_components - not the texture format constants.
 +// Note: Unique names (r32f_v, rg32f_v) to avoid conflicts with float texture formats.
-+const struct gl_format formats_vertex_gl2_1_2comp[] = {
++static const struct gl_format formats_vertex_gl2_1_2comp[] = {
 +    {GL_LUMINANCE,      GL_LUMINANCE,      GL_FLOAT, FMT("r32f_v",  32, FLOAT, V)},
 +    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_FLOAT, FMT("rg32f_v", 32, FLOAT, V)},
 +};
 +
 +// GL 2.0 vertex-only formats, all 4 components (for systems without GL_ARB_texture_rg
 +// and without GL_ARB_texture_float)
-+const struct gl_format formats_basic_vertex_gl2[] = {
++static const struct gl_format formats_basic_vertex_gl2[] = {
 +    {GL_LUMINANCE,      GL_LUMINANCE,      GL_FLOAT, FMT("r32f",    32, FLOAT, V)},
 +    {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_FLOAT, FMT("rg32f",   32, FLOAT, V)},
 +    {GL_RGB,            GL_RGB,            GL_FLOAT, FMT("rgb32f",  32, FLOAT, V)},
@@ -275,7 +482,7 @@ index 94154448..7419b810 100644
  static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
  {
      struct pl_gpu_t *gpu = (struct pl_gpu_t *) pgpu;
-@@ -252,10 +308,12 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+@@ -269,10 +338,12 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
      switch (gl_fmt->fmt) {
      case GL_RED:
      case GL_RED_INTEGER:
@@ -288,7 +495,7 @@ index 94154448..7419b810 100644
          fmt->num_components = 2;
          break;
      case GL_RGB:
-@@ -372,6 +430,10 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
+@@ -397,6 +468,10 @@ static void add_format(pl_gpu pgpu, const struct gl_format *gl_fmt)
      if (fmt->caps & PL_FMT_CAP_SAMPLEABLE)
          fmt->gatherable = p->gather_comps >= fmt->num_components;
  
@@ -299,7 +506,7 @@ index 94154448..7419b810 100644
      bool host_readable = false;
      if (p->gl_ver && p->has_readback)
          host_readable = true;
-@@ -444,8 +506,12 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+@@ -476,8 +551,12 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
      }
  #endif
  
@@ -312,7 +519,7 @@ index 94154448..7419b810 100644
          DO_FORMATS(formats_norm8);
          DO_FORMATS(formats_bgra8);
          DO_FORMATS(formats_norm16);
-@@ -460,8 +526,10 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+@@ -492,8 +571,10 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
      if (p->gl_ver >= 21) {
          // If we have a reasonable set of extensions, we can enable most
          // things. Otherwise, pick simple fallback formats
@@ -324,7 +531,7 @@ index 94154448..7419b810 100644
              pl_opengl_has_ext(p->gl, "GL_ARB_framebuffer_object"))
          {
              DO_FORMATS(formats_norm8);
-@@ -475,9 +543,28 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+@@ -507,9 +588,31 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
                  DO_FORMATS(formats_half16);
              }
          } else {
@@ -332,6 +539,9 @@ index 94154448..7419b810 100644
 +            // Fallback for GL 2.1 without full extension support
              DO_FORMATS(formats_legacy_gl2);
 -            DO_FORMATS(formats_basic_vertex);
++            // GL_BGRA as external format is core since GL 1.2; internal
++            // format is plain GL_RGBA8. Needed for mpv image subs/OSD.
++            DO_FORMATS(formats_bgra8);
 +            if (has_texture_rg) {
 +                DO_FORMATS(formats_norm8_rg);
 +            } else {
@@ -355,7 +565,7 @@ index 94154448..7419b810 100644
          }
          goto done;
      }
-@@ -502,6 +589,42 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+@@ -535,6 +638,45 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
          goto done;
      }
  
@@ -365,6 +575,9 @@ index 94154448..7419b810 100644
 +        bool has_texture_rg = pl_opengl_has_ext(p->gl, "GL_ARB_texture_rg");
 +        PL_INFO(gpu, "Using GL 2.0 format path, has_texture_rg=%d", has_texture_rg);
 +        DO_FORMATS(formats_legacy_gl2);
++        // GL_BGRA as external format is core since GL 1.2; internal
++        // format is plain GL_RGBA8. Needed for mpv image subs/OSD.
++        DO_FORMATS(formats_bgra8);
 +        if (has_texture_rg) {
 +            // Modern single/dual-component formats (r8/rg8 only, not rgb8/rgba8)
 +            DO_FORMATS(formats_norm8_rg);
@@ -398,7 +611,7 @@ index 94154448..7419b810 100644
      if (p->gles_ver >= 20) {
          // GLES 2.0 only has some legacy fallback formats, with support for
          // float16 depending on GL_EXT_texture_norm16 being present
-@@ -521,5 +644,15 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
+@@ -554,5 +696,15 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
      goto done;
  
  done:
@@ -415,7 +628,7 @@ index 94154448..7419b810 100644
      return gl_check_err(gpu, "gl_setup_formats");
  }
 diff --git a/src/opengl/gpu.c b/src/opengl/gpu.c
-index a515943f..c451deb9 100644
+index 0ac06967..04a39d7e 100644
 --- a/src/opengl/gpu.c
 +++ b/src/opengl/gpu.c
 @@ -30,6 +30,39 @@
@@ -476,10 +689,10 @@ index a515943f..c451deb9 100644
          glsl->version = PL_MIN(glsl->version, params->max_glsl_version);
          PL_INFO(gpu, "Restricting GLSL version to %d... new version is %d",
                  params->max_glsl_version, glsl->version);
-@@ -246,6 +279,26 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
-     p->has_invalidate_tex = gl_test_ext(gpu, "GL_ARB_invalidate_subdata", 43, 0);
+@@ -271,6 +304,26 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
      p->has_queries = gl_test_ext(gpu, "GL_ARB_timer_query", 30, 0);
-     p->has_storage = gl_test_ext(gpu, "GL_ARB_shader_image_load_store", 42, 31);
+     p->has_storage = gl_test_ext(gpu, "GL_ARB_shader_image_load_store", 42, 31) &&
+                      gl_test_ext(gpu, "GL_ARB_texture_storage", 42, 30);
 +
 +    // WORKAROUND: Unconditionally enable FBOs on GL 2.0+ (extension query is broken)
 +    // All GL 2.0+ drivers support FBOs via GL_EXT_framebuffer_object or ARB version
@@ -503,7 +716,7 @@ index a515943f..c451deb9 100644
      p->has_readback = true;
  
      if (p->has_readback && p->gles_ver) {
-@@ -277,9 +330,11 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
+@@ -302,9 +355,11 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
  
      // We simply don't know, so make up some values
      limits->align_tex_xfer_offset = 32;
@@ -554,7 +767,7 @@ index 3681f30b..c7380060 100644
      GLenum target;
      GLuint texture;
 diff --git a/src/opengl/gpu_pass.c b/src/opengl/gpu_pass.c
-index 96f15e7d..97127413 100644
+index c5bcf52c..35d25f20 100644
 --- a/src/opengl/gpu_pass.c
 +++ b/src/opengl/gpu_pass.c
 @@ -305,10 +305,16 @@ pl_pass gl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
@@ -625,7 +838,7 @@ index 96f15e7d..97127413 100644
      }
  
 diff --git a/src/opengl/gpu_tex.c b/src/opengl/gpu_tex.c
-index ca488ee2..497b8c50 100644
+index 69e118bf..d07ee04d 100644
 --- a/src/opengl/gpu_tex.c
 +++ b/src/opengl/gpu_tex.c
 @@ -16,6 +16,11 @@
@@ -640,7 +853,7 @@ index ca488ee2..497b8c50 100644
  #include "formats.h"
  #include "utils.h"
  
-@@ -408,8 +413,9 @@ pl_tex gl_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
+@@ -446,8 +451,9 @@ pl_tex gl_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
              goto error;
          }
  
@@ -652,7 +865,7 @@ index ca488ee2..497b8c50 100644
  
          gl->GenFramebuffers(1, &tex_gl->fbo);
          gl->BindFramebuffer(target, tex_gl->fbo);
-@@ -486,14 +492,14 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
+@@ -524,14 +530,14 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
          can_query = false; // can't query default framebuffer on GLES 2.0
  
      if (can_query) {
@@ -669,7 +882,7 @@ index ca488ee2..497b8c50 100644
                              GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
          switch (type) {
          case GL_FLOAT:                  fmt->type = PL_FMT_FLOAT; break;
-@@ -504,16 +510,16 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
+@@ -542,16 +548,16 @@ static bool gl_fb_query(pl_gpu gpu, int fbo, struct pl_fmt_t *fmt,
          default:                        fmt->type = PL_FMT_UNKNOWN; break;
          }
  
@@ -691,7 +904,7 @@ index ca488ee2..497b8c50 100644
          gl_check_err(gpu, "gl_fb_query");
  
          if (!fmt->component_depth[0]) {
-@@ -689,8 +695,9 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
+@@ -727,8 +733,9 @@ pl_tex pl_opengl_wrap(pl_gpu gpu, const struct pl_opengl_wrap_params *params)
                     dims < 3;
  
      if (can_fbo && !tex_gl->fbo) {
@@ -703,7 +916,7 @@ index ca488ee2..497b8c50 100644
  
          gl->GenFramebuffers(1, &tex_gl->fbo);
          gl->BindFramebuffer(target, tex_gl->fbo);
-@@ -788,9 +795,9 @@ void gl_tex_invalidate(pl_gpu gpu, pl_tex tex)
+@@ -826,9 +833,9 @@ void gl_tex_invalidate(pl_gpu gpu, pl_tex tex)
  
      if ((tex_gl->wrapped_fb || tex_gl->fbo) && p->has_invalidate_fb) {
          GLenum attachment = tex_gl->fbo ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
@@ -716,7 +929,7 @@ index ca488ee2..497b8c50 100644
      }
  
      gl_check_err(gpu, "gl_tex_invalidate");
-@@ -807,8 +814,8 @@ void gl_tex_clear_ex(pl_gpu gpu, pl_tex tex, const union pl_clear_color color)
+@@ -845,8 +852,8 @@ void gl_tex_clear_ex(pl_gpu gpu, pl_tex tex, const union pl_clear_color color)
      struct pl_tex_gl *tex_gl = PL_PRIV(tex);
      pl_assert(tex_gl->fbo || tex_gl->wrapped_fb);
  
@@ -727,7 +940,7 @@ index ca488ee2..497b8c50 100644
  
      gl->BindFramebuffer(target, tex_gl->fbo);
  
-@@ -853,8 +860,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
+@@ -891,8 +898,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
  
      pl_assert(src_gl->fbo || src_gl->wrapped_fb);
      pl_assert(dst_gl->fbo || dst_gl->wrapped_fb);
@@ -738,7 +951,7 @@ index ca488ee2..497b8c50 100644
  
      static const GLint filters[PL_TEX_SAMPLE_MODE_COUNT] = {
          [PL_TEX_SAMPLE_NEAREST] = GL_NEAREST,
-@@ -866,8 +873,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
+@@ -904,8 +911,8 @@ void gl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
                          dst_rc.x0, dst_rc.y0, dst_rc.x1, dst_rc.y1,
                          GL_COLOR_BUFFER_BIT, filters[params->sample_mode]);
  
@@ -749,7 +962,7 @@ index ca488ee2..497b8c50 100644
      gl_check_err(gpu, "gl_tex_blit");
      RELEASE_CURRENT();
  }
-@@ -921,15 +928,22 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+@@ -959,15 +966,22 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
          gl->PixelStorei(GL_UNPACK_ALIGNMENT, get_alignment(params->row_pitch));
  
      int rows = pl_rect_h(params->rc);
@@ -778,7 +991,7 @@ index ca488ee2..497b8c50 100644
  
      gl->BindTexture(tex_gl->target, tex_gl->texture);
      gl_timer_begin(gpu, params->timer);
-@@ -964,8 +978,10 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+@@ -1002,8 +1016,10 @@ bool gl_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
      gl_timer_end(gpu, params->timer);
      gl->BindTexture(tex_gl->target, 0);
      gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -791,7 +1004,7 @@ index ca488ee2..497b8c50 100644
  
      if (buf) {
          gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-@@ -1043,17 +1059,20 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+@@ -1081,17 +1097,20 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
              gl->PixelStorei(GL_PACK_ALIGNMENT, get_alignment(params->row_pitch));
  
          int rows = pl_rect_h(params->rc);
@@ -818,7 +1031,7 @@ index ca488ee2..497b8c50 100644
  
          gl->BindFramebuffer(target, tex_gl->fbo);
          for (int y = params->rc.y0; y < params->rc.y1; y += rows) {
-@@ -1063,7 +1082,8 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+@@ -1101,7 +1120,8 @@ bool gl_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
          }
          gl->BindFramebuffer(target, 0);
          gl->PixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -842,10 +1055,10 @@ index 05b3f023..bc5f5301 100644
    ] + (opengl_link.allowed() ? ['--loader'] : [])
  )
 diff --git a/src/opengl/meson.build b/src/opengl/meson.build
-index f753628c..a28ccb00 100644
+index de8a9141..814f5464 100644
 --- a/src/opengl/meson.build
 +++ b/src/opengl/meson.build
-@@ -31,24 +31,37 @@ if opengl_build.allowed()
+@@ -31,25 +31,38 @@ if opengl_build.allowed()
  
    gl_extensions = [
      'GL_AMD_pinned_memory',
@@ -863,15 +1076,17 @@ index f753628c..a28ccb00 100644
      'GL_ARB_shader_storage_buffer_object',
 -    'GL_ARB_sync',
 -    'GL_ARB_texture_float',
+-    'GL_ARB_texture_gather',
+-    'GL_ARB_texture_rg',
 +    # Compute shaders not needed for GL 2.0
 +    # 'GL_ARB_compute_shader',
 +    # GL 4.2+ extensions - needed for compilation even on GL 2.0
 +    'GL_ARB_shader_image_load_store',
+     'GL_ARB_texture_storage',
 +    # GL 4.1+ extensions - needed for compilation even on GL 2.0
 +    'GL_ARB_get_program_binary',
 +    # GL 4.0+ extensions - needed for compilation even on GL 2.0
-     'GL_ARB_texture_gather',
--    'GL_ARB_texture_rg',
++    'GL_ARB_texture_gather',
 +    # GL 3.3+ extensions - needed for compilation even on GL 2.0
      'GL_ARB_timer_query',
 +    # GL 3.1+ extensions - needed for compilation even on GL 2.0
@@ -892,21 +1107,20 @@ index f753628c..a28ccb00 100644
      'GL_EXT_texture3D',
      'GL_EXT_texture_format_BGRA8888',
 diff --git a/src/renderer.c b/src/renderer.c
-index 576528b5..088373e1 100644
+index d9bc5e09..d3bfac9a 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -419,16 +419,32 @@ static void find_fbo_format(struct pass_state *pass)
+@@ -451,16 +451,32 @@ static void find_fbo_format(struct pass_state *pass)
          pass->fbofmt[4] = fmt;
  
          // Probe the right variant for each number of channels, falling
 -        // back to the next biggest format
--        for (int c = 1; c < 4; c++) {
 +        // back to the next biggest format. Must iterate downward so that
 +        // fbofmt[c+1] is already set when we compute the fallback.
 +        // Note: For maximum compatibility (especially on old GL 2.0 drivers),
 +        // we strongly prefer 4-component RGBA formats for FBOs since RGB
 +        // formats often have poor FBO support.
-+        for (int c = 3; c >= 1; c--) {
+         for (int c = 3; c >= 1; c--) {
              pass->fbofmt[c] = pl_find_fmt(rr->gpu, configs[i].type, c,
                                          configs[i].depth, 0, fmt->caps);
 -            pass->fbofmt[c] = PL_DEF(pass->fbofmt[c], pass->fbofmt[c+1]);
@@ -932,7 +1146,7 @@ index 576528b5..088373e1 100644
      rr->errors |= PL_RENDER_ERR_FBO;
  }
  
-@@ -450,9 +466,14 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
+@@ -482,9 +498,14 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
      pl_renderer rr = pass->rr;
      const int n = pass->info.stage;
      comps = PL_DEF(comps, 4);
@@ -948,7 +1162,7 @@ index 576528b5..088373e1 100644
  
      pl_assert(w && h);
      struct pl_tex_params params = {
-@@ -1477,8 +1498,9 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
+@@ -1544,8 +1565,9 @@ static pl_fmt merge_fmt(struct pass_state *pass, const struct img *a,
      int min_depth = PL_MAX(a->repr.bits.sample_depth, b->repr.bits.sample_depth);
  
      // Only return formats that support all relevant caps of both formats
@@ -961,7 +1175,7 @@ index 576528b5..088373e1 100644
  
      // If we have integer formats on input, convert now to FBO format.
 diff --git a/src/shaders.c b/src/shaders.c
-index 73e03ec8..1daef9c7 100644
+index 1421740d..5554cb8a 100644
 --- a/src/shaders.c
 +++ b/src/shaders.c
 @@ -92,8 +92,8 @@ static void init_shader(pl_shader sh, const struct pl_shader_params *params)
@@ -996,14 +1210,16 @@ index 73e03ec8..1daef9c7 100644
 +            GLSLH("const uint "$" = uint(%u); \n", id, *(unsigned int *) sc.data);
 +        }
          return id;
-     case PL_VAR_FLOAT:
-         GLSLH("const float "$" = float(%f); \n", id, *(float *) sc.data);
-@@ -959,26 +964,49 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
+     case PL_VAR_FLOAT: {
+         // The shortest form of an integral value has no decimal point, which
+@@ -994,28 +999,51 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
      ident_t randfun = sh_fresh(sh, "rand"),
              state = sh_fresh(sh, "state");
  
--    // Based on pcg3d (http://jcgt.org/published/0009/03/02/)
--    GLSLP("#define prng_t uvec3\n");
+-    // Based on pcg3d (http://jcgt.org/published/0009/03/02/). The result is
+-    // made from the 24 high bits, which a float holds exactly, so that it
+-    // stays below 1.0 (the full 32 bits would round up to 1.0 at the top)
+-    GLSLG("#define prng_t uvec3\n");
 -    GLSLH("vec3 "$"(inout uvec3 s) {                    \n"
 -          "    s = 1664525u * s + uvec3(1013904223u);   \n"
 -          "    s.x += s.y * s.z;                        \n"
@@ -1013,7 +1229,7 @@ index 73e03ec8..1daef9c7 100644
 -          "    s.x += s.y * s.z;                        \n"
 -          "    s.y += s.z * s.x;                        \n"
 -          "    s.z += s.x * s.y;                        \n"
--          "    return vec3(s) * 1.0/float(0xFFFFFFFFu); \n"
+-          "    return vec3(s >> 8u) * (1.0/16777216.0); \n"
 -          "}                                            \n",
 -          randfun);
 -
@@ -1025,7 +1241,7 @@ index 73e03ec8..1daef9c7 100644
 +    if (glsl.version < 130) {
 +        // GLSL < 130: Use float-based PRNG (no uvec3 support)
 +        // Based on simple hash function using trigonometry
-+        GLSLP("#define prng_t vec3\n");
++        GLSLG("#define prng_t vec3\n");
 +        GLSLH("vec3 "$"(inout vec3 s) {                             \n"
 +              "    vec3 p = fract(s * vec3(0.1031, 0.1030, 0.0973)); \n"
 +              "    p += dot(p, p.yzx + 33.33);                       \n"
@@ -1043,8 +1259,10 @@ index 73e03ec8..1daef9c7 100644
      } else {
 -        GLSL("uvec3 "$" = uvec3(gl_FragCoord.xy, 0.0); \n", state);
 +        // GLSL >= 130: Use uvec3-based PRNG (pcg3d)
-+        // Based on pcg3d (http://jcgt.org/published/0009/03/02/)
-+        GLSLP("#define prng_t uvec3\n");
++        // Based on pcg3d (http://jcgt.org/published/0009/03/02/). The result is
++        // made from the 24 high bits, which a float holds exactly, so that it
++        // stays below 1.0 (the full 32 bits would round up to 1.0 at the top)
++        GLSLG("#define prng_t uvec3\n");
 +        GLSLH("vec3 "$"(inout uvec3 s) {                    \n"
 +              "    s = 1664525u * s + uvec3(1013904223u);   \n"
 +              "    s.x += s.y * s.z;                        \n"
@@ -1054,7 +1272,7 @@ index 73e03ec8..1daef9c7 100644
 +              "    s.x += s.y * s.z;                        \n"
 +              "    s.y += s.z * s.x;                        \n"
 +              "    s.z += s.x * s.y;                        \n"
-+              "    return vec3(s) * 1.0/float(0xFFFFFFFFu); \n"
++              "    return vec3(s >> 8u) * (1.0/16777216.0); \n"
 +              "}                                            \n",
 +              randfun);
 +
@@ -1068,10 +1286,170 @@ index 73e03ec8..1daef9c7 100644
  
      if (p_state)
 diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 475af5ab..29b0d977 100644
+index f9e8120b..777ac0b7 100644
 --- a/src/shaders/colorspace.c
 +++ b/src/shaders/colorspace.c
-@@ -1866,6 +1866,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+@@ -403,7 +403,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
+         GLSL("// constant luminance conversion                              \n"
+              "color.br = color.br * mix(vec2(1.5816, 0.9936),               \n"
+              "                          vec2(1.9404, 1.7184),               \n"
+-             "                          lessThanEqual(color.br, vec2(0.0))) \n"
++             "                          vec2(lessThanEqual(color.br, vec2(0.0)))) \n"
+              "           + color.gg;                                        \n");
+         // Expand channels to camera-linear light. This shader currently just
+         // assumes everything uses the BT.2020 12-bit gamma function, since the
+@@ -412,7 +412,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
+         GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
+              "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
+              "                    vec3(1.0/0.45)),                             \n"
+-             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
++             "                vec3(lessThanEqual(vec3(0.08145), color.rgb)));        \n");
+         // Calculate the green channel from the expanded RYcB, and recompress to G'
+         // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
+         GLSL("color.g = (lin.g - 0.2627*lin.r - 0.0593*lin.b)*1.0/0.6780;   \n"
+@@ -456,7 +456,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
+              "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
+              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
+              "                    + vec3(%f),                                   \n"
+-             "                lessThan(vec3(0.5), color.rgb));                  \n"
++             "                vec3(lessThan(vec3(0.5), color.rgb)));                  \n"
+              // LMS matrix
+              "color.rgb = mat3( 3.43661, -0.79133, -0.0259499,                  \n"
+              "                 -2.50645,  1.98360, -0.0989137,                  \n"
+@@ -464,7 +464,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
+             // HLG OETF
+              "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+-             "                lessThan(vec3(1.0), color.rgb));                  \n",
++             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n",
+              HLG_C, HLG_A, HLG_B,
+              HLG_A, HLG_B, HLG_C);
+         break;
+@@ -572,7 +572,7 @@ void pl_shader_encode_color_ex(pl_shader sh, const struct pl_color_encode_args *
+         GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
+              "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
+              "                    vec3(1.0/0.45)),                             \n"
+-             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
++             "                vec3(lessThanEqual(vec3(0.08145), color.rgb)));        \n");
+ 
+         // Compute Yc from RGB and compress to R'Y'cB'
+         GLSL("color.g = dot(vec3(0.2627, 0.6780, 0.0593), lin);     \n"
+@@ -584,7 +584,7 @@ void pl_shader_encode_color_ex(pl_shader sh, const struct pl_color_encode_args *
+         GLSL("color.br = color.br - color.gg;                       \n"
+              "color.br *= mix(vec2(1.0/1.5816, 1.0/0.9936),         \n"
+              "                vec2(1.0/1.9404, 1.0/1.7184),         \n"
+-             "                lessThanEqual(color.br, vec2(0.0)));  \n");
++             "                vec2(lessThanEqual(color.br, vec2(0.0))));  \n");
+         break;
+ 
+     case PL_COLOR_SYSTEM_BT_2100_PQ:;
+@@ -607,13 +607,13 @@ void pl_shader_encode_color_ex(pl_shader sh, const struct pl_color_encode_args *
+         GLSL("color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
+              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
+              "                    + vec3(%f),                                   \n"
+-             "                lessThan(vec3(0.5), color.rgb));                  \n"
++             "                vec3(lessThan(vec3(0.5), color.rgb)));                  \n"
+              "color.rgb = mat3(0.412109, 0.166748, 0.024170,                    \n"
+              "                 0.523925, 0.720459, 0.075440,                    \n"
+              "                 0.063965, 0.112793, 0.900394) * color.rgb;       \n"
+              "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+-             "                lessThan(vec3(1.0), color.rgb));                  \n",
++             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n",
+              HLG_C, HLG_A, HLG_B,
+              HLG_A, HLG_B, HLG_C);
+         break;
+@@ -716,7 +716,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix(color.rgb * vec3(1.0/12.92),               \n"
+              "                pow((color.rgb + vec3(0.055))/vec3(1.055), \n"
+              "                    vec3(2.4)),                            \n"
+-             "                lessThan(vec3(0.04045), color.rgb));       \n");
++             "                vec3(lessThan(vec3(0.04045), color.rgb)));       \n");
+         goto scale_out;
+     case PL_COLOR_TRC_BT_1886: {
+         const float lb = powf(csp_min, 1/2.4f);
+@@ -749,7 +749,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+     case PL_COLOR_TRC_PRO_PHOTO:
+         GLSL("color.rgb = mix(color.rgb * vec3(1.0/16.0),              \n"
+              "                pow(color.rgb, vec3(1.8)),               \n"
+-             "                lessThan(vec3(0.03125), color.rgb));     \n");
++             "                vec3(lessThan(vec3(0.03125), color.rgb)));     \n");
+         goto scale_out;
+     case PL_COLOR_TRC_ST428:
+         GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
+@@ -772,7 +772,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+              "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,        \n"
+              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))\n"
+              "                    + vec3(%f),                           \n"
+-             "                lessThan(vec3(0.5), color.rgb));          \n",
++             "                vec3(lessThan(vec3(0.5), color.rgb)));          \n",
+              SH_FLOAT(1 - b), SH_FLOAT(b),
+              HLG_C, HLG_A, HLG_B);
+         // OOTF
+@@ -787,7 +787,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix((color.rgb - vec3(0.125)) * vec3(1.0/5.6), \n"
+              "    pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
+              "              - vec3(%f),                                  \n"
+-             "    lessThanEqual(vec3(0.181), color.rgb));                \n",
++             "    vec3(lessThanEqual(vec3(0.181), color.rgb)));                \n",
+              VLOG_D, VLOG_C, VLOG_B);
+         return;
+     case PL_COLOR_TRC_S_LOG1:
+@@ -799,7 +799,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix((color.rgb - vec3(%f)) * vec3(1.0/%f),      \n"
+              "    (pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
+              "              - vec3(%f)) * vec3(1.0/%f),                   \n"
+-             "    lessThanEqual(vec3(%f), color.rgb));                    \n",
++             "    vec3(lessThanEqual(vec3(%f), color.rgb)));                    \n",
+              SLOG_Q, SLOG_P, SLOG_C, SLOG_A, SLOG_B, SLOG_K2, SLOG_Q);
+         return;
+     case PL_COLOR_TRC_SCRGB:
+@@ -857,7 +857,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix(color.rgb * vec3(12.92),                        \n"
+              "                vec3(1.055) * pow(color.rgb, vec3(1.0/2.4))     \n"
+              "                    - vec3(0.055),                              \n"
+-             "                lessThanEqual(vec3(0.0031308), color.rgb));     \n");
++             "                vec3(lessThanEqual(vec3(0.0031308), color.rgb)));     \n");
+         return;
+     case PL_COLOR_TRC_BT_1886: {
+         const float lb = powf(csp_min, 1/2.4f);
+@@ -893,7 +893,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
+     case PL_COLOR_TRC_PRO_PHOTO:
+         GLSL("color.rgb = mix(color.rgb * vec3(16.0),                        \n"
+              "                pow(color.rgb, vec3(1.0/1.8)),                 \n"
+-             "                lessThanEqual(vec3(0.001953), color.rgb));     \n");
++             "                vec3(lessThanEqual(vec3(0.001953), color.rgb)));     \n");
+         return;
+     case PL_COLOR_TRC_PQ:
+         GLSL("color.rgb *= vec3(1.0/%f);                         \n"
+@@ -915,7 +915,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
+         // OETF
+         GLSL("color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
+              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
+-             "                lessThan(vec3(1.0), color.rgb));                  \n"
++             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n"
+              "color.rgb = "$" * color.rgb + vec3("$");                          \n",
+              HLG_A, HLG_B, HLG_C,
+              SH_FLOAT(1 / (1 - b)), SH_FLOAT(-b / (1 - b)));
+@@ -925,7 +925,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix(vec3(5.6) * color.rgb + vec3(0.125),       \n"
+              "                vec3(%f) * log(color.rgb + vec3(%f))       \n"
+              "                    + vec3(%f),                            \n"
+-             "                lessThanEqual(vec3(0.01), color.rgb));     \n",
++             "                vec3(lessThanEqual(vec3(0.01), color.rgb)));     \n",
+              VLOG_C / M_LN10, VLOG_B, VLOG_D);
+         return;
+     case PL_COLOR_TRC_S_LOG1:
+@@ -936,7 +936,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
+         GLSL("color.rgb = mix(vec3(%f) * color.rgb + vec3(%f),                \n"
+              "                vec3(%f) * log(vec3(%f) * color.rgb + vec3(%f)) \n"
+              "                    + vec3(%f),                                 \n"
+-             "                lessThanEqual(vec3(0.0), color.rgb));           \n",
++             "                vec3(lessThanEqual(vec3(0.0), color.rgb)));           \n",
+              SLOG_P, SLOG_Q, SLOG_A / M_LN10, SLOG_K2, SLOG_B, SLOG_C);
+         return;
+     case PL_COLOR_TRC_SCRGB:
+@@ -2278,6 +2278,11 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
          }
  
          bool need_recovery = tone.input_max >= tone.output_max;
@@ -1080,11 +1458,11 @@ index 475af5ab..29b0d977 100644
 +            PL_DEBUG(sh, "GLSL < 130: contrast recovery unavailable, skipping");
 +            need_recovery = false;
 +        }
-         if (need_recovery && params->contrast_recovery && args->feature_map) {
-             ident_t pos, pt;
-             ident_t lowres = sh_bind(sh, args->feature_map, PL_TEX_ADDRESS_CLAMP,
+         // Tone application in the cone (LMS) stage of the IPT model. The
+         // curve is evaluated per cone channel, and the resulting cone
+         // ratios are blended between the source's (chromaticity
 diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
-index 4ef08178..4af70c27 100644
+index fde6dcda..b2b00352 100644
 --- a/src/shaders/custom_mpv.c
 +++ b/src/shaders/custom_mpv.c
 @@ -1153,7 +1153,17 @@ static bool bind_pass_tex(pl_shader sh, pl_str name,
@@ -1107,7 +1485,7 @@ index 4ef08178..4af70c27 100644
  
      float off[2] = { ptex->rect.x0, ptex->rect.y0 };
 diff --git a/src/shaders/deinterlacing.c b/src/shaders/deinterlacing.c
-index 27b285e2..3ee25fdd 100644
+index c439a533..cc8f57de 100644
 --- a/src/shaders/deinterlacing.c
 +++ b/src/shaders/deinterlacing.c
 @@ -27,6 +27,12 @@ void pl_shader_deinterlace(pl_shader sh, const struct pl_deinterlace_source *src
@@ -1124,10 +1502,10 @@ index 27b285e2..3ee25fdd 100644
      if (!sh_require(sh, PL_SHADER_SIG_NONE, texparams->w, texparams->h))
          return;
 diff --git a/src/shaders/dithering.c b/src/shaders/dithering.c
-index 4485d110..df6ca580 100644
+index c1d511d4..27b8448f 100644
 --- a/src/shaders/dithering.c
 +++ b/src/shaders/dithering.c
-@@ -165,11 +165,23 @@ void pl_shader_dither(pl_shader sh, int new_depth,
+@@ -173,11 +173,23 @@ void sh_dither(pl_shader sh, int new_depth, float steps,
      goto done;
  
  fallback:
@@ -1152,8 +1530,26 @@ index 4485d110..df6ca580 100644
      int size = 0;
      if (lut) {
          size = lut_size;
+@@ -251,7 +263,7 @@ done: ;
+ 
+     // Don't let the dither pattern lift true black off zero. Clamp small noise
+     // near zero, which is likely produced by floating point inaccuracies.
+-    GLSL("color = mix(color, vec4(0.0), lessThan(abs(color), vec4(1e-5))); \n");
++    GLSL("color = mix(color, vec4(0.0), vec4(lessThan(abs(color), vec4(1e-5)))); \n");
+ 
+     const float gamma = approx_gamma(params->transfer);
+     if (gamma != 1.0f && new_depth <= 4) {
+@@ -278,7 +290,7 @@ done: ;
+         }
+ 
+         // Mix in the correct ratio corresponding to the offset and bias
+-        GLSL("color = mix(low, high, greaterThan(offset, vec4(bias))); \n");
++        GLSL("color = mix(low, high, vec4(greaterThan(offset, vec4(bias)))); \n");
+     } else {
+         // Approximate each gamma segment as a straight line, this simplifies
+         // the process of dithering down to a single scale and (biased) round.
 diff --git a/src/shaders/lut.c b/src/shaders/lut.c
-index b0124fcc..6ba5684f 100644
+index f6bbfd23..2e62e122 100644
 --- a/src/shaders/lut.c
 +++ b/src/shaders/lut.c
 @@ -435,7 +435,10 @@ next_dim: ; // `continue` out of the inner loop
@@ -1168,8 +1564,25 @@ index b0124fcc..6ba5684f 100644
      bool can_literal = sh_glsl(sh).version > 110; // needed for literal arrays
      can_literal &= size <= SH_LUT_MAX_LITERAL_HARD && !params->dynamic;
  
+@@ -815,6 +818,16 @@ next_dim: ; // `continue` out of the inner loop
+ 
+ error:
+     lut->error = true;
++    // Record the parameters of the failed attempt, so the `update` check
++    // above suppresses re-attempting (and re-logging the error) on every
++    // subsequent invocation with unchanged parameters
++    lut->vartype = vartype;
++    lut->fmt = params->fmt;
++    lut->width = params->width;
++    lut->height = params->height;
++    lut->depth = params->depth;
++    lut->comps = params->comps;
++    lut->signature = params->signature;
+     pl_cache_obj_free(&obj);
+     return NULL_IDENT;
+ }
 diff --git a/src/shaders/sampling.c b/src/shaders/sampling.c
-index 55e966d4..edcb1dfa 100644
+index d761c566..2394af4b 100644
 --- a/src/shaders/sampling.c
 +++ b/src/shaders/sampling.c
 @@ -317,6 +317,12 @@ bool pl_shader_sample_bilinear(pl_shader sh, const struct pl_sample_src *src)
@@ -1250,7 +1663,7 @@ index 55e966d4..edcb1dfa 100644
      pl_gpu gpu = SH_GPU(sh);
      pl_assert(gpu);
  
-@@ -1112,6 +1148,15 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
+@@ -1118,6 +1154,15 @@ void pl_shader_distort(pl_shader sh, pl_tex src_tex, int out_w, int out_h,
      if (!sh_require(sh, PL_SHADER_SIG_NONE, out_w, out_h))
          return;
  
@@ -1266,309 +1679,3 @@ index 55e966d4..edcb1dfa 100644
      const int src_w = src_tex->params.w, src_h = src_tex->params.h;
      float rx = 1.0f, ry = 1.0f;
      if (src_w > src_h) {
-
-
-diff --git a/src/gpu.c b/src/gpu.c
-index 130979f..cba23ef 100644
---- a/src/gpu.c
-+++ b/src/gpu.c
-@@ -303,6 +303,11 @@ bool pl_tex_recreate(pl_gpu gpu, pl_tex *tex, const struct pl_tex_params *params
-         return true;
-     }
- 
-+    if (!params->format) {
-+        PL_ERR(gpu, "pl_tex_recreate: no texture format specified!");
-+        return false;
-+    }
-+
-     PL_DEBUG(gpu, "(Re)creating %dx%dx%d texture with format %s: %s",
-              params->w, params->h, params->d, params->format->name,
-              PL_DEF(params->debug_tag, "unknown"));
-@@ -315,7 +320,13 @@ bool pl_tex_recreate(pl_gpu gpu, pl_tex *tex, const struct pl_tex_params *params
- 
- void pl_tex_clear_ex(pl_gpu gpu, pl_tex dst, const union pl_clear_color color)
- {
--    require(dst->params.blit_dst);
-+    // Also accept renderable targets: the GL backend clears via glClear()
-+    // on a bound FBO, which needs no blit support. Required for the wrapped
-+    // default framebuffer on GL 2.x, where gl_fb_query() cannot query the
-+    // format (no ARB_framebuffer_object) and thus never sets
-+    // PL_FMT_CAP_BLITTABLE, leaving blit_dst unset on the swapchain -- which
-+    // made every letterbox clear fail (garbage bars around the video).
-+    require(dst->params.blit_dst || dst->params.renderable);
- 
-     const struct pl_gpu_fns *impl = PL_PRIV(gpu);
-     if (impl->tex_invalidate)
-diff --git a/src/opengl/formats.c b/src/opengl/formats.c
-index 7419b81..9d4a78e 100644
---- a/src/opengl/formats.c
-+++ b/src/opengl/formats.c
-@@ -545,6 +545,9 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
-         } else {
-             // Fallback for GL 2.1 without full extension support
-             DO_FORMATS(formats_legacy_gl2);
-+            // GL_BGRA as external format is core since GL 1.2; internal
-+            // format is plain GL_RGBA8. Needed for mpv image subs/OSD.
-+            DO_FORMATS(formats_bgra8);
-             if (has_texture_rg) {
-                 DO_FORMATS(formats_norm8_rg);
-             } else {
-@@ -595,6 +598,9 @@ bool gl_setup_formats(struct pl_gpu_t *gpu)
-         bool has_texture_rg = pl_opengl_has_ext(p->gl, "GL_ARB_texture_rg");
-         PL_INFO(gpu, "Using GL 2.0 format path, has_texture_rg=%d", has_texture_rg);
-         DO_FORMATS(formats_legacy_gl2);
-+        // GL_BGRA as external format is core since GL 1.2; internal
-+        // format is plain GL_RGBA8. Needed for mpv image subs/OSD.
-+        DO_FORMATS(formats_bgra8);
-         if (has_texture_rg) {
-             // Modern single/dual-component formats (r8/rg8 only, not rgb8/rgba8)
-             DO_FORMATS(formats_norm8_rg);
-diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
-index 29b0d97..31e9648 100644
---- a/src/shaders/colorspace.c
-+++ b/src/shaders/colorspace.c
-@@ -323,7 +323,7 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
-         GLSL("// constant luminance conversion                              \n"
-              "color.br = color.br * mix(vec2(1.5816, 0.9936),               \n"
-              "                          vec2(1.9404, 1.7184),               \n"
--             "                          lessThanEqual(color.br, vec2(0.0))) \n"
-+             "                          vec2(lessThanEqual(color.br, vec2(0.0)))) \n"
-              "           + color.gg;                                        \n");
-         // Expand channels to camera-linear light. This shader currently just
-         // assumes everything uses the BT.2020 12-bit gamma function, since the
-@@ -332,7 +332,7 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
-         GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
-              "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
-              "                    vec3(1.0/0.45)),                             \n"
--             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
-+             "                vec3(lessThanEqual(vec3(0.08145), color.rgb)));        \n");
-         // Calculate the green channel from the expanded RYcB, and recompress to G'
-         // The BT.2020 specification says Yc = 0.2627*R + 0.6780*G + 0.0593*B
-         GLSL("color.g = (lin.g - 0.2627*lin.r - 0.0593*lin.b)*1.0/0.6780;   \n"
-@@ -376,7 +376,7 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
-              "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
-              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
-              "                    + vec3(%f),                                   \n"
--             "                lessThan(vec3(0.5), color.rgb));                  \n"
-+             "                vec3(lessThan(vec3(0.5), color.rgb)));                  \n"
-              // LMS matrix
-              "color.rgb = mat3( 3.43661, -0.79133, -0.0259499,                  \n"
-              "                 -2.50645,  1.98360, -0.0989137,                  \n"
-@@ -384,7 +384,7 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
-             // HLG OETF
-              "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
-              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
--             "                lessThan(vec3(1.0), color.rgb));                  \n",
-+             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n",
-              HLG_C, HLG_A, HLG_B,
-              HLG_A, HLG_B, HLG_C);
-         break;
-@@ -477,7 +477,7 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
-         GLSL("vec3 lin = mix(color.rgb * vec3(1.0/4.5),                        \n"
-              "                pow((color.rgb + vec3(0.0993))*vec3(1.0/1.0993), \n"
-              "                    vec3(1.0/0.45)),                             \n"
--             "                lessThanEqual(vec3(0.08145), color.rgb));        \n");
-+             "                vec3(lessThanEqual(vec3(0.08145), color.rgb)));        \n");
- 
-         // Compute Yc from RGB and compress to R'Y'cB'
-         GLSL("color.g = dot(vec3(0.2627, 0.6780, 0.0593), lin);     \n"
-@@ -489,7 +489,7 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
-         GLSL("color.br = color.br - color.gg;                       \n"
-              "color.br *= mix(vec2(1.0/1.5816, 1.0/0.9936),         \n"
-              "                vec2(1.0/1.9404, 1.0/1.7184),         \n"
--             "                lessThanEqual(color.br, vec2(0.0)));  \n");
-+             "                vec2(lessThanEqual(color.br, vec2(0.0))));  \n");
-         break;
- 
-     case PL_COLOR_SYSTEM_BT_2100_PQ:;
-@@ -512,13 +512,13 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
-         GLSL("color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,                \n"
-              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))        \n"
-              "                    + vec3(%f),                                   \n"
--             "                lessThan(vec3(0.5), color.rgb));                  \n"
-+             "                vec3(lessThan(vec3(0.5), color.rgb)));                  \n"
-              "color.rgb = mat3(0.412109, 0.166748, 0.024170,                    \n"
-              "                 0.523925, 0.720459, 0.075440,                    \n"
-              "                 0.063965, 0.112793, 0.900394) * color.rgb;       \n"
-              "color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
-              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
--             "                lessThan(vec3(1.0), color.rgb));                  \n",
-+             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n",
-              HLG_C, HLG_A, HLG_B,
-              HLG_A, HLG_B, HLG_C);
-         break;
-@@ -616,7 +616,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix(color.rgb * vec3(1.0/12.92),               \n"
-              "                pow((color.rgb + vec3(0.055))/vec3(1.055), \n"
-              "                    vec3(2.4)),                            \n"
--             "                lessThan(vec3(0.04045), color.rgb));       \n");
-+             "                vec3(lessThan(vec3(0.04045), color.rgb)));       \n");
-         goto scale_out;
-     case PL_COLOR_TRC_BT_1886: {
-         const float lb = powf(csp_min, 1/2.4f);
-@@ -649,7 +649,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
-     case PL_COLOR_TRC_PRO_PHOTO:
-         GLSL("color.rgb = mix(color.rgb * vec3(1.0/16.0),              \n"
-              "                pow(color.rgb, vec3(1.8)),               \n"
--             "                lessThan(vec3(0.03125), color.rgb));     \n");
-+             "                vec3(lessThan(vec3(0.03125), color.rgb)));     \n");
-         goto scale_out;
-     case PL_COLOR_TRC_ST428:
-         GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
-@@ -672,7 +672,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
-              "color.rgb = mix(vec3(4.0) * color.rgb * color.rgb,        \n"
-              "                exp((color.rgb - vec3(%f)) * vec3(1.0/%f))\n"
-              "                    + vec3(%f),                           \n"
--             "                lessThan(vec3(0.5), color.rgb));          \n",
-+             "                vec3(lessThan(vec3(0.5), color.rgb)));          \n",
-              SH_FLOAT(1 - b), SH_FLOAT(b),
-              HLG_C, HLG_A, HLG_B);
-         // OOTF
-@@ -685,7 +685,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix((color.rgb - vec3(0.125)) * vec3(1.0/5.6), \n"
-              "    pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
-              "              - vec3(%f),                                  \n"
--             "    lessThanEqual(vec3(0.181), color.rgb));                \n",
-+             "    vec3(lessThanEqual(vec3(0.181), color.rgb)));                \n",
-              VLOG_D, VLOG_C, VLOG_B);
-         return;
-     case PL_COLOR_TRC_S_LOG1:
-@@ -697,7 +697,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix((color.rgb - vec3(%f)) * vec3(1.0/%f),      \n"
-              "    (pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
-              "              - vec3(%f)) * vec3(1.0/%f),                   \n"
--             "    lessThanEqual(vec3(%f), color.rgb));                    \n",
-+             "    vec3(lessThanEqual(vec3(%f), color.rgb)));                    \n",
-              SLOG_Q, SLOG_P, SLOG_C, SLOG_A, SLOG_B, SLOG_K2, SLOG_Q);
-         return;
-     case PL_COLOR_TRC_LINEAR:
-@@ -748,7 +748,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix(color.rgb * vec3(12.92),                        \n"
-              "                vec3(1.055) * pow(color.rgb, vec3(1.0/2.4))     \n"
-              "                    - vec3(0.055),                              \n"
--             "                lessThanEqual(vec3(0.0031308), color.rgb));     \n");
-+             "                vec3(lessThanEqual(vec3(0.0031308), color.rgb)));     \n");
-         return;
-     case PL_COLOR_TRC_BT_1886: {
-         const float lb = powf(csp_min, 1/2.4f);
-@@ -784,7 +784,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
-     case PL_COLOR_TRC_PRO_PHOTO:
-         GLSL("color.rgb = mix(color.rgb * vec3(16.0),                        \n"
-              "                pow(color.rgb, vec3(1.0/1.8)),                 \n"
--             "                lessThanEqual(vec3(0.001953), color.rgb));     \n");
-+             "                vec3(lessThanEqual(vec3(0.001953), color.rgb)));     \n");
-         return;
-     case PL_COLOR_TRC_PQ:
-         GLSL("color.rgb *= vec3(1.0/%f);                         \n"
-@@ -804,7 +804,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
-         // OETF
-         GLSL("color.rgb = mix(vec3(0.5) * sqrt(color.rgb),                      \n"
-              "                vec3(%f) * log(color.rgb - vec3(%f)) + vec3(%f),  \n"
--             "                lessThan(vec3(1.0), color.rgb));                  \n"
-+             "                vec3(lessThan(vec3(1.0), color.rgb)));                  \n"
-              "color.rgb = "$" * color.rgb + vec3("$");                          \n",
-              HLG_A, HLG_B, HLG_C,
-              SH_FLOAT(1 / (1 - b)), SH_FLOAT(-b / (1 - b)));
-@@ -814,7 +814,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix(vec3(5.6) * color.rgb + vec3(0.125),       \n"
-              "                vec3(%f) * log(color.rgb + vec3(%f))       \n"
-              "                    + vec3(%f),                            \n"
--             "                lessThanEqual(vec3(0.01), color.rgb));     \n",
-+             "                vec3(lessThanEqual(vec3(0.01), color.rgb)));     \n",
-              VLOG_C / M_LN10, VLOG_B, VLOG_D);
-         return;
-     case PL_COLOR_TRC_S_LOG1:
-@@ -825,7 +825,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
-         GLSL("color.rgb = mix(vec3(%f) * color.rgb + vec3(%f),                \n"
-              "                vec3(%f) * log(vec3(%f) * color.rgb + vec3(%f)) \n"
-              "                    + vec3(%f),                                 \n"
--             "                lessThanEqual(vec3(0.0), color.rgb));           \n",
-+             "                vec3(lessThanEqual(vec3(0.0), color.rgb)));           \n",
-              SLOG_P, SLOG_Q, SLOG_A / M_LN10, SLOG_K2, SLOG_B, SLOG_C);
-         return;
-     case PL_COLOR_TRC_LINEAR:
-diff --git a/src/shaders/dithering.c b/src/shaders/dithering.c
-index df6ca58..120ba9b 100644
---- a/src/shaders/dithering.c
-+++ b/src/shaders/dithering.c
-@@ -273,7 +273,7 @@ done: ;
-         }
- 
-         // Mix in the correct ratio corresponding to the offset and bias
--        GLSL("color = mix(low, high, greaterThan(offset, vec4(bias))); \n");
-+        GLSL("color = mix(low, high, vec4(greaterThan(offset, vec4(bias)))); \n");
-     } else {
-         // Approximate each gamma segment as a straight line, this simplifies
-         // the process of dithering down to a single scale and (biased) round.
-diff --git a/src/shaders/lut.c b/src/shaders/lut.c
-index 6ba5684..a6ddf15 100644
---- a/src/shaders/lut.c
-+++ b/src/shaders/lut.c
-@@ -818,6 +818,16 @@ next_dim: ; // `continue` out of the inner loop
- 
- error:
-     lut->error = true;
-+    // Record the parameters of the failed attempt, so the `update` check
-+    // above suppresses re-attempting (and re-logging the error) on every
-+    // subsequent invocation with unchanged parameters
-+    lut->vartype = vartype;
-+    lut->fmt = params->fmt;
-+    lut->width = params->width;
-+    lut->height = params->height;
-+    lut->depth = params->depth;
-+    lut->comps = params->comps;
-+    lut->signature = params->signature;
-     pl_cache_obj_free(&obj);
-     return NULL_IDENT;
- }
-
-
-Add 16-bit luminance texture formats to the legacy GL2 fallback paths.
-
-Fixes broken colors (green image, orange blow-outs) with 10-bit video
-(HEVC Main 10 etc.) on vo=gpu-next / big-endian PowerPC.
-
-Without any 16-bit 1/2-component texture format, mpv's vo_gpu_next
-rejects every >8-bit YUV format (pl_plane_find_fmt finds no fmt with
-texel_size 2 / host_bits {16}), so the player converts the frame with
-libswscale first (FFmpeg's format scoring picks rgb48). That conversion
-path mangles the frame on big-endian hosts. mpv's vo=gpu is unaffected
-because its own ra_gl GL2 table has "l16"/"la16" (GL_LUMINANCE16) and
-uploads 10-bit planes natively.
-
-This gives vo_gpu_next the same native path: GL_UNSIGNED_SHORT client
-data is interpreted in host byte order, so big-endian planes upload
-correctly with no CPU conversion (also a sizeable perf win for 4K
-10-bit on G4/G5). Old GPUs may internally store these at 8 bits per
-component; that costs precision only, not correctness — identical to
-what vo=gpu already does on the same driver.
-
---- a/src/opengl/formats.c	2026-08-04 18:42:52.560327974 +0000
-+++ b/src/opengl/formats.c	2026-08-04 18:20:17.871444669 +0000
-@@ -27,6 +27,12 @@
- #ifndef GL_LUMINANCE_ALPHA
- #define GL_LUMINANCE_ALPHA 0x190A
- #endif
-+#ifndef GL_LUMINANCE16
-+#define GL_LUMINANCE16 0x8042
-+#endif
-+#ifndef GL_LUMINANCE16_ALPHA16
-+#define GL_LUMINANCE16_ALPHA16 0x8048
-+#endif
- 
- #ifdef PL_HAVE_UNIX
- static bool supported_fourcc(struct pl_gl *p, EGLint fourcc)
-@@ -248,6 +254,13 @@
-     // Note: NO 'F' flag - these cannot be FBO attachments
-     {GL_LUMINANCE,      GL_LUMINANCE,      GL_UNSIGNED_BYTE,  FMT("luminance",       8, UNORM, S|L|V)},
-     {GL_LUMINANCE_ALPHA,GL_LUMINANCE_ALPHA,GL_UNSIGNED_BYTE,  FMT("luminance_alpha", 8, UNORM, S|L|V)},
-+    // 16-bit variants: needed for native upload of >8-bit video planes
-+    // (yuv420p10 = HEVC Main 10, etc.). Without them mpv vo_gpu_next
-+    // rejects 10-bit YUV and falls back to a libswscale conversion that
-+    // is broken on big-endian hosts. GL_UNSIGNED_SHORT is host-byte-order,
-+    // and this is the same internal format mpv vo_gpu uses ("l16"/"la16").
-+    {GL_LUMINANCE16,    GL_LUMINANCE,      GL_UNSIGNED_SHORT, FMT("luminance16",       16, UNORM, S|L|V)},
-+    {GL_LUMINANCE16_ALPHA16,GL_LUMINANCE_ALPHA,GL_UNSIGNED_SHORT, FMT("luminance_alpha16", 16, UNORM, S|L|V)},
- };
- 
- // GLES2 legacy formats
