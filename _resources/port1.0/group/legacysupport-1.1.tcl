@@ -179,7 +179,7 @@ proc legacysupport::add_legacysupport {} {
         set ls_cache_ldflags  "[join [legacysupport::get_library_link_flags]]"
         set ls_cache_cppflags "[legacysupport::get_cpp_flags]"
 
-        # Flags for using MP libcxx
+        # TODO: this should use our libcxx:
         if { [option legacysupport.use_mp_libcxx] && ${configure.cxx_stdlib} eq "libc++" } {
             if { [string match macports-clang-* ${configure.compiler}] } {
                 legacysupport::add_once depends_lib append port:macports-libcxx
@@ -187,8 +187,7 @@ proc legacysupport::add_legacysupport {} {
                 append ls_cache_ldflags  " -L${prefix}/lib/libcxx"
                 append ls_cache_cppflags " -nostdinc++ -isystem${prefix}/include/libcxx/v1"
             } elseif { [string match macports-gcc-* ${configure.compiler}] } {
-                # libcxx-powerpc has filesystem in a separate lib
-                append ls_cache_ldflags  " -lc++fs"
+                # TODO: handle gcc case.
             }
         }
 
