@@ -1,0 +1,929 @@
+From 3aa88725e4b73cd2c96fabc0fe021568ee6e7260 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 17:37:09 +0000
+Subject: [PATCH 06/60] ppc32: 32-bit instruction selector for the
+ Turboshaft-only backend
+
+13.6's instruction-selector-ppc.cc is no longer the template<Adapter>
+file the 12.4 series patched: the Turbofan adapter is gone, the file is
+Turboshaft-only (4016 -> 2912 lines) and every one of the 31
+V8_TARGET_ARCH_PPC64 blocks the 12.4 tree carried went with it, so the
+12.4 patches that complete the 32-bit selector (0005 "complete the 32-bit
+guards in instruction selector and code generator", 0006 "restore the
+pair-op visitors", 0041 "guard the turboshaft Word64-compare sites", 0050
+"table switch without the 64-bit index zero-extension" and the selector
+hunk of 0014 "do not advertise round/popcnt machine ops") have nothing
+left to apply to.  This commit re-derives all of that against the 13.6
+file (reference: the pristine-12.4 blocks, `git diff cmake-12.4~7
+ppc-darwin-12.4` on this file, and ia32's 13.6 pair-op visitors for the
+Turboshaft spelling):
+
+- 59 Word64/Int64/Uint64 visitors and their helpers (VisitTryTruncateDouble,
+  IsContiguousMask64, VisitWord64Compare, the four Word64Atomic* visitors,
+  the VISIT_ATOMIC_BINOP64 half of the atomic binop macro, the I64x2
+  splat/lane visitors) sit under V8_TARGET_ARCH_PPC64: on a 32-bit target
+  the generic selector defines every one of them (instruction-selector.cc,
+  V8_TARGET_ARCH_32_BIT and the 64-bit-atomics block), and node/gnmirror-
+  style cross-check: all 64 names of those generic lists are now guarded.
+- the Int32Pair{Add,Sub,Mul} and Word32Pair{Shl,Shr,Sar} visitors (the
+  generic selector marks them unsupported only under V8_TARGET_ARCH_64_BIT,
+  so a 32-bit backend must define them) in Turboshaft form: OptionalOpIndex
+  projections, CanBeImmediate(kShift64Imm) for the shift count.  The pair
+  opcodes they select are still in instruction-codes-ppc.h and the
+  scheduler, and the previous commit restored their code generation.
+- VisitBitcastWord32PairToFloat64 selects kPPC_DoubleConstruct on 32-bit
+  (13.6's kPPC_DoubleFromWord32Pair assembles both words in one 64-bit GPR;
+  its code-generator case is now 64-bit-only as well).
+- SelectLoadOpcode (both overloads) and VisitStoreCommon: uncompressed
+  tagged values are pointer-sized (LoadWordU32 / StoreWord32), Int64 /
+  Uint64 / kWord64 are unreachable, the write-barrier path's extra
+  4-byte-alignment test is 64-bit-only (stw has no DS-form constraint).
+- VisitWordCompareZero's Word64 comparison and Word64Sub/BitwiseAnd
+  fusions, VisitSwitch's Uint32ToUint64 index extension and the
+  round/popcnt entries of SupportedMachineOperatorFlags are 64-bit-only,
+  exactly as the 12.4 series left them.
+
+Not carried here: the Float32Sqrt/Float64Sqrt routing to libm (depends on
+the kIeee754Float64Sqrt opcode that 0030 adds; done when 0030 is rebased).
+---
+ .../backend/ppc/code-generator-ppc.cc         |   2 +
+ .../backend/ppc/instruction-selector-ppc.cc   | 285 +++++++++++++++++-
+ 2 files changed, 279 insertions(+), 8 deletions(-)
+
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 939769c..537f136 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -2033,12 +2033,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ MovDoubleHighToInt(i.OutputRegister(), i.InputDoubleRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_DoubleFromWord32Pair:
+       __ clrldi(kScratchReg, i.InputRegister(1), Operand(32));
+       __ ShiftLeftU64(i.TempRegister(0), i.InputRegister(0), Operand(32));
+       __ OrU64(i.TempRegister(0), i.TempRegister(0), kScratchReg);
+       __ MovInt64ToDouble(i.OutputDoubleRegister(), i.TempRegister(0));
+       break;
++#endif
+     case kPPC_DoubleInsertLowWord32:
+       __ InsertDoubleLow(i.OutputDoubleRegister(), i.InputRegister(1), r0);
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+diff --git a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+index 7076bcd..383bd50 100644
+--- a/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
++++ b/v8/src/compiler/backend/ppc/instruction-selector-ppc.cc
+@@ -114,6 +114,7 @@ void VisitRRO(InstructionSelectorT* selector, InstructionCode opcode,
+                  g.UseOperand(selector->input_at(node, 1), operand_mode));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void VisitTryTruncateDouble(InstructionSelectorT* selector,
+                             InstructionCode opcode, OpIndex node) {
+   PPCOperandGeneratorT g(selector);
+@@ -129,6 +130,7 @@ void VisitTryTruncateDouble(InstructionSelectorT* selector,
+ 
+   selector->Emit(opcode, output_count, outputs, 1, inputs);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ // Shared routine for multiple binary operations.
+ void VisitBinop(InstructionSelectorT* selector, OpIndex node,
+@@ -217,9 +219,13 @@ ArchOpcode SelectLoadOpcode(MemoryRepresentation loaded_rep,
+       return kPPC_LoadWordU32;
+     case MemoryRepresentation::Int64():
+     case MemoryRepresentation::Uint64():
++#if V8_TARGET_ARCH_PPC64
+       DCHECK_EQ(result_rep, RegisterRepresentation::Word64());
+       if (*mode != kInt34Imm) *mode = kInt16Imm_4ByteAligned;
+       return kPPC_LoadWord64;
++#else
++      UNREACHABLE();
++#endif
+     case MemoryRepresentation::Float16():
+       UNIMPLEMENTED();
+     case MemoryRepresentation::Float32():
+@@ -250,15 +256,25 @@ ArchOpcode SelectLoadOpcode(MemoryRepresentation loaded_rep,
+     case MemoryRepresentation::TaggedPointer():
+     case MemoryRepresentation::TaggedSigned():
+       DCHECK_EQ(result_rep, RegisterRepresentation::Tagged());
++#if V8_TARGET_ARCH_PPC64
+       if (*mode != kInt34Imm) *mode = kInt16Imm_4ByteAligned;
+       return kPPC_LoadWord64;
++#else
++      // Uncompressed tagged values are pointer-sized.
++      return kPPC_LoadWordU32;
++#endif
+ #endif
+     case MemoryRepresentation::AnyUncompressedTagged():
+     case MemoryRepresentation::UncompressedTaggedPointer():
+     case MemoryRepresentation::UncompressedTaggedSigned():
+       DCHECK_EQ(result_rep, RegisterRepresentation::Tagged());
++#if V8_TARGET_ARCH_PPC64
+       if (*mode != kInt34Imm) *mode = kInt16Imm_4ByteAligned;
+       return kPPC_LoadWord64;
++#else
++      // Uncompressed tagged values are pointer-sized.
++      return kPPC_LoadWordU32;
++#endif
+     case MemoryRepresentation::SandboxedPointer():
+       return kPPC_LoadDecodeSandboxedPointer;
+     case MemoryRepresentation::Simd128():
+@@ -313,11 +329,20 @@ ArchOpcode SelectLoadOpcode(LoadRepresentation load_rep, ImmediateMode* mode) {
+ #else
+       case MachineRepresentation::kTaggedSigned:   // Fall through.
+       case MachineRepresentation::kTaggedPointer:  // Fall through.
+-      case MachineRepresentation::kTagged:         // Fall through.
++      case MachineRepresentation::kTagged:
++#if !V8_TARGET_ARCH_PPC64
++        // Uncompressed tagged values are pointer-sized.
++        return kPPC_LoadWordU32;
++#endif
++        // Fall through on 64-bit.
+ #endif
+       case MachineRepresentation::kWord64:
++#if V8_TARGET_ARCH_PPC64
+         if (*mode != kInt34Imm) *mode = kInt16Imm_4ByteAligned;
+         return kPPC_LoadWord64;
++#else
++        UNREACHABLE();
++#endif
+       case MachineRepresentation::kSimd128:
+         // Vectors do not support MRI mode, only MRR is available.
+         *mode = kNoImmediate;
+@@ -413,7 +438,9 @@ void VisitStoreCommon(InstructionSelectorT* selector, OpIndex node,
+     // OutOfLineRecordWrite uses the offset in an 'add' instruction as well as
+     // for the store itself, so we must check compatibility with both.
+     if (g.CanBeImmediate(offset, kInt16Imm)
++#if V8_TARGET_ARCH_PPC64
+         && g.CanBeImmediate(offset, kInt16Imm_4ByteAligned)
++#endif
+     ) {
+       inputs[input_count++] = g.UseImmediate(offset);
+       addressing_mode = kMode_MRI;
+@@ -470,6 +497,9 @@ void VisitStoreCommon(InstructionSelectorT* selector, OpIndex node,
+       }
+       case MemoryRepresentation::Int64():
+       case MemoryRepresentation::Uint64(): {
++#if !V8_TARGET_ARCH_PPC64
++        UNREACHABLE();
++#else
+         if (mode != kInt34Imm) mode = kInt16Imm_4ByteAligned;
+         opcode = kPPC_StoreWord64;
+         const Operation& reverse_op = selector->Get(value);
+@@ -479,6 +509,7 @@ void VisitStoreCommon(InstructionSelectorT* selector, OpIndex node,
+           mode = kNoImmediate;
+         }
+         break;
++#endif
+       }
+       case MemoryRepresentation::Float16():
+         UNIMPLEMENTED();
+@@ -497,8 +528,13 @@ void VisitStoreCommon(InstructionSelectorT* selector, OpIndex node,
+       case MemoryRepresentation::AnyUncompressedTagged():
+       case MemoryRepresentation::UncompressedTaggedPointer():
+       case MemoryRepresentation::UncompressedTaggedSigned():
++#if V8_TARGET_ARCH_PPC64
+         if (mode != kInt34Imm) mode = kInt16Imm_4ByteAligned;
+         opcode = kPPC_StoreWord64;
++#else
++        // Uncompressed tagged values are pointer-sized.
++        opcode = kPPC_StoreWord32;
++#endif
+         break;
+       case MemoryRepresentation::ProtectedPointer():
+         // We never store directly to protected pointers from generated code.
+@@ -621,6 +657,7 @@ static inline bool IsContiguousMask32(uint32_t value, int* mb, int* me) {
+   return true;
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ static inline bool IsContiguousMask64(uint64_t value, int* mb, int* me) {
+   int mask_width = base::bits::CountPopulation(value);
+   int mask_msb = base::bits::CountLeadingZeros64(value);
+@@ -631,6 +668,7 @@ static inline bool IsContiguousMask64(uint64_t value, int* mb, int* me) {
+   *me = mask_lsb;
+   return true;
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ // TODO(mbrandy): Absorb rotate-right into rlwinm?
+ void InstructionSelectorT::VisitWord32And(OpIndex node) {
+@@ -676,6 +714,7 @@ void InstructionSelectorT::VisitWord32And(OpIndex node) {
+ }
+ 
+ // TODO(mbrandy): Absorb rotate-right into rldic?
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64And(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+ 
+@@ -735,6 +774,7 @@ void InstructionSelectorT::VisitWord64And(OpIndex node) {
+   VisitLogical(this, node, kPPC_And, CanCover(node, bitwise_and.left()),
+                CanCover(node, bitwise_and.right()), kInt16Imm_Unsigned);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Or(OpIndex node) {
+   const WordBinopOp& op = this->Get(node).template Cast<WordBinopOp>();
+@@ -742,11 +782,13 @@ void InstructionSelectorT::VisitWord32Or(OpIndex node) {
+                CanCover(node, op.right()), kInt16Imm_Unsigned);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Or(OpIndex node) {
+   const WordBinopOp& op = this->Get(node).template Cast<WordBinopOp>();
+   VisitLogical(this, node, kPPC_Or, CanCover(node, op.left()),
+                CanCover(node, op.right()), kInt16Imm_Unsigned);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Xor(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -794,6 +836,7 @@ void InstructionSelectorT::VisitStackPointerGreaterThan(
+                        temp_count, temps, cont);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Xor(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   const WordBinopOp& bitwise_xor = this->Get(node).template Cast<WordBinopOp>();
+@@ -805,6 +848,7 @@ void InstructionSelectorT::VisitWord64Xor(OpIndex node) {
+     VisitBinop(this, node, kPPC_Xor, kInt16Imm_Unsigned);
+   }
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Shl(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -834,6 +878,7 @@ void InstructionSelectorT::VisitWord32Shl(OpIndex node) {
+   VisitRRO(this, kPPC_ShiftLeft32, node, kShift32Imm);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Shl(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   const ShiftOp& shl = this->Get(node).template Cast<ShiftOp>();
+@@ -879,6 +924,7 @@ void InstructionSelectorT::VisitWord64Shl(OpIndex node) {
+   }
+   VisitRRO(this, kPPC_ShiftLeft64, node, kShift64Imm);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Shr(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -910,6 +956,7 @@ void InstructionSelectorT::VisitWord32Shr(OpIndex node) {
+   VisitRRO(this, kPPC_ShiftRight32, node, kShift32Imm);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Shr(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   const ShiftOp& shr = this->Get(node).template Cast<ShiftOp>();
+@@ -953,6 +1000,7 @@ void InstructionSelectorT::VisitWord64Shr(OpIndex node) {
+   }
+   VisitRRO(this, kPPC_ShiftRight64, node, kShift64Imm);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Sar(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -980,6 +1028,7 @@ void InstructionSelectorT::VisitWord32Sar(OpIndex node) {
+   VisitRRO(this, kPPC_ShiftRightAlg32, node, kShift32Imm);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Sar(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   DCHECK(this->Get(node).template Cast<ShiftOp>().IsRightShift());
+@@ -1015,10 +1064,134 @@ void InstructionSelectorT::VisitWord64Sar(OpIndex node) {
+ 
+   VisitRRO(this, kPPC_ShiftRightAlg64, node, kShift64Imm);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
++
++#if !V8_TARGET_ARCH_PPC64
++// The Int32Pair / Word32Pair operations exist only on 32-bit targets (the
++// generic selector marks them unsupported under V8_TARGET_ARCH_64_BIT); the
++// pair opcodes they select are still in instruction-codes-ppc.h and the code
++// generator.  Re-derived in Turboshaft-only form from the 12.4 port.
++namespace {
++// Shared routine for multiple pair binary operations.
++void VisitPairBinop(InstructionSelectorT* selector, InstructionCode opcode,
++                    InstructionCode opcode2, OpIndex node) {
++  PPCOperandGeneratorT g(selector);
++
++  OptionalOpIndex projection1 = selector->FindProjection(node, 1);
++  if (projection1.valid()) {
++    // We use UseUniqueRegister here to avoid register sharing with the output
++    // registers.
++    InstructionOperand inputs[] = {
++        g.UseRegister(selector->input_at(node, 0)),
++        g.UseUniqueRegister(selector->input_at(node, 1)),
++        g.UseRegister(selector->input_at(node, 2)),
++        g.UseUniqueRegister(selector->input_at(node, 3))};
++
++    InstructionOperand outputs[] = {g.DefineAsRegister(node),
++                                    g.DefineAsRegister(projection1.value())};
++
++    selector->Emit(opcode, 2, outputs, 4, inputs);
++  } else {
++    // The high word of the result is not used, so we emit the standard 32 bit
++    // instruction.
++    selector->Emit(opcode2, g.DefineSameAsFirst(node),
++                   g.UseRegister(selector->input_at(node, 0)),
++                   g.UseRegister(selector->input_at(node, 2)));
++  }
++}
++}  // namespace
++
++void InstructionSelectorT::VisitInt32PairAdd(OpIndex node) {
++  VisitPairBinop(this, kPPC_AddPair, kPPC_Add32, node);
++}
++
++void InstructionSelectorT::VisitInt32PairSub(OpIndex node) {
++  VisitPairBinop(this, kPPC_SubPair, kPPC_Sub, node);
++}
++
++void InstructionSelectorT::VisitInt32PairMul(OpIndex node) {
++  PPCOperandGeneratorT g(this);
++  OptionalOpIndex projection1 = FindProjection(node, 1);
++  if (projection1.valid()) {
++    InstructionOperand inputs[] = {
++        g.UseUniqueRegister(this->input_at(node, 0)),
++        g.UseUniqueRegister(this->input_at(node, 1)),
++        g.UseUniqueRegister(this->input_at(node, 2)),
++        g.UseUniqueRegister(this->input_at(node, 3))};
++
++    InstructionOperand outputs[] = {g.DefineAsRegister(node),
++                                    g.DefineAsRegister(projection1.value())};
++
++    InstructionOperand temps[] = {g.TempRegister(), g.TempRegister()};
++
++    Emit(kPPC_MulPair, 2, outputs, 4, inputs, 2, temps);
++  } else {
++    // The high word of the result is not used, so we emit the standard 32 bit
++    // instruction.
++    Emit(kPPC_Mul32, g.DefineSameAsFirst(node),
++         g.UseRegister(this->input_at(node, 0)),
++         g.UseRegister(this->input_at(node, 2)));
++  }
++}
++
++namespace {
++// Shared routine for multiple pair shift operations.
++void VisitPairShift(InstructionSelectorT* selector, InstructionCode opcode,
++                    OpIndex node) {
++  PPCOperandGeneratorT g(selector);
++  // We use g.UseUniqueRegister here to guarantee that there is
++  // no register aliasing of input registers with output registers.
++  InstructionOperand shift_operand;
++  OpIndex shift_by = selector->input_at(node, 2);
++  if (g.CanBeImmediate(shift_by, kShift64Imm)) {
++    shift_operand = g.UseImmediate(shift_by);
++  } else {
++    shift_operand = g.UseUniqueRegister(shift_by);
++  }
++
++  InstructionOperand inputs[] = {
++      g.UseUniqueRegister(selector->input_at(node, 0)),
++      g.UseUniqueRegister(selector->input_at(node, 1)), shift_operand};
++
++  OptionalOpIndex projection1 = selector->FindProjection(node, 1);
++
++  InstructionOperand outputs[2];
++  InstructionOperand temps[1];
++  int32_t output_count = 0;
++  int32_t temp_count = 0;
++
++  outputs[output_count++] = g.DefineAsRegister(node);
++  if (projection1.valid()) {
++    outputs[output_count++] = g.DefineAsRegister(projection1.value());
++  } else {
++    temps[temp_count++] = g.TempRegister();
++  }
++
++  selector->Emit(opcode, output_count, outputs, 3, inputs, temp_count, temps);
++}
++}  // namespace
++
++void InstructionSelectorT::VisitWord32PairShl(OpIndex node) {
++  VisitPairShift(this, kPPC_ShiftLeftPair, node);
++}
++
++void InstructionSelectorT::VisitWord32PairShr(OpIndex node) {
++  VisitPairShift(this, kPPC_ShiftRightPair, node);
++}
++
++void InstructionSelectorT::VisitWord32PairSar(OpIndex node) {
++  VisitPairShift(this, kPPC_ShiftRightAlgPair, node);
++}
++#endif  // !V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Rol(OpIndex node) { UNREACHABLE(); }
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic instruction selector defines the Word64
++// visitors (instruction-selector.cc, V8_TARGET_ARCH_32_BIT); defining them
++// here as well would be a duplicate definition.
+ void InstructionSelectorT::VisitWord64Rol(OpIndex node) { UNREACHABLE(); }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ // TODO(mbrandy): Absorb logical-and into rlwinm?
+ void InstructionSelectorT::VisitWord32Ror(OpIndex node) {
+@@ -1026,9 +1199,11 @@ void InstructionSelectorT::VisitWord32Ror(OpIndex node) {
+ }
+ 
+ // TODO(mbrandy): Absorb logical-and into rldic?
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Ror(OpIndex node) {
+   VisitRRO(this, kPPC_RotRight64, node, kShift64Imm);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Clz(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -1036,11 +1211,13 @@ void InstructionSelectorT::VisitWord32Clz(OpIndex node) {
+        g.UseRegister(this->input_at(node, 0)));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Clz(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   Emit(kPPC_Cntlz64, g.DefineAsRegister(node),
+        g.UseRegister(this->input_at(node, 0)));
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Popcnt(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -1048,23 +1225,29 @@ void InstructionSelectorT::VisitWord32Popcnt(OpIndex node) {
+        g.UseRegister(this->input_at(node, 0)));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Popcnt(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   Emit(kPPC_Popcnt64, g.DefineAsRegister(node),
+        g.UseRegister(this->input_at(node, 0)));
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32Ctz(OpIndex node) { UNREACHABLE(); }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Ctz(OpIndex node) { UNREACHABLE(); }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32ReverseBits(OpIndex node) {
+   UNREACHABLE();
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64ReverseBits(OpIndex node) {
+   UNREACHABLE();
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord64ReverseBytes(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -1119,9 +1302,11 @@ void InstructionSelectorT::VisitInt32Add(OpIndex node) {
+   VisitBinop(this, node, kPPC_Add32, kInt16Imm);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64Add(OpIndex node) {
+   VisitBinop(this, node, kPPC_Add64, kInt16Imm);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitInt32Sub(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -1133,6 +1318,7 @@ void InstructionSelectorT::VisitInt32Sub(OpIndex node) {
+   }
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64Sub(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   const WordBinopOp& sub = this->Get(node).template Cast<WordBinopOp>();
+@@ -1142,6 +1328,7 @@ void InstructionSelectorT::VisitInt64Sub(OpIndex node) {
+     VisitBinop(this, node, kPPC_Sub, kInt16Imm_Negate);
+   }
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ namespace {
+ 
+@@ -1195,9 +1382,11 @@ void InstructionSelectorT::VisitInt32Mul(OpIndex node) {
+   VisitRRR(this, kPPC_Mul32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64Mul(OpIndex node) {
+   VisitRRR(this, kPPC_Mul64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitInt32MulHigh(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+@@ -1213,6 +1402,7 @@ void InstructionSelectorT::VisitUint32MulHigh(OpIndex node) {
+        g.UseRegister(this->input_at(node, 1)));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64MulHigh(OpIndex node) {
+   PPCOperandGeneratorT g(this);
+   Emit(kPPC_MulHighS64, g.DefineAsRegister(node),
+@@ -1226,38 +1416,47 @@ void InstructionSelectorT::VisitUint64MulHigh(OpIndex node) {
+        g.UseRegister(this->input_at(node, 0)),
+        g.UseRegister(this->input_at(node, 1)));
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitInt32Div(OpIndex node) {
+   VisitRRR(this, kPPC_Div32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64Div(OpIndex node) {
+   VisitRRR(this, kPPC_Div64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitUint32Div(OpIndex node) {
+   VisitRRR(this, kPPC_DivU32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitUint64Div(OpIndex node) {
+   VisitRRR(this, kPPC_DivU64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitInt32Mod(OpIndex node) {
+   VisitRRR(this, kPPC_Mod32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64Mod(OpIndex node) {
+   VisitRRR(this, kPPC_Mod64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitUint32Mod(OpIndex node) {
+   VisitRRR(this, kPPC_ModU32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitUint64Mod(OpIndex node) {
+   VisitRRR(this, kPPC_ModU64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitChangeFloat32ToFloat64(OpIndex node) {
+   VisitRR(this, kPPC_Float32ToDouble, node);
+@@ -1301,6 +1500,7 @@ void InstructionSelectorT::VisitSignExtendWord16ToInt32(OpIndex node) {
+   VisitRR(this, kPPC_ExtendSignWord16, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitTryTruncateFloat32ToInt64(OpIndex node) {
+   VisitTryTruncateDouble(this, kPPC_DoubleToInt64, node);
+ }
+@@ -1354,15 +1554,18 @@ void InstructionSelectorT::VisitSignExtendWord32ToInt64(OpIndex node) {
+   // TODO(mbrandy): inspect input to see if nop is appropriate.
+   VisitRR(this, kPPC_ExtendSignWord32, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ bool InstructionSelectorT::ZeroExtendsWord32ToWord64NoPhis(OpIndex node) {
+   UNIMPLEMENTED();
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitChangeUint32ToUint64(OpIndex node) {
+   // TODO(mbrandy): inspect input to see if nop is appropriate.
+   VisitRR(this, kPPC_Uint32ToUint64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitTruncateFloat64ToFloat16RawBits(OpIndex node) {
+   UNIMPLEMENTED();
+@@ -1372,6 +1575,7 @@ void InstructionSelectorT::VisitChangeFloat16RawBitsToFloat64(OpIndex node) {
+   UNIMPLEMENTED();
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitChangeFloat64ToUint64(OpIndex node) {
+   VisitRR(this, kPPC_DoubleToUint64, node);
+ }
+@@ -1379,6 +1583,7 @@ void InstructionSelectorT::VisitChangeFloat64ToUint64(OpIndex node) {
+ void InstructionSelectorT::VisitChangeFloat64ToInt64(OpIndex node) {
+   VisitRR(this, kPPC_DoubleToInt64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitTruncateFloat64ToFloat32(OpIndex node) {
+   VisitRR(this, kPPC_DoubleToFloat32, node);
+@@ -1415,6 +1620,7 @@ void InstructionSelectorT::VisitTruncateFloat32ToUint32(OpIndex node) {
+        g.UseRegister(this->input_at(node, 0)));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitTruncateInt64ToInt32(OpIndex node) {
+   // TODO(mbrandy): inspect input to see if nop is appropriate.
+   VisitRR(this, kPPC_Int64ToInt32, node);
+@@ -1439,22 +1645,27 @@ void InstructionSelectorT::VisitRoundUint64ToFloat32(OpIndex node) {
+ void InstructionSelectorT::VisitRoundUint64ToFloat64(OpIndex node) {
+   VisitRR(this, kPPC_Uint64ToDouble, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitBitcastFloat32ToInt32(OpIndex node) {
+   VisitRR(this, kPPC_BitcastFloat32ToInt32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitBitcastFloat64ToInt64(OpIndex node) {
+   VisitRR(this, kPPC_BitcastDoubleToInt64, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitBitcastInt32ToFloat32(OpIndex node) {
+   VisitRR(this, kPPC_BitcastInt32ToFloat32, node);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitBitcastInt64ToFloat64(OpIndex node) {
+   VisitRR(this, kPPC_BitcastInt64ToDouble, node);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitFloat32Add(OpIndex node) {
+   VisitRRR(this, kPPC_AddDouble | MiscField::encode(1), node);
+@@ -1609,6 +1820,7 @@ void InstructionSelectorT::VisitInt32SubWithOverflow(OpIndex node) {
+     VisitBinop(this, node, kPPC_SubWithOverflow32, kInt16Imm_Negate, &cont);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitInt64AddWithOverflow(OpIndex node) {
+   OptionalOpIndex ovf = FindProjection(node, 1);
+   if (ovf.valid()) {
+@@ -1638,6 +1850,7 @@ void InstructionSelectorT::VisitInt64MulWithOverflow(OpIndex node) {
+     FlagsContinuation cont;
+     EmitInt64MulWithOverflow(this, node, &cont);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ static bool CompareLogical(FlagsContinuationT* cont) {
+   switch (cont->condition()) {
+@@ -1689,11 +1902,13 @@ void VisitWord32Compare(InstructionSelectorT* selector, OpIndex node,
+   VisitWordCompare(selector, node, kPPC_Cmp32, cont, false, mode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void VisitWord64Compare(InstructionSelectorT* selector, OpIndex node,
+                         FlagsContinuationT* cont) {
+   ImmediateMode mode = (CompareLogical(cont) ? kInt16Imm_Unsigned : kInt16Imm);
+   VisitWordCompare(selector, node, kPPC_Cmp64, cont, false, mode);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ // Shared routine for multiple float32 compare operations.
+ void VisitFloat32Compare(InstructionSelectorT* selector, OpIndex node,
+@@ -1730,10 +1945,12 @@ void InstructionSelectorT::VisitWordCompareZero(OpIndex user, OpIndex value,
+           cont->OverwriteAndNegateIfEqual(
+               GetComparisonFlagCondition(*comparison));
+           return VisitWord32Compare(this, value, cont);
++#if V8_TARGET_ARCH_PPC64
+         case RegisterRepresentation::Word64():
+           cont->OverwriteAndNegateIfEqual(
+               GetComparisonFlagCondition(*comparison));
+           return VisitWord64Compare(this, value, cont);
++#endif
+         case RegisterRepresentation::Float32():
+           switch (comparison->kind) {
+             case ComparisonOp::Kind::kEqual:
+@@ -1807,11 +2024,13 @@ void InstructionSelectorT::VisitWordCompareZero(OpIndex user, OpIndex value,
+     } else if (value_op.Is<Opmask::kWord32BitwiseAnd>()) {
+       return VisitWordCompare(this, value, kPPC_Tst32, cont, true,
+                               kInt16Imm_Unsigned);
++#if V8_TARGET_ARCH_PPC64
+     } else if (value_op.Is<Opmask::kWord64Sub>()) {
+       return VisitWord64Compare(this, value, cont);
+     } else if (value_op.Is<Opmask::kWord64BitwiseAnd>()) {
+       return VisitWordCompare(this, value, kPPC_Tst64, cont, true,
+                               kInt16Imm_Unsigned);
++#endif
+     } else if (value_op.Is<StackPointerGreaterThanOp>()) {
+       cont->OverwriteAndNegateIfEqual(kStackPointerGreaterThanCondition);
+       return VisitStackPointerGreaterThan(value, cont);
+@@ -1847,10 +2066,15 @@ void InstructionSelectorT::VisitSwitch(OpIndex node, const SwitchInfo& sw) {
+       Emit(kPPC_Sub, index_operand, value_operand,
+            g.TempImmediate(sw.min_value()));
+       }
++#if V8_TARGET_ARCH_PPC64
+       // Zero extend, because we use it as 64-bit index into the jump table.
+       InstructionOperand index_operand_zero_ext = g.TempRegister();
+       Emit(kPPC_Uint32ToUint64, index_operand_zero_ext, index_operand);
+       index_operand = index_operand_zero_ext;
++#endif
++      // On ppc32 the 32-bit index register is the jump-table index as it is
++      // (AssembleArchTableSwitch shifts and loads at pointer size), and
++      // kPPC_Uint32ToUint64 has no 32-bit code-generator case.
+       // Generate a table lookup.
+       return EmitTableSwitch(sw, index_operand);
+   }
+@@ -1911,6 +2135,7 @@ void InstructionSelectorT::VisitUint32LessThanOrEqual(OpIndex node) {
+   VisitWord32Compare(this, node, &cont);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64Equal(OpIndex const node) {
+   FlagsContinuation cont = FlagsContinuation::ForSet(kEqual, node);
+   VisitWord64Compare(this, node, &cont);
+@@ -1937,6 +2162,7 @@ void InstructionSelectorT::VisitUint64LessThanOrEqual(OpIndex node) {
+       FlagsContinuation::ForSet(kUnsignedLessThanOrEqual, node);
+   VisitWord64Compare(this, node, &cont);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitInt32MulWithOverflow(OpIndex node) {
+   OptionalOpIndex ovf = FindProjection(node, 1);
+@@ -2038,9 +2264,16 @@ void InstructionSelectorT::VisitBitcastWord32PairToFloat64(OpIndex node) {
+   OpIndex hi = bitcast.high_word32();
+   OpIndex lo = bitcast.low_word32();
+ 
++#if V8_TARGET_ARCH_PPC64
+   InstructionOperand temps[] = {g.TempRegister()};
+   Emit(kPPC_DoubleFromWord32Pair, g.DefineAsRegister(node), g.UseRegister(hi),
+        g.UseRegister(lo), arraysize(temps), temps);
++#else
++  // kPPC_DoubleFromWord32Pair assembles the two words in one 64-bit GPR;
++  // kPPC_DoubleConstruct takes (high, low) and goes through memory on 32-bit.
++  Emit(kPPC_DoubleConstruct, g.DefineAsRegister(node), g.UseRegister(hi),
++       g.UseRegister(lo));
++#endif
+ }
+ 
+ void InstructionSelectorT::VisitFloat64InsertLowWord32(OpIndex node) {
+@@ -2063,12 +2296,14 @@ void InstructionSelectorT::VisitWord32AtomicLoad(OpIndex node) {
+   VisitLoadCommon(this, node, mode, opcode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64AtomicLoad(OpIndex node) {
+   auto load_view = this->load_view(node);
+   ImmediateMode mode;
+   InstructionCode opcode = SelectLoadOpcode(load_view.loaded_rep(), &mode);
+   VisitLoadCommon(this, node, mode, opcode);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void InstructionSelectorT::VisitWord32AtomicStore(OpIndex node) {
+   auto store = this->store_view(node);
+@@ -2080,6 +2315,7 @@ void InstructionSelectorT::VisitWord32AtomicStore(OpIndex node) {
+                    store_params.order());
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64AtomicStore(OpIndex node) {
+   auto store = this->store_view(node);
+   AtomicStoreParameters store_params(store.stored_rep().representation(),
+@@ -2089,6 +2325,7 @@ void InstructionSelectorT::VisitWord64AtomicStore(OpIndex node) {
+   VisitStoreCommon(this, node, store_params.store_representation(),
+                    store_params.order());
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void VisitAtomicExchange(InstructionSelectorT* selector, OpIndex node,
+                          ArchOpcode opcode) {
+@@ -2130,6 +2367,7 @@ void InstructionSelectorT::VisitWord32AtomicExchange(OpIndex node) {
+   VisitAtomicExchange(this, node, opcode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64AtomicExchange(OpIndex node) {
+   ArchOpcode opcode;
+     const AtomicRMWOp& atomic_op = this->Get(node).template Cast<AtomicRMWOp>();
+@@ -2146,6 +2384,7 @@ void InstructionSelectorT::VisitWord64AtomicExchange(OpIndex node) {
+     }
+   VisitAtomicExchange(this, node, opcode);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void VisitAtomicCompareExchange(InstructionSelectorT* selector, OpIndex node,
+                                 ArchOpcode opcode) {
+@@ -2193,6 +2432,7 @@ void InstructionSelectorT::VisitWord32AtomicCompareExchange(OpIndex node) {
+   VisitAtomicCompareExchange(this, node, opcode);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void InstructionSelectorT::VisitWord64AtomicCompareExchange(OpIndex node) {
+   ArchOpcode opcode;
+     const AtomicRMWOp& atomic_op = this->Get(node).template Cast<AtomicRMWOp>();
+@@ -2209,6 +2449,7 @@ void InstructionSelectorT::VisitWord64AtomicCompareExchange(OpIndex node) {
+     }
+   VisitAtomicCompareExchange(this, node, opcode);
+ }
++#endif  // V8_TARGET_ARCH_PPC64
+ 
+ void VisitAtomicBinaryOperation(InstructionSelectorT* selector, OpIndex node,
+                                 ArchOpcode int8_op, ArchOpcode uint8_op,
+@@ -2279,13 +2520,6 @@ void InstructionSelectorT::VisitWord64AtomicBinaryOperation(
+         kPPC_Atomic##op##Int16, kPPC_Atomic##op##Uint16,           \
+         kPPC_Atomic##op##Int32, kPPC_Atomic##op##Uint32,           \
+         kPPC_Atomic##op##Int64, kPPC_Atomic##op##Uint64);          \
+-  }                                                                \
+-  void InstructionSelectorT::VisitWord64Atomic##op(OpIndex node) { \
+-    VisitAtomicBinaryOperation(                                    \
+-        this, node, kPPC_Atomic##op##Int8, kPPC_Atomic##op##Uint8, \
+-        kPPC_Atomic##op##Int16, kPPC_Atomic##op##Uint16,           \
+-        kPPC_Atomic##op##Int32, kPPC_Atomic##op##Uint32,           \
+-        kPPC_Atomic##op##Int64, kPPC_Atomic##op##Uint64);          \
+   }
+ VISIT_ATOMIC_BINOP(Add)
+ VISIT_ATOMIC_BINOP(Sub)
+@@ -2294,6 +2528,24 @@ VISIT_ATOMIC_BINOP(Or)
+ VISIT_ATOMIC_BINOP(Xor)
+ #undef VISIT_ATOMIC_BINOP
+ 
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the Word64Atomic* visitors.
++#define VISIT_ATOMIC_BINOP64(op)                                   \
++  void InstructionSelectorT::VisitWord64Atomic##op(OpIndex node) { \
++    VisitAtomicBinaryOperation(                                    \
++        this, node, kPPC_Atomic##op##Int8, kPPC_Atomic##op##Uint8, \
++        kPPC_Atomic##op##Int16, kPPC_Atomic##op##Uint16,           \
++        kPPC_Atomic##op##Int32, kPPC_Atomic##op##Uint32,           \
++        kPPC_Atomic##op##Int64, kPPC_Atomic##op##Uint64);          \
++  }
++VISIT_ATOMIC_BINOP64(Add)
++VISIT_ATOMIC_BINOP64(Sub)
++VISIT_ATOMIC_BINOP64(And)
++VISIT_ATOMIC_BINOP64(Or)
++VISIT_ATOMIC_BINOP64(Xor)
++#undef VISIT_ATOMIC_BINOP64
++#endif
++
+ void InstructionSelectorT::VisitInt32AbsWithOverflow(OpIndex node) {
+   UNREACHABLE();
+ }
+@@ -2493,7 +2745,10 @@ void InstructionSelectorT::VisitInt64AbsWithOverflow(OpIndex node) {
+   }
+ SIMD_VISIT_SPLAT(F64x2, F, 64)
+ SIMD_VISIT_SPLAT(F32x4, F, 32)
++#if V8_TARGET_ARCH_PPC64
++// On 32-bit targets the generic selector defines the I64x2 lane visitors.
+ SIMD_VISIT_SPLAT(I64x2, I, 64)
++#endif
+ SIMD_VISIT_SPLAT(I32x4, I, 32)
+ SIMD_VISIT_SPLAT(I16x8, I, 16)
+ SIMD_VISIT_SPLAT(I8x16, I, 8)
+@@ -2511,7 +2766,9 @@ SIMD_VISIT_SPLAT(I8x16, I, 8)
+   }
+ SIMD_VISIT_EXTRACT_LANE(F64x2, F, , 64)
+ SIMD_VISIT_EXTRACT_LANE(F32x4, F, , 32)
++#if V8_TARGET_ARCH_PPC64
+ SIMD_VISIT_EXTRACT_LANE(I64x2, I, , 64)
++#endif
+ SIMD_VISIT_EXTRACT_LANE(I32x4, I, , 32)
+ SIMD_VISIT_EXTRACT_LANE(I16x8, I, U, 16)
+ SIMD_VISIT_EXTRACT_LANE(I16x8, I, S, 16)
+@@ -2531,7 +2788,9 @@ SIMD_VISIT_EXTRACT_LANE(I8x16, I, S, 8)
+   }
+ SIMD_VISIT_REPLACE_LANE(F64x2, F, 64)
+ SIMD_VISIT_REPLACE_LANE(F32x4, F, 32)
++#if V8_TARGET_ARCH_PPC64
+ SIMD_VISIT_REPLACE_LANE(I64x2, I, 64)
++#endif
+ SIMD_VISIT_REPLACE_LANE(I32x4, I, 32)
+ SIMD_VISIT_REPLACE_LANE(I16x8, I, 16)
+ SIMD_VISIT_REPLACE_LANE(I8x16, I, 8)
+@@ -2889,6 +3148,7 @@ void InstructionSelectorT::VisitF32x4NearestInt(OpIndex node) { UNREACHABLE(); }
+ 
+ MachineOperatorBuilder::Flags
+ InstructionSelector::SupportedMachineOperatorFlags() {
++#if V8_TARGET_ARCH_PPC64
+   return MachineOperatorBuilder::kFloat32RoundDown |
+          MachineOperatorBuilder::kFloat64RoundDown |
+          MachineOperatorBuilder::kFloat32RoundUp |
+@@ -2899,6 +3159,15 @@ InstructionSelector::SupportedMachineOperatorFlags() {
+          MachineOperatorBuilder::kWord32Popcnt |
+          MachineOperatorBuilder::kWord64Popcnt;
+   // We omit kWord32ShiftIsSafe as s[rl]w use 0x3F as a mask rather than 0x1F.
++#else
++  // The round ops emit frim/frip/friz/frin (ISA 2.02, POWER5+) and the
++  // popcnt ops emit popcntw/popcntd (ISA 2.06, POWER7) - none of which
++  // exist on the 32-bit-era cores this target supports (G3/G4/G5), and
++  // CSA bakes them into snapshot builtins at mksnapshot time if
++  // advertised.  Advertise nothing and let the compiler use fallbacks,
++  // matching the configuration proven in the nodejs12 ppc32 port.
++  return MachineOperatorBuilder::kNoFlags;
++#endif
+ }
+ 
+ MachineOperatorBuilder::AlignmentRequirements
+-- 
+2.43.0
+

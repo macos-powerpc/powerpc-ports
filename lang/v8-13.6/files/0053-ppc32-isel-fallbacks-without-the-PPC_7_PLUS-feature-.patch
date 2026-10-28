@@ -1,0 +1,200 @@
+From c06db2916d61459705ab81ef5dac48f22123861b Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Tue, 27 Oct 2026 05:33:00 +0000
+Subject: [PATCH 53/60] ppc32: isel fallbacks without the PPC_7_PLUS feature
+ bit 13.6 removed
+
+G5 parade #4 (2026-10-27): code-generator-ppc.cc fails on the three
+CpuFeatures::IsSupported(PPC_7_PLUS) checks that 0008 ("complete the
+32-bit guards in instruction selector and code generator") carried over
+verbatim from 12.4 - the isel-or-branch fallbacks in kPPC_Float32ToInt32,
+kPPC_Float32ToUint32 and the DOUBLE_TO_INT32 macro.  When 13.6 moved the
+ppc backend's baseline to POWER8 it also deleted the PPC_6_PLUS and
+PPC_7_PLUS enumerators from CpuFeature (cpu-features.h), together with
+their ProbeImpl part probes and PrintFeatures lines; the enum now starts
+at PPC_8_PLUS, hence gcc's "did you mean PPC_9_PLUS".
+
+Rather than resurrect enumerators ProbeImpl would never set (the Darwin
+host_info probe yields kPPCG4/kPPCG5, 0049), spell the three sites the
+way the foundation commit spelled the other pre-POWER7 fallbacks it
+hand-ported (AssembleArchBoolean, MinF64/MaxF64): 13.6's unconditional
+isel under V8_TARGET_ARCH_PPC64, the 12.4 branch-around sequence
+otherwise.  The DOUBLE_TO_INT32 macro cannot hold a preprocessor
+conditional, so it is defined twice under one #if; the 64-bit definition
+is upstream's byte for byte.  The 32-bit sequences (bc over one
+instruction, the mr/ip round trip in the no-check case) are the ones the
+8.4/9.4/12.4 builds ran on the G5.
+
+Sweep of the class (identifiers 13.6 deleted that carried-over code
+still names): grep PPC_[0-9]*_PLUS finds one more, the dead
+INSTR_AND_DATA_CACHE_COHERENCY (= PPC_6_PLUS) in cpu-ppc.cc's non-Darwin
+FlushICache, which 12.4 used to pick the single-icbi path on POWER6+.
+That branch never compiles here (the V8_OS_DARWIN branch is taken), but
+it gets the same shape so no file names the dropped enumerators: 13.6's
+single icbi under V8_TARGET_ARCH_PPC64, the per-line dcbf/icbi loop
+otherwise.  No kPPCPower6/kPPCPower7 part code is referenced anywhere.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ v8/src/codegen/ppc/cpu-ppc.cc                 | 26 +++----
+ .../backend/ppc/code-generator-ppc.cc         | 73 +++++++++++--------
+ 2 files changed, 55 insertions(+), 44 deletions(-)
+
+diff --git a/v8/src/codegen/ppc/cpu-ppc.cc b/v8/src/codegen/ppc/cpu-ppc.cc
+index dadeea6..373c4f7 100644
+--- a/v8/src/codegen/ppc/cpu-ppc.cc
++++ b/v8/src/codegen/ppc/cpu-ppc.cc
+@@ -12,8 +12,6 @@
+ #include <libkern/OSCacheControl.h>  // sys_icache_invalidate, 10.5+
+ #endif
+ 
+-#define INSTR_AND_DATA_CACHE_COHERENCY PPC_6_PLUS
+-
+ namespace v8 {
+ namespace internal {
+ 
+@@ -24,18 +22,18 @@ void CpuFeatures::FlushICache(void* buffer, size_t size) {
+   // Darwin implementation and would assume 128-byte lines, which is wrong
+   // on G4 (32-byte lines). The commpage routine also dispatches per-CPU.
+   sys_icache_invalidate(buffer, size);
++#elif V8_TARGET_ARCH_PPC64
++  // POWER8 baseline: the instruction cache is coherent with the data cache
++  // (POWER6 and later), a single icbi suffices.
++  __asm__ __volatile__(
++      "sync \n"
++      "icbi 0, %0  \n"
++      "isync  \n"
++      : /* no output */
++      : "r"(buffer)
++      : "memory");
+ #else
+-  if (CpuFeatures::IsSupported(INSTR_AND_DATA_CACHE_COHERENCY)) {
+-    __asm__ __volatile__(
+-        "sync \n"
+-        "icbi 0, %0  \n"
+-        "isync  \n"
+-        : /* no output */
+-        : "r"(buffer)
+-        : "memory");
+-    return;
+-  }
+-
++  // No coherent-cache assumption below POWER6 (G3/G4/G5): flush each line.
+   const int kCacheLineSize = CpuFeatures::icache_line_size();
+   intptr_t mask = kCacheLineSize - 1;
+   uint8_t* start =
+@@ -51,7 +49,7 @@ void CpuFeatures::FlushICache(void* buffer, size_t size) {
+         : "r"(pointer));
+   }
+ 
+-#endif  // V8_OS_DARWIN
++#endif  // V8_OS_DARWIN / V8_TARGET_ARCH_PPC64
+ #endif  // !USE_SIMULATOR
+ }
+ }  // namespace internal
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index ee0ce78..e4be213 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1936,12 +1936,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         __ li(kScratchReg, Operand(1));
+         __ ShiftLeftU64(kScratchReg, kScratchReg,
+                         Operand(31));  // generate INT32_MIN.
+-        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
+-          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
+-        } else {
+-          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
+-          __ mr(i.OutputRegister(0), kScratchReg);
+-        }
++#if V8_TARGET_ARCH_PPC64
++        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++#else
++        // No isel before POWER7: branch around the materialisation.
++        __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++        __ mr(i.OutputRegister(0), kScratchReg);
++#endif
+       }
+       break;
+     }
+@@ -1985,16 +1986,36 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         int crbit = v8::internal::Assembler::encode_crbit(
+             cr, static_cast<CRBit>(VXCVI % CRWIDTH));
+         __ mcrfs(cr, VXCVI);  // extract FPSCR field containing VXCVI into cr0
+-        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
+-          __ li(kScratchReg, Operand::Zero());
+-          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
+-        } else {
+-          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
+-          __ li(i.OutputRegister(0), Operand::Zero());
+-        }
++#if V8_TARGET_ARCH_PPC64
++        __ li(kScratchReg, Operand::Zero());
++        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++#else
++        // No isel before POWER7: branch around the materialisation.
++        __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++        __ li(i.OutputRegister(0), Operand::Zero());
++#endif
+       }
+       break;
+     }
++#if V8_TARGET_ARCH_PPC64
++#define DOUBLE_TO_INT32(op)                                                \
++  bool check_conversion = i.OutputCount() > 1;                             \
++  CRegister cr = cr0;                                                      \
++  FPSCRBit fps_bit = VXCVI;                                                \
++  int cr_bit = v8::internal::Assembler::encode_crbit(                      \
++      cr, static_cast<CRBit>(fps_bit % CRWIDTH));                          \
++  __ mtfsb0(fps_bit); /* clear FPSCR:VXCVI bit */                          \
++  __ op(kScratchDoubleReg, i.InputDoubleRegister(0));                      \
++  __ MovDoubleLowToInt(i.OutputRegister(0), kScratchDoubleReg);            \
++  __ mcrfs(cr, VXCVI); /* extract FPSCR field containing VXCVI into cr0 */ \
++  if (check_conversion) {                                                  \
++    __ li(i.OutputRegister(1), Operand(1));                                \
++    __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);         \
++  } else {                                                                 \
++    __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);         \
++  }
++#else
++// No isel before POWER7: branch around the materialisation.
+ #define DOUBLE_TO_INT32(op)                                                \
+   bool check_conversion = i.OutputCount() > 1;                             \
+   CRegister cr = cr0;                                                      \
+@@ -2005,25 +2026,17 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+   __ op(kScratchDoubleReg, i.InputDoubleRegister(0));                      \
+   __ MovDoubleLowToInt(i.OutputRegister(0), kScratchDoubleReg);            \
+   __ mcrfs(cr, VXCVI); /* extract FPSCR field containing VXCVI into cr0 */ \
+-  if (CpuFeatures::IsSupported(PPC_7_PLUS)) {                              \
+-    if (check_conversion) {                                                \
+-      __ li(i.OutputRegister(1), Operand(1));                              \
+-      __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);       \
+-    } else {                                                               \
+-      __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);       \
+-    }                                                                      \
++  if (check_conversion) {                                                  \
++    __ li(i.OutputRegister(1), Operand::Zero());                           \
++    __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                       \
++    __ li(i.OutputRegister(1), Operand(1));                                \
+   } else {                                                                 \
+-    if (check_conversion) {                                                \
+-      __ li(i.OutputRegister(1), Operand::Zero());                         \
+-      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
+-      __ li(i.OutputRegister(1), Operand(1));                              \
+-    } else {                                                               \
+-      __ mr(ip, i.OutputRegister(0));                                      \
+-      __ li(i.OutputRegister(0), Operand::Zero());                         \
+-      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
+-      __ mr(i.OutputRegister(0), ip);                                      \
+-    }                                                                      \
++    __ mr(ip, i.OutputRegister(0));                                        \
++    __ li(i.OutputRegister(0), Operand::Zero());                           \
++    __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                       \
++    __ mr(i.OutputRegister(0), ip);                                        \
+   }
++#endif
+     case kPPC_DoubleToInt32: {
+       DOUBLE_TO_INT32(fctiwz)
+       break;
+-- 
+2.43.0
+

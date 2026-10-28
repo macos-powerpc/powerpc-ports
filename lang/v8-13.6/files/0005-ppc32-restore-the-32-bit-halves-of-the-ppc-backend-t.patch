@@ -1,0 +1,1855 @@
+From b6f8a8a0e16a6bd21c47c39b7c73e0068ef0c27f Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 17:28:20 +0000
+Subject: [PATCH 05/60] ppc32: restore the 32-bit halves of the ppc backend
+ that 13.6 removed
+
+Between 12.4 and 13.6 upstream deleted every 32-bit conditional from the
+ppc backend: the file guards became V8_TARGET_ARCH_PPC64 only, 103
+`#if V8_TARGET_ARCH_PPC64 ... #else ... #endif` blocks lost their #else
+(the 32-bit instruction choices: lwz/stw for ld/std, lis/ori address
+sequences, the two-word double moves, CmpS32 forms, ...), the
+`#if !V8_TARGET_ARCH_PPC64` blocks disappeared outright (the pair
+opcodes' code generation, ShiftLeftPair/ShiftRightPair/ShiftRightAlgPair,
+the dst_hi/src_hi halves of ConvertDoubleToInt64/MovInt64ToDouble/
+MovDoubleToInt64, Is32BitLoadIntoR12), and the 64-bit-only code that
+used to sit under a guard (ld/std/divd/mffpr*/rld* wrappers, the
+Word64/Int64 opcode cases, DoubleToUint64, MovInt64ComponentsToDouble)
+became unconditional.
+
+At the same time the backend's POWER baseline moved to POWER8: the
+CpuFeatures::IsSupported(PPC_7_PLUS)/(PPC_8_PLUS) checks went from 6/13 to
+0/1 and their fallbacks were dropped - the FP<->GPR moves now use mtfprd/
+mffprd/mtfprwa/mtfprwz/mffprwz unconditionally, MinF64/MaxF64 use
+xsmindp/xsmaxdp, AssembleArchBoolean uses isel.  None of these exist on a
+G4/G5.
+
+This commit puts the 12.4 shape back into the 13.6 files, keeping 13.6's
+64-bit code verbatim under V8_TARGET_ARCH_PPC64 and supplying the 12.4
+32-bit / pre-POWER7 code otherwise:
+
+- node/reinsert32.py re-inserted the 73 blocks whose 64-bit side still
+  exists verbatim in 13.6 (assembler-ppc.h 10, assembler-ppc.cc 14,
+  assembler-ppc-inl.h 2, macro-assembler-ppc.h 8, macro-assembler-ppc.cc
+  5, code-generator-ppc.cc 30, builtins-ppc.cc 3, simulator-ppc.h 1) and
+  restored the nine dual file guards;
+- hand-ported where 13.6 rewrote the 64-bit side: set_target_address_at
+  (the WritableJitAllocation form of the two-instruction patch),
+  ConvertDoubleToInt64 / TryInlineTruncateDoubleToI / TestIfInt32 (hi/lo
+  word forms), CallRuntime (RuntimeCEntry(1) on 32-bit), the twelve FP
+  move helpers and LoadDoubleLiteral (stack round-trip through
+  kExponentOffset/kMantissaOffset), MinF64/MaxF64 (compare-and-branch),
+  AssembleArchBoolean (branch around the materialisation), the
+  wasm call-target constants (ToInt32), DoubleToInt64/DoubleToUint64 in
+  the code generator (64-bit-only VXCVI/isel handling, DoubleToUint64
+  64-bit-only), ShiftLeftPair & co (declarations and definitions).
+- not touched: the instruction selector (13.6's is Turboshaft-only, with
+  no 32-bit block left to re-insert - next commit), the isel uses inside
+  the Float32/Double->Int32 conversions and the SIMD helpers (the 12.4
+  series patches on those conversions follow in this series; the SIMD
+  helpers are never reached, SupportsWasmSimd128() is false below
+  POWER9), the disassembler (ENABLE_DISASSEMBLER is off in the harness).
+
+The pair opcodes (kPPC_AddPair ... kPPC_ShiftRightAlgPair) are still in
+instruction-codes-ppc.h and the scheduler at 13.6; only their selection
+and generation had gone.
+---
+ v8/src/builtins/ppc/builtins-ppc.cc           |  13 +-
+ v8/src/codegen/ppc/assembler-ppc-inl.h        |  34 ++
+ v8/src/codegen/ppc/assembler-ppc.cc           |  62 ++-
+ v8/src/codegen/ppc/assembler-ppc.h            |  37 ++
+ v8/src/codegen/ppc/constants-ppc.cc           |   4 +-
+ v8/src/codegen/ppc/cpu-ppc.cc                 |   4 +-
+ .../ppc/interface-descriptors-ppc-inl.h       |   4 +-
+ v8/src/codegen/ppc/macro-assembler-ppc.cc     | 367 +++++++++++++++++-
+ v8/src/codegen/ppc/macro-assembler-ppc.h      |  49 +++
+ .../backend/ppc/code-generator-ppc.cc         | 163 ++++++++
+ v8/src/diagnostics/ppc/disasm-ppc.cc          |   4 +-
+ v8/src/execution/ppc/frame-constants-ppc.cc   |   4 +-
+ v8/src/execution/ppc/simulator-ppc.h          |   4 +
+ .../regexp/ppc/regexp-macro-assembler-ppc.cc  |   2 +-
+ 14 files changed, 733 insertions(+), 18 deletions(-)
+
+diff --git a/v8/src/builtins/ppc/builtins-ppc.cc b/v8/src/builtins/ppc/builtins-ppc.cc
+index fd74da9..22b1aad 100644
+--- a/v8/src/builtins/ppc/builtins-ppc.cc
++++ b/v8/src/builtins/ppc/builtins-ppc.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/api/api-arguments.h"
+ #include "src/builtins/builtins-descriptors.h"
+@@ -4488,10 +4488,17 @@ void Builtins::Generate_DoubleToI(MacroAssembler* masm) {
+ 
+   // Do fast-path convert from double to int.
+   __ ConvertDoubleToInt64(double_scratch,
++#if !V8_TARGET_ARCH_PPC64
++                          scratch,
++#endif
+                           result_reg, d0);
+ 
+ // Test for overflow
++#if V8_TARGET_ARCH_PPC64
+   __ TestIfInt32(result_reg, r0);
++#else
++  __ TestIfInt32(scratch, result_reg, r0);
++#endif
+   __ beq(&fastpath_done);
+ 
+   __ Push(scratch_high, scratch_low);
+@@ -4557,7 +4564,9 @@ void Builtins::Generate_DoubleToI(MacroAssembler* masm) {
+   // Input_high ASR 31 equals 0xFFFFFFFF and scratch_high LSR 31 equals 1.
+   // New result = (result eor 0xFFFFFFFF) + 1 = 0 - result.
+   __ srawi(r0, scratch_high, 31);
++#if V8_TARGET_ARCH_PPC64
+   __ srdi(r0, r0, Operand(32));
++#endif
+   __ xor_(result_reg, result_reg, r0);
+   __ srwi(r0, scratch_high, Operand(31));
+   __ add(result_reg, result_reg, r0);
+@@ -5115,4 +5124,4 @@ void Builtins::Generate_RestartFrameTrampoline(MacroAssembler* masm) {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/codegen/ppc/assembler-ppc-inl.h b/v8/src/codegen/ppc/assembler-ppc-inl.h
+index 5385472..15dfa2d 100644
+--- a/v8/src/codegen/ppc/assembler-ppc-inl.h
++++ b/v8/src/codegen/ppc/assembler-ppc-inl.h
+@@ -268,6 +268,7 @@ Address Assembler::target_address_at(Address pc, Address constant_pool) {
+   Instr instr2 = instr_at(pc + kInstrSize);
+   // Interpret 2 instructions generated by lis/ori
+   if (IsLis(instr1) && IsOri(instr2)) {
++#if V8_TARGET_ARCH_PPC64
+     Instr instr4 = instr_at(pc + (3 * kInstrSize));
+     Instr instr5 = instr_at(pc + (4 * kInstrSize));
+     // Assemble the 64 bit value.
+@@ -276,12 +277,21 @@ Address Assembler::target_address_at(Address pc, Address constant_pool) {
+     uint64_t lo = (static_cast<uint32_t>((instr4 & kImm16Mask) << 16) |
+                    static_cast<uint32_t>(instr5 & kImm16Mask));
+     return static_cast<Address>((hi << 32) | lo);
++#else
++    // Assemble the 32 bit value.
++    return static_cast<Address>(((instr1 & kImm16Mask) << 16) |
++                                (instr2 & kImm16Mask));
++#endif
+   }
+ 
+   UNREACHABLE();
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ const uint32_t kLoadIntptrOpcode = LD;
++#else
++const uint32_t kLoadIntptrOpcode = LWZ;
++#endif
+ 
+ // Constant pool load sequence detection:
+ // 1) REGULAR access:
+@@ -434,6 +444,7 @@ void Assembler::set_target_address_at(Address pc, Address constant_pool,
+   Instr instr2 = instr_at(pc + kInstrSize);
+   // Interpret 2 instructions generated by lis/ori
+   if (IsLis(instr1) && IsOri(instr2)) {
++#if V8_TARGET_ARCH_PPC64
+     Instr instr4 = instr_at(pc + (3 * kInstrSize));
+     Instr instr5 = instr_at(pc + (4 * kInstrSize));
+     // Needs to be fixed up when mov changes to handle 64-bit values.
+@@ -474,6 +485,29 @@ void Assembler::set_target_address_at(Address pc, Address constant_pool,
+     if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
+       FlushInstructionCache(p, 5 * kInstrSize);
+     }
++#else
++    uint32_t* p = reinterpret_cast<uint32_t*>(pc);
++    uint32_t itarget = static_cast<uint32_t>(target);
++    int lo_word = itarget & kImm16Mask;
++    int hi_word = itarget >> 16;
++    instr1 &= ~kImm16Mask;
++    instr1 |= hi_word;
++    instr2 &= ~kImm16Mask;
++    instr2 |= lo_word;
++
++    if (jit_allocation) {
++      jit_allocation->WriteUnalignedValue(reinterpret_cast<Address>(&p[0]),
++                                          instr1);
++      jit_allocation->WriteUnalignedValue(reinterpret_cast<Address>(&p[1]),
++                                          instr2);
++    } else {
++      *p = instr1;
++      *(p + 1) = instr2;
++    }
++    if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
++      FlushInstructionCache(p, 2 * kInstrSize);
++    }
++#endif
+     return;
+   }
+   UNREACHABLE();
+diff --git a/v8/src/codegen/ppc/assembler-ppc.cc b/v8/src/codegen/ppc/assembler-ppc.cc
+index 40be1cd..1bf771a 100644
+--- a/v8/src/codegen/ppc/assembler-ppc.cc
++++ b/v8/src/codegen/ppc/assembler-ppc.cc
+@@ -40,7 +40,7 @@
+ #include <sys/utsname.h>
+ #endif
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/base/bits.h"
+ #include "src/base/cpu.h"
+@@ -118,7 +118,11 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
+ 
+ void CpuFeatures::PrintTarget() {
+   const char* ppc_arch = nullptr;
++#if V8_TARGET_ARCH_PPC64
+   ppc_arch = "ppc64";
++#else
++  ppc_arch = "ppc";
++#endif
+   printf("target %s\n", ppc_arch);
+ }
+ 
+@@ -321,6 +325,7 @@ Register Assembler::GetRB(Instr instr) {
+   return Register::from_code(Instruction::RBValue(instr));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ // This code assumes a FIXED_SEQUENCE for 64bit loads (lis/ori)
+ bool Assembler::Is64BitLoadIntoR12(Instr instr1, Instr instr2, Instr instr3,
+                                    Instr instr4, Instr instr5) {
+@@ -334,6 +339,15 @@ bool Assembler::Is64BitLoadIntoR12(Instr instr1, Instr instr2, Instr instr3,
+           (instr3 == 0x798C07C6) && ((instr4 >> 16) == 0x658C) &&
+           ((instr5 >> 16) == 0x618C));
+ }
++#else
++// This code assumes a FIXED_SEQUENCE for 32bit loads (lis/ori)
++bool Assembler::Is32BitLoadIntoR12(Instr instr1, Instr instr2) {
++  // Check the instruction is indeed a two part load (into r12)
++  // 3d802553       lis     r12, 9555
++  // 618c5000       ori   r12, r12, 20480
++  return (((instr1 >> 16) == 0x3D80) && ((instr2 >> 16) == 0x618C));
++}
++#endif
+ 
+ bool Assembler::IsCmpRegister(Instr instr) {
+   return (((instr & kOpcodeMask) == EXT2) &&
+@@ -346,10 +360,12 @@ bool Assembler::IsRlwinm(Instr instr) {
+ 
+ bool Assembler::IsAndi(Instr instr) { return ((instr & kOpcodeMask) == ANDIx); }
+ 
++#if V8_TARGET_ARCH_PPC64
+ bool Assembler::IsRldicl(Instr instr) {
+   return (((instr & kOpcodeMask) == EXT5) &&
+           ((EXT5 | (instr & kExt5OpcodeMask)) == RLDICL));
+ }
++#endif
+ 
+ bool Assembler::IsCmpImmediate(Instr instr) {
+   return ((instr & kOpcodeMask) == CMPI);
+@@ -886,7 +902,11 @@ void Assembler::oris(Register dst, Register src, const Operand& imm) {
+ 
+ void Assembler::cmpi(Register src1, const Operand& src2, CRegister cr) {
+   intptr_t imm16 = src2.immediate();
++#if V8_TARGET_ARCH_PPC64
+   int L = 1;
++#else
++  int L = 0;
++#endif
+   DCHECK(is_int16(imm16));
+   DCHECK(cr.code() >= 0 && cr.code() <= 7);
+   imm16 &= kImm16Mask;
+@@ -895,7 +915,11 @@ void Assembler::cmpi(Register src1, const Operand& src2, CRegister cr) {
+ 
+ void Assembler::cmpli(Register src1, const Operand& src2, CRegister cr) {
+   uintptr_t uimm16 = src2.immediate();
++#if V8_TARGET_ARCH_PPC64
+   int L = 1;
++#else
++  int L = 0;
++#endif
+   DCHECK(is_uint16(uimm16));
+   DCHECK(cr.code() >= 0 && cr.code() <= 7);
+   uimm16 &= kImm16Mask;
+@@ -974,11 +998,15 @@ void Assembler::lha(Register dst, const MemOperand& src) {
+ }
+ 
+ void Assembler::lwa(Register dst, const MemOperand& src) {
++#if V8_TARGET_ARCH_PPC64
+   int offset = src.offset();
+   DCHECK(src.ra_ != r0);
+   CHECK(!(offset & 3) && is_int16(offset));
+   offset = kImm16Mask & offset;
+   emit(LD | dst.code() * B21 | src.ra().code() * B16 | offset | 2);
++#else
++  lwz(dst, src);
++#endif
+ }
+ 
+ void Assembler::stb(Register dst, const MemOperand& src) {
+@@ -1005,6 +1033,7 @@ void Assembler::neg(Register rt, Register ra, OEBit o, RCBit r) {
+   emit(EXT2 | NEGX | rt.code() * B21 | ra.code() * B16 | o | r);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ // 64bit specific instructions
+ void Assembler::ld(Register rd, const MemOperand& src) {
+   int offset = src.offset();
+@@ -1114,6 +1143,7 @@ void Assembler::divdu(Register dst, Register src1, Register src2, OEBit o,
+                       RCBit r) {
+   xo_form(EXT2 | DIVDU, dst, src1, src2, o, r);
+ }
++#endif
+ 
+ // Prefixed instructions.
+ #define GENERATE_PREFIX_SUFFIX_BITS(immediate, prefix, suffix)      \
+@@ -1295,7 +1325,11 @@ bool Assembler::use_constant_pool_for_mov(Register dst, const Operand& src,
+     return false;
+   }
+   intptr_t value = src.immediate();
++#if V8_TARGET_ARCH_PPC64
+   bool allowOverflow = !((canOptimize && is_int32(value)) || dst == r0);
++#else
++  bool allowOverflow = !(canOptimize || dst == r0);
++#endif
+   if (canOptimize &&
+       (is_int16(value) ||
+        (CpuFeatures::IsSupported(PPC_10_PLUS) && is_int34(value)))) {
+@@ -1357,12 +1391,21 @@ void Assembler::mov(Register dst, const Operand& src) {
+       RecordRelocInfo(src.rmode_);
+     }
+     ConstantPoolEntry::Access access = ConstantPoolAddEntry(src.rmode_, value);
++#if V8_TARGET_ARCH_PPC64
+     if (access == ConstantPoolEntry::OVERFLOWED) {
+       addis(dst, kConstantPoolRegister, Operand::Zero());
+       ld(dst, MemOperand(dst, 0));
+     } else {
+       ld(dst, MemOperand(kConstantPoolRegister, 0));
+     }
++#else
++    if (access == ConstantPoolEntry::OVERFLOWED) {
++      addis(dst, kConstantPoolRegister, Operand::Zero());
++      lwz(dst, MemOperand(dst, 0));
++    } else {
++      lwz(dst, MemOperand(kConstantPoolRegister, 0));
++    }
++#endif
+     return;
+   }
+ 
+@@ -1373,8 +1416,11 @@ void Assembler::mov(Register dst, const Operand& src) {
+       pli(dst, Operand(value));
+     } else {
+       uint16_t u16;
++#if V8_TARGET_ARCH_PPC64
+       if (is_int32(value)) {
++#endif
+         lis(dst, Operand(value >> 16));
++#if V8_TARGET_ARCH_PPC64
+       } else {
+         if (is_int48(value)) {
+           li(dst, Operand(value >> 32));
+@@ -1391,6 +1437,7 @@ void Assembler::mov(Register dst, const Operand& src) {
+           oris(dst, dst, Operand(u16));
+         }
+       }
++#endif
+       u16 = (value & 0xFFFF);
+       if (u16) {
+         ori(dst, dst, Operand(u16));
+@@ -1408,6 +1455,7 @@ void Assembler::mov(Register dst, const Operand& src) {
+ 
+ void Assembler::bitwise_mov(Register dst, intptr_t value) {
+   BlockTrampolinePoolScope block_trampoline_pool(this);
++#if V8_TARGET_ARCH_PPC64
+   int32_t hi_32 = static_cast<int32_t>(value >> 32);
+   int32_t lo_32 = static_cast<int32_t>(value);
+   int hi_word = static_cast<int>(hi_32 >> 16);
+@@ -1419,6 +1467,12 @@ void Assembler::bitwise_mov(Register dst, intptr_t value) {
+   lo_word = static_cast<int>(lo_32 & 0xFFFF);
+   oris(dst, dst, Operand(hi_word));
+   ori(dst, dst, Operand(lo_word));
++#else
++  int hi_word = static_cast<int>(value >> 16);
++  int lo_word = static_cast<int>(value & 0xFFFF);
++  lis(dst, Operand(SIGN_EXT_IMM16(hi_word)));
++  ori(dst, dst, Operand(lo_word));
++#endif
+ }
+ 
+ void Assembler::bitwise_mov32(Register dst, int32_t value) {
+@@ -1557,7 +1611,9 @@ void Assembler::emit_label_addr(Label* label) {
+     // the link and target_at_put patches the instruction(s).
+     BlockTrampolinePoolScope block_trampoline_pool(this);
+     emit(kUnboundJumpTableEntryOpcode | (link & kImm26Mask));
++#if V8_TARGET_ARCH_PPC64
+     nop();
++#endif
+   }
+ }
+ 
+@@ -1598,6 +1654,7 @@ void Assembler::mfcr(Register dst) { emit(EXT2 | MFCR | dst.code() * B21); }
+ void Assembler::mtcrf(Register src, uint8_t FXM) {
+   emit(MTCRF | src.code() * B21 | FXM * B12);
+ }
++#if V8_TARGET_ARCH_PPC64
+ void Assembler::mffprd(Register dst, DoubleRegister src) {
+   emit(EXT2 | MFVSRD | src.code() * B21 | dst.code() * B16);
+ }
+@@ -1617,6 +1674,7 @@ void Assembler::mtfprwz(DoubleRegister dst, Register src) {
+ void Assembler::mtfprwa(DoubleRegister dst, Register src) {
+   emit(EXT2 | MTVSRWA | dst.code() * B21 | src.code() * B16);
+ }
++#endif
+ 
+ // Exception-generating instructions and debugging support.
+ // Stops with a non-negative code less than kNumOfWatchedStops support
+@@ -2204,4 +2262,4 @@ PatchingAssembler::~PatchingAssembler() {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/codegen/ppc/assembler-ppc.h b/v8/src/codegen/ppc/assembler-ppc.h
+index 2d82fd9..d19f696 100644
+--- a/v8/src/codegen/ppc/assembler-ppc.h
++++ b/v8/src/codegen/ppc/assembler-ppc.h
+@@ -306,12 +306,18 @@ class Assembler : public AssemblerBase {
+   static constexpr int kSpecialTargetSize = 0;
+ 
+ // Number of instructions to load an address via a mov sequence.
++#if V8_TARGET_ARCH_PPC64
+   static constexpr int kMovInstructionsConstantPool = 1;
+   static constexpr int kMovInstructionsNoConstantPool = 5;
+ #if defined(V8_PPC_TAGGING_OPT)
+   static constexpr int kTaggedLoadInstructions = 1;
+ #else
+   static constexpr int kTaggedLoadInstructions = 2;
++#endif
++#else
++  static constexpr int kMovInstructionsConstantPool = 1;
++  static constexpr int kMovInstructionsNoConstantPool = 2;
++  static constexpr int kTaggedLoadInstructions = 1;
+ #endif
+   static constexpr int kMovInstructions = V8_EMBEDDED_CONSTANT_POOL_BOOL
+                                               ? kMovInstructionsConstantPool
+@@ -393,7 +399,11 @@ class Assembler : public AssemblerBase {
+   }
+   inline void x_form(Instr instr, CRegister cr, Register s1, Register s2,
+                      RCBit rc) {
++#if V8_TARGET_ARCH_PPC64
+     int L = 1;
++#else
++    int L = 0;
++#endif
+     emit(instr | cr.code() * B23 | L * B21 | s1.code() * B16 | s2.code() * B11 |
+          rc);
+   }
+@@ -412,13 +422,22 @@ class Assembler : public AssemblerBase {
+     nor(dst, src, src, rc);
+   }
+   inline void lwax(Register rt, const MemOperand& src) {
++#if V8_TARGET_ARCH_PPC64
+     Register ra = src.ra();
+     Register rb = src.rb();
+     DCHECK(ra != r0);
+     x_form(LWAX, rt, ra, rb, LeaveRC);
++#else
++    lwzx(rt, src);
++#endif
+   }
+   inline void extsw(Register rs, Register ra, RCBit rc = LeaveRC) {
++#if V8_TARGET_ARCH_PPC64
+     emit(EXT2 | EXTSW | ra.code() * B21 | rs.code() * B16 | rc);
++#else
++    // nop on 32-bit
++    DCHECK(rs == ra && rc == LeaveRC);
++#endif
+   }
+ 
+ #undef DECLARE_PPC_X_INSTRUCTIONS_A_FORM
+@@ -941,6 +960,7 @@ class Assembler : public AssemblerBase {
+   void stwu(Register dst, const MemOperand& src);
+   void neg(Register rt, Register ra, OEBit o = LeaveOE, RCBit c = LeaveRC);
+ 
++#if V8_TARGET_ARCH_PPC64
+   void ld(Register rd, const MemOperand& src);
+   void ldu(Register rd, const MemOperand& src);
+   void std(Register rs, const MemOperand& src);
+@@ -966,6 +986,7 @@ class Assembler : public AssemblerBase {
+             RCBit r = LeaveRC);
+   void divdu(Register dst, Register src1, Register src2, OEBit o = LeaveOE,
+              RCBit r = LeaveRC);
++#endif
+ 
+   void rlwinm(Register ra, Register rs, int sh, int mb, int me,
+               RCBit rc = LeaveRC);
+@@ -1027,11 +1048,13 @@ class Assembler : public AssemblerBase {
+   void mcrfs(CRegister cr, FPSCRBit bit);
+   void mfcr(Register dst);
+   void mtcrf(Register src, uint8_t FXM);
++#if V8_TARGET_ARCH_PPC64
+   void mffprd(Register dst, DoubleRegister src);
+   void mffprwz(Register dst, DoubleRegister src);
+   void mtfprd(DoubleRegister dst, Register src);
+   void mtfprwz(DoubleRegister dst, Register src);
+   void mtfprwa(DoubleRegister dst, Register src);
++#endif
+ 
+   // Exception-generating instructions and debugging support
+   void stop(Condition cond = al, int32_t code = kDefaultStopCode,
+@@ -1178,11 +1201,19 @@ class Assembler : public AssemblerBase {
+   void nop(int type = 0);  // 0 is the default non-marking type.
+ 
+   void push(Register src) {
++#if V8_TARGET_ARCH_PPC64
+     stdu(src, MemOperand(sp, -kSystemPointerSize));
++#else
++    stwu(src, MemOperand(sp, -kSystemPointerSize));
++#endif
+   }
+ 
+   void pop(Register dst) {
++#if V8_TARGET_ARCH_PPC64
+     ld(dst, MemOperand(sp));
++#else
++    lwz(dst, MemOperand(sp));
++#endif
+     addi(sp, sp, Operand(kSystemPointerSize));
+   }
+ 
+@@ -1265,14 +1296,20 @@ class Assembler : public AssemblerBase {
+   static bool IsBranch(Instr instr);
+   static Register GetRA(Instr instr);
+   static Register GetRB(Instr instr);
++#if V8_TARGET_ARCH_PPC64
+   static bool Is64BitLoadIntoR12(Instr instr1, Instr instr2, Instr instr3,
+                                  Instr instr4, Instr instr5);
++#else
++  static bool Is32BitLoadIntoR12(Instr instr1, Instr instr2);
++#endif
+ 
+   static bool IsCmpRegister(Instr instr);
+   static bool IsCmpImmediate(Instr instr);
+   static bool IsRlwinm(Instr instr);
+   static bool IsAndi(Instr instr);
++#if V8_TARGET_ARCH_PPC64
+   static bool IsRldicl(Instr instr);
++#endif
+   static bool IsCrSet(Instr instr);
+   static Register GetCmpImmediateRegister(Instr instr);
+   static int GetCmpImmediateRawImmediate(Instr instr);
+diff --git a/v8/src/codegen/ppc/constants-ppc.cc b/v8/src/codegen/ppc/constants-ppc.cc
+index 02e4fc8..5359195 100644
+--- a/v8/src/codegen/ppc/constants-ppc.cc
++++ b/v8/src/codegen/ppc/constants-ppc.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/codegen/ppc/constants-ppc.h"
+ 
+@@ -57,4 +57,4 @@ int Registers::Number(const char* name) {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/codegen/ppc/cpu-ppc.cc b/v8/src/codegen/ppc/cpu-ppc.cc
+index c6edb0a..d599e7d 100644
+--- a/v8/src/codegen/ppc/cpu-ppc.cc
++++ b/v8/src/codegen/ppc/cpu-ppc.cc
+@@ -4,7 +4,7 @@
+ 
+ // CPU specific code for ppc independent of OS goes here.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/codegen/cpu-features.h"
+ 
+@@ -25,4 +25,4 @@ void CpuFeatures::FlushICache(void* buffer, size_t size) {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/codegen/ppc/interface-descriptors-ppc-inl.h b/v8/src/codegen/ppc/interface-descriptors-ppc-inl.h
+index 0c6fbac..90bb8de 100644
+--- a/v8/src/codegen/ppc/interface-descriptors-ppc-inl.h
++++ b/v8/src/codegen/ppc/interface-descriptors-ppc-inl.h
+@@ -5,7 +5,7 @@
+ #ifndef V8_CODEGEN_PPC_INTERFACE_DESCRIPTORS_PPC_INL_H_
+ #define V8_CODEGEN_PPC_INTERFACE_DESCRIPTORS_PPC_INL_H_
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/codegen/interface-descriptors.h"
+ #include "src/execution/frames.h"
+@@ -379,6 +379,6 @@ constexpr auto WasmJSToWasmWrapperDescriptor::registers() {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #endif  // V8_CODEGEN_PPC_INTERFACE_DESCRIPTORS_PPC_INL_H_
+diff --git a/v8/src/codegen/ppc/macro-assembler-ppc.cc b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+index 118a8df..7c8ae34 100644
+--- a/v8/src/codegen/ppc/macro-assembler-ppc.cc
++++ b/v8/src/codegen/ppc/macro-assembler-ppc.cc
+@@ -5,7 +5,7 @@
+ #include <assert.h>  // For assert
+ #include <limits.h>  // For LONG_MIN, LONG_MAX.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include <optional>
+ 
+@@ -1361,6 +1361,7 @@ void MacroAssembler::ConvertUnsignedIntToFloat(Register src,
+   fcfids(dst, dst);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void MacroAssembler::ConvertInt64ToDouble(Register src,
+                                           DoubleRegister double_dst) {
+   MovInt64ToDouble(double_dst, src);
+@@ -1384,8 +1385,12 @@ void MacroAssembler::ConvertInt64ToFloat(Register src,
+   MovInt64ToDouble(double_dst, src);
+   fcfids(double_dst, double_dst);
+ }
++#endif
+ 
+ void MacroAssembler::ConvertDoubleToInt64(const DoubleRegister double_input,
++#if !V8_TARGET_ARCH_PPC64
++                                          const Register dst_hi,
++#endif
+                                           const Register dst,
+                                           const DoubleRegister double_dst,
+                                           FPRoundingMode rounding_mode) {
+@@ -1398,9 +1403,13 @@ void MacroAssembler::ConvertDoubleToInt64(const DoubleRegister double_input,
+   }
+ 
+   MovDoubleToInt64(
++#if !V8_TARGET_ARCH_PPC64
++      dst_hi,
++#endif
+       dst, double_dst);
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void MacroAssembler::ConvertDoubleToUnsignedInt64(
+     const DoubleRegister double_input, const Register dst,
+     const DoubleRegister double_dst, FPRoundingMode rounding_mode) {
+@@ -1414,6 +1423,149 @@ void MacroAssembler::ConvertDoubleToUnsignedInt64(
+ 
+   MovDoubleToInt64(dst, double_dst);
+ }
++#endif
++
++#if !V8_TARGET_ARCH_PPC64
++void MacroAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
++                                   Register src_low, Register src_high,
++                                   Register scratch, Register shift) {
++  DCHECK(!AreAliased(dst_low, src_high));
++  DCHECK(!AreAliased(dst_high, src_low));
++  DCHECK(!AreAliased(dst_low, dst_high, shift));
++  Label less_than_32;
++  Label done;
++  cmpi(shift, Operand(32));
++  blt(&less_than_32);
++  // If shift >= 32
++  andi(scratch, shift, Operand(0x1F));
++  ShiftLeftU32(dst_high, src_low, scratch);
++  li(dst_low, Operand::Zero());
++  b(&done);
++  bind(&less_than_32);
++  // If shift < 32
++  subfic(scratch, shift, Operand(32));
++  ShiftLeftU32(dst_high, src_high, shift);
++  srw(scratch, src_low, scratch);
++  orx(dst_high, dst_high, scratch);
++  ShiftLeftU32(dst_low, src_low, shift);
++  bind(&done);
++}
++
++void MacroAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
++                                   Register src_low, Register src_high,
++                                   uint32_t shift) {
++  DCHECK(!AreAliased(dst_low, src_high));
++  DCHECK(!AreAliased(dst_high, src_low));
++  if (shift == 32) {
++    Move(dst_high, src_low);
++    li(dst_low, Operand::Zero());
++  } else if (shift > 32) {
++    shift &= 0x1F;
++    ShiftLeftU32(dst_high, src_low, Operand(shift));
++    li(dst_low, Operand::Zero());
++  } else if (shift == 0) {
++    Move(dst_low, src_low);
++    Move(dst_high, src_high);
++  } else {
++    ShiftLeftU32(dst_high, src_high, Operand(shift));
++    rlwimi(dst_high, src_low, shift, 32 - shift, 31);
++    ShiftLeftU32(dst_low, src_low, Operand(shift));
++  }
++}
++
++void MacroAssembler::ShiftRightPair(Register dst_low, Register dst_high,
++                                    Register src_low, Register src_high,
++                                    Register scratch, Register shift) {
++  DCHECK(!AreAliased(dst_low, src_high));
++  DCHECK(!AreAliased(dst_high, src_low));
++  DCHECK(!AreAliased(dst_low, dst_high, shift));
++  Label less_than_32;
++  Label done;
++  cmpi(shift, Operand(32));
++  blt(&less_than_32);
++  // If shift >= 32
++  andi(scratch, shift, Operand(0x1F));
++  srw(dst_low, src_high, scratch);
++  li(dst_high, Operand::Zero());
++  b(&done);
++  bind(&less_than_32);
++  // If shift < 32
++  subfic(scratch, shift, Operand(32));
++  srw(dst_low, src_low, shift);
++  ShiftLeftU32(scratch, src_high, scratch);
++  orx(dst_low, dst_low, scratch);
++  srw(dst_high, src_high, shift);
++  bind(&done);
++}
++
++void MacroAssembler::ShiftRightPair(Register dst_low, Register dst_high,
++                                    Register src_low, Register src_high,
++                                    uint32_t shift) {
++  DCHECK(!AreAliased(dst_low, src_high));
++  DCHECK(!AreAliased(dst_high, src_low));
++  if (shift == 32) {
++    Move(dst_low, src_high);
++    li(dst_high, Operand::Zero());
++  } else if (shift > 32) {
++    shift &= 0x1F;
++    srwi(dst_low, src_high, Operand(shift));
++    li(dst_high, Operand::Zero());
++  } else if (shift == 0) {
++    Move(dst_low, src_low);
++    Move(dst_high, src_high);
++  } else {
++    srwi(dst_low, src_low, Operand(shift));
++    rlwimi(dst_low, src_high, 32 - shift, 0, shift - 1);
++    srwi(dst_high, src_high, Operand(shift));
++  }
++}
++
++void MacroAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
++                                       Register src_low, Register src_high,
++                                       Register scratch, Register shift) {
++  DCHECK(!AreAliased(dst_low, src_high, shift));
++  DCHECK(!AreAliased(dst_high, src_low, shift));
++  Label less_than_32;
++  Label done;
++  cmpi(shift, Operand(32));
++  blt(&less_than_32);
++  // If shift >= 32
++  andi(scratch, shift, Operand(0x1F));
++  sraw(dst_low, src_high, scratch);
++  srawi(dst_high, src_high, 31);
++  b(&done);
++  bind(&less_than_32);
++  // If shift < 32
++  subfic(scratch, shift, Operand(32));
++  srw(dst_low, src_low, shift);
++  ShiftLeftU32(scratch, src_high, scratch);
++  orx(dst_low, dst_low, scratch);
++  sraw(dst_high, src_high, shift);
++  bind(&done);
++}
++
++void MacroAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
++                                       Register src_low, Register src_high,
++                                       uint32_t shift) {
++  DCHECK(!AreAliased(dst_low, src_high));
++  DCHECK(!AreAliased(dst_high, src_low));
++  if (shift == 32) {
++    Move(dst_low, src_high);
++    srawi(dst_high, src_high, 31);
++  } else if (shift > 32) {
++    shift &= 0x1F;
++    srawi(dst_low, src_high, shift);
++    srawi(dst_high, src_high, 31);
++  } else if (shift == 0) {
++    Move(dst_low, src_low);
++    Move(dst_high, src_high);
++  } else {
++    srwi(dst_low, src_low, Operand(shift));
++    rlwimi(dst_low, src_high, 32 - shift, 0, shift - 1);
++    srawi(dst_high, src_high, shift);
++  }
++}
++#endif
+ 
+ void MacroAssembler::LoadConstantPoolPointerRegisterFromCodeTargetAddress(
+     Register code_target_address, Register scratch1, Register scratch2) {
+@@ -2130,6 +2282,7 @@ void MacroAssembler::SubAndCheckForOverflow(Register dst, Register left,
+ 
+ void MacroAssembler::MinF64(DoubleRegister dst, DoubleRegister lhs,
+                             DoubleRegister rhs, DoubleRegister scratch) {
++#if V8_TARGET_ARCH_PPC64
+   Label return_nan, done;
+   fcmpu(lhs, rhs);
+   bunordered(&return_nan);
+@@ -2139,10 +2292,55 @@ void MacroAssembler::MinF64(DoubleRegister dst, DoubleRegister lhs,
+   /* If left or right are NaN, fadd propagates the appropriate one.*/
+   fadd(dst, lhs, rhs);
+   bind(&done);
++#else
++  // No VSX (xsmindp is POWER7): the compare-and-select sequence V8 used
++  // before it required POWER7, with the -0/+0 and NaN cases spelled out.
++  Label check_zero, return_left, return_right, return_nan, done;
++  fcmpu(lhs, rhs);
++  bunordered(&return_nan);
++  beq(&check_zero);
++  ble(&return_left);
++  b(&return_right);
++
++  bind(&check_zero);
++  fcmpu(lhs, kDoubleRegZero);
++  /* left == right != 0. */
++  bne(&return_left);
++  /* At this point, both left and right are either 0 or -0. */
++  /* Min: The algorithm is: -((-L) + (-R)), which in case of L and R */
++  /* being different registers is most efficiently expressed */
++  /* as -((-L) - R). */
++  fneg(scratch, lhs);
++  if (scratch == rhs) {
++    fadd(dst, scratch, rhs);
++  } else {
++    fsub(dst, scratch, rhs);
++  }
++  fneg(dst, dst);
++  b(&done);
++
++  bind(&return_nan);
++  /* If left or right are NaN, fadd propagates the appropriate one.*/
++  fadd(dst, lhs, rhs);
++  b(&done);
++
++  bind(&return_right);
++  if (rhs != dst) {
++    fmr(dst, rhs);
++  }
++  b(&done);
++
++  bind(&return_left);
++  if (lhs != dst) {
++    fmr(dst, lhs);
++  }
++  bind(&done);
++#endif
+ }
+ 
+ void MacroAssembler::MaxF64(DoubleRegister dst, DoubleRegister lhs,
+                             DoubleRegister rhs, DoubleRegister scratch) {
++#if V8_TARGET_ARCH_PPC64
+   Label return_nan, done;
+   fcmpu(lhs, rhs);
+   bunordered(&return_nan);
+@@ -2152,6 +2350,40 @@ void MacroAssembler::MaxF64(DoubleRegister dst, DoubleRegister lhs,
+   /* If left or right are NaN, fadd propagates the appropriate one.*/
+   fadd(dst, lhs, rhs);
+   bind(&done);
++#else
++  // No VSX (xsmaxdp is POWER7): the pre-POWER7 compare-and-select sequence.
++  Label check_zero, return_left, return_right, return_nan, done;
++  fcmpu(lhs, rhs);
++  bunordered(&return_nan);
++  beq(&check_zero);
++  bge(&return_left);
++  b(&return_right);
++
++  bind(&check_zero);
++  fcmpu(lhs, kDoubleRegZero);
++  /* left == right != 0. */
++  bne(&return_left);
++  /* At this point, both left and right are either 0 or -0. */
++  fadd(dst, lhs, rhs);
++  b(&done);
++
++  bind(&return_nan);
++  /* If left or right are NaN, fadd propagates the appropriate one.*/
++  fadd(dst, lhs, rhs);
++  b(&done);
++
++  bind(&return_right);
++  if (rhs != dst) {
++    fmr(dst, rhs);
++  }
++  b(&done);
++
++  bind(&return_left);
++  if (lhs != dst) {
++    fmr(dst, lhs);
++  }
++  bind(&done);
++#endif
+ }
+ 
+ void MacroAssembler::JumpIfIsInRange(Register value, Register scratch,
+@@ -2199,11 +2431,22 @@ void MacroAssembler::TryInlineTruncateDoubleToI(Register result,
+                                                 DoubleRegister double_input,
+                                                 Label* done) {
+   DoubleRegister double_scratch = kScratchDoubleReg;
++#if !V8_TARGET_ARCH_PPC64
++  Register scratch = ip;
++#endif
++
+   ConvertDoubleToInt64(double_input,
++#if !V8_TARGET_ARCH_PPC64
++                       scratch,
++#endif
+                        result, double_scratch);
+ 
+ // Test for overflow
++#if V8_TARGET_ARCH_PPC64
+   TestIfInt32(result, r0);
++#else
++  TestIfInt32(scratch, result, r0);
++#endif
+   beq(done);
+ }
+ 
+@@ -2395,7 +2638,11 @@ void MacroAssembler::CallRuntime(const Runtime::Function* f,
+   mov(r3, Operand(num_arguments));
+   Move(r4, ExternalReference::Create(f));
+   bool switch_to_central_stack = options().is_wasm;
++#if V8_TARGET_ARCH_PPC64
+   CallBuiltin(Builtins::RuntimeCEntry(f->result_size, switch_to_central_stack));
++#else
++  CallBuiltin(Builtins::RuntimeCEntry(1, switch_to_central_stack));
++#endif
+ }
+ 
+ void MacroAssembler::TailCallRuntime(Runtime::FunctionId fid) {
+@@ -2930,32 +3177,82 @@ void MacroAssembler::LoadDoubleLiteral(DoubleRegister result,
+   // avoid gcc strict aliasing error using union cast
+   union {
+     uint64_t dval;
++#if V8_TARGET_ARCH_PPC64
+     intptr_t ival;
++#else
++    intptr_t ival[2];
++#endif
+   } litVal;
+ 
+   litVal.dval = value.AsUint64();
+ 
++#if V8_TARGET_ARCH_PPC64
+   mov(scratch, Operand(litVal.ival));
+   mtfprd(result, scratch);
++#else
++  addi(sp, sp, Operand(-kDoubleSize));
++  LoadIntLiteral(scratch, litVal.ival[0]);
++  stw(scratch, MemOperand(sp, 0));
++  LoadIntLiteral(scratch, litVal.ival[1]);
++  stw(scratch, MemOperand(sp, 4));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(result, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovIntToDouble(DoubleRegister dst, Register src,
+                                     Register scratch) {
+   // sign-extend src to 64-bit
++#if V8_TARGET_ARCH_PPC64
+   mtfprwa(dst, src);
++#else
++  DCHECK(src != scratch);
++  subi(sp, sp, Operand(kDoubleSize));
++  srawi(scratch, src, 31);
++  stw(scratch, MemOperand(sp, Register::kExponentOffset));
++  stw(src, MemOperand(sp, Register::kMantissaOffset));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovUnsignedIntToDouble(DoubleRegister dst, Register src,
+                                             Register scratch) {
+   // zero-extend src to 64-bit
++#if V8_TARGET_ARCH_PPC64
+   mtfprwz(dst, src);
++#else
++  DCHECK(src != scratch);
++  subi(sp, sp, Operand(kDoubleSize));
++  li(scratch, Operand::Zero());
++  stw(scratch, MemOperand(sp, Register::kExponentOffset));
++  stw(src, MemOperand(sp, Register::kMantissaOffset));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovInt64ToDouble(DoubleRegister dst,
++#if !V8_TARGET_ARCH_PPC64
++                                      Register src_hi,
++#endif
+                                       Register src) {
++#if V8_TARGET_ARCH_PPC64
+   mtfprd(dst, src);
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stw(src_hi, MemOperand(sp, Register::kExponentOffset));
++  stw(src, MemOperand(sp, Register::kMantissaOffset));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void MacroAssembler::MovInt64ComponentsToDouble(DoubleRegister dst,
+                                                 Register src_hi,
+                                                 Register src_lo,
+@@ -2964,45 +3261,109 @@ void MacroAssembler::MovInt64ComponentsToDouble(DoubleRegister dst,
+   rldimi(scratch, src_lo, 0, 32);
+   mtfprd(dst, scratch);
+ }
++#endif
+ 
+ void MacroAssembler::InsertDoubleLow(DoubleRegister dst, Register src,
+                                      Register scratch) {
++#if V8_TARGET_ARCH_PPC64
+   mffprd(scratch, dst);
+   rldimi(scratch, src, 0, 32);
+   mtfprd(dst, scratch);
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(dst, MemOperand(sp));
++  stw(src, MemOperand(sp, Register::kMantissaOffset));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::InsertDoubleHigh(DoubleRegister dst, Register src,
+                                       Register scratch) {
++#if V8_TARGET_ARCH_PPC64
+   mffprd(scratch, dst);
+   rldimi(scratch, src, 32, 0);
+   mtfprd(dst, scratch);
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(dst, MemOperand(sp));
++  stw(src, MemOperand(sp, Register::kExponentOffset));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfd(dst, MemOperand(sp));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovDoubleLowToInt(Register dst, DoubleRegister src) {
++#if V8_TARGET_ARCH_PPC64
+   mffprwz(dst, src);
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(src, MemOperand(sp));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lwz(dst, MemOperand(sp, Register::kMantissaOffset));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovDoubleHighToInt(Register dst, DoubleRegister src) {
++#if V8_TARGET_ARCH_PPC64
+   mffprd(dst, src);
+   srdi(dst, dst, Operand(32));
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(src, MemOperand(sp));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lwz(dst, MemOperand(sp, Register::kExponentOffset));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+-void MacroAssembler::MovDoubleToInt64(Register dst, DoubleRegister src) {
++void MacroAssembler::MovDoubleToInt64(
++#if !V8_TARGET_ARCH_PPC64
++    Register dst_hi,
++#endif
++    Register dst, DoubleRegister src) {
++#if V8_TARGET_ARCH_PPC64
+   mffprd(dst, src);
++#else
++  subi(sp, sp, Operand(kDoubleSize));
++  stfd(src, MemOperand(sp));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lwz(dst_hi, MemOperand(sp, Register::kExponentOffset));
++  lwz(dst, MemOperand(sp, Register::kMantissaOffset));
++  addi(sp, sp, Operand(kDoubleSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovIntToFloat(DoubleRegister dst, Register src,
+                                    Register scratch) {
++#if V8_TARGET_ARCH_PPC64
+   ShiftLeftU64(scratch, src, Operand(32));
+   mtfprd(dst, scratch);
+   xscvspdpn(dst, dst);
++#else
++  subi(sp, sp, Operand(kFloatSize));
++  stw(src, MemOperand(sp, 0));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lfs(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kFloatSize));
++#endif
+ }
+ 
+ void MacroAssembler::MovFloatToInt(Register dst, DoubleRegister src,
+                                    DoubleRegister scratch) {
++#if V8_TARGET_ARCH_PPC64
+   xscvdpspn(scratch, src);
+   mffprwz(dst, scratch);
++#else
++  subi(sp, sp, Operand(kFloatSize));
++  stfs(src, MemOperand(sp, 0));
++  nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
++  lwz(dst, MemOperand(sp, 0));
++  addi(sp, sp, Operand(kFloatSize));
++#endif
+ }
+ 
+ void MacroAssembler::AddS64(Register dst, Register src, Register value, OEBit s,
+@@ -5717,4 +6078,4 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
+ 
+ #undef __
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/codegen/ppc/macro-assembler-ppc.h b/v8/src/codegen/ppc/macro-assembler-ppc.h
+index 9bca1e2..42e1523 100644
+--- a/v8/src/codegen/ppc/macro-assembler-ppc.h
++++ b/v8/src/codegen/ppc/macro-assembler-ppc.h
+@@ -40,8 +40,13 @@ Register GetRegisterThatIsNotOneOf(Register reg1, Register reg2 = no_reg,
+                                    Register reg6 = no_reg);
+ 
+ // These exist to provide portability between 32 and 64bit
++#if V8_TARGET_ARCH_PPC64
+ #define ClearLeftImm clrldi
+ #define ClearRightImm clrrdi
++#else
++#define ClearLeftImm clrlwi
++#define ClearRightImm clrrwi
++#endif
+ 
+ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+  public:
+@@ -68,23 +73,30 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   // a float, storing the result in |dst|
+   void ConvertUnsignedIntToFloat(Register src, DoubleRegister dst);
+ 
++#if V8_TARGET_ARCH_PPC64
+   void ConvertInt64ToFloat(Register src, DoubleRegister double_dst);
+   void ConvertInt64ToDouble(Register src, DoubleRegister double_dst);
+   void ConvertUnsignedInt64ToFloat(Register src, DoubleRegister double_dst);
+   void ConvertUnsignedInt64ToDouble(Register src, DoubleRegister double_dst);
++#endif
+ 
+   // Converts the double_input to an integer.  Note that, upon return,
+   // the contents of double_dst will also hold the fixed point representation.
+   void ConvertDoubleToInt64(const DoubleRegister double_input,
++#if !V8_TARGET_ARCH_PPC64
++                            const Register dst_hi,
++#endif
+                             const Register dst, const DoubleRegister double_dst,
+                             FPRoundingMode rounding_mode = kRoundToZero);
+ 
++#if V8_TARGET_ARCH_PPC64
+   // Converts the double_input to an unsigned integer.  Note that, upon return,
+   // the contents of double_dst will also hold the fixed point representation.
+   void ConvertDoubleToUnsignedInt64(
+       const DoubleRegister double_input, const Register dst,
+       const DoubleRegister double_dst,
+       FPRoundingMode rounding_mode = kRoundToZero);
++#endif
+ 
+   // Activation support.
+   void EnterFrame(StackFrame::Type type,
+@@ -679,6 +691,21 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   // Print a message to stdout and abort execution.
+   void Abort(AbortReason reason);
+ 
++#if !V8_TARGET_ARCH_PPC64
++  void ShiftLeftPair(Register dst_low, Register dst_high, Register src_low,
++                     Register src_high, Register scratch, Register shift);
++  void ShiftLeftPair(Register dst_low, Register dst_high, Register src_low,
++                     Register src_high, uint32_t shift);
++  void ShiftRightPair(Register dst_low, Register dst_high, Register src_low,
++                      Register src_high, Register scratch, Register shift);
++  void ShiftRightPair(Register dst_low, Register dst_high, Register src_low,
++                      Register src_high, uint32_t shift);
++  void ShiftRightAlgPair(Register dst_low, Register dst_high, Register src_low,
++                         Register src_high, Register scratch, Register shift);
++  void ShiftRightAlgPair(Register dst_low, Register dst_high, Register src_low,
++                         Register src_high, uint32_t shift);
++#endif
++
+   void LoadFromConstantsTable(Register destination, int constant_index) final;
+   void LoadRootRegisterOffset(Register destination, intptr_t offset) final;
+   void LoadRootRelative(Register destination, int32_t offset) final;
+@@ -766,14 +793,22 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   void MovUnsignedIntToDouble(DoubleRegister dst, Register src,
+                               Register scratch);
+   void MovInt64ToDouble(DoubleRegister dst,
++#if !V8_TARGET_ARCH_PPC64
++                        Register src_hi,
++#endif
+                         Register src);
++#if V8_TARGET_ARCH_PPC64
+   void MovInt64ComponentsToDouble(DoubleRegister dst, Register src_hi,
+                                   Register src_lo, Register scratch);
++#endif
+   void InsertDoubleLow(DoubleRegister dst, Register src, Register scratch);
+   void InsertDoubleHigh(DoubleRegister dst, Register src, Register scratch);
+   void MovDoubleLowToInt(Register dst, DoubleRegister src);
+   void MovDoubleHighToInt(Register dst, DoubleRegister src);
+   void MovDoubleToInt64(
++#if !V8_TARGET_ARCH_PPC64
++      Register dst_hi,
++#endif
+       Register dst, DoubleRegister src);
+   void MovIntToFloat(DoubleRegister dst, Register src, Register scratch);
+   void MovFloatToInt(Register dst, DoubleRegister src, DoubleRegister scratch);
+@@ -841,7 +876,12 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+       // Prefer faster andi when applicable.
+       andi(dst, src, Operand(((1 << width) - 1) << rangeEnd));
+     } else {
++#if V8_TARGET_ARCH_PPC64
+       rldicl(dst, src, rotate, kBitsPerSystemPointer - width, rc);
++#else
++      rlwinm(dst, src, rotate, kBitsPerSystemPointer - width,
++             kBitsPerSystemPointer - 1, rc);
++#endif
+     }
+   }
+ 
+@@ -910,12 +950,21 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
+   void LoadFeedbackVector(Register dst, Register closure, Register scratch,
+                           Label* fbv_undef);
+ 
++#if V8_TARGET_ARCH_PPC64
+   inline void TestIfInt32(Register value, Register scratch,
+                           CRegister cr = cr0) {
+     // High bits must be identical to fit into an 32-bit integer
+     extsw(scratch, value);
+     CmpS64(scratch, value, cr);
+   }
++#else
++  inline void TestIfInt32(Register hi_word, Register lo_word, Register scratch,
++                          CRegister cr = cr0) {
++    // High bits must be identical to fit into an 32-bit integer
++    srawi(scratch, lo_word, 31);
++    CmpS64(scratch, hi_word, cr);
++  }
++#endif
+ 
+   // Overflow handling functions.
+   // Usage: call the appropriate arithmetic function and then call one of the
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 1b4245b..939769c 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -75,7 +75,9 @@ class PPCOperandConverter final : public InstructionOperandConverter {
+       case Constant::kFloat64:
+         return Operand::EmbeddedNumber(constant.ToFloat64().value());
+       case Constant::kInt64:
++#if V8_TARGET_ARCH_PPC64
+         return Operand(constant.ToInt64());
++#endif
+       case Constant::kExternalReference:
+         return Operand(constant.ToExternalReference());
+       case Constant::kCompressedHeapObject: {
+@@ -274,9 +276,11 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
+     case kOverflow:
+       // Overflow checked for add/sub only.
+       switch (op) {
++#if V8_TARGET_ARCH_PPC64
+         case kPPC_Add32:
+         case kPPC_Add64:
+         case kPPC_Sub:
++#endif
+         case kPPC_AddWithOverflow32:
+         case kPPC_SubWithOverflow32:
+           return lt;
+@@ -286,9 +290,11 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
+       break;
+     case kNotOverflow:
+       switch (op) {
++#if V8_TARGET_ARCH_PPC64
+         case kPPC_Add32:
+         case kPPC_Add64:
+         case kPPC_Sub:
++#endif
+         case kPPC_AddWithOverflow32:
+         case kPPC_SubWithOverflow32:
+           return ge;
+@@ -377,6 +383,7 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
+     }                                                                   \
+   } while (0)
+ 
++#if V8_TARGET_ARCH_PPC64
+ #define ASSEMBLE_ADD_WITH_OVERFLOW32()         \
+   do {                                         \
+     ASSEMBLE_ADD_WITH_OVERFLOW();              \
+@@ -388,6 +395,10 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
+     ASSEMBLE_SUB_WITH_OVERFLOW();              \
+     __ extsw(kScratchReg, kScratchReg, SetRC); \
+   } while (0)
++#else
++#define ASSEMBLE_ADD_WITH_OVERFLOW32 ASSEMBLE_ADD_WITH_OVERFLOW
++#define ASSEMBLE_SUB_WITH_OVERFLOW32 ASSEMBLE_SUB_WITH_OVERFLOW
++#endif
+ 
+ #define ASSEMBLE_COMPARE(cmp_instr, cmpl_instr)                        \
+   do {                                                                 \
+@@ -585,8 +596,12 @@ Condition FlagsConditionToCondition(FlagsCondition condition, ArchOpcode op) {
+     DCHECK_EQ(LeaveRC, i.OutputRCBit());                 \
+   } while (0)
+ 
++#if V8_TARGET_ARCH_PPC64
+ // TODO(mbrandy): fix paths that produce garbage in offset's upper 32-bits.
+ #define CleanUInt32(x) __ ClearLeftImm(x, x, Operand(32))
++#else
++#define CleanUInt32(x)
++#endif
+ 
+ #if V8_ENABLE_WEBASSEMBLY
+ static inline bool is_wasm_on_be(bool IsWasm) {
+@@ -845,7 +860,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       if (instr->InputAt(0)->IsImmediate()) {
+         DCHECK_EQ(opcode, kArchCallWasmFunction);
+         Constant constant = i.ToConstant(instr->InputAt(0));
++#ifdef V8_TARGET_ARCH_PPC64
+         Address wasm_code = static_cast<Address>(constant.ToInt64());
++#else
++        Address wasm_code = static_cast<Address>(constant.ToInt32());
++#endif
+         __ Call(wasm_code, constant.rmode());
+       } else if (opcode == kArchCallWasmFunctionIndirect) {
+         __ CallWasmCodePointer(i.InputRegister(0));
+@@ -864,7 +883,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       if (instr->InputAt(0)->IsImmediate()) {
+         DCHECK_EQ(opcode, kArchTailCallWasm);
+         Constant constant = i.ToConstant(instr->InputAt(0));
++#ifdef V8_TARGET_ARCH_PPC64
+         Address wasm_code = static_cast<Address>(constant.ToInt64());
++#else
++        Address wasm_code = static_cast<Address>(constant.ToInt32());
++#endif
+         __ Jump(wasm_code, constant.rmode());
+       } else if (opcode == kArchTailCallWasmIndirect) {
+         __ CallWasmCodePointer(i.InputRegister(0), CallJumpMode::kTailCall);
+@@ -965,8 +988,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       AssemblePrepareTailCall();
+       break;
+     case kArchComment:
++#ifdef V8_TARGET_ARCH_PPC64
+       __ RecordComment(reinterpret_cast<const char*>(i.InputInt64(0)),
+                        SourceLocation());
++#else
++      __ RecordComment(reinterpret_cast<const char*>(i.InputInt32(0)),
++                       SourceLocation());
++#endif
+       break;
+     case kArchCallCFunctionWithFrameState:
+     case kArchCallCFunction: {
+@@ -1303,6 +1331,78 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kPPC_ShiftRightAlg64:
+       ASSEMBLE_BINOP_INT_RC(ShiftRightS64, ShiftRightS64);
+       break;
++#if !V8_TARGET_ARCH_PPC64
++    case kPPC_AddPair:
++      // i.InputRegister(0) ... left low word.
++      // i.InputRegister(1) ... left high word.
++      // i.InputRegister(2) ... right low word.
++      // i.InputRegister(3) ... right high word.
++      __ addc(i.OutputRegister(0), i.InputRegister(0), i.InputRegister(2));
++      __ adde(i.OutputRegister(1), i.InputRegister(1), i.InputRegister(3));
++      DCHECK_EQ(LeaveRC, i.OutputRCBit());
++      break;
++    case kPPC_SubPair:
++      // i.InputRegister(0) ... left low word.
++      // i.InputRegister(1) ... left high word.
++      // i.InputRegister(2) ... right low word.
++      // i.InputRegister(3) ... right high word.
++      __ subc(i.OutputRegister(0), i.InputRegister(0), i.InputRegister(2));
++      __ sube(i.OutputRegister(1), i.InputRegister(1), i.InputRegister(3));
++      DCHECK_EQ(LeaveRC, i.OutputRCBit());
++      break;
++    case kPPC_MulPair:
++      // i.InputRegister(0) ... left low word.
++      // i.InputRegister(1) ... left high word.
++      // i.InputRegister(2) ... right low word.
++      // i.InputRegister(3) ... right high word.
++      __ mullw(i.TempRegister(0), i.InputRegister(0), i.InputRegister(3));
++      __ mullw(i.TempRegister(1), i.InputRegister(2), i.InputRegister(1));
++      __ add(i.TempRegister(0), i.TempRegister(0), i.TempRegister(1));
++      __ mullw(i.OutputRegister(0), i.InputRegister(0), i.InputRegister(2));
++      __ mulhwu(i.OutputRegister(1), i.InputRegister(0), i.InputRegister(2));
++      __ add(i.OutputRegister(1), i.OutputRegister(1), i.TempRegister(0));
++      break;
++    case kPPC_ShiftLeftPair: {
++      Register second_output =
++          instr->OutputCount() >= 2 ? i.OutputRegister(1) : i.TempRegister(0);
++      if (instr->InputAt(2)->IsImmediate()) {
++        __ ShiftLeftPair(i.OutputRegister(0), second_output, i.InputRegister(0),
++                         i.InputRegister(1), i.InputInt32(2));
++      } else {
++        __ ShiftLeftPair(i.OutputRegister(0), second_output, i.InputRegister(0),
++                         i.InputRegister(1), kScratchReg, i.InputRegister(2));
++      }
++      break;
++    }
++    case kPPC_ShiftRightPair: {
++      Register second_output =
++          instr->OutputCount() >= 2 ? i.OutputRegister(1) : i.TempRegister(0);
++      if (instr->InputAt(2)->IsImmediate()) {
++        __ ShiftRightPair(i.OutputRegister(0), second_output,
++                          i.InputRegister(0), i.InputRegister(1),
++                          i.InputInt32(2));
++      } else {
++        __ ShiftRightPair(i.OutputRegister(0), second_output,
++                          i.InputRegister(0), i.InputRegister(1), kScratchReg,
++                          i.InputRegister(2));
++      }
++      break;
++    }
++    case kPPC_ShiftRightAlgPair: {
++      Register second_output =
++          instr->OutputCount() >= 2 ? i.OutputRegister(1) : i.TempRegister(0);
++      if (instr->InputAt(2)->IsImmediate()) {
++        __ ShiftRightAlgPair(i.OutputRegister(0), second_output,
++                             i.InputRegister(0), i.InputRegister(1),
++                             i.InputInt32(2));
++      } else {
++        __ ShiftRightAlgPair(i.OutputRegister(0), second_output,
++                             i.InputRegister(0), i.InputRegister(1),
++                             kScratchReg, i.InputRegister(2));
++      }
++      break;
++    }
++#endif
+     case kPPC_RotRight32:
+       if (HasRegisterInput(instr, 1)) {
+         __ subfic(kScratchReg, i.InputRegister(1), Operand(32));
+@@ -1313,6 +1413,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         __ rotrwi(i.OutputRegister(), i.InputRegister(0), sh, i.OutputRCBit());
+       }
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_RotRight64:
+       if (HasRegisterInput(instr, 1)) {
+         __ subfic(kScratchReg, i.InputRegister(1), Operand(64));
+@@ -1323,6 +1424,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         __ rotrdi(i.OutputRegister(), i.InputRegister(0), sh, i.OutputRCBit());
+       }
+       break;
++#endif
+     case kPPC_Not:
+       __ notx(i.OutputRegister(), i.InputRegister(0), i.OutputRCBit());
+       break;
+@@ -1330,6 +1432,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ rlwinm(i.OutputRegister(), i.InputRegister(0), i.InputInt32(1),
+                 31 - i.InputInt32(2), 31 - i.InputInt32(3), i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_RotLeftAndClear64:
+       __ rldic(i.OutputRegister(), i.InputRegister(0), i.InputInt32(1),
+                63 - i.InputInt32(2), i.OutputRCBit());
+@@ -1342,10 +1445,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ rldicr(i.OutputRegister(), i.InputRegister(0), i.InputInt32(1),
+                 63 - i.InputInt32(2), i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Add32:
++#if V8_TARGET_ARCH_PPC64
+       if (FlagsModeField::decode(instr->opcode()) != kFlags_none) {
+         ASSEMBLE_ADD_WITH_OVERFLOW();
+       } else {
++#endif
+         if (HasRegisterInput(instr, 1)) {
+           __ add(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
+                  LeaveOE, i.OutputRCBit());
+@@ -1354,8 +1460,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+                     r0, LeaveOE, i.OutputRCBit());
+         }
+         __ extsw(i.OutputRegister(), i.OutputRegister());
++#if V8_TARGET_ARCH_PPC64
+       }
++#endif
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Add64:
+       if (FlagsModeField::decode(instr->opcode()) != kFlags_none) {
+         ASSEMBLE_ADD_WITH_OVERFLOW();
+@@ -1369,6 +1478,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         }
+       }
+       break;
++#endif
+     case kPPC_AddWithOverflow32:
+       ASSEMBLE_ADD_WITH_OVERFLOW32();
+       break;
+@@ -1376,9 +1486,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       ASSEMBLE_FLOAT_BINOP_RC(fadd, MiscField::decode(instr->opcode()));
+       break;
+     case kPPC_Sub:
++#if V8_TARGET_ARCH_PPC64
+       if (FlagsModeField::decode(instr->opcode()) != kFlags_none) {
+         ASSEMBLE_SUB_WITH_OVERFLOW();
+       } else {
++#endif
+         if (HasRegisterInput(instr, 1)) {
+           __ sub(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
+                  LeaveOE, i.OutputRCBit());
+@@ -1386,7 +1498,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+           __ SubS64(i.OutputRegister(), i.InputRegister(0), i.InputImmediate(1),
+                     r0, LeaveOE, i.OutputRCBit());
+         }
++#if V8_TARGET_ARCH_PPC64
+       }
++#endif
+       break;
+     case kPPC_SubWithOverflow32:
+       ASSEMBLE_SUB_WITH_OVERFLOW32();
+@@ -1398,10 +1512,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ mullw(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
+                LeaveOE, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Mul64:
+       __ mulld(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1),
+                LeaveOE, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Mul32WithHigh32:
+       if (i.OutputRegister(0) == i.InputRegister(0) ||
+           i.OutputRegister(0) == i.InputRegister(1) ||
+@@ -1445,18 +1561,22 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ divw(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Div64:
+       __ divd(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_DivU32:
+       __ divwu(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_DivU64:
+       __ divdu(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_DivDouble:
+       ASSEMBLE_FLOAT_BINOP_RC(fdiv, MiscField::decode(instr->opcode()));
+       break;
+@@ -1467,6 +1587,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         ASSEMBLE_MODULO(divw, mullw);
+       }
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Mod64:
+       if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+         __ modsd(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+@@ -1474,6 +1595,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         ASSEMBLE_MODULO(divd, mulld);
+       }
+       break;
++#endif
+     case kPPC_ModU32:
+       if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+         __ moduw(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+@@ -1481,6 +1603,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         ASSEMBLE_MODULO(divwu, mullw);
+       }
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_ModU64:
+       if (CpuFeatures::IsSupported(PPC_9_PLUS)) {
+         __ modud(i.OutputRegister(), i.InputRegister(0), i.InputRegister(1));
+@@ -1488,6 +1611,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         ASSEMBLE_MODULO(divdu, mulld);
+       }
+       break;
++#endif
+     case kPPC_ModDouble:
+       // TODO(bmeurer): We should really get rid of this special instruction,
+       // and generate a CallAddress instruction instead.
+@@ -1592,24 +1716,30 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ cntlzw(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Cntlz64:
+       __ cntlzd(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Popcnt32:
+       __ Popcnt32(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Popcnt64:
+       __ Popcnt64(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Cmp32:
+       ASSEMBLE_COMPARE(cmpw, cmplw);
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Cmp64:
+       ASSEMBLE_COMPARE(cmp, cmpl);
+       break;
++#endif
+     case kPPC_CmpDouble:
+       ASSEMBLE_FLOAT_COMPARE(fcmpu);
+       break;
+@@ -1619,9 +1749,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       } else {
+         __ andi(r0, i.InputRegister(0), i.InputImmediate(1));
+       }
++#if V8_TARGET_ARCH_PPC64
+       __ extsw(r0, r0, i.OutputRCBit());
++#endif
+       DCHECK_EQ(SetRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_Tst64:
+       if (HasRegisterInput(instr, 1)) {
+         __ and_(r0, i.InputRegister(0), i.InputRegister(1), i.OutputRCBit());
+@@ -1630,6 +1763,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       }
+       DCHECK_EQ(SetRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Float64SilenceNaN: {
+       DoubleRegister value = i.InputDoubleRegister(0);
+       DoubleRegister result = i.OutputDoubleRegister();
+@@ -1720,6 +1854,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ extsh(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_ExtendSignWord32:
+       __ extsw(i.OutputRegister(), i.InputRegister(0));
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+@@ -1751,6 +1886,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+                                       i.OutputDoubleRegister());
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
++#endif
+     case kPPC_Int32ToFloat32:
+       __ ConvertIntToFloat(i.InputRegister(0), i.OutputDoubleRegister());
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+@@ -1835,10 +1971,16 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     }
+ #undef DOUBLE_TO_INT32
+     case kPPC_DoubleToInt64: {
++#if V8_TARGET_ARCH_PPC64
+       bool check_conversion = i.OutputCount() > 1;
+       __ mtfsb0(VXCVI);  // clear FPSCR:VXCVI bit
++#endif
+       __ ConvertDoubleToInt64(i.InputDoubleRegister(0),
++#if !V8_TARGET_ARCH_PPC64
++                              kScratchReg,
++#endif
+                               i.OutputRegister(0), kScratchDoubleReg);
++#if V8_TARGET_ARCH_PPC64
+       CRegister cr = cr0;
+       int crbit = v8::internal::Assembler::encode_crbit(
+           cr, static_cast<CRBit>(VXCVI % CRWIDTH));
+@@ -1850,9 +1992,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       } else {
+         __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), crbit);
+       }
++#endif
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
+     }
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_DoubleToUint64: {
+       bool check_conversion = (i.OutputCount() > 1);
+       if (check_conversion) {
+@@ -1872,6 +2016,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
+     }
++#endif
+     case kPPC_DoubleToFloat32:
+       ASSEMBLE_FLOAT_UNOP_RC(frsp, 0);
+       break;
+@@ -1903,8 +2048,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
+     case kPPC_DoubleConstruct:
++#if V8_TARGET_ARCH_PPC64
+       __ MovInt64ComponentsToDouble(i.OutputDoubleRegister(),
+                                     i.InputRegister(0), i.InputRegister(1), r0);
++#else
++      __ MovInt64ToDouble(i.OutputDoubleRegister(), i.InputRegister(0),
++                          i.InputRegister(1));
++#endif
+       DCHECK_EQ(LeaveRC, i.OutputRCBit());
+       break;
+     case kPPC_BitcastFloat32ToInt32:
+@@ -1914,12 +2064,14 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kPPC_BitcastInt32ToFloat32:
+       __ MovIntToFloat(i.OutputDoubleRegister(), i.InputRegister(0), ip);
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_BitcastDoubleToInt64:
+       __ MovDoubleToInt64(i.OutputRegister(), i.InputDoubleRegister(0));
+       break;
+     case kPPC_BitcastInt64ToDouble:
+       __ MovInt64ToDouble(i.OutputDoubleRegister(), i.InputRegister(0));
+       break;
++#endif
+     case kPPC_LoadWordU8:
+       ASSEMBLE_LOAD_INTEGER(lbz, plbz, lbzx, false);
+       break;
+@@ -1939,9 +2091,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kPPC_LoadWordS32:
+       ASSEMBLE_LOAD_INTEGER(lwa, plwa, lwax, true);
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_LoadWord64:
+       ASSEMBLE_LOAD_INTEGER(ld, pld, ldx, true);
+       break;
++#endif
+     case kPPC_LoadFloat32:
+       ASSEMBLE_LOAD_FLOAT(lfs, plfs, lfsx);
+       break;
+@@ -1972,9 +2126,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+     case kPPC_StoreWord32:
+       ASSEMBLE_STORE_INTEGER(stw, pstw, stwx, false);
+       break;
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_StoreWord64:
+       ASSEMBLE_STORE_INTEGER(std, pstd, stdx, true);
+       break;
++#endif
+     case kPPC_StoreFloat32:
+       ASSEMBLE_STORE_FLOAT(stfs, pstfs, stfsx);
+       break;
+@@ -2977,6 +3133,7 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
+     }
+     // Unnecessary for eq/lt & ne/ge since only FU bit will be set.
+   }
++#if V8_TARGET_ARCH_PPC64
+   switch (cond) {
+     case eq:
+     case lt:
+@@ -2995,6 +3152,12 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
+     default:
+       UNREACHABLE();
+   }
++#else
++  // No isel before POWER7: branch around the materialisation.
++  if (reg_value != 0) __ li(reg, Operand::Zero());
++  __ b(NegateCondition(cond), &done, cr);
++  __ li(reg, Operand(1));
++#endif
+   __ bind(&done);
+ }
+ 
+diff --git a/v8/src/diagnostics/ppc/disasm-ppc.cc b/v8/src/diagnostics/ppc/disasm-ppc.cc
+index b811f14..417dc36 100644
+--- a/v8/src/diagnostics/ppc/disasm-ppc.cc
++++ b/v8/src/diagnostics/ppc/disasm-ppc.cc
+@@ -27,7 +27,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/base/platform/platform.h"
+ #include "src/base/strings.h"
+@@ -1954,4 +1954,4 @@ void Disassembler::Disassemble(FILE* f, uint8_t* begin, uint8_t* end,
+ 
+ }  // namespace disasm
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/execution/ppc/frame-constants-ppc.cc b/v8/src/execution/ppc/frame-constants-ppc.cc
+index f200493..f4256a0 100644
+--- a/v8/src/execution/ppc/frame-constants-ppc.cc
++++ b/v8/src/execution/ppc/frame-constants-ppc.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/execution/ppc/frame-constants-ppc.h"
+ 
+@@ -38,4 +38,4 @@ intptr_t MaglevFrame::StackGuardFrameSize(int register_input_count) {
+ }  // namespace internal
+ }  // namespace v8
+ 
+-#endif  // V8_TARGET_ARCH_PPC64
++#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+diff --git a/v8/src/execution/ppc/simulator-ppc.h b/v8/src/execution/ppc/simulator-ppc.h
+index c9ebe64..9c75f1b 100644
+--- a/v8/src/execution/ppc/simulator-ppc.h
++++ b/v8/src/execution/ppc/simulator-ppc.h
+@@ -494,7 +494,11 @@ class Simulator : public SimulatorBase {
+   static const size_t kStackProtectionSize = 256 * kSystemPointerSize;
+   // This includes a protection margin at each end of the stack area.
+   static size_t AllocatedStackSize() {
++#if V8_TARGET_ARCH_PPC64
+     size_t stack_size = v8_flags.sim_stack_size * KB;
++#else
++    size_t stack_size = MB;  // allocate 1MB for stack
++#endif
+     return stack_size + (2 * kStackProtectionSize);
+   }
+   static size_t UsableStackSize() {
+diff --git a/v8/src/regexp/ppc/regexp-macro-assembler-ppc.cc b/v8/src/regexp/ppc/regexp-macro-assembler-ppc.cc
+index 748dc2d..4aeba4c 100644
+--- a/v8/src/regexp/ppc/regexp-macro-assembler-ppc.cc
++++ b/v8/src/regexp/ppc/regexp-macro-assembler-ppc.cc
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-#if V8_TARGET_ARCH_PPC64
++#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+ 
+ #include "src/regexp/ppc/regexp-macro-assembler-ppc.h"
+ 
+-- 
+2.43.0
+

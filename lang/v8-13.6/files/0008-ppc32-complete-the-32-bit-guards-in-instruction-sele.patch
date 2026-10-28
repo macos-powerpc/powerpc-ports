@@ -1,0 +1,170 @@
+From a1eecda0c5520898cc072791f1e7e602dc1e094e Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Wed, 21 Oct 2026 17:38:19 +0000
+Subject: [PATCH 08/60] ppc32: complete the 32-bit guards in instruction
+ selector and code generator
+
+12.4 re-derivation of the 9.4-series patch 0002, adapted to the
+templated (Adapter-split) selector.  The duplicate-definition landscape
+changed since 9.4: the generic selector's 32-bit VISIT_UNSUPPORTED_OP
+list grew to 54 ops plus the Word64Atomic* and wasm I64x2 lane blocks,
+and because the templated members are weak symbols, an unguarded ppc
+definition no longer breaks the link - it silently races the generic
+UNSUPPORTED stub at symbol coalescing time.  Every overlapping ppc
+definition is therefore PPC64-gated so the generic stub is the single
+definition on 32-bit and stray 64-bit nodes fail loudly:
+
+selector:
+- VisitLoadCommon: uncompressed tagged loads are pointer-sized, route
+  to kPPC_LoadWordU32 on 32-bit; kWord64 -> UNREACHABLE
+- VisitStoreCommon: kWord64 -> UNREACHABLE on 32-bit
+- PPC64-gate VisitWord64Rol, Int64MulHigh, Uint64MulHigh, the five
+  Word64Atomic* visitors, VisitWord64AtomicBinaryOperation, and the
+  Word64 half of VISIT_ATOMIC_BINOP (split into a 32-bit macro and a
+  PPC64-only VISIT_ATOMIC_BINOP64)
+- I64x2Splat out of SIMD_UNOP_LIST into a PPC64-gated emission;
+  SIMD_VISIT_EXTRACT_LANE(I64x2)/REPLACE_LANE likewise gated (the
+  generic selector defines the I64x2 lane visitors on 32-bit)
+
+code generator:
+- kPPC_Add32: trailing extsw canonicalization escaped the PPC64 guard
+- kPPC_ByteRev32: extsw -> mr on 32-bit in both the brw and rlwimi
+  paths; kPPC_ByteRev64: gate the case (rldicl/rldicr are declared
+  only under V8_TARGET_ARCH_PPC64)
+- kPPC_Float32ToInt32/kPPC_Float32ToUint32 saturating variants and the
+  DOUBLE_TO_INT32 macro emitted isel unconditionally (ISA 2.03, absent
+  on G3/G4/G5); add the IsSupported(PPC_7_PLUS)-with-branch-fallback
+  idiom that 12.4's own AssembleArchBoolean already uses
+
+Verified on the linux box with the cross-g++14 preprocessor name-set
+audit (both TUs -E'd under the ppc32 define set; ppc definition set vs
+the generic 32-bit definition set intersects only in the benign
+VisitStackPointerGreaterThan overload pair) and ppcheck/sweep64; the
+remaining sweep64 hits are IsSupported-guarded isel/modsw/moduw with
+correct fallbacks, the wasm-only atomic-macro extsw sites the 9.4
+series also shipped (retired for JS by the 0037-class runtime routing,
+later in this series), and kPPC_Float32ToUint32's fctiwuz (the
+0027-class item).  9.4's kPPC_I64x2Mul mulld guard is obsolete here:
+12.4 moved the multiply into the I64x2Mul masm helper.
+
+Not in this commit: the Int32Pair/Word32Pair/BitcastWord32PairToFloat64
+visitors that upstream deleted from this backend (their codegen cases
+and kPPC_DoubleConstruct survived) - restored separately.
+
+13.6 rebase: only the code-generator half of this patch survives here (kPPC_Add32 extsw placement, ByteRev32/64 on 32-bit, the IsSupported(PPC_7_PLUS)-with-branch fallbacks for the isel uses in Float32ToInt32/Float32ToUint32 and the DOUBLE_TO_INT32 macro - 13.6 had dropped every PPC_7 check).  The selector half is superseded by 'ppc32: 32-bit instruction selector for the Turboshaft-only backend' earlier in this series.
+---
+ .../backend/ppc/code-generator-ppc.cc         | 47 +++++++++++++++----
+ 1 file changed, 39 insertions(+), 8 deletions(-)
+
+diff --git a/v8/src/compiler/backend/ppc/code-generator-ppc.cc b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+index 537f136..af0fd02 100644
+--- a/v8/src/compiler/backend/ppc/code-generator-ppc.cc
++++ b/v8/src/compiler/backend/ppc/code-generator-ppc.cc
+@@ -1459,8 +1459,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+           __ AddS64(i.OutputRegister(), i.InputRegister(0), i.InputImmediate(1),
+                     r0, LeaveOE, i.OutputRCBit());
+         }
+-        __ extsw(i.OutputRegister(), i.OutputRegister());
+ #if V8_TARGET_ARCH_PPC64
++        __ extsw(i.OutputRegister(), i.OutputRegister());
+       }
+ #endif
+       break;
+@@ -1922,7 +1922,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         __ li(kScratchReg, Operand(1));
+         __ ShiftLeftU64(kScratchReg, kScratchReg,
+                         Operand(31));  // generate INT32_MIN.
+-        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
++          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        } else {
++          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++          __ mr(i.OutputRegister(0), kScratchReg);
++        }
+       }
+       break;
+     }
+@@ -1940,8 +1945,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+         int crbit = v8::internal::Assembler::encode_crbit(
+             cr, static_cast<CRBit>(VXCVI % CRWIDTH));
+         __ mcrfs(cr, VXCVI);  // extract FPSCR field containing VXCVI into cr0
+-        __ li(kScratchReg, Operand::Zero());
+-        __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        if (CpuFeatures::IsSupported(PPC_7_PLUS)) {
++          __ li(kScratchReg, Operand::Zero());
++          __ isel(i.OutputRegister(0), kScratchReg, i.OutputRegister(0), crbit);
++        } else {
++          __ bc(v8::internal::kInstrSize * 2, BF, crbit);
++          __ li(i.OutputRegister(0), Operand::Zero());
++        }
+       }
+       break;
+     }
+@@ -1955,11 +1965,24 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+   __ op(kScratchDoubleReg, i.InputDoubleRegister(0));                      \
+   __ MovDoubleLowToInt(i.OutputRegister(0), kScratchDoubleReg);            \
+   __ mcrfs(cr, VXCVI); /* extract FPSCR field containing VXCVI into cr0 */ \
+-  if (check_conversion) {                                                  \
+-    __ li(i.OutputRegister(1), Operand(1));                                \
+-    __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);         \
++  if (CpuFeatures::IsSupported(PPC_7_PLUS)) {                              \
++    if (check_conversion) {                                                \
++      __ li(i.OutputRegister(1), Operand(1));                              \
++      __ isel(i.OutputRegister(1), r0, i.OutputRegister(1), cr_bit);       \
++    } else {                                                               \
++      __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);       \
++    }                                                                      \
+   } else {                                                                 \
+-    __ isel(i.OutputRegister(0), r0, i.OutputRegister(0), cr_bit);         \
++    if (check_conversion) {                                                \
++      __ li(i.OutputRegister(1), Operand::Zero());                         \
++      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
++      __ li(i.OutputRegister(1), Operand(1));                              \
++    } else {                                                               \
++      __ mr(ip, i.OutputRegister(0));                                      \
++      __ li(i.OutputRegister(0), Operand::Zero());                         \
++      __ bc(v8::internal::kInstrSize * 2, BT, cr_bit);                     \
++      __ mr(i.OutputRegister(0), ip);                                      \
++    }                                                                      \
+   }
+     case kPPC_DoubleToInt32: {
+       DOUBLE_TO_INT32(fctiwz)
+@@ -2250,13 +2273,19 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       Register temp1 = r0;
+       if (CpuFeatures::IsSupported(PPC_10_PLUS)) {
+         __ brw(output, input);
++#if V8_TARGET_ARCH_PPC64
+         __ extsw(output, output);
++#endif
+         break;
+       }
+       __ rotlwi(temp1, input, 8);
+       __ rlwimi(temp1, input, 24, 0, 7);
+       __ rlwimi(temp1, input, 24, 16, 23);
++#if V8_TARGET_ARCH_PPC64
+       __ extsw(output, temp1);
++#else
++      __ mr(output, temp1);
++#endif
+       break;
+     }
+     case kPPC_LoadByteRev32: {
+@@ -2267,6 +2296,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       ASSEMBLE_STORE_INTEGER_RR(stwbrx);
+       break;
+     }
++#if V8_TARGET_ARCH_PPC64
+     case kPPC_ByteRev64: {
+       Register input = i.InputRegister(0);
+       Register output = i.OutputRegister();
+@@ -2288,6 +2318,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
+       __ orx(output, temp2, temp3);
+       break;
+     }
++#endif
+     case kPPC_LoadByteRev64: {
+       ASSEMBLE_LOAD_INTEGER_RR(ldbrx);
+       break;
+-- 
+2.43.0
+
