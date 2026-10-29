@@ -1,0 +1,150 @@
+From df13bf7cacb3d5069114ba968f158a6daeccce31 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 29 Oct 2026 15:06:59 +0000
+Subject: [PATCH] Fix the time zone data loader on big-endian hosts
+
+The time zone block is generated little endian, but tz_loader.cpp read it
+by reinterpreting the decompressed bytes as native integers, and the
+transition, offset and link arrays are dereferenced in place by
+timezone.cpp. On big-endian hosts such as PowerPC the header counts came
+out byte-swapped, the bounds check rejected them, and loading the ICU
+extension failed with "The time zone data is corrupt", which stopped the
+CLI from starting.
+
+BlockReader now swaps every section into host order in place as it reads
+it, using BSwapIfBE as introduced for big-endian support in #19748. On
+little-endian hosts the swap compiles away. The per-zone arrays are now
+read through the same bounds-checked reader, and zones are required not
+to overlap, so that no part of the block is swapped twice.
+
+Fixes #28085
+
+Assisted-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ extension/icu/datetime/tz_loader.cpp | 54 +++++++++++++++++-----------
+ 1 file changed, 33 insertions(+), 21 deletions(-)
+
+diff --git a/extension/icu/datetime/tz_loader.cpp b/extension/icu/datetime/tz_loader.cpp
+index 1adb4fce..463b1906 100644
+--- extension/icu/datetime/tz_loader.cpp
++++ extension/icu/datetime/tz_loader.cpp
+@@ -1,5 +1,6 @@
+ #include "tz_data.hpp"
+ 
++#include "duckdb/common/bswap.hpp"
+ #include "duckdb/common/exception.hpp"
+ #include "duckdb/common/helper.hpp"
+ #include "duckdb/common/unique_ptr.hpp"
+@@ -33,17 +34,23 @@ struct TZZoneHeader {
+ 	int32_t final_rule;
+ };
+ 
+-//! Walks the block, checking that nothing reaches past the end of it
++//! Walks the block, checking that nothing reaches past the end of it. The block is stored little endian,
++//! so what is read is swapped into host order in place, one FIELD at a time.
+ class BlockReader {
+ public:
+-	BlockReader(const uint8_t *data, idx_t size) : position(data), end(data + size) {
++	BlockReader(uint8_t *data, idx_t size) : position(data), end(data + size) {
+ 	}
+ 
+-	template <class T>
++	template <class T, class FIELD = T>
+ 	const T *Read(idx_t count) {
+-		const auto result = reinterpret_cast<const T *>(position);
++		static_assert(sizeof(T) % sizeof(FIELD) == 0, "T must be made up of FIELD sized values");
++		const auto result = position;
+ 		Advance(count * sizeof(T));
+-		return result;
++		const auto fields = reinterpret_cast<FIELD *>(result);
++		for (idx_t i = 0; i < count * (sizeof(T) / sizeof(FIELD)); i++) {
++			fields[i] = BSwapIfBE(fields[i]);
++		}
++		return reinterpret_cast<const T *>(result);
+ 	}
+ 
+ 	void Advance(idx_t bytes) {
+@@ -53,17 +60,22 @@ public:
+ 		position += bytes;
+ 	}
+ 
+-	const uint8_t *Position() const {
++	uint8_t *Position() const {
+ 		return position;
+ 	}
++
++	idx_t Remaining() const {
++		return idx_t(end - position);
++	}
++
+ 	//! Rounds the position up, so that what is read next is aligned for its element type
+ 	void Align(idx_t alignment) {
+ 		Advance((alignment - (uintptr_t(position) % alignment)) % alignment);
+ 	}
+ 
+ private:
+-	const uint8_t *position;
+-	const uint8_t *end;
++	uint8_t *position;
++	uint8_t *end;
+ };
+ 
+ //! The decompressed block together with the tables that point into it
+@@ -76,9 +88,8 @@ struct TZBlock {
+ 	TZData data;
+ };
+ 
+-static void ReadZone(const uint8_t *base, TZZoneData &zone) {
+-	const auto header = reinterpret_cast<const TZZoneHeader *>(base);
+-	auto position = base + sizeof(TZZoneHeader);
++static void ReadZone(BlockReader &reader, TZZoneData &zone) {
++	const auto header = reader.Read<TZZoneHeader, uint32_t>(1);
+ 
+ 	zone.transition_count = header->transition_count;
+ 	zone.type_count = uint16_t(header->type_count);
+@@ -87,13 +98,10 @@ static void ReadZone(const uint8_t *base, TZZoneData &zone) {
+ 	zone.final_year = header->final_year;
+ 	zone.final_rule = int16_t(header->final_rule);
+ 
+-	zone.transitions = reinterpret_cast<const int64_t *>(position);
+-	position += header->transition_count * sizeof(int64_t);
+-	zone.type_offsets = reinterpret_cast<const TZTypeOffset *>(position);
+-	position += header->type_count * sizeof(TZTypeOffset);
+-	zone.links = reinterpret_cast<const uint16_t *>(position);
+-	position += header->link_count * sizeof(uint16_t);
+-	zone.type_map = position;
++	zone.transitions = reader.Read<int64_t>(header->transition_count);
++	zone.type_offsets = reader.Read<TZTypeOffset, int32_t>(header->type_count);
++	zone.links = reader.Read<uint16_t>(header->link_count);
++	zone.type_map = reader.Read<uint8_t>(header->transition_count);
+ }
+ 
+ static unique_ptr<TZBlock> Decompress() {
+@@ -106,7 +114,7 @@ static unique_ptr<TZBlock> Decompress() {
+ 	}
+ 
+ 	BlockReader reader(block->bytes.get(), TZ_UNCOMPRESSED_SIZE);
+-	const auto header = reader.Read<TZBlockHeader>(1);
++	const auto header = reader.Read<TZBlockHeader, uint32_t>(1);
+ 
+ 	// the zone data comes first, while the block is still aligned for the 64 bit transitions
+ 	const auto zone_region = reader.Position();
+@@ -119,12 +127,16 @@ static unique_ptr<TZBlock> Decompress() {
+ 	const auto data_indexes = reader.Read<uint16_t>(header->zone_count);
+ 	const auto pool = reinterpret_cast<const char *>(reader.Read<uint8_t>(header->pool_size));
+ 
++	// the zones may not overlap, as reading one swaps it in place
+ 	block->zone_data.resize(header->zone_data_count);
++	idx_t zone_end = 0;
+ 	for (idx_t i = 0; i < header->zone_data_count; i++) {
+-		if (data_offsets[i] >= header->zone_region_size) {
++		if (data_offsets[i] < zone_end || data_offsets[i] >= header->zone_region_size) {
+ 			throw InternalException("The time zone data is corrupt");
+ 		}
+-		ReadZone(zone_region + data_offsets[i], block->zone_data[i]);
++		BlockReader zone_reader(zone_region + data_offsets[i], header->zone_region_size - data_offsets[i]);
++		ReadZone(zone_reader, block->zone_data[i]);
++		zone_end = header->zone_region_size - zone_reader.Remaining();
+ 	}
+ 
+ 	block->zones.resize(header->zone_count);
