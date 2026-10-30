@@ -15,7 +15,8 @@
 #   legacysupport.redirect_bins: binary files that mix different versions of libstdc++
 #                                create a wrapper so that only MacPorts libstdc++ is used
 #
-#   legacysupport.use_mp_libcxx: Use an update libcxx runtime from a recent macports clang build
+#   legacysupport.use_mp_libcxx: use libc++ from the libcxx port on systems which require legacy
+#                                support (sets configure.libcxx_port to yes, see portconfigure.tcl)
 
 namespace eval legacysupport {
     # Newest Darwin version that requires legacy support.
@@ -24,6 +25,8 @@ namespace eval legacysupport {
     variable ls_cache_incpath  [list]
     variable ls_cache_ldflags  [list]
     variable ls_cache_cppflags [list]
+    # configure.libcxx_port as it was before use_mp_libcxx set it
+    variable ls_saved_libcxx_port {}
 }
 
 options legacysupport.newest_darwin_requires_legacy
@@ -155,7 +158,6 @@ proc legacysupport::relink_libSystem { exe } {
 
 proc legacysupport::add_legacysupport {} {
     global prefix os.platform os.major
-    global configure.cxx_stdlib configure.compiler
     variable ls_cache_incpath
     variable ls_cache_ldflags
     variable ls_cache_cppflags
@@ -178,18 +180,6 @@ proc legacysupport::add_legacysupport {} {
         set ls_cache_incpath  "${prefix}/include/LegacySupport"
         set ls_cache_ldflags  "[join [legacysupport::get_library_link_flags]]"
         set ls_cache_cppflags "[legacysupport::get_cpp_flags]"
-
-        # TODO: this should use our libcxx:
-        if { [option legacysupport.use_mp_libcxx] && ${configure.cxx_stdlib} eq "libc++" } {
-            if { [string match macports-clang-* ${configure.compiler}] } {
-                legacysupport::add_once depends_lib append port:macports-libcxx
-                append ls_cache_incpath  " ${prefix}/include/libcxx/v1"
-                append ls_cache_ldflags  " -L${prefix}/lib/libcxx"
-                append ls_cache_cppflags " -nostdinc++ -isystem${prefix}/include/libcxx/v1"
-            } elseif { [string match macports-gcc-* ${configure.compiler}] } {
-                # TODO: handle gcc case.
-            }
-        }
 
         ui_debug "legacysupport: ldflags  ${ls_cache_ldflags}"
         ui_debug "legacysupport: cppflags ${ls_cache_cppflags}"
@@ -235,8 +225,38 @@ proc legacysupport::legacysupport_proc {option action args} {
 
 # Reconfigure if any options are explicitly set
 option_proc legacysupport.newest_darwin_requires_legacy legacysupport::legacysupport_proc
-option_proc legacysupport.legacysupport.use_mp_libcxx   legacysupport::legacysupport_proc
 option_proc legacysupport.legacysupport.use_static      legacysupport::legacysupport_proc
+
+# libc++ from the libcxx port: base adds the flags and the dependency, and
+# chooses a compiler which can use it. Its callback runs before
+# add_legacysupport, so set configure.libcxx_port as the options change.
+proc legacysupport::set_libcxx_port {} {
+    global os.platform os.major
+    variable ls_saved_libcxx_port
+    if {![exists configure.libcxx_port]} {
+        ui_debug "legacysupport: use_mp_libcxx needs configure.libcxx_port from MacPorts base"
+        return
+    }
+    if {[option legacysupport.use_mp_libcxx] && ${os.platform} eq "darwin"
+            && ${os.major} <= [option legacysupport.newest_darwin_requires_legacy]} {
+        if {${ls_saved_libcxx_port} eq ""} {
+            set ls_saved_libcxx_port [option configure.libcxx_port]
+        }
+        ui_debug "legacysupport: setting configure.libcxx_port to yes"
+        configure.libcxx_port yes
+    } elseif {${ls_saved_libcxx_port} ne ""} {
+        configure.libcxx_port ${ls_saved_libcxx_port}
+        set ls_saved_libcxx_port {}
+    }
+}
+
+proc legacysupport::libcxx_port_proc {option action args} {
+    if {$action ne "set"} return
+    legacysupport::set_libcxx_port
+}
+
+option_proc legacysupport.newest_darwin_requires_legacy legacysupport::libcxx_port_proc
+option_proc legacysupport.use_mp_libcxx                 legacysupport::libcxx_port_proc
 
 # see https://trac.macports.org/ticket/59832
 post-destroot {
