@@ -1,0 +1,434 @@
+From e1b17ef8ad67cffdca592b6351c76bac833dcea0 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 31 Oct 2026 03:47:02 +0000
+Subject: [PATCH] osx: build the macOS utilities as C++
+
+GCC's Objective-C++ front end cannot parse mega.h:
+
+- a C++14 lambda init-capture such as [oldValue = std::move(location)]
+  is taken as the start of a message send, so scoped_helpers.h,
+  logging.h and sync.h fail;
+- id is the Objective-C object type, so the local variable of that name
+  in makeNameid (name_id.h) does not parse.
+
+Since the previous change the macOS code in osxutils.mm is plain
+CoreFoundation and SystemConfiguration, so it does not need to be
+Objective-C++ at all. Rename it to osxutils.cpp and move the only
+Objective-C left, the iOS-only availableDiskSpaceForImportantUsage, to
+osxutils_ios.mm, which is built only on iOS (where it still gets ARC).
+CoreFoundation is now included unconditionally because path2localMac
+uses it on both platforms.
+
+The Swift package picks up both files; osxutils_ios.mm stays guarded by
+TARGET_OS_IPHONE, so it is empty in macOS builds.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/cmake/modules/sdklib_target.cmake b/cmake/modules/sdklib_target.cmake
+index e333b77..7c6ba01 100644
+--- sdk/cmake/modules/sdklib_target.cmake
++++ sdk/cmake/modules/sdklib_target.cmake
+@@ -297,13 +297,14 @@ target_sources_conditional(SDKlib
+     include/mega/osx/osxutils.h
+     include/mega/osx/megafs.h
+ 
+-    src/osx/osxutils.mm
++    src/osx/osxutils.cpp
+     src/osx/fs.cpp
+ )
+ 
+ target_sources_conditional(SDKlib
+     FLAG IOS
+     PRIVATE
++    src/osx/osxutils_ios.mm
+     src/gfx/GfxProcCG.mm
+ )
+ 
+diff --git a/src/osx/osxutils.cpp b/src/osx/osxutils.cpp
+new file mode 100644
+index 0000000..62761c3
+--- /dev/null
++++ sdk/src/osx/osxutils.cpp
+@@ -0,0 +1,130 @@
++#include "mega/osx/osxutils.h"
++#include <CoreFoundation/CoreFoundation.h>
++#if defined(__APPLE__) && !(TARGET_OS_IPHONE)
++#include <SystemConfiguration/SystemConfiguration.h>
++#endif
++
++#include "mega.h"
++
++using namespace mega;
++using namespace std;
++
++enum { HTTP_PROXY = 0, HTTPS_PROXY };
++
++void path2localMac(const string* path, string* local)
++{
++    if (!path->size())
++    {
++        *local = "";
++        return;
++    }
++
++    // Compatibility with new APFS filesystem
++    // Use the file system representation when creating and opening files with lower-level
++    // filesystem APIs such as POSIX open(2), or when storing filenames externally from the filesystem
++    CFStringRef tempPath =
++        CFStringCreateWithCString(kCFAllocatorDefault, path->c_str(), kCFStringEncodingUTF8);
++    if (!tempPath)
++    {
++        local->clear();
++        return;
++    }
++
++    CFIndex maxSize = CFStringGetMaximumSizeOfFileSystemRepresentation(tempPath);
++    std::unique_ptr<char[]> buffer(new char[static_cast<size_t>(maxSize)]);
++    if (CFStringGetFileSystemRepresentation(tempPath, buffer.get(), maxSize))
++    {
++        *local = buffer.get();
++    }
++    else
++    {
++        LOG_err << "Failed getting file system representation (APFS filesystem)";
++        local->clear();
++    }
++    CFRelease(tempPath);
++}
++
++#if defined(__APPLE__) && !(TARGET_OS_IPHONE)
++
++CFTypeRef getValueFromKey(CFDictionaryRef dict, const void *key, CFTypeID type)
++{
++    CFTypeRef value = CFDictionaryGetValue(dict, key);
++    if (!value)
++    {
++        return NULL;
++    }
++
++    if ((CFGetTypeID(value) == type))
++    {
++        return value;
++    }
++
++    return NULL;
++}
++
++bool getProxyConfiguration(CFDictionaryRef dict, int proxyType, Proxy* proxy)
++{
++    int isEnabled = 0;
++    int port;
++
++    if (proxyType != HTTPS_PROXY && proxyType != HTTP_PROXY)
++    {
++        return false;
++    }
++
++    CFStringRef proxyEnableKey = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPEnable : kSCPropNetProxiesHTTPSEnable;
++    CFStringRef proxyHostKey   = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPProxy : kSCPropNetProxiesHTTPSProxy;
++    CFStringRef portKey        = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPPort : kSCPropNetProxiesHTTPSPort;
++
++    CFNumberRef proxyEnabledRef = (CFNumberRef)getValueFromKey(dict, proxyEnableKey, CFNumberGetTypeID());
++    if (proxyEnabledRef && CFNumberGetValue(proxyEnabledRef, kCFNumberIntType, &isEnabled) && (isEnabled != 0))
++    {
++        if (CFDictionaryGetValue(dict, proxyType == HTTP_PROXY ? CFSTR("HTTPUser") : CFSTR("HTTPSUser")))
++        {
++            // Username set, skip proxy configuration. We only allow proxies withouth user/pw credentials
++            // to not have to request the password to the user to read the keychain
++            return false;
++        }
++
++        CFStringRef hostRef = (CFStringRef)getValueFromKey(dict, proxyHostKey, CFStringGetTypeID());
++        if (hostRef)
++        {
++            CFIndex length = CFStringGetLength(hostRef);
++            CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
++            char *buffer = new char[static_cast<size_t>(maxSize)];
++            if (CFStringGetCString(hostRef, buffer, maxSize, kCFStringEncodingUTF8))
++            {
++                CFNumberRef portRef = (CFNumberRef)getValueFromKey(dict, portKey, CFNumberGetTypeID());
++                if (portRef && CFNumberGetValue(portRef, kCFNumberIntType, &port))
++                {
++                    ostringstream oss;
++                    oss << (proxyType == HTTP_PROXY ? "http://" : "https://") << buffer << ":" << port;
++                    string link = oss.str();
++                    proxy->setProxyType(Proxy::CUSTOM);
++                    proxy->setProxyURL(link);
++                    delete [] buffer;
++                    return true;
++                }
++            }
++            delete [] buffer;
++        }
++    }
++    return false;
++}
++
++void getOSXproxy(Proxy* proxy)
++{
++    CFDictionaryRef proxySettings = NULL;
++    proxySettings = SCDynamicStoreCopyProxies(NULL);
++    if (!proxySettings)
++    {
++        return;
++    }
++
++    if (!getProxyConfiguration(proxySettings, HTTPS_PROXY, proxy))
++    {
++        getProxyConfiguration(proxySettings, HTTP_PROXY, proxy);
++    }
++    CFRelease(proxySettings);
++}
++#endif
+diff --git a/src/osx/osxutils.mm b/src/osx/osxutils.mm
+deleted file mode 100644
+index a0cf9dd..0000000
+--- sdk/src/osx/osxutils.mm
++++ /dev/null
+@@ -1,183 +0,0 @@
+-#include "mega/osx/osxutils.h"
+-#if defined(__APPLE__) && !(TARGET_OS_IPHONE)
+-#include <CoreFoundation/CoreFoundation.h>
+-#include <SystemConfiguration/SystemConfiguration.h>
+-#elif TARGET_OS_IOS
+-#include <Foundation/Foundation.h>
+-#endif
+-
+-#include "mega.h"
+-
+-using namespace mega;
+-using namespace std;
+-
+-enum { HTTP_PROXY = 0, HTTPS_PROXY };
+-
+-void path2localMac(const string* path, string* local)
+-{
+-    if (!path->size())
+-    {
+-        *local = "";
+-        return;
+-    }
+-
+-    // Compatibility with new APFS filesystem
+-    // Use the file system representation when creating and opening files with lower-level
+-    // filesystem APIs such as POSIX open(2), or when storing filenames externally from the filesystem
+-    CFStringRef tempPath =
+-        CFStringCreateWithCString(kCFAllocatorDefault, path->c_str(), kCFStringEncodingUTF8);
+-    if (!tempPath)
+-    {
+-        local->clear();
+-        return;
+-    }
+-
+-    CFIndex maxSize = CFStringGetMaximumSizeOfFileSystemRepresentation(tempPath);
+-    std::unique_ptr<char[]> buffer(new char[static_cast<size_t>(maxSize)]);
+-    if (CFStringGetFileSystemRepresentation(tempPath, buffer.get(), maxSize))
+-    {
+-        *local = buffer.get();
+-    }
+-    else
+-    {
+-        LOG_err << "Failed getting file system representation (APFS filesystem)";
+-        local->clear();
+-    }
+-    CFRelease(tempPath);
+-}
+-
+-#if defined(__APPLE__) && !(TARGET_OS_IPHONE)
+-
+-CFTypeRef getValueFromKey(CFDictionaryRef dict, const void *key, CFTypeID type)
+-{
+-    CFTypeRef value = CFDictionaryGetValue(dict, key);
+-    if (!value)
+-    {
+-        return NULL;
+-    }
+-
+-    if ((CFGetTypeID(value) == type))
+-    {
+-        return value;
+-    }
+-
+-    return NULL;
+-}
+-
+-bool getProxyConfiguration(CFDictionaryRef dict, int proxyType, Proxy* proxy)
+-{
+-    int isEnabled = 0;
+-    int port;
+-
+-    if (proxyType != HTTPS_PROXY && proxyType != HTTP_PROXY)
+-    {
+-        return false;
+-    }
+-
+-    CFStringRef proxyEnableKey = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPEnable : kSCPropNetProxiesHTTPSEnable;
+-    CFStringRef proxyHostKey   = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPProxy : kSCPropNetProxiesHTTPSProxy;
+-    CFStringRef portKey        = proxyType == HTTP_PROXY ? kSCPropNetProxiesHTTPPort : kSCPropNetProxiesHTTPSPort;
+-
+-    CFNumberRef proxyEnabledRef = (CFNumberRef)getValueFromKey(dict, proxyEnableKey, CFNumberGetTypeID());
+-    if (proxyEnabledRef && CFNumberGetValue(proxyEnabledRef, kCFNumberIntType, &isEnabled) && (isEnabled != 0))
+-    {
+-        if (CFDictionaryGetValue(dict, proxyType == HTTP_PROXY ? CFSTR("HTTPUser") : CFSTR("HTTPSUser")))
+-        {
+-            // Username set, skip proxy configuration. We only allow proxies withouth user/pw credentials
+-            // to not have to request the password to the user to read the keychain
+-            return false;
+-        }
+-
+-        CFStringRef hostRef = (CFStringRef)getValueFromKey(dict, proxyHostKey, CFStringGetTypeID());
+-        if (hostRef)
+-        {
+-            CFIndex length = CFStringGetLength(hostRef);
+-            CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+-            char *buffer = new char[static_cast<size_t>(maxSize)];
+-            if (CFStringGetCString(hostRef, buffer, maxSize, kCFStringEncodingUTF8))
+-            {
+-                CFNumberRef portRef = (CFNumberRef)getValueFromKey(dict, portKey, CFNumberGetTypeID());
+-                if (portRef && CFNumberGetValue(portRef, kCFNumberIntType, &port))
+-                {
+-                    ostringstream oss;
+-                    oss << (proxyType == HTTP_PROXY ? "http://" : "https://") << buffer << ":" << port;
+-                    string link = oss.str();
+-                    proxy->setProxyType(Proxy::CUSTOM);
+-                    proxy->setProxyURL(link);
+-                    delete [] buffer;
+-                    return true;
+-                }
+-            }
+-            delete [] buffer;
+-        }
+-    }
+-    return false;
+-}
+-
+-void getOSXproxy(Proxy* proxy)
+-{
+-    CFDictionaryRef proxySettings = NULL;
+-    proxySettings = SCDynamicStoreCopyProxies(NULL);
+-    if (!proxySettings)
+-    {
+-        return;
+-    }
+-
+-    if (!getProxyConfiguration(proxySettings, HTTPS_PROXY, proxy))
+-    {
+-        getProxyConfiguration(proxySettings, HTTP_PROXY, proxy);
+-    }
+-    CFRelease(proxySettings);
+-}
+-#endif
+-
+-#if TARGET_OS_IPHONE
+-std::optional<std::int64_t> availableDiskSpaceForImportantUsage(const std::string& path)
+-{
+-    if (path.empty())
+-    {
+-        LOG_warn << "availableDiskSpaceForImportantUsage: empty path";
+-        return std::nullopt;
+-    }
+-
+-    @autoreleasepool
+-    {
+-        NSString* pathString = [NSString stringWithUTF8String:path.c_str()];
+-        if (pathString == nil)
+-        {
+-            LOG_warn
+-                << "availableDiskSpaceForImportantUsage: NSString conversion failed (non-UTF-8 path?) for "
+-                << path;
+-            return std::nullopt;
+-        }
+-
+-        NSURL* url = [NSURL fileURLWithPath:pathString isDirectory:YES];
+-        if (url == nil)
+-        {
+-            LOG_warn << "availableDiskSpaceForImportantUsage: failed to build file URL for "
+-                      << path;
+-            return std::nullopt;
+-        }
+-
+-        NSError* error = nil;
+-        NSDictionary<NSURLResourceKey, id>* values =
+-            [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
+-                                 error:&error];
+-        if (!values)
+-        {
+-            LOG_warn << "availableDiskSpaceForImportantUsage: query failed for " << path << ": "
+-                      << (error ? [[error localizedDescription] UTF8String] : "unknown");
+-            return std::nullopt;
+-        }
+-
+-        NSNumber* bytes = values[NSURLVolumeAvailableCapacityForImportantUsageKey];
+-        if (!bytes)
+-        {
+-            LOG_warn << "availableDiskSpaceForImportantUsage: key unavailable for " << path;
+-            return std::nullopt;
+-        }
+-
+-        return static_cast<std::int64_t>([bytes longLongValue]);
+-    }
+-}
+-#endif
+diff --git a/src/osx/osxutils_ios.mm b/src/osx/osxutils_ios.mm
+new file mode 100644
+index 0000000..7a0282b
+--- /dev/null
++++ sdk/src/osx/osxutils_ios.mm
+@@ -0,0 +1,56 @@
++#include "mega/osx/osxutils.h"
++
++#include <Foundation/Foundation.h>
++
++#include "mega.h"
++
++#if TARGET_OS_IPHONE
++std::optional<std::int64_t> availableDiskSpaceForImportantUsage(const std::string& path)
++{
++    if (path.empty())
++    {
++        LOG_warn << "availableDiskSpaceForImportantUsage: empty path";
++        return std::nullopt;
++    }
++
++    @autoreleasepool
++    {
++        NSString* pathString = [NSString stringWithUTF8String:path.c_str()];
++        if (pathString == nil)
++        {
++            LOG_warn
++                << "availableDiskSpaceForImportantUsage: NSString conversion failed (non-UTF-8 path?) for "
++                << path;
++            return std::nullopt;
++        }
++
++        NSURL* url = [NSURL fileURLWithPath:pathString isDirectory:YES];
++        if (url == nil)
++        {
++            LOG_warn << "availableDiskSpaceForImportantUsage: failed to build file URL for "
++                      << path;
++            return std::nullopt;
++        }
++
++        NSError* error = nil;
++        NSDictionary<NSURLResourceKey, id>* values =
++            [url resourceValuesForKeys:@[NSURLVolumeAvailableCapacityForImportantUsageKey]
++                                 error:&error];
++        if (!values)
++        {
++            LOG_warn << "availableDiskSpaceForImportantUsage: query failed for " << path << ": "
++                      << (error ? [[error localizedDescription] UTF8String] : "unknown");
++            return std::nullopt;
++        }
++
++        NSNumber* bytes = values[NSURLVolumeAvailableCapacityForImportantUsageKey];
++        if (!bytes)
++        {
++            LOG_warn << "availableDiskSpaceForImportantUsage: key unavailable for " << path;
++            return std::nullopt;
++        }
++
++        return static_cast<std::int64_t>([bytes longLongValue]);
++    }
++}
++#endif

@@ -1,0 +1,138 @@
+From 157ee155f962b5409bac4bd4a517e1f0a6f252c5 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 31 Oct 2026 03:39:38 +0000
+Subject: [PATCH] osx: support directory-level FSEvents and 10.6 libdispatch
+
+src/osx/fs.cpp used several APIs that first appeared in 10.7 or later,
+so it failed to build against the 10.6 SDK:
+
+- dispatch_barrier_sync_f and DISPATCH_QUEUE_SERIAL (10.7)
+- kFSEventStreamCreateFlagFileEvents and the per-item
+  kFSEventStreamEventFlagItem* flags (10.7, some 10.9/10.10)
+
+flushDispatchQueue now uses dispatch_sync_f. The queue is always created
+serial, and on a serial queue a plain sync call already waits for all
+previously enqueued work, so this is equivalent to the barrier on every
+version. DISPATCH_QUEUE_SERIAL falls back to NULL, which has always
+meant a serial queue.
+
+When the deployment target is below 10.7, create the stream without
+kFSEventStreamCreateFlagFileEvents and handle directory-level events.
+Each such event names the directory whose contents changed (with
+a trailing separator), so strip the separator and report the path as
+FOLDER_NEEDS_SELF_SCAN instead of NEEDS_PARENT_SCAN, which would scan
+the wrong directory. MustScanSubDirs still maps to a recursive scan.
+The per-item flag logging and the folder self-rescan on ownership
+changes are compiled out, as those flags are not delivered.
+
+The check is on the deployment target rather than the SDK, so a binary
+targeting 10.6 behaves correctly on 10.6 even if built with a newer
+SDK. iOS and 10.7+ builds are unchanged.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/osx/fs.cpp | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/osx/fs.cpp b/src/osx/fs.cpp
+index 24a5454..eb36465 100644
+--- sdk/src/osx/fs.cpp
++++ sdk/src/osx/fs.cpp
+@@ -13,6 +13,15 @@
+ #    include <DiskArbitration/DADisk.h>
+ #endif // ! USE_IOS
+ 
++#include <AvailabilityMacros.h>
++#if MAC_OS_X_VERSION_MIN_REQUIRED < 1070
++#    define MEGA_FSEVENTS_DIRECTORY_LEVEL 1
++#endif
++
++#ifndef DISPATCH_QUEUE_SERIAL
++#    define DISPATCH_QUEUE_SERIAL NULL
++#endif
++
+ namespace mega {
+ 
+ // Convenience.
+@@ -322,7 +331,7 @@ m_off_t MacFileSystemAccess::availableDiskSpace(const LocalPath& drivePath)
+ 
+ void MacFileSystemAccess::flushDispatchQueue()
+ {
+-    dispatch_barrier_sync_f(mDispatchQueue, nullptr, [](void*) {});
++    dispatch_sync_f(mDispatchQueue, nullptr, [](void*) {});
+ }
+ 
+ #ifdef ENABLE_SYNC
+@@ -386,7 +395,11 @@ MacDirNotify::MacDirNotify(MacFileSystemAccess& owner,
+         context.info = this;
+ 
+         // Flags customizing the stream's behavior.
++#ifdef MEGA_FSEVENTS_DIRECTORY_LEVEL
++        constexpr auto flags = kFSEventStreamCreateFlagNone;
++#else
+         constexpr auto flags = kFSEventStreamCreateFlagFileEvents;
++#endif
+ 
+         // How long the stream should wait before sending events.
+         constexpr auto latency = 0.1;
+@@ -476,6 +489,14 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+         if (*path == '/')
+             ++path;
+ 
++#ifdef MEGA_FSEVENTS_DIRECTORY_LEVEL
++        // Skip trailing separator.
++        std::string relative(path);
++        if (!relative.empty() && relative.back() == '/')
++            relative.pop_back();
++        path = relative.c_str();
++#endif
++
+         // Has the root path been invalidated?
+         if ((flag & kFSEventStreamEventFlagRootChanged))
+             setFailed(EINVAL, "The root path has been invalidated.");
+@@ -484,8 +505,13 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+         if ((flag & kFSEventStreamEventFlagUnmount))
+             setFailed(EINVAL, "A device has been unmounted below the root path.");
+ 
++#ifdef MEGA_FSEVENTS_DIRECTORY_LEVEL
++        // The path is the directory whose contents changed.
++        auto scanFlags = Notification::FOLDER_NEEDS_SELF_SCAN;
++#else
+         // even a folder renamed, comes in as that folder's path and we need to rescan the parent to see the changed name
+         auto scanFlags = Notification::NEEDS_PARENT_SCAN;
++#endif
+ 
+         // Have some events been coalesced?
+         if ((flag & kFSEventStreamEventFlagMustScanSubDirs))
+@@ -501,6 +527,7 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+         if (flag & kFSEventStreamEventFlagRootChanged) LOG_debug << "FSEv root changed";
+         if (flag & kFSEventStreamEventFlagMount) LOG_debug << "FSEv mount";
+         if (flag & kFSEventStreamEventFlagUnmount) LOG_debug << "FSEv unmount";
++#ifndef MEGA_FSEVENTS_DIRECTORY_LEVEL
+         if (flag & kFSEventStreamEventFlagItemCreated) LOG_debug << "FSEv item created";
+         if (flag & kFSEventStreamEventFlagItemRemoved) LOG_debug << "FSEv item removed";
+         //if (flag & kFSEventStreamEventFlagItemInodeMetaMod) LOG_debug << "FSEv inode meta mod";
+@@ -516,6 +543,7 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+         if (flag & kFSEventStreamEventFlagItemIsHardlink) LOG_debug << "FSEv is hard link";
+         if (flag & kFSEventStreamEventFlagItemIsLastHardlink) LOG_debug << "FSEv is last hard link";
+         //if (flag & kFSEventStreamEventFlagItemCloned) LOG_debug << "FSEv item cloned";
++#endif
+ 
+         // Pass the notification to the engine.
+         notify(fsEventq,
+@@ -523,6 +551,7 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+                scanFlags,
+                LocalPath::fromPlatformEncodedRelative(path));
+ 
++#ifndef MEGA_FSEVENTS_DIRECTORY_LEVEL
+         // No need for the below if we're performing a recursive scan.
+         if (scanFlags == Notification::FOLDER_NEEDS_SCAN_RECURSIVE)
+             continue;
+@@ -547,6 +576,7 @@ void MacDirNotify::callback(const FSEventStreamEventFlags* flags,
+                &mRoot,
+                Notification::FOLDER_NEEDS_SELF_SCAN,
+                LocalPath::fromPlatformEncodedRelative(path));
++#endif
+     }
+ 
+     // Let the engine know it has events to process.

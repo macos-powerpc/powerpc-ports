@@ -1,0 +1,312 @@
+From 2ea191377f189e1c7d9f954bca07b707fb579691 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 31 Oct 2026 04:04:05 +0000
+Subject: [PATCH] macOS: write the updater launch agent with CoreFoundation
+
+megacmdplatform.mm was the only Objective-C in the server, and it did
+not build with GCC:
+
+- Objective-C 2.0 literals (@{...}, @[...], @7200, @true) are a clang
+  extension;
+- -[NSFileManager createDirectoryAtURL:withIntermediateDirectories:
+  attributes:error:] needs 10.7.
+
+Rewrite registerUpdateDaemon in C++ as megacmdplatform.cpp:
+
+- build the same launchd dictionary with CFDictionaryCreate and
+  serialize it with CFPropertyListCreateData as an XML plist, which is
+  what -[NSDictionary writeToFile:atomically:] produced;
+- write it atomically through a temporary file and rename(), as before;
+- create ~/Library/LaunchAgents with mkdir(2).
+
+The chmod and launchctl reload are unchanged. Using CoreFoundation's
+explicit ownership also drops the autoreleased objects that, with no
+pool in place, were logged as leaks on 10.6.
+
+Assisted-by: Claude Opus 5.5
+---
+ CMakeLists.txt          |   2 +-
+ src/megacmdplatform.cpp | 162 ++++++++++++++++++++++++++++++++++++++++
+ src/megacmdplatform.mm  |  91 ----------------------
+ 3 files changed, 163 insertions(+), 92 deletions(-)
+ create mode 100644 src/megacmdplatform.cpp
+ delete mode 100644 src/megacmdplatform.mm
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d368673..a25c9b6 100644
+--- CMakeLists.txt
++++ CMakeLists.txt
+@@ -212,7 +212,7 @@ target_sources_conditional(LMegacmdServer
+     FLAG APPLE
+     PRIVATE
+     "${ProjectDir}/src/megacmdplatform.h"
+-    "${ProjectDir}/src/megacmdplatform.mm"
++    "${ProjectDir}/src/megacmdplatform.cpp"
+ )
+ 
+ # Given we are no longer including the sdk, and some sources use certain defines without including SDK's config.h,
+diff --git a/src/megacmdplatform.cpp b/src/megacmdplatform.cpp
+new file mode 100644
+index 0000000..83b458b
+--- /dev/null
++++ src/megacmdplatform.cpp
+@@ -0,0 +1,162 @@
++#include "megacmdplatform.h"
++#include <CoreFoundation/CoreFoundation.h>
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <iostream>
++
++#include <sstream>
++#include <string>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#ifdef __MACH__
++
++namespace megacmd {
++
++static CFDataRef createUpdaterPlistData()
++{
++    const void* arguments[] = {
++        CFSTR("/Applications/MEGAcmd.app/Contents/MacOS/MEGAcmdUpdater"),
++        CFSTR("--emergency-update"),
++    };
++    CFArrayRef programArguments =
++        CFArrayCreate(kCFAllocatorDefault, arguments, 2, &kCFTypeArrayCallBacks);
++
++    int interval = 7200;
++    CFNumberRef startInterval = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &interval);
++
++    CFDataRef data = nullptr;
++    if (programArguments && startInterval)
++    {
++        const void* keys[] = {
++            CFSTR("Label"),
++            CFSTR("ProgramArguments"),
++            CFSTR("StartInterval"),
++            CFSTR("RunAtLoad"),
++            CFSTR("StandardErrorPath"),
++            CFSTR("StandardOutPath"),
++        };
++        const void* values[] = {
++            CFSTR("megacmd.mac.megaupdater"),
++            programArguments,
++            startInterval,
++            kCFBooleanTrue,
++            CFSTR("/dev/null"),
++            CFSTR("/dev/null"),
++        };
++        CFDictionaryRef plistd = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 6,
++                                                    &kCFTypeDictionaryKeyCallBacks,
++                                                    &kCFTypeDictionaryValueCallBacks);
++        if (plistd)
++        {
++            data = CFPropertyListCreateData(kCFAllocatorDefault, plistd,
++                                            kCFPropertyListXMLFormat_v1_0, 0, nullptr);
++            CFRelease(plistd);
++        }
++    }
++
++    if (programArguments)
++    {
++        CFRelease(programArguments);
++    }
++    if (startInterval)
++    {
++        CFRelease(startInterval);
++    }
++    return data;
++}
++
++static bool writeFileAtomically(const std::string& path, CFDataRef data)
++{
++    std::string tmpPath = path + ".tmp";
++    FILE* file = fopen(tmpPath.c_str(), "wb");
++    if (!file)
++    {
++        return false;
++    }
++
++    size_t size = static_cast<size_t>(CFDataGetLength(data));
++    bool written = fwrite(CFDataGetBytePtr(data), 1, size, file) == size;
++    if (fclose(file) || !written || rename(tmpPath.c_str(), path.c_str()))
++    {
++        unlink(tmpPath.c_str());
++        return false;
++    }
++    return true;
++}
++
++static bool makeDirectory(const std::string& path)
++{
++    return !mkdir(path.c_str(), S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) || errno == EEXIST;
++}
++
++bool registerUpdateDaemon()
++{
++    const char* home = getenv("HOME");
++    if (!home)
++    {
++        return false;
++    }
++
++    std::string libraryPath = std::string(home) + "/Library/";
++    std::string dirPath = libraryPath + "LaunchAgents/";
++    if (!makeDirectory(libraryPath) || !makeDirectory(dirPath))
++    {
++        return false;
++    }
++
++    CFDataRef plistData = createUpdaterPlistData();
++    if (!plistData)
++    {
++        return false;
++    }
++
++    std::string path = dirPath + "megacmd.mac.megaupdater.plist";
++    bool written = writeFileAtomically(path, plistData);
++    CFRelease(plistData);
++    if (!written)
++    {
++        return false;
++    }
++
++    chmod(path.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++    int pid = fork();
++    if (pid)
++    {
++        int status = 0;
++        waitpid(pid, &status, 0);
++
++        if ( WIFEXITED(status) )
++        {
++            int exit_code = WEXITSTATUS(status);
++            return (!exit_code);
++        }
++        else
++        {
++            std::cerr << " failed return. errno=" << errno << std::endl;
++            return false;
++        }
++    }
++    else
++    {
++        char **argv = new char*[4];
++        int i = 0;
++        argv[i++]="/bin/bash";
++        argv[i++]="-c";
++        std::string ls="launchctl unload ";
++        ls.append(path);
++        ls.append(" ; launchctl load -w ");
++        ls.append(path);
++        argv[i++]=(char *)ls.c_str();
++        argv[i++]=NULL;
++        execv(argv[0],argv);
++    }
++
++    return false;
++}
++
++}// end of namespace
++
++#endif
+diff --git a/src/megacmdplatform.mm b/src/megacmdplatform.mm
+deleted file mode 100644
+index 0b99b20..0000000
+--- src/megacmdplatform.mm
++++ /dev/null
+@@ -1,91 +0,0 @@
+-#include "megacmdplatform.h"
+-#include <Cocoa/Cocoa.h>
+-#import <Foundation/Foundation.h>
+-
+-#include <iostream>
+-
+-#include <sstream>
+-#include <string>
+-#include <sys/stat.h>
+-#ifdef __MACH__
+-
+-namespace megacmd {
+-
+-bool registerUpdateDaemon()
+-{
+-    NSDictionary *plistd = @{
+-            @"Label": @"megacmd.mac.megaupdater",
+-            @"ProgramArguments": @[@"/Applications/MEGAcmd.app/Contents/MacOS/MEGAcmdUpdater", @"--emergency-update"],
+-            @"StartInterval": @7200,
+-            @"RunAtLoad": @true,
+-            @"StandardErrorPath": @"/dev/null",
+-            @"StandardOutPath": @"/dev/null",
+-     };
+-
+-    const char* home = getenv("HOME");
+-    if (!home)
+-    {
+-        return false;
+-    }
+-
+-    NSString *homepath = [NSString stringWithUTF8String:home];
+-    if (!homepath)
+-    {
+-        return false;
+-    }
+-
+-    NSFileManager *fileManager = [NSFileManager defaultManager];
+-
+-    NSString *dirPath = [homepath stringByAppendingString:@"/Library/LaunchAgents/"];
+-    NSURL *dirURL = [NSURL fileURLWithPath:dirPath isDirectory:YES];
+-    if ([fileManager createDirectoryAtURL:dirURL withIntermediateDirectories:YES attributes:nil error:nil] == NO)
+-    {
+-        return false;
+-    }
+-
+-    NSString *fullPath = [dirPath stringByAppendingString:@"megacmd.mac.megaupdater.plist"];
+-    if ([plistd writeToFile:fullPath atomically:YES] == NO)
+-    {
+-        return false;
+-    }
+-
+-    std::string path = [fullPath UTF8String];
+-    chmod(path.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+-    int pid = fork();
+-    if (pid)
+-    {
+-        int status = 0;
+-        waitpid(pid, &status, 0);
+-
+-        if ( WIFEXITED(status) )
+-        {
+-            int exit_code = WEXITSTATUS(status);
+-            return (!exit_code);
+-        }
+-        else
+-        {
+-            std::cerr << " failed return. errno=" << errno << std::endl;
+-            return false;
+-        }
+-    }
+-    else
+-    {
+-        char **argv = new char*[4];
+-        int i = 0;
+-        argv[i++]="/bin/bash";
+-        argv[i++]="-c";
+-        std::string ls="launchctl unload ";
+-        ls.append(path);
+-        ls.append(" ; launchctl load -w ");
+-        ls.append(path);
+-        argv[i++]=(char *)ls.c_str();
+-        argv[i++]=NULL;
+-        execv(argv[0],argv);
+-    }
+-
+-    return false;
+-}
+-
+-}// end of namespace
+-
+-#endif
