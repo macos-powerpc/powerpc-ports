@@ -1,0 +1,306 @@
+From bc43fb44d72609c1a23d8d7865a87cf28b7fee04 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 30 Oct 2026 19:59:04 +0000
+Subject: [PATCH 415/415] proc_macro: a forwarded macro_rules fragment reaches
+ a proc macro as an invisible group
+
+bunt 0.2.8 (jwt-cli 6.2.0 decode.rs:191) `println!("{$red+bold}...{/$}")`:
+    compile_error! "expected none or () delimited group, but found different
+    token tree (note: do not use the macros from `bunt-macros` directly, ...)"
+
+bunt's `println!` hands the format string (`$format_str:literal`, inside
+`[..]`) and every argument (`$arg:expr`) to the proc macro `bunt_macros::
+writeln!`, whose parser requires each to be a `Delimiter::None` or `()`
+group. rustc passes a forwarded fragment (`expr`, `literal`, `ty`, `pat`,
+`path`, `stmt`, `block`, `meta`; not `ident`, `lifetime`, `tt`) as
+an invisible group (1.90 proc_macro_server.rs turns every
+`Invisible(MetaVar(_))` tree into a `Delimiter::None` Group). mrustc's
+protocol had none: the fragment went over as its bare tokens.
+
+Protocol tags 15/16 (`TokenClass::GroupNoneOpen/Close`, libproc_macro
+`Token::GroupNoneOpen/Close`): the compiler brackets each interpolated
+fragment with them (the parentheses an operator expression gets stay inside),
+libproc_macro's reader builds `Group::new(Delimiter::None, ..)`, its writer
+still prints nothing for such a group (output groups come back as their
+tokens, as before) and the compiler's output reader skips the tags should
+a child echo them. The fake proc macros of the kits know the tags; the expected
+dumps of the fragment-forwarding kits change accordingly.
+
+Assisted-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+
+diff --git a/lib/libproc_macro/src/protocol.rs b/lib/libproc_macro/src/protocol.rs
+index adb6b57c..253d5f98 100644
+--- a/lib/libproc_macro/src/protocol.rs
++++ b/lib/libproc_macro/src/protocol.rs
+@@ -25,6 +25,11 @@ pub enum Token
+     SpanDef(SpanDef),
+     /// Suffix of the preceding literal (`"re"i`)
+     Suffix(String),
++    /// Start of an invisible (`Delimiter::None`) group: a macro_rules fragment (`$e:expr`, `$t:ty`, `$p:pat`, ..)
++    /// forwarded to the macro, as rustc hands them over. Only the compiler sends these.
++    GroupNoneOpen,
++    /// End of an invisible group
++    GroupNoneClose,
+ }
+ pub struct SpanDef {
+     pub idx: usize,
+@@ -106,6 +111,8 @@ impl<R: ::std::io::Read> Reader<R>
+             v as u8
+             }),
+         14 => Token::CString(self.get_byte_vec()),
++        15 => Token::GroupNoneOpen,
++        16 => Token::GroupNoneClose,
+         _ => panic!("Unknown tag byte: {:#x}", hdr_b),
+         })
+     }
+@@ -217,6 +224,8 @@ impl<T: ::std::io::Write> Writer<T>
+         Token::Suffix(v) => { self.putb(12); self.put_bytes(v.as_bytes()); },
+         Token::ByteChar(v) => { self.putb(13); self.put_u128v(v as u128); },
+         Token::CString(v) => { self.putb(14); self.put_bytes(&v[..]); },
++        Token::GroupNoneOpen => { self.putb(15); },
++        Token::GroupNoneClose => { self.putb(16); },
+         }
+     }
+     pub fn write_sym(&mut self, v: &[u8])
+diff --git a/lib/libproc_macro/src/serialisation.rs b/lib/libproc_macro/src/serialisation.rs
+index 0f0d4f51..68a98c3e 100644
+--- a/lib/libproc_macro/src/serialisation.rs
++++ b/lib/libproc_macro/src/serialisation.rs
+@@ -9,6 +9,8 @@ pub fn recv_token_stream<R: ::std::io::Read>(reader: R) -> TokenStream
+     let mut s = Reader::new(reader);
+     return get_subtree(&mut s, "");
+ 
++    /// An invisible group ends with `Token::GroupNoneClose`, not a symbol
++    const NONE_GROUP_END: &str = "\u{0}";
+     fn get_subtree<R: ::std::io::Read>(s: &mut Reader<R>, end: &'static str) -> TokenStream {
+         let mut toks: Vec<TokenTree> = Vec::new();
+         while let Some(t) = s.read_ent()
+@@ -41,6 +43,10 @@ pub fn recv_token_stream<R: ::std::io::Read>(reader: R) -> TokenStream
+                     },
+                 Token::EndOfStream if end == "" => return TokenStream { inner: toks, },
+                 Token::Symbol(ref s) if s == end => return TokenStream { inner: toks, },
++                // A forwarded macro_rules fragment (`$e:expr`, ..): an invisible group, as rustc gives it
++                Token::GroupNoneOpen => { Group::new(Delimiter::None, get_subtree(s, NONE_GROUP_END)).into() },
++                Token::GroupNoneClose if end == NONE_GROUP_END => return TokenStream { inner: toks, },
++                Token::GroupNoneClose => panic!("Protocol error: invisible group closed inside a `{}` group", end),
+                 Token::Symbol(ref s) if s == "" => panic!("Unexpected end-of-stream marker"),
+                 Token::EndOfStream => panic!("Unexpected end-of-stream marker"),
+                 Token::Symbol(sym) => {
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index f5833f81..1e5c543c 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -218,6 +218,10 @@ enum class TokenClass
+     Suffix   = 12,  // Suffix of the preceding literal (see `Token::m_suffix`)
+     ByteChar = 13,  // v128, a byte literal (`b'a'`)
+     CString  = 14,  // String (bytes, no terminating NUL), a C string literal (`c"a"`)
++    // An invisible (`Delimiter::None`) group around a forwarded macro_rules fragment (`$e:expr`, `$t:ty`, `$p:pat`,
++    // ...), as rustc hands them to a proc macro; only ever sent to the child, output ones are read as their tokens
++    GroupNoneOpen  = 15,
++    GroupNoneClose = 16,
+ };
+ enum class FragType
+ {
+@@ -237,6 +241,9 @@ struct TokenSink
+ {
+     virtual ~TokenSink() = default;
+     virtual void send_symbol(const char* val) = 0;
++    /// Start/end of an invisible group (a forwarded fragment, see `TokenClass::GroupNoneOpen`)
++    virtual void send_none_group_open() = 0;
++    virtual void send_none_group_close() = 0;
+     virtual void send_rword(const char* val) = 0;
+     virtual void send_ident(const char* val) = 0;
+     void send_ident(const Ident& val) { send_ident(val.name.c_str()); }
+@@ -316,6 +323,12 @@ public:
+         this->send_u8(static_cast<uint8_t>(TokenClass::Symbol));
+         this->send_bytes(val, ::std::strlen(val));
+     }
++    void send_none_group_open() override {
++        this->send_u8(static_cast<uint8_t>(TokenClass::GroupNoneOpen));
++    }
++    void send_none_group_close() override {
++        this->send_u8(static_cast<uint8_t>(TokenClass::GroupNoneClose));
++    }
+     void send_rword(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Ident));
+         this->send_bytes(val, ::std::strlen(val));
+@@ -572,6 +585,16 @@ namespace {
+             return false;
+         }
+         void visit_token(const ::Token& tok)
++        {
++            // A `:literal` fragment (one token, or `-` and a number; `Token::m_literal_frag`) is an invisible group
++            // like the parsed fragments below: bunt-macros reads its format string out of one
++            if( tok.is_literal_frag_first() )
++                m_pmi.send_none_group_open();
++            visit_token_inner(tok);
++            if( tok.is_literal_frag_last() )
++                m_pmi.send_none_group_close();
++        }
++        void visit_token_inner(const ::Token& tok)
+         {
+             switch(tok.type())
+             {
+@@ -585,27 +608,41 @@ namespace {
+             case TOK_COMMENT:
+                 BUG(sp, "Unexpected whitepace in tokenstream");
+                 break;
++            // A forwarded macro_rules fragment is an invisible (`Delimiter::None`) group to the proc macro, as rustc
++            // sends it: bunt 0.2.8's `println!` hands each `$arg:expr` to bunt-macros' `writeln!`, whose parser
++            // takes "none or () delimited group"s for the arguments (jwt-cli 6.2.0). `ident`, `lifetime` and `tt`
++            // fragments are plain tokens.
+             case TOK_INTERPOLATED_TYPE:
++                m_pmi.send_none_group_open();
+                 visit_type(const_cast<::Token&>(tok).frag_type());
++                m_pmi.send_none_group_close();
+                 break;
+             case TOK_INTERPOLATED_PATH:
++                m_pmi.send_none_group_open();
+                 visit_path(const_cast<::Token&>(tok).frag_path());
++                m_pmi.send_none_group_close();
+                 break;
+             // A `:pat` fragment forwarded to a proc macro
+             // - tokio 1.53.1 `select!`: `$crate::select_priv_clean_pattern!($bind)` (interprocess 2.4.4, skim)
+             case TOK_INTERPOLATED_PATTERN:
++                m_pmi.send_none_group_open();
+                 visit_pattern(const_cast<::Token&>(tok).frag_pattern());
++                m_pmi.send_none_group_close();
+                 break;
+             case TOK_INTERPOLATED_STMT:
+             case TOK_INTERPOLATED_BLOCK:
++                m_pmi.send_none_group_open();
+                 visit_node( const_cast<::Token&>(tok).frag_node() );
++                m_pmi.send_none_group_close();
+                 break;
+             // A `:expr` fragment: i18n-embed-fl 0.9.4 `fl!` emits `args.insert("duration", #value.into())` for age
+             // 0.11.1 error.rs `duration = (1 << (required - target))` (kbs2); the dump had dropped the source's
+-            // parentheses, so the output re-parsed as `1 << (required - target).into()`
++            // parentheses, so the output re-parsed as `1 << (required - target).into()`. The parentheses stay inside
++            // the invisible group: the group itself comes back flattened (libproc_macro prints none), they don't.
+             case TOK_INTERPOLATED_EXPR: {
+                 const auto& e = const_cast<::Token&>(tok).frag_node();
+                 bool wrap = expr_fragment_needs_parens(e);
++                m_pmi.send_none_group_open();
+                 if( wrap ) {
+                     m_pmi.send_symbol("(");
+                 }
+@@ -613,9 +650,12 @@ namespace {
+                 if( wrap ) {
+                     m_pmi.send_symbol(")");
+                 }
++                m_pmi.send_none_group_close();
+                 } break;
+             case TOK_INTERPOLATED_META:
++                m_pmi.send_none_group_open();
+                 visit_meta_item(const_cast<::Token&>(tok).frag_meta());
++                m_pmi.send_none_group_close();
+                 break;
+             case TOK_INTERPOLATED_ITEM:
+             case TOK_INTERPOLATED_VIS:
+@@ -2165,6 +2205,9 @@ namespace {
+             ASSERT_BUG(Span(), t != TOK_NULL, "Unknown symbol `" << val << "`");
+             out.push_back(::std::move(t));
+         }
++        // mrustc tokens have no invisible groups: a fragment's tokens are collected as written
++        void send_none_group_open() override {}
++        void send_none_group_close() override {}
+         void send_rword(const char* val) override {
+             auto t = Lex_FindOperator(val);
+             if( t == TOK_NULL )
+@@ -2852,6 +2895,10 @@ Token ProcMacroInv::realGetToken_() {
+         break;
+     case TokenClass::Suffix:
+         BUG(this->m_parent_span, "Literal suffix from child process without a string literal");
++    case TokenClass::GroupNoneOpen:
++    case TokenClass::GroupNoneClose:
++        // An invisible group echoed back (libproc_macro prints none today): its tokens are read as written
++        return this->realGetToken_();
+     case TokenClass::Symbol: {
+         auto val = this->recv_bytes();
+         if( val == "" ) {
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index c9238c59..bb322e1e 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -692,6 +692,9 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+             }
+             GET_TOK(tok, lex);
+             toks.push_back(tok);
++            // A `:literal` fragment is an invisible group to a proc macro (see Token::m_literal_frag)
++            toks.front().tok().set_literal_frag(true, false);
++            toks.back().tok().set_literal_frag(false, true);
+             return InterpolatedFragment( TokenTree(lex.get_edition(), lex.get_hygiene(), std::move(toks)) );
+         }
+         switch(tok.type())
+@@ -712,6 +715,7 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+         default:
+             throw ParseError::Unexpected(lex, tok, {TOK_INTEGER, TOK_FLOAT, TOK_STRING, TOK_BYTESTRING, TOK_CSTRING, TOK_RWORD_TRUE, TOK_RWORD_FALSE});
+         }
++        tok.set_literal_frag(true, true);
+         return InterpolatedFragment( TokenTree(lex.get_edition(), lex.get_hygiene(), tok) );
+     }
+     throw "";
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 711af1bf..5b6f3246 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -193,6 +193,7 @@ Token::Token(const Token& t):
+     , m_pos( t.m_pos )
+     , m_hygiene(t.m_hygiene)
+     , m_suffix(t.m_suffix)
++    , m_literal_frag(t.m_literal_frag)
+ {
+     assert( t.m_data.tag() != Data::TAGDEAD );
+     TU_MATCH_HDRA( (t.m_data), {)
+@@ -212,6 +213,7 @@ Token Token::clone() const
+     rv.m_pos = m_pos;
+     rv.m_hygiene = m_hygiene;
+     rv.m_suffix = m_suffix;
++    rv.m_literal_frag = m_literal_frag;
+ 
+     assert( m_data.tag() != Data::TAGDEAD );
+     TU_MATCH(Data, (m_data), (e),
+diff --git a/src/parse/token.hpp b/src/parse/token.hpp
+index 634c6c10..221f617b 100644
+--- a/src/parse/token.hpp
++++ b/src/parse/token.hpp
+@@ -97,6 +97,10 @@ class Token
+     // Literal suffix: any identifier may follow a literal in a token stream (rustc rejects it only where the literal
+     // is parsed as an expression). Proc macros read it, e.g. lazy_regex `regex_is_match!("re"i, s)`. Strings only.
+     RcString    m_suffix;
++    // A `:literal` fragment forwarded to a proc macro is an invisible group (as rustc sends it, bunt-macros' format
++    // string): the macro_rules capture marks the fragment's first and last token (a negative literal is `-` and
++    // a number), expand/proc_macro.cpp brackets them. Not compared, not serialised (set at expansion time).
++    uint8_t     m_literal_frag = 0;
+ 
+     Token(enum eTokenType t, Data d, Position p):
+         m_type(t),
+@@ -114,6 +118,7 @@ public:
+         m_pos = ::std::move(t.m_pos);
+         m_hygiene = ::std::move(t.m_hygiene);
+         m_suffix = ::std::move(t.m_suffix);
++        m_literal_frag = t.m_literal_frag;
+         return *this;
+     }
+     Token(Token&& t):
+@@ -121,7 +126,8 @@ public:
+         m_data( ::std::move(t.m_data) ),
+         m_pos( ::std::move(t.m_pos) ),
+         m_hygiene( std::move(t.m_hygiene) ),
+-        m_suffix( std::move(t.m_suffix) )
++        m_suffix( std::move(t.m_suffix) ),
++        m_literal_frag( t.m_literal_frag )
+     {
+         t.m_type = TOK_NULL;
+     }
+@@ -153,6 +159,9 @@ public:
+     const Ident::Hygiene& str_hygiene() const { return m_hygiene; }
+     const RcString& suffix() const { return m_suffix; }
+     void set_suffix(RcString s) { m_suffix = ::std::move(s); }
++    void set_literal_frag(bool first, bool last) { m_literal_frag = (first ? 1 : 0) | (last ? 2 : 0); }
++    bool is_literal_frag_first() const { return (m_literal_frag & 1) != 0; }
++    bool is_literal_frag_last() const { return (m_literal_frag & 2) != 0; }
+     enum eCoreType  datatype() const { TU_MATCH_DEF(Data, (m_data), (e), (assert(!"Getting datatype of invalid token type");), (Integer, return e.m_datatype;), (Float, return e.m_datatype;)) throw ""; }
+     U128 intval() const { return m_data.as_Integer().m_intval; }
+     bool is_byte_char() const { return m_data.is_Integer() && m_data.as_Integer().m_is_byte_char; }

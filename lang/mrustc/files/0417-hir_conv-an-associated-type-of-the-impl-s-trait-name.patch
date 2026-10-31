@@ -1,0 +1,147 @@
+From 1d51d0daf50f97e72325ac1f3bc97545ccccaefd Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 31 Oct 2026 00:34:14 +0000
+Subject: [PATCH 417/418] hir_conv: an associated type of the impl's trait
+ names the struct of a brace pattern
+
+zi 0.3.2 (zee 0.3.2) src/components/text.rs:97, in
+`impl Component for Text { type Properties = TextProperties; .. }`:
+    let Self { frame, properties: Self::Properties { ref content, align, style, wrap } } = *self;
+    error:0: Expeted enum path in pattern binding, got Struct
+(`<Self as Component>::Properties { .. }` asserted `path.m_data.is_Generic()`.)
+
+Resolve Type Aliases read every `<Type>::Name { .. }` pattern path as an enum
+variant. rustc resolves the path in the type namespace and normalises the
+projection: an associated type that is a struct is a valid struct pattern
+(brace patterns only; `Self::Assoc(..)` and a unit `Self::Assoc` are value
+paths and errors in rustc too).
+
+`Self::Name` that is no variant of the impl type, `<Self as Trait>::Name` and
+`<Type as Trait>::Name` now look `Name` up in the enclosing trait impl, else
+in the crate's impls of the trait whose type equals the type (bindings are
+not set yet in this pass, so by equality over the still-unsorted impl
+lists). The associated type's aliases are expanded on a copy (an impl's
+types are visited after its methods) and the pattern binds to the struct
+with the type's own parameters.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir_conv/expand_type.cpp b/src/hir_conv/expand_type.cpp
+index d06db86c..390b7246 100644
+--- a/src/hir_conv/expand_type.cpp
++++ b/src/hir_conv/expand_type.cpp
+@@ -245,6 +245,8 @@ class Expander:
+     // The next type visited is the head of a value path (`Foo::new()`, `Foo { .. }`): its omitted lists are inferred
+     bool m_value_head = false;
+     const ::HIR::TypeRef*   m_impl_type = nullptr;
++    const ::HIR::SimplePath*    m_trait_path = nullptr;
++    const ::HIR::TraitImpl* m_trait_impl = nullptr;
+ 
+ public:
+     Expander(const ::HIR::Crate& crate):
+@@ -375,14 +377,77 @@ public:
+         return mv$( rv );
+     }
+ 
++    /// `Self::Name { .. }` / `<Type as Trait>::Name { .. }`: `Name` as an associated type of a trait impl for the type,
++    /// expanded to the struct it names (rustc normalises the projection; it is the type namespace, so only brace
++    /// patterns) - zi 0.3.2 components/text.rs:97 `let Self { properties: Self::Properties { .. }, .. } = *self;`
++    const ::HIR::Struct* get_assoc_type_struct(const Span& sp, const ::HIR::TypeRef& for_type, const ::HIR::SimplePath* trait_path, const RcString& name, ::HIR::GenericPath& out_path)
++    {
++        const ::HIR::TypeRef* aty = nullptr;
++        if( m_trait_impl && for_type == *m_impl_type && (!trait_path || *trait_path == *m_trait_path) ) {
++            auto it = m_trait_impl->m_types.find(name);
++            if( it != m_trait_impl->m_types.end() )
++                aty = &it->second.data;
++        }
++        // Another impl of the named trait for the type (type bindings are not set yet, so impls are matched by
++        // equality and are all still in the unsorted list)
++        if( !aty && trait_path ) {
++            auto it_g = m_crate.m_trait_impls.find(*trait_path);
++            if( it_g != m_crate.m_trait_impls.end() ) {
++                auto check_list = [&](const ::std::vector<::std::unique_ptr<::HIR::TraitImpl>>& list) {
++                    for(const auto& impl : list) {
++                        if( impl->m_type != for_type )
++                            continue;
++                        auto it = impl->m_types.find(name);
++                        if( it != impl->m_types.end() )
++                            aty = &it->second.data;
++                    }
++                    };
++                check_list(it_g->second.generic);
++                check_list(it_g->second.non_named);
++                for(const auto& l : it_g->second.named)
++                    check_list(l.second);
++            }
++        }
++        if( !aty )
++            return nullptr;
++        // The impl's associated types are visited after its methods: expand aliases on a copy
++        auto ty = aty->clone();
++        this->visit_type(ty);
++        if( !TU_TEST1(ty.data(), Path, .path.m_data.is_Generic()) ) {
++            ERROR(sp, E0000, "Associated type " << name << " = " << ty << " is not a struct, can't be used in a pattern");
++        }
++        const auto& gp = ty.data().as_Path().path.m_data.as_Generic();
++        const auto& ti = m_crate.get_typeitem_by_path(sp, gp.m_path);
++        if( !ti.is_Struct() ) {
++            ERROR(sp, E0000, "Associated type " << name << " = " << ty << " is not a struct, can't be used in a pattern");
++        }
++        out_path = gp.clone();
++        return &ti.as_Struct();
++    }
++
+     ::HIR::Pattern::PathBinding visit_pattern_PathBinding(const Span& sp, ::HIR::Path& path)
+     {
++        if( path.m_data.is_UfcsKnown() ) {
++            const auto& pe = path.m_data.as_UfcsKnown();
++            bool is_self = pe.type.data().is_Generic() && pe.type.data().as_Generic().binding == GENERIC_Self;
++            if( is_self && !m_impl_type ) {
++                ERROR(sp, E0000, "Use of `Self` pattern outside of an impl block");
++            }
++            ::HIR::GenericPath  str_path;
++            if( const auto* str = get_assoc_type_struct(sp, is_self ? *m_impl_type : pe.type, &pe.trait.m_path, pe.item, str_path) ) {
++                path = ::HIR::Path(mv$(str_path));
++                return ::HIR::Pattern::PathBinding::make_Struct(str);
++            }
++            ERROR(sp, E0000, "Unknown associated struct in pattern binding - " << path);
++        }
+         if( path.m_data.is_UfcsUnknown() ) {
+             const auto& ty = path.m_data.as_UfcsUnknown().type;
+             const auto& name = path.m_data.as_UfcsUnknown().item;
+ 
+             const HIR::GenericPath* gp_p;
++            bool is_self = false;
+             if( ty.data().is_Generic() && ty.data().as_Generic().binding == GENERIC_Self ) {
++                is_self = true;
+                 if(!m_impl_type) {
+                     ERROR(sp, E0000, "Use of `Self` pattern outside of an impl block");
+                 }
+@@ -402,6 +467,14 @@ public:
+             }
+             const auto& gp = *gp_p;
+             const auto& ti = m_crate.get_typeitem_by_path(sp, gp.m_path);
++            // Not a variant of the impl type: an associated type of the enclosing trait impl
++            if( is_self && (!ti.is_Enum() || ti.as_Enum().find_variant(name) == SIZE_MAX) ) {
++                ::HIR::GenericPath  str_path;
++                if( const auto* str = get_assoc_type_struct(sp, *m_impl_type, nullptr, name, str_path) ) {
++                    path = ::HIR::Path(mv$(str_path));
++                    return ::HIR::Pattern::PathBinding::make_Struct(str);
++                }
++            }
+             if( !ti.is_Enum() ) {
+                 ERROR(sp, E0000, "Expeted enum path in pattern binding, got " << ti.tag_str());
+             }
+@@ -648,7 +721,11 @@ public:
+     {
+         static Span sp;
+         m_impl_type = &impl.m_type;
++        m_trait_path = &trait_path;
++        m_trait_impl = &impl;
+         ::HIR::Visitor::visit_trait_impl(trait_path, impl);
++        m_trait_impl = nullptr;
++        m_trait_path = nullptr;
+         m_impl_type = nullptr;
+     }
+ 

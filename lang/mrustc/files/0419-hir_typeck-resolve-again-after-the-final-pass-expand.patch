@@ -1,0 +1,94 @@
+From 7768121949484ae7e07e8e75a07f378ec77d9583 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 31 Oct 2026 03:32:53 +0000
+Subject: [PATCH] hir_typeck: resolve again after the final pass expands
+ an associated type
+
+zi-term 0.3.2 (zee 0.3.2) src/lib.rs:196 poll_events_batch:
+
+    (runtime.block_on(async { tokio::select! { .. } }) as Result<()>)?;
+
+-> `<null> BUG: ASSERT FAIL: src/hir_typeck/common.cpp:314:allow_infer:
+Unexpected ivar seen - _/*56*/` in Expand HIR Lifetimes, from the strict
+monomorph of the method call's cached return type.
+
+tokio's `Runtime::block_on<F: Future>(&self, future: F) -> F::Output` is
+called with an async block whose output type (`Result<(), _>` from its
+`Ok(())`) is pinned only by the cast on the call's result. The call
+cache's return slot is the projection `<_F as Future>::Output`. The
+final typeck pass (ExprVisitor_Apply::check_type_resolved_top) resolves
+the ivars in it, giving `<async[..] as Future>::Output`, and then
+expands the projection; the expansion answers with the async node's own
+return slot, which still holds the raw ivar because the visitor reaches
+that node only afterwards (and the typeck EAT cache keeps the answer).
+Nothing resolved the expansion's result, so the ivar stayed in the HIR.
+A `let r: Result<()> = ..` annotation does not show it; a free generic
+function with the cast does.
+
+The final pass now resolves once more when an expansion surfaces
+an ivar, and expands again; the path-parameter expansion of
+check_type_resolved_path took the same resolve-then-expand route and
+gets the same treatment.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index bb67cd6e..319fe31c 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1858,7 +1858,7 @@ namespace {
+     private:
+         void check_type_resolved_top(const Span& sp, ::HIR::TypeRef& ty) const {
+             check_type_resolved(sp, ty, ty);
+-            ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++            expand_resolved(sp, ty, ty);
+             MonomorphHrlsOnly(HIR::PathParams()).monomorph_type(sp, ty);
+             DEBUG(ty);
+             #if 0   // Sanity check
+@@ -1893,27 +1893,38 @@ namespace {
+             TU_MATCH(::HIR::Path::Data, (path.m_data), (pe),
+             (Generic,
+                 for(auto& ty : pe.m_params.m_types)
+-                    ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++                    expand_resolved(sp, ty, tmp);
+                 ),
+             (UfcsInherent,
+-                pe.type = this->context.m_resolve.expand_associated_types(sp, mv$(pe.type));
++                expand_resolved(sp, pe.type, tmp);
+                 for(auto& ty : pe.params.m_types)
+-                    ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++                    expand_resolved(sp, ty, tmp);
+                 for(auto& ty : pe.impl_params.m_types)
+-                    ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++                    expand_resolved(sp, ty, tmp);
+                 ),
+             (UfcsKnown,
+-                pe.type = this->context.m_resolve.expand_associated_types(sp, mv$(pe.type));
++                expand_resolved(sp, pe.type, tmp);
+                 for(auto& ty : pe.params.m_types)
+-                    ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++                    expand_resolved(sp, ty, tmp);
+                 for(auto& ty : pe.trait.m_params.m_types)
+-                    ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++                    expand_resolved(sp, ty, tmp);
+                 ),
+             (UfcsUnknown,
+                 throw "";
+                 )
+             )
+         }
++        /// Expand associated types in an already-resolved type, then resolve again: a projection on an async block or
++        /// closure type answers with that node's return slot, which holds the raw ivar until this visitor reaches the
++        /// node (and the EAT cache keeps that answer).
++        void expand_resolved(const Span& sp, ::HIR::TypeRef& ty, const ::HIR::TypeRef& top_type) const {
++            ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++            if( this->ivars.type_contains_ivars(ty) ) {
++                DEBUG("Expansion surfaced an ivar: " << ty);
++                check_type_resolved(sp, ty, top_type);
++                ty = this->context.m_resolve.expand_associated_types(sp, mv$(ty));
++            }
++        }
+         void check_type_resolved_path(const Span& sp, ::HIR::Path& path, const ::HIR::TypeRef& top_type) const {
+             TU_MATCH(::HIR::Path::Data, (path.m_data), (pe),
+             (Generic,
