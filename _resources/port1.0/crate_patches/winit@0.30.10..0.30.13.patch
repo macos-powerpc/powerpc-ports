@@ -1,0 +1,405 @@
+winit 0.30.10..0.30.13 on powerpc-apple-darwin: `platform_impl/macos/app.rs` swizzles `-[NSApplication
+sendEvent:]` (method_setImplementation) and calls the saved original IMP as a plain `extern "C" fn`.
+On Darwin PowerPC an Objective-C method built by Apple's GCC takes its PIC base from r12
+(`mflr r0; stmw ..; mr r31,r12; addis r2,r31,..; lwz r2,..(r2); .. lwz r0,0(r2)`): the ABI puts the
+callee's address in r12 for indirect calls, objc_msgSend and the dyld stubs do, but FSF GCC's Darwin
+backend (rs6000_call_darwin_1: force_reg + mtctr) does not, so the call arrives with r12 = the IMP of the
+last objc_msgSend (`-[NSEvent type]`) and AppKit faults at sendEvent: + 44 (alacritty 0.17.0 on 10.6.8:
+EXC_BAD_ACCESS at 0 on the very first event, which is winit's own exit dummy event). On powerpc the
+original implementation is added to the class as `winitOriginalSendEvent:` and reached through
+objc_msgSend. 0.30.0..0.30.9 subclassed NSApplication and used `msg_send![super(..)]`, which is fine.
+
+winit 0.30.10..0.30.13 on powerpc-apple-darwin (Mac OS X 10.6, the last PowerPC release): the macOS backend
+sends these 10.7+ selectors on the window-creation and event paths, each an `unrecognized selector` (or, with
+objc2's debug assertions, a panic `invalid message send to -[NSScreen backingScaleFactor]: method not found`,
+alacritty 0.17.0 right after the GL config): `backingScaleFactor` (NSScreen/NSWindow, 10.7) -> 1.0, no HiDPI;
+`convertRectToScreen:` (10.7) -> `convertBaseToScreen:` for the IME rect; `scrollingDeltaX/Y`,
+`hasPreciseScrollingDeltas`, `momentumPhase`, `phase` (10.7) -> the classic `deltaX/Y` line deltas and
+TouchPhase::Moved; `setWantsBestResolutionOpenGLSurface:` (10.7), `setTitlebarAppearsTransparent:` /
+`setTitleVisibility:` (10.10), `setTabbingIdentifier:`/`setTabbingMode:` and the tab methods (10.12) skipped;
+`setAppearance:`/`appearance`/NSAppearance (10.9): theme() = Light, set_theme no-op; `toggleFullScreen:`
+(10.7): `set_fullscreen`/`fullscreen` are the window-level "simple" fullscreen; `performWindowDragWithEvent:`
+(10.11): NotSupported. Everything else the backend sends exists in the 10.6 SDK (checked against the AppKit,
+Foundation and OpenGL headers). Delegate callbacks 10.6 never invokes (occlusion, pressure, smart magnify,
+fullscreen transitions) are left alone. Gated on target_arch powerpc/powerpc64: whole-item cfg copies for fns,
+`#[cfg] let` for the scroll/gesture values, `util::LEGACY_MACOS` for the creation-time attributes.
+
+--- winit-0.30.13/src/platform_impl/macos/app.rs
++++ wm/b/src/platform_impl/macos/app.rs
+@@ -46,10 +46,44 @@
+     maybe_dispatch_device_event(&delegate, event);
+ 
+     let _ = mtm;
++    call_original(app, sel, event)
++}
++
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++fn call_original(app: &NSApplication, sel: Sel, event: &NSEvent) {
+     let original = unsafe { ORIGINAL.get().expect("no existing sendEvent: handler set") };
+     original(app, sel, event)
+ }
+ 
++// Darwin PowerPC: Apple's compiler makes Objective-C methods take their PIC base from r12, which the ABI sets to
++// the callee's address on indirect calls; objc_msgSend does that, a plain function pointer call from code GCC
++// generates does not (r12 is whatever the last dispatch left), and AppKit's `sendEvent:` then reads through a
++// bogus pointer. So the original implementation is reached through objc_msgSend, as a method of its own.
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++fn call_original(app: &NSApplication, _sel: Sel, event: &NSEvent) {
++    unsafe { objc2::msg_send![app, winitOriginalSendEvent: event] }
++}
++
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++fn add_original_method(_class: &objc2::runtime::AnyClass, _method: &objc2::runtime::Method, _original: Imp) {}
++
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++fn add_original_method(class: &objc2::runtime::AnyClass, method: &objc2::runtime::Method, original: Imp) {
++    // Same type encoding as `sendEvent:`; `class_addMethod` is 10.5+.
++    let types = unsafe {
++        objc2::ffi::method_getTypeEncoding(method as *const objc2::runtime::Method as *const objc2::ffi::objc_method)
++    };
++    let added = unsafe {
++        objc2::ffi::class_addMethod(
++            class as *const objc2::runtime::AnyClass as *mut objc2::ffi::objc_class,
++            sel!(winitOriginalSendEvent:).as_ptr(),
++            Some(original),
++            types,
++        )
++    };
++    assert!(added != 0, "could not add winitOriginalSendEvent: to NSApplication");
++}
++
+ /// Override the [`sendEvent:`][NSApplication::sendEvent] method on the given application class.
+ ///
+ /// The previous implementation created a subclass of [`NSApplication`], however we would like to
+@@ -87,6 +121,7 @@
+     // 1. The same signature as `sendEvent:`.
+     // 2. Does not impose extra safety requirements on callers.
+     let original = unsafe { method.set_implementation(overridden) };
++    add_original_method(class, method, original);
+ 
+     // SAFETY: This is the actual signature of `sendEvent:`.
+     let original = unsafe { mem::transmute::<Imp, SendEvent>(original) };
+--- winit-0.30.13/src/platform_impl/macos/util.rs
++++ wm/b/src/platform_impl/macos/util.rs
+@@ -25,3 +25,24 @@
+         trace!(target = self.module_path, "Completed `{}`", self.called_from_fn);
+     }
+ }
++
++// Mac OS X 10.6, the last release for PowerPC: no HiDPI (`backingScaleFactor` is 10.7), no native
++// fullscreen, tabs or appearances. The 10.7+ selectors are not sent there.
++pub(crate) const LEGACY_MACOS: bool = cfg!(any(target_arch = "powerpc", target_arch = "powerpc64"));
++
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++pub(crate) fn window_scale_factor(_window: &objc2_app_kit::NSWindow) -> objc2_foundation::CGFloat {
++    1.0
++}
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++pub(crate) fn window_scale_factor(window: &objc2_app_kit::NSWindow) -> objc2_foundation::CGFloat {
++    window.backingScaleFactor()
++}
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++pub(crate) fn screen_scale_factor(_screen: &objc2_app_kit::NSScreen) -> objc2_foundation::CGFloat {
++    1.0
++}
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++pub(crate) fn screen_scale_factor(screen: &objc2_app_kit::NSScreen) -> objc2_foundation::CGFloat {
++    screen.backingScaleFactor()
++}
+--- winit-0.30.13/src/platform_impl/macos/monitor.rs
++++ wm/b/src/platform_impl/macos/monitor.rs
+@@ -251,7 +251,7 @@
+     pub fn scale_factor(&self) -> f64 {
+         run_on_main(|mtm| {
+             match self.ns_screen(mtm) {
+-                Some(screen) => screen.backingScaleFactor() as f64,
++                Some(screen) => super::util::screen_scale_factor(&screen) as f64,
+                 None => 1.0, // default to 1.0 when we can't find the screen
+             }
+         })
+--- winit-0.30.13/src/platform_impl/macos/view.rs
++++ wm/b/src/platform_impl/macos/view.rs
+@@ -385,8 +385,17 @@
+                 self.ivars().ime_size.get()
+             );
+             // Return value is expected to be in screen coordinates, so we need a conversion here
+-            self.window()
+-                .convertRectToScreen(self.convertRect_toView(rect, None))
++            let rect = self.convertRect_toView(rect, None);
++            #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++            let rect = self.window().convertRectToScreen(rect);
++            // Mac OS X 10.6: `convertRectToScreen:` is 10.7, `convertBaseToScreen:` (10.0) moves the origin
++            #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++            let rect = {
++                let origin: NSPoint =
++                    unsafe { objc2::msg_send![&*self.window(), convertBaseToScreen: rect.origin] };
++                NSRect::new(origin, rect.size)
++            };
++            rect
+         }
+ 
+         #[method(insertText:replacementRange:)]
+@@ -665,6 +674,15 @@
+ 
+             self.mouse_motion(event);
+ 
++            // Mac OS X 10.6: no `scrollingDelta*`/`hasPreciseScrollingDeltas`/phases (10.7), the classic line deltas
++            #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++            let delta = {
++                let (x, y) = unsafe { (event.deltaX(), event.deltaY()) };
++                MouseScrollDelta::LineDelta(x as f32, y as f32)
++            };
++            #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++            let phase = TouchPhase::Moved;
++            #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+             let delta = {
+                 let (x, y) = unsafe { (event.scrollingDeltaX(), event.scrollingDeltaY()) };
+                 if unsafe { event.hasPreciseScrollingDeltas() } {
+@@ -679,6 +697,7 @@
+             // be mutually exclusive anyhow, which is why the API is rather incoherent). If no momentum
+             // phase is recorded (or rather, the started/ended cases of the momentum phase) then we
+             // report the touch phase.
++            #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+             #[allow(non_upper_case_globals)]
+             let phase = match unsafe { event.momentumPhase() } {
+                 NSEventPhase::MayBegin | NSEventPhase::Began => TouchPhase::Started,
+@@ -706,6 +725,10 @@
+ 
+             self.mouse_motion(event);
+ 
++            // Mac OS X 10.6: `phase` is 10.7
++            #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++            let phase = TouchPhase::Moved;
++            #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+             #[allow(non_upper_case_globals)]
+             let phase = match unsafe { event.phase() } {
+                 NSEventPhase::Began => TouchPhase::Started,
+@@ -739,6 +762,10 @@
+ 
+             self.mouse_motion(event);
+ 
++            // Mac OS X 10.6: `phase` is 10.7
++            #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++            let phase = TouchPhase::Moved;
++            #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+             #[allow(non_upper_case_globals)]
+             let phase = match unsafe { event.phase() } {
+                 NSEventPhase::Began => TouchPhase::Started,
+@@ -840,7 +867,7 @@
+     }
+ 
+     fn scale_factor(&self) -> f64 {
+-        self.window().backingScaleFactor() as f64
++        super::util::window_scale_factor(&self.window()) as f64
+     }
+ 
+     fn is_ime_enabled(&self) -> bool {
+--- winit-0.30.13/src/platform_impl/macos/window_delegate.rs
++++ wm/b/src/platform_impl/macos/window_delegate.rs
+@@ -508,7 +508,7 @@
+             Some(screen) => screen.frame(),
+             None => {
+                 let scale_factor = NSScreen::mainScreen(mtm)
+-                    .map(|screen| screen.backingScaleFactor() as f64)
++                    .map(|screen| super::util::screen_scale_factor(&screen) as f64)
+                     .unwrap_or(1.0);
+                 let size = match attrs.inner_size {
+                     Some(size) => {
+@@ -586,18 +586,20 @@
+         window.setAcceptsMouseMovedEvents(true);
+ 
+         if let Some(identifier) = &attrs.platform_specific.tabbing_identifier {
+-            window.setTabbingIdentifier(&NSString::from_str(identifier));
+-            window.setTabbingMode(NSWindowTabbingMode::Preferred);
++            if !super::util::LEGACY_MACOS {
++                window.setTabbingIdentifier(&NSString::from_str(identifier));
++                window.setTabbingMode(NSWindowTabbingMode::Preferred);
++            }
+         }
+ 
+         if attrs.content_protected {
+             window.setSharingType(NSWindowSharingType::NSWindowSharingNone);
+         }
+ 
+-        if attrs.platform_specific.titlebar_transparent {
++        if attrs.platform_specific.titlebar_transparent && !super::util::LEGACY_MACOS {
+             window.setTitlebarAppearsTransparent(true);
+         }
+-        if attrs.platform_specific.title_hidden {
++        if attrs.platform_specific.title_hidden && !super::util::LEGACY_MACOS {
+             window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
+         }
+         if attrs.platform_specific.titlebar_buttons_hidden {
+@@ -641,7 +643,9 @@
+         // macos 10.14 and `true` after 10.15, we should set it to `YES` or `NO` to avoid
+         // always the default system value in favour of the user's code
+         #[allow(deprecated)]
+-        view.setWantsBestResolutionOpenGLSurface(!attrs.platform_specific.disallow_hidpi);
++        if !super::util::LEGACY_MACOS {
++            view.setWantsBestResolutionOpenGLSurface(!attrs.platform_specific.disallow_hidpi);
++        }
+ 
+         // On Mojave, views automatically become layer-backed shortly after being added to
+         // a window. Changing the layer-backedness of a view breaks the association between
+@@ -704,17 +708,19 @@
+         }
+ 
+         let resize_increments =
+-            match attrs.resize_increments.map(|i| i.to_logical(window.backingScaleFactor() as _)) {
++            match attrs.resize_increments.map(|i| i.to_logical(super::util::window_scale_factor(&window) as _)) {
+                 Some(LogicalSize { width, height }) if width >= 1. && height >= 1. => {
+                     NSSize::new(width, height)
+                 },
+                 _ => NSSize::new(1., 1.),
+             };
+ 
+-        let scale_factor = window.backingScaleFactor() as _;
++        let scale_factor = super::util::window_scale_factor(&window) as _;
+ 
+-        if let Some(appearance) = theme_to_appearance(attrs.preferred_theme) {
+-            unsafe { window.setAppearance(Some(&appearance)) };
++        if !super::util::LEGACY_MACOS {
++            if let Some(appearance) = theme_to_appearance(attrs.preferred_theme) {
++                unsafe { window.setAppearance(Some(&appearance)) };
++            }
+         }
+ 
+         let delegate = mtm.alloc().set_ivars(State {
+@@ -1145,7 +1151,7 @@
+ 
+     #[inline]
+     pub fn scale_factor(&self) -> f64 {
+-        self.window().backingScaleFactor() as _
++        super::util::window_scale_factor(&self.window()) as _
+     }
+ 
+     #[inline]
+@@ -1166,6 +1172,14 @@
+         Ok(())
+     }
+ 
++    // Mac OS X 10.6: `performWindowDragWithEvent:` is 10.11
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    #[inline]
++    pub fn drag_window(&self) -> Result<(), ExternalError> {
++        Err(ExternalError::NotSupported(NotSupportedError::new()))
++    }
++
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     pub fn drag_window(&self) -> Result<(), ExternalError> {
+         let mtm = MainThreadMarker::from(self);
+@@ -1288,6 +1302,22 @@
+     }
+ 
+     #[inline]
++    // Mac OS X 10.6 has no `toggleFullScreen:` (10.7): fullscreen is the window-level "simple" one
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    pub(crate) fn fullscreen(&self) -> Option<Fullscreen> {
++        if self.ivars().is_simple_fullscreen.get() {
++            Some(Fullscreen::Borderless(None))
++        } else {
++            None
++        }
++    }
++
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
++        self.set_simple_fullscreen(fullscreen.is_some());
++    }
++
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     pub(crate) fn fullscreen(&self) -> Option<Fullscreen> {
+         self.ivars().fullscreen.borrow().clone()
+     }
+@@ -1298,6 +1328,7 @@
+     }
+ 
+     #[inline]
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     pub(crate) fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
+         let mtm = MainThreadMarker::from(self);
+         let app = NSApplication::sharedApplication(mtm);
+@@ -1672,6 +1703,16 @@
+         self.window().isKeyWindow()
+     }
+ 
++    // Mac OS X 10.6: NSAppearance is 10.9
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    pub fn theme(&self) -> Option<Theme> {
++        Some(Theme::Light)
++    }
++
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    pub fn set_theme(&self, _theme: Option<Theme>) {}
++
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     pub fn theme(&self) -> Option<Theme> {
+         unsafe { self.window().appearance() }
+             .map(|appearance| appearance_to_theme(&appearance))
+@@ -1687,6 +1728,7 @@
+             })
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     pub fn set_theme(&self, theme: Option<Theme>) {
+         unsafe { self.window().setAppearance(theme_to_appearance(theme).as_deref()) };
+     }
+@@ -1808,26 +1850,49 @@
+         self.window().setHasShadow(has_shadow)
+     }
+ 
++    // Mac OS X 10.6: window tabs are 10.12
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn set_tabbing_identifier(&self, _identifier: &str) {}
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn tabbing_identifier(&self) -> String {
++        String::new()
++    }
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn select_next_tab(&self) {}
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn select_previous_tab(&self) {}
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn select_tab_at_index(&self, _index: usize) {}
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    fn num_tabs(&self) -> usize {
++        1
++    }
++
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn set_tabbing_identifier(&self, identifier: &str) {
+         self.window().setTabbingIdentifier(&NSString::from_str(identifier))
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn tabbing_identifier(&self) -> String {
+         self.window().tabbingIdentifier().to_string()
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn select_next_tab(&self) {
+         self.window().selectNextTab(None)
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn select_previous_tab(&self) {
+         unsafe { self.window().selectPreviousTab(None) }
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn select_tab_at_index(&self, index: usize) {
+         if let Some(group) = self.window().tabGroup() {
+@@ -1839,6 +1904,7 @@
+         }
+     }
+ 
++    #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+     #[inline]
+     fn num_tabs(&self) -> usize {
+         unsafe { self.window().tabbedWindows() }.map(|windows| windows.len()).unwrap_or(1)
