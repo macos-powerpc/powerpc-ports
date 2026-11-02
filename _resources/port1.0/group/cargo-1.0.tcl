@@ -12,17 +12,18 @@
 #
 # See the cargo_fetch PortGroup for more options
 #
+# With rust.compiler mrustc (see the rust_compiler PortGroup; the default on
+# powerpc) minicargo builds the port. With rustc this is the cargo PortGroup
+# of the default ports tree, which this file shadows in the overlay.
+#
 
-default use_configure           no
+PortGroup                       rust_compiler 1.0
 
-global os.arch
-
-# On powerpc mrustc is used, since the full rustc is still broken:
-# https://github.com/thepowersgang/mrustc/issues/300
-if {${os.arch} eq "powerpc"} {
+if {${rust.compiler} eq "mrustc"} {
     # (also sets rustc_target_ver, the Rust version of the mrustc port)
     PortGroup                   mrustc 1.0
 
+    default use_configure       no
     default universal_variant   no
 
     default build.cmd           {MRUSTC_TARGET_VER=${rustc_target_ver} ${cargo.bin} \.}
@@ -31,26 +32,19 @@ if {${os.arch} eq "powerpc"} {
     # instead of appending would otherwise drop them (minicargo then finds no crate at all)
     default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs} --vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
     default build.args          {}
+
+    destroot {
+        ui_error "No destroot phase in the Portfile!"
+        ui_msg "Here is an example destroot phase:"
+        ui_msg
+        ui_msg "destroot {"
+        ui_msg {    xinstall -m 0755 ${worksrcpath}/target/[option triplet.${muniversal.build_arch}]/release/${name} ${destroot}${prefix}/bin/}
+        ui_msg {    xinstall -m 0444 ${worksrcpath}/doc/${name}.1 ${destroot}${prefix}/share/man/man1/}
+        ui_msg "}"
+        ui_msg
+        ui_msg "Please check if there are additional files (configuration, documentation etc.) that need to be installed."
+        error "destroot phase not implemented"
+    }
 } else {
-    PortGroup                   rust 1.0
-
-    default universal_variant   yes
-
-    default build.cmd           {${cargo.bin} build}
-    default build.target        {}
-    default build.pre_args      {--release ${cargo.offline_cmd} -v -j${build.jobs}}
-    default build.args          {}
-}
-
-destroot {
-    ui_error "No destroot phase in the Portfile!"
-    ui_msg "Here is an example destroot phase:"
-    ui_msg
-    ui_msg "destroot {"
-    ui_msg {    xinstall -m 0755 ${worksrcpath}/target/[option triplet.${muniversal.build_arch}]/release/${name} ${destroot}${prefix}/bin/}
-    ui_msg {    xinstall -m 0444 ${worksrcpath}/doc/${name}.1 ${destroot}${prefix}/share/man/man1/}
-    ui_msg "}"
-    ui_msg
-    ui_msg "Please check if there are additional files (configuration, documentation etc.) that need to be installed."
-    error "destroot phase not implemented"
+    rust_compiler::source_default_portgroup cargo
 }

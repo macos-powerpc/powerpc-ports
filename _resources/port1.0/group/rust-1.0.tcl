@@ -7,26 +7,21 @@
 #
 # PortGroup     rust 1.0
 #
-# On powerpc this is the mrustc PortGroup: it vendors cargo.crates the same way,
+# With rust.compiler mrustc (see the rust_compiler PortGroup; the default on
+# powerpc) this is the mrustc PortGroup: it vendors cargo.crates the same way,
 # and its cargo and rustc stand-ins (mrustc.cargo_shim) build with minicargo.
-# Elsewhere it is the rust PortGroup of the default ports tree, which this file
-# shadows in the overlay.
+# With rustc it is the rust PortGroup of the default ports tree, which this
+# file shadows in the overlay.
 #
 
-global os.arch
+PortGroup                       rust_compiler 1.0
 
-if {${os.arch} eq "powerpc"} {
+if {${rust.compiler} eq "mrustc"} {
     # This port's build system runs cargo: the mrustc PortGroup gives it the stand-ins (mrustc.cargo_shim)
     namespace eval rust {
         variable runs_cargo yes
     }
     PortGroup                   mrustc 1.0
 } else {
-    namespace eval rust {
-        variable default_portgroup [getdefaultportresourcepath port1.0/group/rust-1.0.tcl]
-    }
-    if {[file normalize ${::rust::default_portgroup}] eq [file normalize [info script]]} {
-        return -code error "rust-1.0.tcl: the default ports tree in sources.conf is this overlay, so MacPorts' rust PortGroup cannot be found"
-    }
-    source ${::rust::default_portgroup}
+    rust_compiler::source_default_portgroup rust
 }

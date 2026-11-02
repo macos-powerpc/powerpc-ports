@@ -1,7 +1,8 @@
 # -*- coding: utf-8; mode: python; indent-tabs-mode: nil; tab-width: 4 -*-
 """cargo and rustc stand-ins of the mrustc PortGroup.
 
-On powerpc there is no cargo or rustc; minicargo builds the crates with mrustc.
+In ports built with mrustc (rust.compiler, the default on powerpc) they take
+the place of cargo and rustc; minicargo builds the crates with mrustc.
 Python build backends drive cargo themselves:
 
 - setuptools-rust (which also builds maturin itself) runs `rustc -V`, `-Vv`,

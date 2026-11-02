@@ -6,6 +6,9 @@
 #
 # PortGroup     mrustc 1.0
 #
+# Ports normally get it from the cargo or rust PortGroup, when rust.compiler is
+# mrustc (see the rust_compiler PortGroup; the default on powerpc).
+#
 # cargo.crates \
 #     foo  1.0.1  abcdef123456... \
 #     bar  2.5.0  fedcba654321...
@@ -40,9 +43,9 @@
 #
 # cargo.crate_patch_dirs-append ${filespath}/crate_patches
 #
-# Ports whose own build system runs cargo (PortGroup rust 1.0, which selects
-# this PortGroup on powerpc) get cargo and rustc stand-ins in ${cargo.home}/bin
-# that build with minicargo, see mrustc.cargo_shim. By default this is on for
+# Ports whose own build system runs cargo (PortGroup rust 1.0) get cargo and
+# rustc stand-ins in ${cargo.home}/bin that build with minicargo, see
+# mrustc.cargo_shim. By default this is on for
 # ports that use the rust PortGroup (configure scripts and makefiles that run
 # `cargo build`, e.g. newsboat) or the python PortGroup (Python packages built
 # by setuptools-rust or maturin: binaries and cdylib extension modules).
@@ -1015,7 +1018,9 @@ port::register_callback rust::set_environment
 # SecureTransport only speaks TLS 1.0 and trusts the root certificates of that release.
 # Crates fall back to them quietly (curl-sys `-l curl`, Security.framework backends), and
 # such binaries link but cannot talk to current servers. Executables are linked with
-# -dead_strip, so a SecureTransport import here is actually used.
+# -dead_strip, so a SecureTransport import here is actually used. The system libcurl and
+# SecureTransport are fine from 10.12 on (Let's Encrypt's root came with 10.12.1), the
+# system OpenSSL never is.
 proc rust::is_macho {f} {
     if {[catch {open ${f} r} fd]} {
         return 0
@@ -1031,9 +1036,13 @@ proc rust::is_macho {f} {
 
 proc rust::check_system_tls {} {
     set destroot    [option destroot]
-    set bad_libs    {/usr/lib/libssl.* /usr/lib/libcrypto.* /usr/lib/libcurl.*}
-    set bad_syms    {_SSLCreateContext _SSLNewContext _SSLHandshake
-                     _SecTrustSettingsCopyCertificates _SecTrustCopyAnchorCertificates}
+    set bad_libs    {/usr/lib/libssl.* /usr/lib/libcrypto.*}
+    set bad_syms    {}
+    if {[vercmp [option macosx_deployment_target] < 10.12]} {
+        lappend bad_libs    /usr/lib/libcurl.*
+        set bad_syms        {_SSLCreateContext _SSLNewContext _SSLHandshake
+                             _SecTrustSettingsCopyCertificates _SecTrustCopyAnchorCertificates}
+    }
     set problems    [list]
     # (no `continue` in the body: on a directory, fs-traverse skips its contents)
     fs-traverse f [list ${destroot}] {
