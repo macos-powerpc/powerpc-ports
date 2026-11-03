@@ -1,0 +1,267 @@
+alacritty_terminal on powerpc-apple-darwin (Mac OS X 10.6.8): `[ERROR] [alacritty_terminal] Event loop registration
+error: Invalid argument (os error 22)` at startup, then a terminal that never reads or writes its pty (alacritty 0.17.0:
+window and red message bar, no reaction to input). The pty master fd is registered with the `polling` crate, i.e. kqueue
+on macOS, and 10.6's kernel has no kqueue filter for tty devices (`spec_kqfilter` knows only bpf; `filt_specattach` for
+ttys came with 10.7), so kevent answers EINVAL; Darwin's poll(2) takes no devices either, select(2) does. On PowerPC the
+pty is watched by a "PTY select relay" thread: select(2) on the master, one token into a socketpair the poller watches
+under PTY_READ_WRITE_TOKEN, re-armed when the event loop's reader takes the token; the reader and writer are dups of the
+pty fd (a write that would block waits with select(2); when alacritty asks for writable interest the socketpair is
+always writable, so the pending output is flushed at once and the interest dropped). Nothing changes on other targets.
+
+--- a/src/tty/unix.rs
++++ b/src/tty/unix.rs
+@@ -104,6 +104,19 @@
+     file: File,
+     signals: UnixStream,
+     sig_id: SigId,
++    #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++    relay: select_relay::Relay,
++}
++
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
++fn make_pty(child: Child, file: File, signals: UnixStream, sig_id: SigId) -> Result<Pty> {
++    Ok(Pty { child, file, signals, sig_id })
++}
++
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++fn make_pty(child: Child, file: File, signals: UnixStream, sig_id: SigId) -> Result<Pty> {
++    let relay = select_relay::Relay::new(&file)?;
++    Ok(Pty { child, file, signals, sig_id, relay })
+ }
+ 
+ impl Pty {
+@@ -293,7 +306,7 @@
+                 set_nonblocking(master_fd);
+             }
+ 
+-            Ok(Pty { child, file: File::from(master), signals, sig_id })
++            make_pty(child, File::from(master), signals, sig_id)
+         },
+         Err(err) => Err(Error::new(
+             err.kind(),
+@@ -320,6 +333,71 @@
+     }
+ }
+ 
++// Mac OS X 10.6 (PowerPC): the kernel has no kqueue filter for tty devices (kevent on the pty master fails with
++// EINVAL: `spec_kqfilter` knows only bpf there, ttys came with 10.7) and Darwin's poll(2) takes no devices either.
++// The pty is watched with select(2) on a helper thread that drops a token into a socketpair the poller can watch;
++// reads and writes still go straight to the pty.
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++impl EventedReadWrite for Pty {
++    type Reader = select_relay::Reader;
++    type Writer = select_relay::Writer;
++
++    #[inline]
++    unsafe fn register(
++        &mut self,
++        poll: &Arc<Poller>,
++        mut interest: Event,
++        poll_opts: PollMode,
++    ) -> Result<()> {
++        interest.key = PTY_READ_WRITE_TOKEN;
++        unsafe {
++            poll.add_with_mode(self.relay.token_receiver(), interest, poll_opts)?;
++        }
++
++        unsafe {
++            poll.add_with_mode(
++                &self.signals,
++                Event::readable(PTY_CHILD_EVENT_TOKEN),
++                PollMode::Level,
++            )
++        }
++    }
++
++    #[inline]
++    fn reregister(
++        &mut self,
++        poll: &Arc<Poller>,
++        mut interest: Event,
++        poll_opts: PollMode,
++    ) -> Result<()> {
++        interest.key = PTY_READ_WRITE_TOKEN;
++        poll.modify_with_mode(self.relay.token_receiver(), interest, poll_opts)?;
++
++        poll.modify_with_mode(
++            &self.signals,
++            Event::readable(PTY_CHILD_EVENT_TOKEN),
++            PollMode::Level,
++        )
++    }
++
++    #[inline]
++    fn deregister(&mut self, poll: &Arc<Poller>) -> Result<()> {
++        poll.delete(self.relay.token_receiver())?;
++        poll.delete(&self.signals)
++    }
++
++    #[inline]
++    fn reader(&mut self) -> &mut select_relay::Reader {
++        self.relay.reader()
++    }
++
++    #[inline]
++    fn writer(&mut self) -> &mut select_relay::Writer {
++        self.relay.writer()
++    }
++}
++
++#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+ impl EventedReadWrite for Pty {
+     type Reader = File;
+     type Writer = File;
+@@ -446,3 +524,153 @@
+     let mut buf: [i8; 1024] = [0; 1024];
+     let _pw = get_pw_entry(&mut buf).unwrap();
+ }
++
++/// select(2) stand-in for the pty's kqueue registration on Mac OS X 10.6 (PowerPC).
++#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
++mod select_relay {
++    use std::fs::File;
++    use std::io::{self, Read, Write};
++    use std::os::unix::io::AsRawFd;
++    use std::os::unix::net::UnixStream;
++    use std::sync::Arc;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::thread::{self, JoinHandle};
++    use std::{mem, ptr};
++
++    /// Wait with select(2) until `fd` is readable (`read`) or writable; `Ok(false)` on timeout.
++    fn wait(fd: libc::c_int, read: bool, timeout_ms: Option<u32>) -> io::Result<bool> {
++        loop {
++            let mut set: libc::fd_set = unsafe { mem::zeroed() };
++            unsafe {
++                libc::FD_ZERO(&mut set);
++                libc::FD_SET(fd, &mut set);
++            }
++            let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
++            let tv_ptr = match timeout_ms {
++                Some(ms) => {
++                    tv.tv_sec = (ms / 1000) as _;
++                    tv.tv_usec = ((ms % 1000) * 1000) as _;
++                    &mut tv as *mut libc::timeval
++                },
++                None => ptr::null_mut(),
++            };
++            let set_ptr = &mut set as *mut libc::fd_set;
++            let (read_set, write_set) =
++                if read { (set_ptr, ptr::null_mut()) } else { (ptr::null_mut(), set_ptr) };
++            let res = unsafe { libc::select(fd + 1, read_set, write_set, ptr::null_mut(), tv_ptr) };
++            if res >= 0 {
++                return Ok(res > 0);
++            }
++            let err = io::Error::last_os_error();
++            if err.kind() != io::ErrorKind::Interrupted {
++                return Err(err);
++            }
++        }
++    }
++
++    /// The pty's reader: takes the relay's token, then reads the pty itself.
++    pub struct Reader {
++        file: File,
++        token_receiver: UnixStream,
++        ack_sender: UnixStream,
++    }
++
++    /// The pty's writer: a write that would block waits for the pty with select(2).
++    pub struct Writer {
++        file: File,
++    }
++
++    pub struct Relay {
++        reader: Reader,
++        writer: Writer,
++        stop: Arc<AtomicBool>,
++        thread: Option<JoinHandle<()>>,
++    }
++
++    impl Relay {
++        pub fn new(file: &File) -> io::Result<Relay> {
++            let (mut token_sender, token_receiver) = UnixStream::pair()?;
++            let (ack_sender, mut ack_receiver) = UnixStream::pair()?;
++            token_receiver.set_nonblocking(true)?;
++            let fd = file.as_raw_fd();
++            let stop = Arc::new(AtomicBool::new(false));
++            let stop_flag = stop.clone();
++            let thread = thread::Builder::new().name("PTY select relay".into()).spawn(move || {
++                let mut ack = [0u8; 1];
++                while !stop_flag.load(Ordering::Relaxed) {
++                    // One token per readiness, then wait for the event loop to take it: level-triggered
++                    // without spinning while the loop is still reading.
++                    match wait(fd, true, Some(500)) {
++                        Ok(true) => (),
++                        Ok(false) => continue,
++                        Err(_) => break,
++                    }
++                    if token_sender.write_all(&[1]).is_err() {
++                        break;
++                    }
++                    if !matches!(ack_receiver.read(&mut ack), Ok(1)) {
++                        break;
++                    }
++                }
++            })?;
++            Ok(Relay {
++                reader: Reader { file: file.try_clone()?, token_receiver, ack_sender },
++                writer: Writer { file: file.try_clone()? },
++                stop,
++                thread: Some(thread),
++            })
++        }
++
++        /// What the poller watches in place of the pty.
++        pub fn token_receiver(&self) -> &UnixStream {
++            &self.reader.token_receiver
++        }
++
++        pub fn reader(&mut self) -> &mut Reader {
++            &mut self.reader
++        }
++
++        pub fn writer(&mut self) -> &mut Writer {
++            &mut self.writer
++        }
++    }
++
++    impl Drop for Relay {
++        fn drop(&mut self) {
++            self.stop.store(true, Ordering::Relaxed);
++            // Wake a thread waiting for the ack; one waiting in select(2) sees `stop` within its timeout.
++            let _ = self.reader.ack_sender.write_all(&[0]);
++            if let Some(thread) = self.thread.take() {
++                let _ = thread.join();
++            }
++        }
++    }
++
++    impl Read for Reader {
++        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++            // Take the pending token, if any, and let the thread arm select(2) again.
++            let mut token = [0u8; 8];
++            if matches!(self.token_receiver.read(&mut token), Ok(n) if n > 0) {
++                let _ = self.ack_sender.write_all(&[1]);
++            }
++            self.file.read(buf)
++        }
++    }
++
++    impl Write for Writer {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            loop {
++                match self.file.write(buf) {
++                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                        wait(self.file.as_raw_fd(), false, None)?;
++                    },
++                    result => return result,
++                }
++            }
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            self.file.flush()
++        }
++    }
++}
