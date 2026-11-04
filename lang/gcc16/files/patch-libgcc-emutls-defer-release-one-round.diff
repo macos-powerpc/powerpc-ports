@@ -1,0 +1,69 @@
+emutls_destroy keeps a thread's TLS storage alive for one more round of the
+pthread key destructor loop (POSIX repeats the loop while destructors set
+values; Darwin runs PTHREAD_DESTRUCTOR_ITERATIONS = 4 rounds), so destructors
+of later-created keys, in particular libstdc++'s thread_local destructor
+runner, find their objects intact.  Independent of image initialization
+order, so it also covers -static-libstdc++ links and C __thread users with key
+destructors.  Runtime library only (libgcc_s.1.dylib, libgcc_eh.a), no
+compiler change.
+
+Background: thread_local destructors ran on storage libgcc's emutls had already freed:
+GCC on Darwin has no native TLS, thread_local is emutls, whose per-thread
+blocks a pthread key destructor (emutls_destroy) releases; libstdc++ has no
+__cxa_thread_atexit_impl on Darwin and runs the C++ thread_local destructors
+from a pthread key of its own, created lazily on the first __cxa_thread_atexit
+call, i.e. always after emutls created its key, and _pthread_tsd_cleanup runs
+key destructors in key order.  Seen as node 24 (V8 13.6, absl::Mutex-backed
+base::Mutex) dying with EXC_BAD_INSTRUCTION at every V8 worker-thread exit:
+the unique_ptr holder of abseil's ThreadIdentity was destroyed on a freed
+block, the deleter slot holding malloc's free-list link.
+
+--- libgcc/emutls.c
++++ libgcc/emutls.c
+@@ -47,6 +47,8 @@
+ struct __emutls_array
+ {
+   pointer size;
++  /* Set once emutls_destroy has deferred the release of this array.  */
++  pointer deferred;
+   void **data[];
+ };
+ 
+@@ -86,6 +88,19 @@
+   pointer size = arr->size;
+   pointer i;
+ 
++  /* Destructors of keys created after ours still run after us where key
++     destructors run in creation order (POSIX allows it; Darwin does it),
++     and they may use emulated TLS: libstdc++'s __cxa_thread_atexit
++     fallback runs the C++ thread_local destructors from such a key.  Keep
++     the storage alive for one more iteration of the destructor loop by
++     registering the array again, and release it when called back.  */
++  if (!arr->deferred)
++    {
++      arr->deferred = 1;
++      if (__gthread_setspecific (emutls_key, ptr) == 0)
++	return;
++    }
++
+   for (i = 0; i < size; ++i)
+     {
+       if (arr->data[i])
+@@ -177,7 +192,7 @@
+   if (__builtin_expect (arr == NULL, 0))
+     {
+       pointer size = offset + 32;
+-      arr = calloc (size + 1, sizeof (void *));
++      arr = calloc (size + 2, sizeof (void *));
+       if (arr == NULL)
+ 	abort ();
+       arr->size = size;
+@@ -189,7 +204,7 @@
+       pointer size = orig_size * 2;
+       if (offset > size)
+ 	size = offset + 32;
+-      arr = realloc (arr, (size + 1) * sizeof (void *));
++      arr = realloc (arr, (size + 2) * sizeof (void *));
+       if (arr == NULL)
+ 	abort ();
+       arr->size = size;
