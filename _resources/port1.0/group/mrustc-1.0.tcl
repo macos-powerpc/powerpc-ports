@@ -549,17 +549,6 @@ proc rust::old_macos_compatibility {cname cversion} {
         return
     }
 
-    switch ${cname} {
-        "cc" {
-            if {[vercmp ${cversion} < 1.1.1] && [vercmp ${cversion} >= 1.0.85]} {
-                reinplace "s|\"i686\" => AppleArchSpec::Device(\"-m32\")|\"powerpc\" => AppleArchSpec::Device(\"-m32\")|" \
-                    ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
-                reinplace "s|\"aarch64\" => AppleArchSpec::Device(\"-m64\")|\"powerpc64\" => AppleArchSpec::Device(\"-m64\")|" \
-                    ${cargo.home}/macports/${cname}-${cversion}/src/lib.rs
-            }
-        }
-    }
-
     if {[option os.platform] ne "darwin" || [vercmp [option macosx_deployment_target] >= 10.6]} {
         return
     }
