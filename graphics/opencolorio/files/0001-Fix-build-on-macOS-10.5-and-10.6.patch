@@ -1,0 +1,443 @@
+From b39015e04b7ebaed94dd600671671c315f245e0e Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 5 Nov 2026 12:59:32 +0000
+Subject: [PATCH] Fix build on macOS 10.5 and 10.6
+
+- Detect big-endian targets instead of hardcoding little-endian, which
+  broke Iridas .look parsing on PowerPC.
+- Monitor ICC profiles: CGDisplayCreateUUIDFromDisplayID is 10.7+, so use
+  CMGetProfileByAVID and NCMGetProfileLocation, which exist for both
+  32-bit and 64-bit on 10.5 and 10.6.
+- ColorSync and CoreGraphics are not top-level frameworks before 10.8;
+  include and link ApplicationServices instead.
+- Add OCIO_METAL_ENABLED (default OFF) to gate the Metal backend.
+- Add OCIO_USE_APPLE_GL (default ON) to choose between the system
+  OpenGL/GLUT frameworks and GLEW/freeglut, exported from oglapphelpers
+  so the apps and GPU tests see it.
+- With the system frameworks, use EXT_framebuffer_object and
+  GL_LUMINANCE32F_ARB, which GL 2.x renderers on 10.5/10.6 provide;
+  the 10.5 SDK lacks ARB_framebuffer_object and ARB_texture_rg.
+
+Assisted-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                            |  7 +++
+ src/OpenColorIO/CMakeLists.txt            |  3 +-
+ src/OpenColorIO/Platform.h                |  6 +-
+ src/OpenColorIO/SystemMonitor_macos.cpp   | 68 ++++-------------------
+ src/apps/ociodisplay/main.cpp             | 14 ++---
+ src/libutils/oglapphelpers/CMakeLists.txt | 18 +++++-
+ src/libutils/oglapphelpers/glsl.cpp       | 10 +++-
+ src/libutils/oglapphelpers/oglapp.cpp     | 21 ++++++-
+ tests/cpu/CMakeLists.txt                  |  3 +-
+ tests/gpu/CMakeLists.txt                  |  2 +-
+ tests/gpu/GPUUnitTest.cpp                 |  6 +-
+ 11 files changed, 75 insertions(+), 83 deletions(-)
+
+diff --git CMakeLists.txt CMakeLists.txt
+index aa942edf..f7aa63b8 100755
+--- CMakeLists.txt
++++ CMakeLists.txt
+@@ -300,6 +300,13 @@ mark_as_advanced(OCIO_DIRECTX_ENABLED)
+ option(OCIO_VULKAN_ENABLED "Enable Vulkan GPU rendering support" OFF)
+ mark_as_advanced(OCIO_VULKAN_ENABLED)
+ 
++if(APPLE)
++    option(OCIO_METAL_ENABLED "Enable Metal GPU rendering support" OFF)
++    mark_as_advanced(OCIO_METAL_ENABLED)
++    option(OCIO_USE_APPLE_GL "Use the OpenGL and GLUT frameworks instead of GLEW and freeglut" ON)
++    mark_as_advanced(OCIO_USE_APPLE_GL)
++endif()
++
+ 
+ ###############################################################################
+ # Check for ARM neon here because we need to know if ARM NEON is supported
+diff --git src/OpenColorIO/CMakeLists.txt src/OpenColorIO/CMakeLists.txt
+index 646423e9..6648ec42 100755
+--- src/OpenColorIO/CMakeLists.txt
++++ src/OpenColorIO/CMakeLists.txt
+@@ -339,9 +339,8 @@ endif()
+ if(APPLE)
+     target_link_libraries(OpenColorIO
+         PRIVATE
+-            "-framework ColorSync"
++            "-framework ApplicationServices"
+             "-framework CoreFoundation"
+-            "-framework CoreGraphics"
+             "-framework IOKit"
+     )
+ endif()
+diff --git src/OpenColorIO/Platform.h src/OpenColorIO/Platform.h
+index 67413c76..f66f0627 100644
+--- src/OpenColorIO/Platform.h
++++ src/OpenColorIO/Platform.h
+@@ -49,9 +49,9 @@ typedef ostringstream tostringstream;
+ namespace OCIO_NAMESPACE
+ {
+ 
+-// TODO: Add proper endian detection using architecture / compiler mojo
+-//       In the meantime, hardcode to x86
+-#define OCIO_LITTLE_ENDIAN 1  // This is correct on x86
++#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_BIG_ENDIAN__
++#define OCIO_LITTLE_ENDIAN 1
++#endif
+ 
+ namespace Platform
+ {
+diff --git src/OpenColorIO/SystemMonitor_macos.cpp src/OpenColorIO/SystemMonitor_macos.cpp
+index 4b212e68..fcebf74d 100644
+--- src/OpenColorIO/SystemMonitor_macos.cpp
++++ src/OpenColorIO/SystemMonitor_macos.cpp
+@@ -9,8 +9,7 @@
+ #endif
+ 
+ 
+-#include <ColorSync/ColorSync.h>
+-#include <CoreGraphics/CoreGraphics.h>
++#include <ApplicationServices/ApplicationServices.h>
+ #include <IOKit/graphics/IOGraphicsLib.h>
+ 
+ #include "Logging.h"
+@@ -52,71 +51,26 @@ struct Guard
+ 
+ std::string GetICCProfilePath(CGDirectDisplayID dispId)
+ {
+-    CFUUIDRef displayUUID = CGDisplayCreateUUIDFromDisplayID(dispId);
+-    Guard<CFUUIDRef> uuid(displayUUID);
+-
+-    if (!displayUUID)
++    CMProfileRef profile = nullptr;
++    if (CMGetProfileByAVID((CMDisplayIDType)dispId, &profile) != noErr || !profile)
+     {
+         throw Exception(ErrorMsg);
+     }
+ 
+-    CFDictionaryRef displayInfo = ColorSyncDeviceCopyDeviceInfo(kColorSyncDisplayDeviceClass, displayUUID);
+-    Guard<CFDictionaryRef> info(displayInfo);
+-
+-    uuid.release();
+-
+-    if (!displayInfo)
+-    {
+-        throw Exception(ErrorMsg);
+-    }
++    CMProfileLocation location;
++    UInt32 locationSize = cmCurrentProfileLocationSize;
++    const CMError err = NCMGetProfileLocation(profile, &location, &locationSize);
++    CMCloseProfile(profile);
+ 
+-    CFDictionaryRef factoryInfo
+-        = (CFDictionaryRef)CFDictionaryGetValue(displayInfo, kColorSyncFactoryProfiles);
+-    if (!factoryInfo)
++    if (err != noErr || location.locType != cmPathBasedProfile)
+     {
+         throw Exception(ErrorMsg);
+     }
+ 
+-    CFStringRef defaultProfileID
+-        = (CFStringRef)CFDictionaryGetValue(factoryInfo, kColorSyncDeviceDefaultProfileID);
+-    if (!defaultProfileID)
+-    {
+-        throw Exception(ErrorMsg);
+-    }
+-
+-    CFURLRef profileURL;
+-    CFDictionaryRef customProfileInfo
+-        = (CFDictionaryRef)CFDictionaryGetValue(displayInfo, kColorSyncCustomProfiles);
+-    if (customProfileInfo)
+-    {
+-        profileURL = (CFURLRef)CFDictionaryGetValue(customProfileInfo, defaultProfileID);
+-        if (!profileURL)
+-        {
+-            throw Exception(ErrorMsg);
+-        }
+-    }
+-    else
+-    {
+-        CFDictionaryRef factoryProfileInfo
+-            = (CFDictionaryRef)CFDictionaryGetValue(factoryInfo, defaultProfileID);
+-        if (!factoryProfileInfo)
+-        {
+-            throw Exception(ErrorMsg);
+-        }
+-
+-        profileURL
+-            = (CFURLRef)CFDictionaryGetValue(factoryProfileInfo, kColorSyncDeviceProfileURL);
+-        if (!profileURL)
+-        {
+-            throw Exception(ErrorMsg);
+-        }
+-    }
+-
+-    char path[PATH_MAX];
+-    const bool result
+-        = CFURLGetFileSystemRepresentation(profileURL, true, (UInt8 *)path, PATH_MAX);
++    char * path = location.u.pathLoc.path;
++    path[sizeof(location.u.pathLoc.path) - 1] = '\0';
+ 
+-    return result ? std::string(path) : throw Exception(ErrorMsg);
++    return std::string(path);
+ }
+ 
+ // Some references for 'Quartz Display Services' part of the 'Core Graphics' framework:
+diff --git src/apps/ociodisplay/main.cpp src/apps/ociodisplay/main.cpp
+index 6eebc3b6..654f14b7 100644
+--- src/apps/ociodisplay/main.cpp
++++ src/apps/ociodisplay/main.cpp
+@@ -16,7 +16,7 @@
+ #include <OpenColorIO/OpenColorIO.h>
+ namespace OCIO = OCIO_NAMESPACE;
+ 
+-#ifdef __APPLE__
++#ifdef OCIO_USE_APPLE_GL
+ #include <OpenGL/gl.h>
+ #include <OpenGL/glext.h>
+ #include <GLUT/glut.h>
+@@ -28,7 +28,7 @@ namespace OCIO = OCIO_NAMESPACE;
+ #include <GL/gl.h>
+ #include <GL/glut.h>
+ #endif
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+ #include "metalapp.h"
+ #endif
+ 
+@@ -39,7 +39,7 @@ namespace OCIO = OCIO_NAMESPACE;
+ bool g_verbose = false;
+ bool g_gpulegacy = false;
+ bool g_gpuinfo = false;
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+ bool g_useMetal = false;
+ #endif
+ 
+@@ -403,7 +403,7 @@ void UpdateOCIOGLState()
+     // Set the shader context.
+     OCIO::GpuShaderDescRcPtr shaderDesc = OCIO::GpuShaderDesc::CreateShaderDesc();
+     shaderDesc->setLanguage(
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+         g_useMetal ? OCIO::GPU_LANGUAGE_MSL_2_0 :
+ #endif
+                    OCIO::GPU_LANGUAGE_GLSL_1_2);
+@@ -614,7 +614,7 @@ void parseArguments(int argc, char **argv)
+         {
+             g_gpuinfo = true;
+         }
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+         else if (0 == strcmp(argv[i], "-metal"))
+         {
+             g_useMetal = true;
+@@ -631,7 +631,7 @@ void parseArguments(int argc, char **argv)
+             std::cout << "     -v         :  displays the color space information" << std::endl;
+             std::cout << "     -gpulegacy :  use the legacy (i.e. baked) GPU color processing" << std::endl;
+             std::cout << "     -gpuinfo   :  output the OCIO shader program" << std::endl;
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+             std::cout << "     -metal     :  use metal OCIO shader backend " << std::endl;
+ #endif
+             std::cout << std::endl;
+@@ -650,7 +650,7 @@ int main(int argc, char **argv)
+ 
+     try
+     {
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+         if (g_useMetal)
+         {
+             g_oglApp = std::make_shared<OCIO::MetalApp>("ociodisplay", 512, 512);
+diff --git src/libutils/oglapphelpers/CMakeLists.txt src/libutils/oglapphelpers/CMakeLists.txt
+index 88e53c31..6576cda7 100644
+--- src/libutils/oglapphelpers/CMakeLists.txt
++++ src/libutils/oglapphelpers/CMakeLists.txt
+@@ -36,7 +36,7 @@ if(WIN32 AND OCIO_DIRECTX_ENABLED)
+     )
+ endif()
+ 
+-if(APPLE)
++if(APPLE AND OCIO_METAL_ENABLED)
+ 
+     list(APPEND SOURCES
+         msl.mm
+@@ -143,7 +143,7 @@ if(OCIO_GL_ENABLED)
+     endif()
+ endif()
+ 
+-if(APPLE)
++if(APPLE AND OCIO_METAL_ENABLED)
+     target_link_libraries(oglapphelpers
+         PRIVATE
+             "-framework ColorSync"
+@@ -162,6 +162,20 @@ if(OCIO_GL_ENABLED)
+     )
+ endif()
+ 
++if(APPLE AND OCIO_METAL_ENABLED)
++    target_compile_definitions(oglapphelpers
++        PUBLIC
++            OCIO_METAL_ENABLED
++    )
++endif()
++
++if(APPLE AND OCIO_USE_APPLE_GL)
++    target_compile_definitions(oglapphelpers
++        PUBLIC
++            OCIO_USE_APPLE_GL
++    )
++endif()
++
+ if(WIN32 AND OCIO_DIRECTX_ENABLED)
+     include(ocio_handle_dependency)
+     ocio_handle_dependency(DirectX-Headers REQUIRED ALLOW_INSTALL
+diff --git src/libutils/oglapphelpers/glsl.cpp src/libutils/oglapphelpers/glsl.cpp
+index 0b73ea4c..7521854e 100644
+--- src/libutils/oglapphelpers/glsl.cpp
++++ src/libutils/oglapphelpers/glsl.cpp
+@@ -2,7 +2,7 @@
+ // Copyright Contributors to the OpenColorIO Project.
+ 
+ 
+-#ifdef __APPLE__
++#ifdef OCIO_USE_APPLE_GL
+ 
+ #include <OpenGL/gl.h>
+ #include <OpenGL/glext.h>
+@@ -48,7 +48,7 @@ bool GetGLError(std::string & error)
+     const GLenum glErr = glGetError();
+     if(glErr!=GL_NO_ERROR)
+     {
+-#ifdef __APPLE__
++#ifdef OCIO_USE_APPLE_GL
+         // Unfortunately no gluErrorString equivalent on Mac.
+         error = "OpenGL Error";
+ #else
+@@ -124,7 +124,11 @@ void AllocateTexture(unsigned index, unsigned & texId,
+ 
+     if (channel == GpuShaderCreator::TEXTURE_RED_CHANNEL)
+     {
++#ifdef OCIO_USE_APPLE_GL
++        internalformat = GL_LUMINANCE32F_ARB;
++#else
+         internalformat = GL_R32F;
++#endif
+         format         = GL_RED;
+     }
+ 
+@@ -563,7 +567,7 @@ unsigned OpenGLBuilder::GetTextureMaxWidth()
+             }
+         }
+ 
+-#ifndef __APPLE__
++#ifndef OCIO_USE_APPLE_GL
+         //
+         // In case of Linux, if glTexImage2D() succeeds
+         //  glGetTexLevelParameteriv() could fail.
+diff --git src/libutils/oglapphelpers/oglapp.cpp src/libutils/oglapphelpers/oglapp.cpp
+index 0b8e49fa..7c0202c7 100644
+--- src/libutils/oglapphelpers/oglapp.cpp
++++ src/libutils/oglapphelpers/oglapp.cpp
+@@ -6,11 +6,26 @@
+ #include <sstream>
+ #include <utility>
+ 
+-#ifdef __APPLE__
++#ifdef OCIO_USE_APPLE_GL
+ 
+ #include <OpenGL/gl.h>
++#include <OpenGL/glext.h>
+ #include <GLUT/glut.h>
+ 
++#define glGenFramebuffers glGenFramebuffersEXT
++#define glBindFramebuffer glBindFramebufferEXT
++#define glGenRenderbuffers glGenRenderbuffersEXT
++#define glBindRenderbuffer glBindRenderbufferEXT
++#define glRenderbufferStorage glRenderbufferStorageEXT
++#define glFramebufferTexture2D glFramebufferTexture2DEXT
++#define glFramebufferRenderbuffer glFramebufferRenderbufferEXT
++#ifndef GL_FRAMEBUFFER
++#define GL_FRAMEBUFFER GL_FRAMEBUFFER_EXT
++#define GL_RENDERBUFFER GL_RENDERBUFFER_EXT
++#define GL_COLOR_ATTACHMENT0 GL_COLOR_ATTACHMENT0_EXT
++#define GL_COLOR_ATTACHMENT1 GL_COLOR_ATTACHMENT1_EXT
++#endif
++
+ #elif _WIN32
+ #include <GL/glew.h>
+ #ifndef NDEBUG
+@@ -254,7 +269,7 @@ void OglApp::printGraphicsInfo() const noexcept
+ 
+ void OglApp::setupCommon()
+ {
+-#ifndef __APPLE__
++#ifndef OCIO_USE_APPLE_GL
+     glewInit();
+ 
+     // TO DO: Find out why glewInit() != GLEW_OK
+@@ -269,7 +284,7 @@ void OglApp::setupCommon()
+ 
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);           // 4-byte pixel alignment
+ 
+-#ifndef __APPLE__
++#ifndef OCIO_USE_APPLE_GL
+     glClampColor(GL_CLAMP_READ_COLOR, GL_FALSE);     //
+     glClampColor(GL_CLAMP_VERTEX_COLOR, GL_FALSE);   // avoid any kind of clamping
+     glClampColor(GL_CLAMP_FRAGMENT_COLOR, GL_FALSE); //
+diff --git tests/cpu/CMakeLists.txt tests/cpu/CMakeLists.txt
+index 55a25588..f6970281 100755
+--- tests/cpu/CMakeLists.txt
++++ tests/cpu/CMakeLists.txt
+@@ -67,9 +67,8 @@ function(add_ocio_test NAME SOURCES TESTS PRIVATE_INCLUDES)
+         # Frameworks needed to access the ICC monitor profile.
+         target_link_libraries(${TEST_BINARY}
+             PRIVATE
+-                "-framework ColorSync"
++                "-framework ApplicationServices"
+                 "-framework CoreFoundation"
+-                "-framework CoreGraphics"
+                 "-framework IOKit"
+         )
+     endif(APPLE)
+diff --git tests/gpu/CMakeLists.txt tests/gpu/CMakeLists.txt
+index df49452e..01031def 100644
+--- tests/gpu/CMakeLists.txt
++++ tests/gpu/CMakeLists.txt
+@@ -44,7 +44,7 @@ target_link_libraries(test_gpu_exec
+ if(OCIO_GL_ENABLED)
+     add_test(NAME test_opengl COMMAND test_gpu_exec)
+ endif()
+-if(APPLE)
++if(APPLE AND OCIO_METAL_ENABLED)
+ 	add_test(NAME test_metal COMMAND test_gpu_exec -metal)
+ endif()
+ if(WIN32 AND OCIO_DIRECTX_ENABLED)
+diff --git tests/gpu/GPUUnitTest.cpp tests/gpu/GPUUnitTest.cpp
+index a5aa491c..b58a4d9f 100644
+--- tests/gpu/GPUUnitTest.cpp
++++ tests/gpu/GPUUnitTest.cpp
+@@ -25,7 +25,7 @@
+ #include "dxapp.h"
+ #endif
+ 
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+ #include "metalapp.h"
+ #endif
+ #ifdef OCIO_VULKAN_ENABLED
+@@ -639,7 +639,7 @@ int main(int argc, const char ** argv)
+     {
+         if(useMetalRenderer)
+         {
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+             app = OCIO::MetalApp::CreateMetalGlApp("GPU tests - Metal", 10, 10);
+ #else
+             std::cerr << std::endl << "'GPU tests - Metal' is not supported" << std::endl;
+@@ -732,7 +732,7 @@ int main(int argc, const char ** argv)
+         // Select the appropriate shading language based on the renderer
+         // (default GLSL 1.2 is used when none of the alternate backends match).
+         OCIO::GpuLanguage shadingLanguage = OCIO::GPU_LANGUAGE_GLSL_1_2;
+-#if __APPLE__
++#ifdef OCIO_METAL_ENABLED
+         if (useMetalRenderer)
+         {
+             shadingLanguage = OCIO::GPU_LANGUAGE_MSL_2_0;
