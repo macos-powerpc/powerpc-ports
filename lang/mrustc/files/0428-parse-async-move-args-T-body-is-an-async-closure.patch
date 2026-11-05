@@ -1,0 +1,300 @@
+From 53c51129767d8b673a422f3a88aaea327ee89987 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 5 Nov 2026 00:37:09 +0000
+Subject: [PATCH 428/429] parse: `async [move] |args| [-> T] body` is an async
+ closure
+
+futures-copy 0.5.0 (arti 2.7.0) src/copy_buf.rs:256
+`MockRuntime::test_with_various(async |rt| { .. })`:
+"Unexpected token TOK_PIPE, expected TOK_BRACE_OPEN". Async closures
+(1.85) were never parsed: after `async` only `[move] { .. }` was known.
+
+The closure parser takes `is_async` and makes the body an async block
+(a non-block body goes into a block first), the AST closure records it
+(`m_is_async`; the dumper prints the source form back, as an attribute
+proc macro re-lexes it), and the HIR lowering moves the declared `-> T`
+into the block's `m_return` (the future's output, as for an async fn)
+and marks the block as a closure body.
+
+For such a block annotate_value_usage moves the closure's own variables
+(its arguments) into the future whatever the body does with them, since
+the closure's frame is gone when the future runs, while every other
+capture is used as the body uses it (rustc's rule). A plain
+`|args| async move { body }` desugar would move every capture and make
+`.map(async |addr| runtime.listen(addr).await)` (arti-relay relay.rs:295)
+FnOnce; a non-move block would keep `&arg` into the dead frame.
+`async move |..|` is a move closure with a move block: the future owns
+everything. The macro `expr` fragment matcher accepts the form too
+(tor-rtcompat `test_with_one_runtime!(async |rt| ..)`).
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index 5e0b649b..93b84f38 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -505,6 +505,9 @@ public:
+     }
+     virtual void visit(AST::ExprNode_Closure& n) override {
+         m_expr_root = false;
++        if( n.m_is_async ) {
++            m_os << "async ";
++        }
+         if( n.m_is_move ) {
+             m_os << "move ";
+         }
+@@ -521,7 +524,13 @@ public:
+         m_os << "| ->";
+         print_type(n.m_return);
+         m_os << " { ";
+-        this->visit(n.m_code);
++        // An async closure's body is the async block the parser wrapped it in
++        if( n.m_is_async ) {
++            this->visit(dynamic_cast<AST::ExprNode_AsyncBlock&>(*n.m_code).m_inner);
++        }
++        else {
++            this->visit(n.m_code);
++        }
+         m_os << " }";
+     }
+     virtual void visit(AST::ExprNode_WildcardPattern& n) override {
+diff --git a/src/ast/expr.cpp b/src/ast/expr.cpp
+index 7e668b29..d75bf90f 100644
+--- a/src/ast/expr.cpp
++++ b/src/ast/expr.cpp
+@@ -475,6 +475,8 @@ NODE(ExprNode_CString, {
+ })
+ 
+ NODE(ExprNode_Closure, {
++    if( m_is_async )
++        os << "async ";
+     if( m_is_pinned )
+         os << "static ";
+     if( m_is_move )
+@@ -486,13 +488,14 @@ NODE(ExprNode_Closure, {
+     }
+     os << "|";
+     os << "->" << m_return;
+-    os << " " << *m_code;
++    // An async closure's body is the async block the parser wrapped it in
++    os << " " << (m_is_async ? *dynamic_cast<const ExprNode_AsyncBlock&>(*m_code).m_inner : *m_code);
+ },{
+     ExprNode_Closure::args_t    args;
+     for(const auto& a : m_args) {
+         args.push_back( ::std::make_pair(a.first.clone(), a.second.clone()) );
+     }
+-    return NEWNODE(ExprNode_Closure, mv$(args), m_return.clone(), m_code->clone(), m_is_move, m_is_pinned);
++    return NEWNODE(ExprNode_Closure, mv$(args), m_return.clone(), m_code->clone(), m_is_move, m_is_pinned, m_is_async);
+ });
+ 
+ NODE(ExprNode_StructLiteral, {
+diff --git a/src/ast/expr.hpp b/src/ast/expr.hpp
+index f0dbe30c..bc64bec9 100644
+--- a/src/ast/expr.hpp
++++ b/src/ast/expr.hpp
+@@ -548,13 +548,15 @@ struct ExprNode_Closure:
+     ExprNodeP    m_code;
+     bool m_is_move;     //< The closure takes ownership of all values
+     bool m_is_pinned;   //< The closure cannot be moved (this is for generators)
++    bool m_is_async;    //< `async [move] |..| [-> T] ..` (1.85): `m_code` is the async block, `m_return` its output
+     
+-    ExprNode_Closure(args_t args, TypeRef rv, ExprNodeP code, bool is_move, bool is_pinned):
++    ExprNode_Closure(args_t args, TypeRef rv, ExprNodeP code, bool is_move, bool is_pinned, bool is_async = false):
+         m_args( ::std::move(args) ),
+         m_return( ::std::move(rv) ),
+         m_code( ::std::move(code) ),
+         m_is_move( is_move ),
+-        m_is_pinned( is_pinned )
++        m_is_pinned( is_pinned ),
++        m_is_async( is_async )
+     {}
+ 
+     NODE_METHODS();
+diff --git a/src/hir/dump.cpp b/src/hir/dump.cpp
+index 1c4ccc07..7d567c06 100644
+--- a/src/hir/dump.cpp
++++ b/src/hir/dump.cpp
+@@ -817,7 +817,7 @@ namespace {
+             if( node.m_is_move ) {
+                 m_os << "move ";
+             }
+-            m_os << "async -> " << node.m_return << " {";
++            m_os << "async" << (node.m_is_closure_body ? "/*closure body*/" : "") << " -> " << node.m_return << " {";
+             if( !node.m_code ) {
+                 m_os << "/* lowered: " << node.m_obj_path << " */";
+             }
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index e33fcd45..44f5cad6 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -990,6 +990,9 @@ struct ExprNode_AsyncBlock
+ {
+     ::HIR::ExprNodeP    m_code;
+     bool    m_is_move;
++    /// The body of an async closure (`async |args| ..`, 1.85): the closure's own variables (its arguments) move into
++    /// the future whatever the body does with them, its captures are used as the body uses them (annotate_value_usage)
++    bool    m_is_closure_body = false;
+     /// The future's `Output`: the target of `return` in the block, which the block's value coerces to. Separate from
+     /// `m_code`'s type, which a diverging tail makes `!` (an `async fn`'s body ending in `loop { .. return x; }`).
+     ::HIR::TypeRef  m_return;
+diff --git a/src/hir/from_ast_expr.cpp b/src/hir/from_ast_expr.cpp
+index 040a2f0d..3d920e55 100644
+--- a/src/hir/from_ast_expr.cpp
++++ b/src/hir/from_ast_expr.cpp
+@@ -691,9 +691,18 @@ struct LowerHIR_ExprNode_Visitor:
+             if( v.m_is_pinned ) {
+                 ERROR(v.span(), E0000, "Invalid use of `static` on non-yielding closure");
+             }
++            auto ret = LowerHIR_Type(v.m_return);
++            if( v.m_is_async ) {
++                // `async |args| -> T body`: the declared type is the future's output (as for an `async fn`), the closure
++                // returns the async block
++                auto& ab = dynamic_cast<::HIR::ExprNode_AsyncBlock&>(*inner);
++                ab.m_is_closure_body = true;
++                ab.m_return = std::move(ret);
++                ret = ::HIR::TypeRef();
++            }
+             m_rv.reset( new ::HIR::ExprNode_Closure( v.span(),
+                 std::move(args),
+-                LowerHIR_Type(v.m_return),
++                std::move(ret),
+                 std::move(inner),
+                 v.m_is_move
+                 ) );
+diff --git a/src/hir_expand/annotate_value_usage.cpp b/src/hir_expand/annotate_value_usage.cpp
+index 8887ed2a..bb3c86dd 100644
+--- a/src/hir_expand/annotate_value_usage.cpp
++++ b/src/hir_expand/annotate_value_usage.cpp
+@@ -918,7 +918,7 @@ namespace {
+             auto ent = std::move(m_closure_stack.back().as_Coroutine());
+             m_closure_stack.pop_back();
+ 
+-            apply_coroutine(node.span(), node.m_is_move, node.m_avu_cache, ent.used_variables);
++            apply_coroutine(node.span(), node.m_is_move, nullptr, node.m_avu_cache, ent.used_variables);
+         }
+         void visit(::HIR::ExprNode_GeneratorWrapper& node) override
+         {
+@@ -939,7 +939,14 @@ namespace {
+             auto scope = std::move(m_closure_stack.back().as_Coroutine());
+             m_closure_stack.pop_back();
+ 
+-            apply_coroutine(node.span(), node.m_is_move, node.m_avu_cache, scope.used_variables);
++            // The body of an async closure: the enclosing closure's own variables (its arguments) move into the future
++            const ::std::vector<unsigned int>* closure_locals = nullptr;
++            if( node.m_is_closure_body )
++            {
++                ASSERT_BUG(node.span(), !m_closure_stack.empty() && m_closure_stack.back().is_Closure(), "Async closure body outside a closure");
++                closure_locals = &m_closure_stack.back().as_Closure().local_vars;
++            }
++            apply_coroutine(node.span(), node.m_is_move, closure_locals, node.m_avu_cache, scope.used_variables);
+         }
+ 
+     private:
+@@ -1430,7 +1437,9 @@ namespace {
+             }
+         }
+ 
+-        void apply_coroutine(const Span& sp, bool is_move, ::HIR::ExprNode_Generator::AvuCache& avu_cache, std::map<unsigned, CoroutineScope::Var>& used_variables)
++        /// `moved_locals`: variables that move into the coroutine whatever the body does with them (an async closure's
++        /// own variables: the closure's frame is gone when its future runs, so a borrow of an argument can't be kept)
++        void apply_coroutine(const Span& sp, bool is_move, const ::std::vector<unsigned int>* moved_locals, ::HIR::ExprNode_Generator::AvuCache& avu_cache, std::map<unsigned, CoroutineScope::Var>& used_variables)
+         {
+             // Captures are the places recorded for the variables defined outside: in edition 2021 a variable used only
+             // through fields is captured field by field, as a closure captures it (rustc's precise capture applies to
+@@ -1447,9 +1456,11 @@ namespace {
+                     // Defined outside, no use recorded: the whole variable
+                     cap.second.captures.push_back(HIR::ExprNode_Closure::AvuCache::Capture { cap.first, {}, cap.second.usage });
+                 }
++                bool move_var = is_move
++                    || (moved_locals && ::std::find(moved_locals->begin(), moved_locals->end(), cap.first) != moved_locals->end());
+                 // If this is a move coroutine, all captures are tagged with ValueUsage::Move; a place reached through
+                 // a reference is truncated to the reference, which moves in (as for closures, and as rustc does)
+-                if( is_move )
++                if( move_var )
+                 {
+                     std::vector<HIR::ExprNode_Closure::AvuCache::Capture>  merged;
+                     for(auto& c : cap.second.captures)
+@@ -1464,7 +1475,7 @@ namespace {
+                 }
+                 for(auto& c : cap.second.captures)
+                 {
+-                    if( is_move )
++                    if( move_var )
+                     {
+                     }
+                     else if( c.usage == ::HIR::ValueUsage::Borrow )
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 5fedded7..cf68cfaa 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -1415,9 +1415,18 @@ namespace
+             consume_tt(lex);
+         }
+ 
+-        // Closures
+-        if( lex.next() == TOK_RWORD_MOVE || lex.next() == TOK_PIPE || lex.next() == TOK_DOUBLE_PIPE )
++        // Closures (`async [move] |..| ..` since 1.85, `async [move] {` stays a block below)
++        bool is_closure = lex.next() == TOK_RWORD_MOVE || lex.next() == TOK_PIPE || lex.next() == TOK_DOUBLE_PIPE;
++        if( !is_closure && lex.next() == TOK_RWORD_ASYNC )
+         {
++            auto lex2 = lex.clone();
++            lex2.consume();
++            lex2.consume_if(TOK_RWORD_MOVE);
++            is_closure = (lex2.next() == TOK_PIPE || lex2.next() == TOK_DOUBLE_PIPE);
++        }
++        if( is_closure )
++        {
++            lex.consume_if(TOK_RWORD_ASYNC);
+             lex.consume_if(TOK_RWORD_MOVE);
+             if( lex.consume_if(TOK_PIPE) )
+             {
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 0f0c5133..75c7620a 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -1326,9 +1326,10 @@ ExprNodeP Parse_ExprVal_StructLiteral(TokenStream& lex, AST::Path path)
+     return NEWNODE( AST::ExprNode_StructLiteral, path, ::std::move(base_val), ::std::move(items) );
+ }
+ 
+-ExprNodeP Parse_ExprVal_Closure(TokenStream& lex)
++/// `[static] [move] |args| [-> T] body`, or with `is_async` the rest of `async [move] |args| [-> T] body` (1.85)
++ExprNodeP Parse_ExprVal_Closure(TokenStream& lex, bool is_async = false)
+ {
+-    TRACE_FUNCTION;
++    TRACE_FUNCTION_F("is_async=" << is_async);
+     Token   tok;
+ 
+     GET_TOK(tok, lex);
+@@ -1398,7 +1399,16 @@ ExprNodeP Parse_ExprVal_Closure(TokenStream& lex)
+         code = Parse_Expr0(lex);
+     }
+ 
+-    return NEWNODE( AST::ExprNode_Closure, ::std::move(args), ::std::move(rt), ::std::move(code), is_move, is_immovable );
++    // An async closure is a closure whose body is an async block: `-> T` is the future's output, the arguments move
++    // into the future and the captures are used as the body uses them (both in annotate_value_usage)
++    if( is_async ) {
++        if( !dynamic_cast<AST::ExprNode_Block*>(code.get()) ) {
++            code = NEWNODE( AST::ExprNode_Block, ::std::move(code) );
++        }
++        code = NEWNODE( AST::ExprNode_AsyncBlock, ::std::move(code), is_move );
++    }
++
++    return NEWNODE( AST::ExprNode_Closure, ::std::move(args), ::std::move(rt), ::std::move(code), is_move, is_immovable, is_async );
+ }
+ 
+ ExprNodeP Parse_ExprVal_Inner(TokenStream& lex)
+@@ -1476,6 +1486,13 @@ ExprNodeP Parse_ExprVal_Inner(TokenStream& lex)
+     case TOK_RWORD_IF:
+         return Parse_IfStmt(lex);
+     case TOK_RWORD_ASYNC: {
++        // `async [move] |..| ..` (1.85) is an async closure
++        // - futures-copy 0.5.0 (arti 2.7.0) copy_buf.rs:256 `MockRuntime::test_with_various(async |rt| { .. })`
++        if( lex.lookahead(0) == TOK_PIPE || lex.lookahead(0) == TOK_DOUBLE_PIPE
++         || (lex.lookahead(0) == TOK_RWORD_MOVE && (lex.lookahead(1) == TOK_PIPE || lex.lookahead(1) == TOK_DOUBLE_PIPE)) )
++        {
++            return Parse_ExprVal_Closure(lex, /*is_async=*/true);
++        }
+         bool is_move = lex.getTokenIf(TOK_RWORD_MOVE);
+         return NEWNODE(AST::ExprNode_AsyncBlock, Parse_ExprBlockNode(lex, AST::ExprNode_Block::Type::Bare), is_move);
+     }

@@ -1,0 +1,675 @@
+From 1c97752ff84b3898d8485a090c46aafe8ef58c0d Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 5 Nov 2026 00:41:05 +0000
+Subject: [PATCH 429/429] hir_typeck: builtin `AsyncFn*` impls for callables
+ returning a Future
+
+cargo 0.99.0 (cargo-c 0.10.25) src/cargo/core/resolver/dep_cache.rs:256
+`self.poller.poll(RegistryQueryerAsync::query, ..)` with
+util/local_poll_adapter.rs:39 `F: AsyncFn(&S::Target, &K) -> Result<V, E>`
+and `async fn query(&self, key: &(..)) -> CargoResult<..>`:
+"Failed to find an impl of AsyncFnOnce<(&RegistryQueryerAsync<'_, T>, ..)>
+for fn{RegistryQueryerAsync::query} with Output = Result<..>".
+
+Since 1.85 rustc implements AsyncFn, AsyncFnMut and AsyncFnOnce itself
+for closures, fn items and fn pointers whose return type is a Future
+(`CallOnceFuture`/`CallRefFuture<'a>` are that type, `Output` its
+`Future::Output`); core 1.90 ops/async_function.rs only has the `&F` and
+`&mut F` forwarders, and mrustc only registered the lang items.
+
+The Fn* arms of find_trait_impls_types (typeck) and find_impl (static)
+now answer the AsyncFn* traits too when the return type is a Future,
+plus a static arm for the post-expansion `closure#N` struct through its
+Fn* impl. A value known only through AsyncFn* bounds is called as
+`async_call`/`async_call_mut`/`async_call_once`: typeck gives it the
+future type (`<F as AsyncFnMut<A>>::CallRefFuture<'_>`, or
+`CallOnceFuture`), the validate, annotate-usage, lifetime and
+ufcs_everything passes follow that choice, and trans enumerate plus MIR
+cleanup rewrite `<callable as AsyncFn*>::async_call*` into the Fn* call
+(closures have those impls, fn items and pointers then become direct
+calls as before).
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir/expr.hpp b/src/hir/expr.hpp
+index 44f5cad6..829ff46a 100644
+--- a/src/hir/expr.hpp
++++ b/src/hir/expr.hpp
+@@ -621,6 +621,10 @@ struct ExprNode_CallValue:
+         Fn,
+         FnMut,
+         FnOnce,
++        // 1.85: the value is only known to implement the AsyncFn* traits (`F: AsyncFn(A) -> R`), the call is `async_call*`
++        AsyncFn,
++        AsyncFnMut,
++        AsyncFnOnce,
+     };
+     TraitUsed   m_trait_used = TraitUsed::Unknown;
+ 
+diff --git a/src/hir_expand/annotate_value_usage.cpp b/src/hir_expand/annotate_value_usage.cpp
+index bb3c86dd..ba443113 100644
+--- a/src/hir_expand/annotate_value_usage.cpp
++++ b/src/hir_expand/annotate_value_usage.cpp
+@@ -626,12 +626,15 @@ namespace {
+                 BUG(node.span(), "Annotate usage when CallValue trait is unknown");
+                 break;
+             case ::HIR::ExprNode_CallValue::TraitUsed::Fn:
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn:
+                 vu = ::HIR::ValueUsage::Borrow;
+                 break;
+             case ::HIR::ExprNode_CallValue::TraitUsed::FnMut:
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut:
+                 vu = ::HIR::ValueUsage::Mutate;
+                 break;
+             case ::HIR::ExprNode_CallValue::TraitUsed::FnOnce:
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce:
+                 vu = ::HIR::ValueUsage::Move;
+                 break;
+             }
+diff --git a/src/hir_expand/lifetime_infer.cpp b/src/hir_expand/lifetime_infer.cpp
+index 0fb83882..ee52b107 100644
+--- a/src/hir_expand/lifetime_infer.cpp
++++ b/src/hir_expand/lifetime_infer.cpp
+@@ -1624,7 +1624,13 @@ namespace {
+                 // Look up the trait impl and check the generics on it
+                 // - If it's a bound, then handle the HRLs
+                 // - If an impl ref, just as normal.
+-                auto trait = m_resolve.m_crate.get_lang_item_path(node.span(), "fn_once");
++                // A call through the AsyncFn* traits (1.85, typeck's `async_call*` pick) returns the future instead of
++                // `Output`: `CallOnceFuture` for AsyncFnOnce, `CallRefFuture<'a>` borrowing the callable otherwise
++                // - cargo 0.99.0 local_poll_adapter.rs `f(self_parameter.deref(), &key).await` with `F: AsyncFn(..)`
++                bool is_async_call = node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn
++                    || node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut
++                    || node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce;
++                auto trait = m_resolve.m_crate.get_lang_item_path(node.span(), is_async_call ? "async_fn_once" : "fn_once");
+                 ::std::vector< ::HIR::TypeRef>  tup_ents;
+                 for(const auto& arg : node.m_args) {
+                     tup_ents.push_back( arg->m_res_type.clone() );
+@@ -1653,7 +1659,23 @@ namespace {
+                         }
+                     }
+                     equate_pps(node.span(), impl_ref.get_trait_params(), params);
+-                    auto res_ty = impl_ref.get_type("Output", {});
++                    ::HIR::TypeRef  res_ty;
++                    if( !is_async_call ) {
++                        res_ty = impl_ref.get_type("Output", {});
++                    }
++                    else if( node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce ) {
++                        res_ty = impl_ref.get_type("CallOnceFuture", {});
++                        if( res_ty == ::HIR::TypeRef() ) {
++                            res_ty = ::HIR::TypeRef::new_path(::HIR::Path(val_ty.clone(), ::HIR::GenericPath(trait, params.clone()), "CallOnceFuture", {}), {});
++                        }
++                    }
++                    else {
++                        ::HIR::PathParams   aty_pp;
++                        aty_pp.m_lifetimes.push_back( m_state.allocate_ivar(node.span()) );
++                        res_ty = ::HIR::TypeRef::new_path(::HIR::Path(val_ty.clone(),
++                            ::HIR::GenericPath(m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn_mut"), params.clone()),
++                            "CallRefFuture", mv$(aty_pp)), {});
++                    }
+                     m_resolve.expand_associated_types(node.span(), res_ty);
+                     equate_types(node.span(), node.m_res_type, res_ty);
+ 
+diff --git a/src/hir_expand/ufcs_everything.cpp b/src/hir_expand/ufcs_everything.cpp
+index 2bebf406..61bc23d9 100644
+--- a/src/hir_expand/ufcs_everything.cpp
++++ b/src/hir_expand/ufcs_everything.cpp
+@@ -150,6 +150,36 @@ namespace {
+                     RcString::new_interned("call_once")
+                     );
+                 break;
++            // 1.85: a call through an `AsyncFn*` bound (the value's type is a generic with only those bounds); the result
++            // type (`CallRefFuture<'_>`/`CallOnceFuture`) was set by typeck
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn:
++                self_arg_type = ::HIR::TypeRef::new_borrow( ::HIR::BorrowType::Shared, ty_val.clone() );
++                node.m_value = NEWNODE(self_arg_type.clone(), Borrow, sp,  ::HIR::BorrowType::Shared, mv$(node.m_value));
++                method_path = ::HIR::Path(
++                    ty_val.clone(),
++                    ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "async_fn"), mv$(trait_args) ),
++                    RcString::new_interned("async_call"),
++                    HIR::PathParams(HIR::LifetimeRef())
++                    );
++                break;
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut:
++                self_arg_type = ::HIR::TypeRef::new_borrow( ::HIR::BorrowType::Unique, ty_val.clone() );
++                node.m_value = NEWNODE(self_arg_type.clone(), Borrow, sp,  ::HIR::BorrowType::Unique, mv$(node.m_value));
++                method_path = ::HIR::Path(
++                    ty_val.clone(),
++                    ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "async_fn_mut"), mv$(trait_args) ),
++                    RcString::new_interned("async_call_mut"),
++                    HIR::PathParams(HIR::LifetimeRef())
++                    );
++                break;
++            case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce:
++                self_arg_type = ty_val.clone();
++                method_path = ::HIR::Path(
++                    ty_val.clone(),
++                    ::HIR::GenericPath( m_crate.get_lang_item_path(sp, "async_fn_once"), mv$(trait_args) ),
++                    RcString::new_interned("async_call_once")
++                    );
++                break;
+ 
+             //case ::HIR::ExprNode_CallValue::TraitUsed::Unknown:
+             default:
+diff --git a/src/hir_typeck/expr_check.cpp b/src/hir_typeck/expr_check.cpp
+index 1bf01ba4..f790036e 100644
+--- a/src/hir_typeck/expr_check.cpp
++++ b/src/hir_typeck/expr_check.cpp
+@@ -942,6 +942,9 @@ namespace {
+                 case ::HIR::ExprNode_CallValue::TraitUsed::Fn:     trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "fn"); break;
+                 case ::HIR::ExprNode_CallValue::TraitUsed::FnMut:  trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "fn_mut"); break;
+                 case ::HIR::ExprNode_CallValue::TraitUsed::FnOnce: trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "fn_once"); break;
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn:     trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn"); break;
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut:  trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn_mut"); break;
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce: trait_p = &m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn_once"); break;
+                 default:
+                     throw "";
+                 }
+@@ -961,11 +964,33 @@ namespace {
+                 if( !found ) {
+                     ERROR(node.span(), E0000, "Unable to find a matching impl of " << trait << " for " << val_ty);
+                 }
+-                auto exp_ret = ::HIR::TypeRef::new_path( ::HIR::Path(
+-                    node.m_value->m_res_type.clone(),
+-                    { m_resolve.m_crate.get_lang_item_path(node.span(), "fn_once"), mv$(params) },
+-                    "Output", {}
+-                    ), {} );
++                // `<T as FnOnce<A>>::Output`, or the future an `AsyncFn*` call returns
++                ::HIR::TypeRef exp_ret;
++                switch(node.m_trait_used)
++                {
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn:
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut:
++                    exp_ret = ::HIR::TypeRef::new_path( ::HIR::Path(
++                        node.m_value->m_res_type.clone(),
++                        { m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn_mut"), mv$(params) },
++                        "CallRefFuture", HIR::PathParams(HIR::LifetimeRef())
++                        ), {} );
++                    break;
++                case ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce:
++                    exp_ret = ::HIR::TypeRef::new_path( ::HIR::Path(
++                        node.m_value->m_res_type.clone(),
++                        { m_resolve.m_crate.get_lang_item_path(node.span(), "async_fn_once"), mv$(params) },
++                        "CallOnceFuture", {}
++                        ), {} );
++                    break;
++                default:
++                    exp_ret = ::HIR::TypeRef::new_path( ::HIR::Path(
++                        node.m_value->m_res_type.clone(),
++                        { m_resolve.m_crate.get_lang_item_path(node.span(), "fn_once"), mv$(params) },
++                        "Output", {}
++                        ), {} );
++                    break;
++                }
+                 m_resolve.expand_associated_types(node.span(), exp_ret);
+                 check_types_equal(node.span(), node.m_res_type, exp_ret);
+             }
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index 319fe31c..74b3db2a 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -1038,6 +1038,81 @@ namespace {
+                     }
+                     else
+                     {
++                        // 1.85: a value known only through the AsyncFn* traits (`F: AsyncFn(A) -> R`) is called with
++                        // `async_call*` and gives the future (`CallRefFuture<'_>`, or `CallOnceFuture` for AsyncFnOnce).
++                        // rustc's builtin impls for callables returning a Future are in find_trait_impls_types.
++                        // - cargo 0.99.0 local_poll_adapter.rs `f(self_parameter.deref(), &key).await`
++                        bool async_ambiguous = false;
++                        auto try_async_call = [&]()->bool {
++                            const auto& lang_AsyncFnOnce = this->context.m_resolve.m_lang_AsyncFnOnce;
++                            if( lang_AsyncFnOnce == ::HIR::SimplePath() )
++                                return false;
++                            unsigned int acount = 0;
++                            this->context.m_resolve.find_trait_impls(node.span(), lang_AsyncFnOnce, trait_pp, ty, [&](auto impl, auto cmp)->bool {
++                                acount ++;
++                                auto tup = impl.get_trait_ty_param(0);
++                                if( !tup.data().is_Tuple() )
++                                    ERROR(node.span(), E0000, "AsyncFnOnce expects a tuple argument, got " << tup);
++                                MonomorphHrlsOnly(HIR::PathParams()).monomorph_type(node.span(), tup);
++                                fcn_args_tup = mv$(tup);
++                                return cmp == ::HIR::Compare::Equal;
++                                });
++                            DEBUG("Found " << acount << " impls of AsyncFnOnce");
++                            if( acount == 0 )
++                                return false;
++                            if( acount > 1 ) {
++                                async_ambiguous = true;
++                                return false;
++                            }
++                            // The most permissive AsyncFn* trait, as for Fn*
++                            auto has_impl = [&](const ::HIR::SimplePath& t)->bool {
++                                return t != ::HIR::SimplePath() && this->context.m_resolve.find_trait_impls(node.span(), t, trait_pp, ty, [&](auto, auto)->bool { return true; });
++                                };
++                            const ::HIR::SimplePath* aty_trait;
++                            const char* aty_name;
++                            ::HIR::PathParams   aty_pp;
++                            if( has_impl(this->context.m_resolve.m_lang_AsyncFn) ) {
++                                DEBUG("-- Using AsyncFn");
++                                node.m_trait_used = ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn;
++                                aty_trait = &this->context.m_resolve.m_lang_AsyncFnMut;
++                                aty_name = "CallRefFuture";
++                                aty_pp = HIR::PathParams(HIR::LifetimeRef());
++                            }
++                            else if( has_impl(this->context.m_resolve.m_lang_AsyncFnMut) ) {
++                                DEBUG("-- Using AsyncFnMut");
++                                node.m_trait_used = ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut;
++                                aty_trait = &this->context.m_resolve.m_lang_AsyncFnMut;
++                                aty_name = "CallRefFuture";
++                                aty_pp = HIR::PathParams(HIR::LifetimeRef());
++                            }
++                            else {
++                                DEBUG("-- Using AsyncFnOnce");
++                                node.m_trait_used = ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce;
++                                aty_trait = &lang_AsyncFnOnce;
++                                aty_name = "CallOnceFuture";
++                            }
++                            this->context.equate_types_assoc(node.span(), node.m_res_type, *aty_trait, HIR::PathParams(fcn_args_tup.clone()), ty, aty_name, aty_pp);
++                            fcn_ret = ::HIR::TypeRef::new_path(::HIR::Path(::HIR::Path::Data::make_UfcsKnown({
++                                ty.clone(),
++                                ::HIR::GenericPath(*aty_trait, ::HIR::PathParams(fcn_args_tup.clone())),
++                                aty_name,
++                                aty_pp.clone()
++                                })),
++                                {}
++                                );
++                            return true;
++                            };
++                        if( try_async_call() )
++                        {
++                            // Cache filled below
++                        }
++                        else if( async_ambiguous )
++                        {
++                            DEBUG("Multiple AsyncFnOnce impls, returning early");
++                            return ;
++                        }
++                        else
++                        {
+                         if( !ty.data().is_Generic() )
+                         {
+                             bool found = this->context.m_resolve.find_trait_impls_crate(node.span(), lang_FnOnce, trait_pp, ty, [&](auto impl, auto cmp)->bool {
+@@ -1077,6 +1152,7 @@ namespace {
+ 
+                         // Didn't find anything. Error?
+                         ERROR(node.span(), E0000, "Unable to find an implementation of Fn*" << trait_pp << " for " << this->context.m_ivars.fmt_type(ty));
++                        }
+                     }
+ 
+                     node.m_arg_types = mv$(fcn_args_tup.get_unique().as_Tuple());
+@@ -1701,6 +1777,12 @@ namespace {
+                 {
+                     node.m_trait_used = ::HIR::ExprNode_CallValue::TraitUsed::Fn;
+                 }
++                else if( node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFn
++                    || node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnMut
++                    || node.m_trait_used == ::HIR::ExprNode_CallValue::TraitUsed::AsyncFnOnce )
++                {
++                    // Picked when the call resolved through an AsyncFn* bound (no Fn* impl to find here)
++                }
+                 else
+                 {
+                     // 1. Create a param set with a single tuple (of all argument types)
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index fa27bfbd..48e64d1d 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -1709,6 +1709,38 @@ bool TraitResolution::find_trait_impls_types(
+     t_cb_trait_impl_r callback
+ ) const
+ {
++    // 1.85: rustc's builtin `AsyncFn`/`AsyncFnMut`/`AsyncFnOnce` impls for closures, fn items and fn pointers whose return
++    // type is a Future (core 1.90 ops/async_function.rs only has the `&F`/`&mut F` forwarders): `CallOnceFuture` and
++    // `CallRefFuture` are that type, `Output` its `Future::Output`.
++    // - cargo 0.99.0 local_poll_adapter.rs `fn poll<F>(.., f: F, ..) where F: AsyncFn(&S::Target, &K) -> Result<V, E>`
++    //   called with an `async fn` item: "Failed to find an impl of AsyncFnOnce<(..)> for fn{..::query} with Output = .."
++    auto async_fn_assoc = [&](const ::HIR::TypeRef& ret, const ::HIR::PathParams& pp, ::HIR::TraitPath::assoc_list_t& types, ::HIR::Compare& cmp)->bool {
++        ::HIR::TypeRef  fut_output;
++        const auto& ret_r = this->m_ivars.get_type(ret);
++        if( ret_r.data().is_Infer() ) {
++            // Not known yet: assume a future, the projection below resolves once it is
++            cmp &= ::HIR::Compare::Fuzzy;
++        }
++        else {
++            bool is_future = this->find_trait_impls(sp, m_lang_Future, ::HIR::PathParams(), ret_r, [&](auto impl, auto fcmp)->bool {
++                cmp &= fcmp;
++                fut_output = impl.get_type("Output", {});
++                return fcmp == ::HIR::Compare::Equal;
++                });
++            if( !is_future ) {
++                DEBUG("- No AsyncFn* impl, the return type " << ret_r << " isn't a Future");
++                return false;
++            }
++        }
++        if( fut_output == ::HIR::TypeRef() ) {
++            fut_output = ::HIR::TypeRef::new_path(::HIR::Path(ret.clone(), ::HIR::GenericPath(m_lang_Future, {}), "Output", {}), {});
++        }
++        types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnOnce, pp.clone()), {}, mv$(fut_output) } ) );
++        types.insert( ::std::make_pair( "CallOnceFuture", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnOnce, pp.clone()), {}, ret.clone() } ) );
++        types.insert( ::std::make_pair( "CallRefFuture", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnMut, pp.clone()), {}, ret.clone() } ) );
++        return true;
++        };
++
+     TU_MATCH_HDRA( (type.data()), {)
+     default:
+         break;
+@@ -1717,7 +1749,7 @@ bool TraitResolution::find_trait_impls_types(
+         // Magic impls of the Fn* traits for closure types
+         TU_ARMA(Closure, node_p) {
+             DEBUG("Closure, " << trait << " ?= Fn*");
+-            if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce ) {
++            if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce || is_async_fn_trait(trait) ) {
+                 if( params.m_types.size() != 1 )
+                     BUG(sp, "Fn* traits require a single tuple argument");
+                 if( !params.m_types[0].data().is_Tuple() )
+@@ -1748,7 +1780,13 @@ bool TraitResolution::find_trait_impls_types(
+                     ::HIR::PathParams   pp;
+                     pp.m_types.push_back( ::HIR::TypeRef(mv$(args)) );
+                     ::HIR::TraitPath::assoc_list_t  types;
+-                    types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, node_p->m_return.clone()} ) );
++                    if( is_async_fn_trait(trait) ) {
++                        if( !async_fn_assoc(node_p->m_return, pp, types, cmp) )
++                            return false;
++                    }
++                    else {
++                        types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, node_p->m_return.clone()} ) );
++                    }
+                     return callback( ImplRef(type.clone(), mv$(pp), mv$(types)), cmp );
+                 }
+                 else
+@@ -1787,7 +1825,7 @@ bool TraitResolution::find_trait_impls_types(
+     }
+     // Magic Fn* trait impls for function pointers
+     TU_ARMA(Function, e) {
+-        if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce ) {
++        if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce || is_async_fn_trait(trait) ) {
+             DEBUG("Fn* trait for fn pointer");
+             if( params.m_types.size() != 1 )
+                 BUG(sp, "Fn* traits require a single tuple argument");
+@@ -1817,14 +1855,20 @@ bool TraitResolution::find_trait_impls_types(
+             ::HIR::PathParams   pp;
+             pp.m_types.push_back( ::HIR::TypeRef(mv$(args)) );
+             ::HIR::TraitPath::assoc_list_t  types;
+-            types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, e.m_rettype.clone()} ) );
++            if( is_async_fn_trait(trait) ) {
++                if( !async_fn_assoc(e.m_rettype, pp, types, cmp) )
++                    return false;
++            }
++            else {
++                types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, e.m_rettype.clone()} ) );
++            }
+             auto hrls = get_hrls(sp, e.hrls, pp, params);
+             return callback( ImplRef(std::move(hrls), type.clone(), mv$(pp), mv$(types)), cmp );
+         }
+         }
+     // Magic Fn* trait impls for function pointers
+     TU_ARMA(NamedFunction, real_e) {
+-        if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce ) {
++        if( trait == m_lang_Fn || trait == m_lang_FnMut || trait == m_lang_FnOnce || is_async_fn_trait(trait) ) {
+             if( params.m_types.size() != 1 )
+                 BUG(sp, "Fn* traits require a single tuple argument");
+             if( !params.m_types[0].data().is_Tuple() )
+@@ -1861,7 +1905,13 @@ bool TraitResolution::find_trait_impls_types(
+             ::HIR::PathParams   pp;
+             pp.m_types.push_back( ::HIR::TypeRef(mv$(args)) );
+             ::HIR::TraitPath::assoc_list_t  types;
+-            types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, e.m_rettype.clone()} ) );
++            if( is_async_fn_trait(trait) ) {
++                if( !async_fn_assoc(e.m_rettype, pp, types, cmp) )
++                    return false;
++            }
++            else {
++                types.insert( ::std::make_pair( "Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, pp.clone()), {}, e.m_rettype.clone()} ) );
++            }
+             auto hrls = get_hrls(sp, e.hrls, pp, params);
+             return callback( ImplRef(std::move(hrls), type.clone(), mv$(pp), mv$(types)), cmp );
+         }
+diff --git a/src/hir_typeck/resolve_common.hpp b/src/hir_typeck/resolve_common.hpp
+index 2f2a4c72..ab9a0fa2 100644
+--- a/src/hir_typeck/resolve_common.hpp
++++ b/src/hir_typeck/resolve_common.hpp
+@@ -87,6 +87,9 @@ struct TraitResolveCommon
+     ::HIR::SimplePath   m_lang_MetaSized;    // 1.90
+     ::HIR::SimplePath   m_lang_Destruct;    // 1.90
+     ::HIR::SimplePath   m_lang_Future;    // 1.90 (well, added earlier)
++    ::HIR::SimplePath   m_lang_AsyncFn;    // 1.85
++    ::HIR::SimplePath   m_lang_AsyncFnMut;    // 1.85
++    ::HIR::SimplePath   m_lang_AsyncFnOnce;    // 1.85
+ 
+     TraitResolveCommon(const ::HIR::Crate& crate):
+         m_crate(crate),
+@@ -113,6 +116,31 @@ struct TraitResolveCommon
+         m_lang_MetaSized = m_crate.get_lang_item_path_opt("meta_sized");
+         m_lang_Destruct = m_crate.get_lang_item_path_opt("destruct");
+         m_lang_Future = m_crate.get_lang_item_path_opt("future_trait");
++        m_lang_AsyncFn = m_crate.get_lang_item_path_opt("async_fn");
++        m_lang_AsyncFnMut = m_crate.get_lang_item_path_opt("async_fn_mut");
++        m_lang_AsyncFnOnce = m_crate.get_lang_item_path_opt("async_fn_once");
++    }
++
++    /// `AsyncFn`/`AsyncFnMut`/`AsyncFnOnce` (1.85): rustc implements them itself for closures, fn items and fn pointers
++    /// whose return type is a Future (core only has the `&F`/`&mut F` forwarders)
++    bool is_async_fn_trait(const ::HIR::SimplePath& trait) const {
++        return m_lang_AsyncFnOnce != ::HIR::SimplePath()
++            && (trait == m_lang_AsyncFn || trait == m_lang_AsyncFnMut || trait == m_lang_AsyncFnOnce);
++    }
++    /// The Fn* trait and method behind a builtin AsyncFn* method (`AsyncFnOnce::async_call_once` -> `FnOnce::call_once`)
++    void async_fn_to_fn(::HIR::SimplePath& trait, RcString& method) const {
++        if( trait == m_lang_AsyncFn ) {
++            trait = m_lang_Fn.clone();
++            method = RcString::new_interned("call");
++        }
++        else if( trait == m_lang_AsyncFnMut ) {
++            trait = m_lang_FnMut.clone();
++            method = RcString::new_interned("call_mut");
++        }
++        else if( trait == m_lang_AsyncFnOnce ) {
++            trait = m_lang_FnOnce.clone();
++            method = RcString::new_interned("call_once");
++        }
+     }
+ 
+     bool has_self() const {
+diff --git a/src/hir_typeck/static.cpp b/src/hir_typeck/static.cpp
+index d68e7d29..c6aaee6c 100644
+--- a/src/hir_typeck/static.cpp
++++ b/src/hir_typeck/static.cpp
+@@ -301,6 +301,58 @@ bool StaticTraitResolve::find_impl(
+     }
+ 
+     // --- MAGIC IMPLS ---
++    // 1.85: rustc's builtin `AsyncFn*` impls for closures, fn items and fn pointers whose return type is a Future (see
++    // TraitResolution::find_trait_impls_types): `CallOnceFuture`/`CallRefFuture` are that type, `Output` its `Future::Output`
++    auto async_fn_assoc = [&](const ::HIR::TypeRef& ret, const ::HIR::PathParams& params, ::HIR::TraitPath::assoc_list_t& assoc)->bool {
++        ::HIR::TypeRef  fut_output;
++        // With explicit (empty) params: the ErasedType arm below only answers when params are given, and an `async fn`
++        // item's return type is its `impl Future<Output = ..>`
++        ::HIR::PathParams   future_params;
++        bool is_future = this->find_impl(sp, m_lang_Future, &future_params, ret, [&](auto impl, bool)->bool {
++            fut_output = impl.get_type("Output", {});
++            return true;
++            });
++        if( !is_future ) {
++            DEBUG("- No AsyncFn* impl, the return type " << ret << " isn't a Future");
++            return false;
++        }
++        if( fut_output == ::HIR::TypeRef() ) {
++            fut_output = ::HIR::TypeRef::new_path(::HIR::Path(ret.clone(), ::HIR::GenericPath(m_lang_Future, {}), "Output", {}), {});
++        }
++        assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnOnce, params.clone()), {}, mv$(fut_output) }) );
++        assoc.insert( ::std::make_pair("CallOnceFuture", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnOnce, params.clone()), {}, ret.clone() }) );
++        assoc.insert( ::std::make_pair("CallRefFuture", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_AsyncFnMut, params.clone()), {}, ret.clone() }) );
++        return true;
++        };
++    // After closure expansion a closure is its `closure#N<..>` struct with the Fn* impls: the AsyncFn* impl is those plus
++    // the future types (MIR cleanup turns the `async_call*` call into the `call*` one)
++    if( is_async_fn_trait(trait_path) && type.data().is_Path() && type.data().as_Path().is_closure() )
++    {
++        const auto& fn_trait = (trait_path == m_lang_AsyncFn ? m_lang_Fn : trait_path == m_lang_AsyncFnMut ? m_lang_FnMut : m_lang_FnOnce);
++        bool rv = false;
++        this->find_impl(sp, fn_trait, trait_params, type, [&](auto impl, bool fuzzy)->bool {
++            auto params = trait_params ? trait_params->clone() : impl.get_trait_params();
++            // `Output` is only on the FnOnce impl (the Fn/FnMut ones hold just their method)
++            ::HIR::TypeRef  ret;
++            if( fn_trait == m_lang_FnOnce ) {
++                ret = impl.get_type("Output", {});
++            }
++            else {
++                this->find_impl(sp, m_lang_FnOnce, &params, type, [&](auto impl_once, bool)->bool {
++                    ret = impl_once.get_type("Output", {});
++                    return true;
++                    });
++            }
++            if( ret == ::HIR::TypeRef() )
++                return false;
++            ::HIR::TraitPath::assoc_list_t  assoc;
++            if( !async_fn_assoc(ret, params, assoc) )
++                return false;
++            rv = found_cb( ImplRef(type.clone(), mv$(params), mv$(assoc)), fuzzy );
++            return true;
++            });
++        return rv;
++    }
+     // TODO: There should be quite a few more here, but laziness
+     TU_MATCH_HDRA( (type.data()), {)
+     default:
+@@ -311,7 +363,7 @@ bool StaticTraitResolve::find_impl(
+         }
+         }
+     TU_ARMA(Function, e) {
+-        if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce ) {
++        if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce || is_async_fn_trait(trait_path) ) {
+             if( trait_params )
+             {
+                 const auto& des_arg_tys = trait_params->m_types.at(0).data().as_Tuple();
+@@ -333,7 +385,13 @@ bool StaticTraitResolve::find_impl(
+             HIR::PathParams params;
+             params.m_types.push_back(HIR::TypeRef::new_tuple(std::move(arg_types)));
+             ::HIR::TraitPath::assoc_list_t  assoc;
+-            assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, params.clone()), {}, e.m_rettype.clone() }) );
++            if( is_async_fn_trait(trait_path) ) {
++                if( !async_fn_assoc(e.m_rettype, params, assoc) )
++                    return false;
++            }
++            else {
++                assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, params.clone()), {}, e.m_rettype.clone() }) );
++            }
+             auto hrls = get_hrls(sp, e.hrls, params, trait_params);
+             return found_cb( ImplRef(std::move(hrls), type.clone(), mv$(params), mv$(assoc)), false );
+         }
+@@ -343,7 +401,7 @@ bool StaticTraitResolve::find_impl(
+         }
+         }
+     TU_ARMA(NamedFunction, real_e) {
+-        if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce ) {
++        if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce || is_async_fn_trait(trait_path) ) {
+             auto e = real_e.decay(sp);
+             if( trait_params )
+             {
+@@ -366,7 +424,13 @@ bool StaticTraitResolve::find_impl(
+             HIR::PathParams params;
+             params.m_types.push_back(HIR::TypeRef::new_tuple(std::move(arg_types)));
+             ::HIR::TraitPath::assoc_list_t  assoc;
+-            assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, params.clone()), {}, e.m_rettype.clone() }) );
++            if( is_async_fn_trait(trait_path) ) {
++                if( !async_fn_assoc(e.m_rettype, params, assoc) )
++                    return false;
++            }
++            else {
++                assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, params.clone()), {}, e.m_rettype.clone() }) );
++            }
+             auto hrls = get_hrls(sp, e.hrls, params, trait_params);
+             return found_cb( ImplRef(std::move(hrls), type.clone(), mv$(params), mv$(assoc)), false );
+         }
+@@ -374,7 +438,7 @@ bool StaticTraitResolve::find_impl(
+     TU_ARMA(NodeType, e) {
+         TU_MATCH_HDRA((e), {)
+         TU_ARMA(Closure, node_p) {
+-            if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce )
++            if( trait_path == m_lang_Fn || trait_path == m_lang_FnMut || trait_path == m_lang_FnOnce || is_async_fn_trait(trait_path) )
+             {
+                 if( trait_params )
+                 {
+@@ -400,16 +464,22 @@ bool StaticTraitResolve::find_impl(
+                 case ::HIR::ExprNode_Closure::Class::NoCapture:
+                     break;
+                 case ::HIR::ExprNode_Closure::Class::Once:
+-                    if( trait_path == m_lang_FnMut )
++                    if( trait_path == m_lang_FnMut || trait_path == m_lang_AsyncFnMut )
+                         return false;
+                 case ::HIR::ExprNode_Closure::Class::Mut:
+-                    if( trait_path == m_lang_Fn )
++                    if( trait_path == m_lang_Fn || trait_path == m_lang_AsyncFn )
+                         return false;
+                 case ::HIR::ExprNode_Closure::Class::Shared:
+                     break;
+                 }
+                 ::HIR::TraitPath::assoc_list_t  assoc;
+-                assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, trait_params->clone()), {}, node_p->m_return.clone() }) );
++                if( is_async_fn_trait(trait_path) ) {
++                    if( !async_fn_assoc(node_p->m_return, *trait_params, assoc) )
++                        return false;
++                }
++                else {
++                    assoc.insert( ::std::make_pair("Output", ::HIR::TraitPath::AtyEqual { ::HIR::GenericPath(m_lang_FnOnce, trait_params->clone()), {}, node_p->m_return.clone() }) );
++                }
+                 return found_cb( ImplRef(type.clone(), trait_params->clone(), mv$(assoc)), false );
+             }
+             }
+diff --git a/src/mir/cleanup.cpp b/src/mir/cleanup.cpp
+index 241e4916..df3a1ef0 100644
+--- a/src/mir/cleanup.cpp
++++ b/src/mir/cleanup.cpp
+@@ -1463,6 +1463,17 @@ void MIR_Cleanup(const StaticTraitResolve& resolve, const ::HIR::ItemPath& path,
+                     }
+                 }
+ 
++                // 1.85: `<T as AsyncFn*<A>>::async_call*` on a closure, fn item or fn pointer is rustc's builtin impl,
++                // the Fn* call returning the future: make it that (closures have the Fn* impls, the others convert below)
++                if( path.m_data.is_UfcsKnown() && resolve.is_async_fn_trait(path.m_data.as_UfcsKnown().trait.m_path) )
++                {
++                    auto& pe = path.m_data.as_UfcsKnown();
++                    if( pe.type.data().is_Function() || pe.type.data().is_NamedFunction() || (pe.type.data().is_Path() && pe.type.data().as_Path().is_closure()) )
++                    {
++                        DEBUG("Convert AsyncFn* call " << path);
++                        resolve.async_fn_to_fn(pe.trait.m_path, pe.item);
++                    }
++                }
+                 if( path.m_data.is_UfcsKnown() && path.m_data.as_UfcsKnown().type.data().is_Function() )
+                 {
+                     const auto& pe = path.m_data.as_UfcsKnown();
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index ffe59b46..a550f805 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -1826,6 +1826,28 @@ void Trans_Enumerate_FillFrom_PathMono(EnumState& state, ::HIR::Path path_mono)
+             // Calling a non-dynamic function, need to visit that function
+             Trans_Enumerate_FillFrom_Path(state, path_mono.m_data.as_UfcsKnown().type.data().as_NamedFunction().path, sub_pp);
+         }
++        // - <fn(...) / fn{...} / closure#N as AsyncFn*>::async_call*: rustc's builtin impls for callables that return
++        //   a Future (1.85). MIR cleanup makes these the Fn* call, so enumerate what that call needs.
++        else if( path_mono.m_data.is_UfcsKnown() && state.resolve.is_async_fn_trait(path_mono.m_data.as_UfcsKnown().trait.m_path)
++            && (  path_mono.m_data.as_UfcsKnown().type.data().is_Function()
++               || path_mono.m_data.as_UfcsKnown().type.data().is_NamedFunction()
++               || (path_mono.m_data.as_UfcsKnown().type.data().is_Path() && path_mono.m_data.as_UfcsKnown().type.data().as_Path().is_closure())
++               ) )
++        {
++            const auto& pe = path_mono.m_data.as_UfcsKnown();
++            if( pe.type.data().is_NamedFunction() )
++            {
++                Trans_Enumerate_FillFrom_Path(state, pe.type.data().as_NamedFunction().path, sub_pp);
++            }
++            else if( pe.type.data().is_Path() )
++            {
++                auto fn_path = path_mono.clone();
++                auto& fpe = fn_path.m_data.as_UfcsKnown();
++                state.resolve.async_fn_to_fn(fpe.trait.m_path, fpe.item);
++                Trans_Enumerate_FillFrom_Path(state, fn_path, sub_pp);
++            }
++            // A function pointer: nothing to visit, the call is made direct
++        }
+         // - <fn(...) as FnPtr>::addr
+         else if( path_mono.m_data.is_UfcsKnown() && path_mono.m_data.as_UfcsKnown().type.data().is_Function()
+             && path_mono.m_data.as_UfcsKnown().trait.m_path == state.crate.get_lang_item_path_opt("fn_ptr_trait") )
