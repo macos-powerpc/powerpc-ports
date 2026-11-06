@@ -1,0 +1,251 @@
+From c6375118dd58b548884b8dafc70596e8c3362d1a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 5 Nov 2026 20:37:27 +0000
+Subject: [PATCH 431/433] macro_rules: a `stmt` fragment can be an item
+ (`extern crate askama;`)
+
+askama_macros 0.16.0 (zoxide 0.10.0) src/lib.rs:6: "BUG:
+src/macro_rules/eval.cpp:2443: TODO: Macro_InvokeRules_MatchPattern - No arm
+matched - (18, 83)".
+
+askama_derive's `make_derive_template! { #[proc_macro_derive(..)] pub fn
+derive_template() { extern crate askama; } }` matches the body with
+`$($import:stmt)+` and forwards it through `quote!($($import)*)`. A `stmt`
+fragment covers item statements (rustc: items, `let`, expressions), but:
+
+- the arm matcher's lookahead (consume_stmt) knew `let` and expressions only,
+  so the arm failed at `extern` (18 tokens in);
+- the capture parsed with Parse_Stmt into an expression node, which cannot
+  hold an item;
+- `stringify!` of an item fragment was the placeholder `/*:item*/`, and
+  quote!'s `$other:tt` arm feeds every forwarded fragment through
+  `parse(stringify!($other))`;
+- an item fragment given to a proc macro directly was a TODO in
+  expand/proc_macro.cpp.
+
+Now a statement that starts an item (the block parser's rule, after any outer
+attributes: item keywords, `pub`, `crate` not followed by `::`, `const` /
+`unsafe` not followed by `{`, `async fn`, `union Ident`, `auto trait`) is
+matched by consume_item and captured as an `$i:item` fragment, which a block
+already takes back as one of its items (Parse_ExprBlockLine_WithItems).
+Token::to_str prints an item fragment as source (a new DumpAST_Item over the
+module printer, so `extern crate askama;` comes out as the `extern crate
+"askama" as askama;` the parser also reads), and the proc-macro serialiser
+sends it as an invisible group of the item's tokens (visit_named_item).
+Attributes before a non-item statement go onto the statement node.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/ast/dump.cpp b/src/ast/dump.cpp
+index 93b84f38..7e304c2d 100644
+--- a/src/ast/dump.cpp
++++ b/src/ast/dump.cpp
+@@ -1603,6 +1603,14 @@ void DumpAST_Node(::std::ostream& os, const AST::ExprNode& node)
+     if( node.is_parenthesised() )
+         os << ")";
+ }
++void DumpAST_Item(::std::ostream& os, const AST::Named<AST::Item>& item)
++{
++    // The printer works on modules: one holding a copy of the item
++    AST::Module mod { AST::AbsolutePath() };
++    mod.add_item( AST::Named<AST::Item>( item.span, item.attrs.clone(), item.vis, item.name, item.data.clone() ) );
++    RustPrinter p { os, false };
++    p.handle_module(mod);
++}
+ void DumpAST_Pattern(::std::ostream& os, const AST::Pattern& pat)
+ {
+     RustPrinter printer(os, /*is_debug=*/false);
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index a3da3d78..7a255ae4 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -657,7 +657,14 @@ namespace {
+                 visit_meta_item(const_cast<::Token&>(tok).frag_meta());
+                 m_pmi.send_none_group_close();
+                 break;
+-            case TOK_INTERPOLATED_ITEM:
++            // An item fragment (`$i:item`, or an item a `$s:stmt` captured) forwarded to a proc macro: an invisible
++            // group of the item's tokens (taken from a clone, the stream is read-only)
++            case TOK_INTERPOLATED_ITEM: {
++                auto named = tok.clone().take_frag_item();
++                m_pmi.send_none_group_open();
++                visit_named_item(named);
++                m_pmi.send_none_group_close();
++                } break;
+             case TOK_INTERPOLATED_VIS:
+                 TODO(sp, "TOK_INTERPOLATED_...");
+             // Value tokens
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index cf68cfaa..f3629f68 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -620,6 +620,49 @@ static bool Macro_IsLiteralExprFragment(const Token& tok)
+         || dynamic_cast<const AST::ExprNode_CString*>(node);
+ }
+ 
++/// Does the statement at the cursor (after its attributes) start with an item? The block parser's rule
++/// (Parse_ExprBlockLine_WithItems), for a `stmt` fragment that is one
++static bool Macro_StmtIsItem(TokenStream& lex)
++{
++    Token   tok;
++    GET_TOK(tok, lex);
++    auto next = lex.lookahead(0);
++    // (PUTBACK moves the token)
++    const auto ty = tok.type();
++    const bool is_union = (ty == TOK_IDENT && tok.ident().name == "union");
++    const bool is_auto = (ty == TOK_IDENT && tok.ident().name == "auto");
++    PUTBACK(tok, lex);
++    switch(ty)
++    {
++    case TOK_INTERPOLATED_ITEM:
++    case TOK_INTERPOLATED_VIS:
++    case TOK_RWORD_PUB:
++    case TOK_RWORD_TYPE:
++    case TOK_RWORD_USE:
++    case TOK_RWORD_EXTERN:
++    case TOK_RWORD_STATIC:
++    case TOK_RWORD_STRUCT:
++    case TOK_RWORD_MACRO:
++    case TOK_RWORD_ENUM:
++    case TOK_RWORD_TRAIT:
++    case TOK_RWORD_IMPL:
++    case TOK_RWORD_FN:
++    case TOK_RWORD_MOD:
++        return true;
++    case TOK_RWORD_CRATE:
++        return next != TOK_DOUBLE_COLON;
++    case TOK_RWORD_CONST:
++    case TOK_RWORD_UNSAFE:
++        return next != TOK_BRACE_OPEN;
++    case TOK_RWORD_ASYNC:
++        return next == TOK_RWORD_FN || next == TOK_RWORD_UNSAFE;
++    case TOK_IDENT:
++        return (is_union && next == TOK_IDENT) || (is_auto && next == TOK_RWORD_TRAIT);
++    default:
++        return false;
++    }
++}
++
+ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type type)
+ {
+     Token   tok;
+@@ -647,8 +690,22 @@ InterpolatedFragment Macro_HandlePatternCap(TokenStream& lex, MacroPatEnt::Type
+         return InterpolatedFragment( Parse_Type(lex) );
+     case MacroPatEnt::PAT_EXPR:
+         return InterpolatedFragment( InterpolatedFragment::EXPR, Parse_Expr0(lex).release() );
+-    case MacroPatEnt::PAT_STMT:
+-        return InterpolatedFragment( InterpolatedFragment::STMT, Parse_Stmt(lex).release() );
++    case MacroPatEnt::PAT_STMT: {
++        // An item statement (`extern crate askama;` in askama_macros 0.16.0's make_derive_template! input, zoxide
++        // 0.10.0) is captured as the item: a statement node can't hold one, and a block takes the item fragment back
++        // as one of its items (Parse_ExprBlockLine_WithItems)
++        auto attrs = Parse_ItemAttrs(lex);
++        if( Macro_StmtIsItem(lex) ) {
++            assert( lex.parse_state().module );
++            const auto& cur_mod = *lex.parse_state().module;
++            return InterpolatedFragment( Parse_Mod_Item_S(lex, cur_mod.m_file_info, cur_mod.path(), mv$(attrs)) );
++        }
++        auto node = Parse_Stmt(lex);
++        if( node && !attrs.m_items.empty() ) {
++            node->set_attrs( mv$(attrs) );
++        }
++        return InterpolatedFragment( InterpolatedFragment::STMT, node.release() );
++        }
+     case MacroPatEnt::PAT_PATH:
+         // HACK for `rustc-1.90.0-src/vendor/icu_locid_transform_data-1.5.0/data/macros.rs::23`
+         if( lex.lookahead(0) == TOK_INTERPOLATED_TYPE ) {
+@@ -1790,6 +1847,61 @@ namespace
+         } while(cont);
+         return true;
+     }
++    bool consume_item(TokenStreamRO& lex);
++    /// Does this statement start with an item? (the block parser's rule, Parse_ExprBlockLine_WithItems)
++    bool stmt_is_item(const TokenStreamRO& lex_in)
++    {
++        auto lex = lex_in.clone();
++        // Outer attributes
++        while( lex.next() == TOK_HASH )
++        {
++            lex.consume();
++            if( !consume_tt(lex) )
++                return false;
++        }
++        switch(lex.next())
++        {
++        case TOK_INTERPOLATED_ITEM:
++        case TOK_INTERPOLATED_VIS:
++        case TOK_RWORD_PUB:
++        case TOK_RWORD_TYPE:
++        case TOK_RWORD_USE:
++        case TOK_RWORD_EXTERN:
++        case TOK_RWORD_STATIC:
++        case TOK_RWORD_STRUCT:
++        case TOK_RWORD_ENUM:
++        case TOK_RWORD_TRAIT:
++        case TOK_RWORD_IMPL:
++        case TOK_RWORD_FN:
++        case TOK_RWORD_MOD:
++            return true;
++        // `crate::path` starts an expression
++        case TOK_RWORD_CRATE:
++            lex.consume();
++            return lex.next() != TOK_DOUBLE_COLON;
++        // `const { .. }` and `unsafe { .. }` are blocks
++        case TOK_RWORD_CONST:
++        case TOK_RWORD_UNSAFE:
++            lex.consume();
++            return lex.next() != TOK_BRACE_OPEN;
++        // `async [unsafe] fn` is an item, `async [move] { .. }` an expression
++        case TOK_RWORD_ASYNC:
++            lex.consume();
++            return lex.next() == TOK_RWORD_FN || lex.next() == TOK_RWORD_UNSAFE;
++        case TOK_IDENT:
++            if( lex.next_tok().ident().name == "union" ) {
++                lex.consume();
++                return lex.next() == TOK_IDENT;
++            }
++            if( lex.next_tok().ident().name == "auto" ) {
++                lex.consume();
++                return lex.next() == TOK_RWORD_TRAIT;
++            }
++            return false;
++        default:
++            return false;
++        }
++    }
+     bool consume_stmt(TokenStreamRO& lex)
+     {
+         TRACE_FUNCTION;
+@@ -1797,6 +1909,12 @@ namespace
+         {
+             return true;
+         }
++        // An item statement: askama_macros 0.16.0 `make_derive_template! { pub fn derive_template() { extern crate
++        // askama; } }` against `$($import:stmt)+` (zoxide 0.10.0)
++        if( stmt_is_item(lex) )
++        {
++            return consume_item(lex);
++        }
+         if( lex.consume_if(TOK_RWORD_LET) )
+         {
+             if( !consume_pat(lex) )
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 5b6f3246..0e278905 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -449,7 +449,13 @@ struct EscapedByteString {
+         DumpAST_Node(ss, *reinterpret_cast<const ::AST::ExprNode*>(m_data.as_Fragment()));
+         return ss.str();
+     case TOK_INTERPOLATED_META: return "/*:meta*/";
+-    case TOK_INTERPOLATED_ITEM: return "/*:item*/";
++    // An item captured by `$s:stmt` (`extern crate askama;`, askama_macros 0.16.0 make_derive_template!) reaches
++    // quote!'s `parse(stringify!($other))` this way
++    case TOK_INTERPOLATED_ITEM: {
++        extern void DumpAST_Item(::std::ostream& os, const AST::Named<AST::Item>& item);
++        DumpAST_Item(ss, *reinterpret_cast<const ::AST::Named<AST::Item>*>(m_data.as_Fragment()));
++        }
++        return ss.str();
+     case TOK_INTERPOLATED_VIS: {
+         ::std::stringstream ss;
+         ss << *reinterpret_cast<const ::AST::Visibility*>(m_data.as_Fragment());

@@ -1,0 +1,389 @@
+From 4d240c493899c13003cb22c1adc22aeb0001e08a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Thu, 5 Nov 2026 20:37:27 +0000
+Subject: [PATCH 433/433] trans: MRUSTC_CODEGEN_UNIT_SIZE splits the C output
+ into translation units
+
+cargo 0.99.0 (cargo-c 0.10.25): "virtual memory exhausted: Cannot allocate
+memory" from the C compiler on the crate's 750MB libcargo-0_99_0_H2.rlib.c.
+GCC parses a translation unit completely before compiling it, and a 32-bit
+GCC (ppc on 10.6) runs out of address space on a source that size.
+
+With MRUSTC_CODEGEN_UNIT_SIZE=<MiB> (GCC mode only; unset or 0 = as before)
+the C backend records where the shared declarations end (types, constructors,
+prototypes, static declarations), where the static definitions end and where
+each function body ends, and after the single source is complete writes
+`<out>.<n>.c` units of about that many bytes of bodies: every unit starts
+with the declarations, unit 0 also has the static definitions, the last one
+the trailer (global asm, an executable's shims and main). Each unit compiles
+with the single compile's compiler and options, `cc -nostdlib -r` merges the
+objects into the object the single compile would have produced (the GCC
+Darwin and Linux link specs pass `-r` through without start files or default
+libraries), the unit files are removed; an executable or dynamic library
+links the merged object. The single `.c` stays, for reference. Nothing is
+split when the bodies fit one unit.
+
+What the single compile emitted as `static` must be shared by the units:
+this crate's copies of other crates' generic/inlined functions and statics
+(every crate that uses one emits it under the same mangled name) and
+extern-weak static shims. With units enabled, such a function or static is
+a hidden-visibility symbol renamed per crate (`#define <mangled>
+<mangled>__<crate>` next to its prototype, before any use), every static is
+declared `extern` and defined in unit 0 (a zero static too, which the single
+compile left as a tentative definition), and the extern-weak shim (a pointer)
+is `static` in each unit. Items with a link name keep `static`.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/trans/codegen_c.cpp b/src/trans/codegen_c.cpp
+index 59954c6d..3aa33542 100644
+--- a/src/trans/codegen_c.cpp
++++ b/src/trans/codegen_c.cpp
+@@ -22,6 +22,8 @@
+ #include "target_version.hpp"
+ #include <string_view.hpp>
+ #include <cstring>
++#include <cctype>
++#include <cstdlib>
+ #ifdef _WIN32
+ # include <direct.h>
+ #else
+@@ -442,6 +444,17 @@ namespace {
+         ::std::set< const TypeRepr*>    m_embedded_tags;
+         // Link names of the functions this crate defines (`#[no_mangle]`/`#[export_name]`): a cdylib exports only these
+         ::std::vector< ::std::string>   m_defined_link_names;
++
++        // `MRUSTC_CODEGEN_UNIT_SIZE=<MiB>`: the function bodies are split into translation units of about that size
++        // (0 = the one unit). A 750MB cargo 0.99.0 source exhausted a 32-bit GCC's address space (cargo-c on ppc).
++        // Every unit repeats the declarations (`m_unit_hdr_end`), unit 0 has the static definitions, the last the
++        // trailer (global asm, an executable's shims). What was `static` (this crate's copy of another crate's
++        // generic/inlined item) is then a hidden symbol renamed with `m_unit_suffix`, as the units share it.
++        size_t  m_unit_size = 0;
++        ::std::string   m_unit_suffix;
++        ::std::streamoff    m_unit_hdr_end = -1;
++        ::std::streamoff    m_unit_statics_end = -1;
++        ::std::vector<::std::streamoff> m_unit_body_ends;
+     public:
+         CodeGenerator_C(const ::HIR::Crate& crate, const ::std::string& outfile):
+             m_crate(crate),
+@@ -471,6 +484,19 @@ namespace {
+                 m_options.disallow_empty_structs = true;
+                 break;
+             }
++            if( const char* v = getenv("MRUSTC_CODEGEN_UNIT_SIZE") )
++            {
++                if( m_compiler == Compiler::Gcc && ::std::strtoul(v, nullptr, 10) > 0 )
++                {
++                    m_unit_size = static_cast<size_t>(::std::strtoul(v, nullptr, 10)) << 20;
++                    m_unit_suffix = m_crate.m_crate_name.c_str();
++                    for(auto& c : m_unit_suffix) {
++                        if( !isalnum(static_cast<unsigned char>(c)) ) {
++                            c = '_';
++                        }
++                    }
++                }
++            }
+ 
+             m_of
+                 << "/*\n"
+@@ -1057,6 +1083,83 @@ namespace {
+ 
+         ~CodeGenerator_C() {}
+ 
++        /// Linkage of an item this crate has its own copy of (a monomorphisation, or an inlined function or static
++        /// of another crate: every crate that uses it emits one under the same name): `static`, or with split units
++        /// a hidden symbol, renamed per crate by `emit_unit_rename` in the shared declarations so the units can share it
++        void emit_local_linkage(const ::HIR::Linkage& linkage)
++        {
++            if( m_unit_size > 0 && linkage.name == "" ) {
++                m_of << "__attribute__((visibility(\"hidden\"))) ";
++            }
++            else {
++                m_of << "static ";
++            }
++        }
++        void emit_unit_rename(const ::std::string& name, const ::HIR::Linkage& linkage)
++        {
++            if( m_unit_size > 0 && linkage.name == "" ) {
++                m_of << "#define " << name << " " << name << "__" << m_unit_suffix << "\n";
++            }
++        }
++        /// Write the units (see `m_unit_size`): `<out>.<n>.c` = the declarations (unit 0: with the static
++        /// definitions) + a run of function bodies (+ the trailer in the last). Nothing when the source is one unit.
++        ::std::vector<::std::string> split_units()
++        {
++            ::std::vector<::std::string>    rv;
++            if( m_unit_size == 0 || m_unit_body_ends.empty() ) {
++                return rv;
++            }
++            ::std::ifstream src(m_outfile_path_c, ::std::ios::binary);
++            ASSERT_BUG(Span(), src.is_open(), "Failed to open `" << m_outfile_path_c << "` for reading");
++            src.seekg(0, ::std::ios::end);
++            ::std::streamoff    total = src.tellg();
++            ::std::streamoff    bodies_start = m_unit_statics_end;
++            ::std::streamoff    bodies_end = m_unit_body_ends.back();
++            ::std::vector<::std::pair<::std::streamoff, ::std::streamoff>>   chunks;
++            ::std::streamoff    cur = bodies_start;
++            for(auto e : m_unit_body_ends)
++            {
++                if( e - cur >= static_cast<::std::streamoff>(m_unit_size) ) {
++                    chunks.push_back( ::std::make_pair(cur, e) );
++                    cur = e;
++                }
++            }
++            if( cur < bodies_end || chunks.empty() ) {
++                chunks.push_back( ::std::make_pair(cur, bodies_end) );
++            }
++            if( chunks.size() < 2 ) {
++                return rv;
++            }
++            ::std::vector<char> buf(1 << 20);
++            auto copy_range = [&](::std::ostream& dst, ::std::streamoff a, ::std::streamoff b) {
++                src.seekg(a);
++                while( a < b )
++                {
++                    auto n = ::std::min<::std::streamoff>(b - a, buf.size());
++                    src.read(buf.data(), n);
++                    ASSERT_BUG(Span(), src.gcount() == n, "Short read from `" << m_outfile_path_c << "`");
++                    dst.write(buf.data(), n);
++                    a += n;
++                }
++                };
++            for(size_t i = 0; i < chunks.size(); i ++)
++            {
++                auto path = FMT(m_outfile_path << "." << i << ".c");
++                ::std::ofstream dst(path, ::std::ios::binary);
++                ASSERT_BUG(Span(), dst.is_open(), "Failed to open `" << path << "` for writing");
++                copy_range(dst, 0, i == 0 ? m_unit_statics_end : m_unit_hdr_end);
++                copy_range(dst, chunks[i].first, chunks[i].second);
++                if( i == chunks.size() - 1 ) {
++                    copy_range(dst, bodies_end, total);
++                }
++                dst.close();
++                ASSERT_BUG(Span(), !dst.bad(), "Error set on output stream for: " << path);
++                rv.push_back(path);
++            }
++            ::std::cerr << "note: " << m_outfile_path_c << " (" << (total >> 20) << " MiB) compiled as " << rv.size() << " units" << ::std::endl;
++            return rv;
++        }
++
+         void finalise(const TransOptions& opt, CodegenOutput out_ty, const ::std::string& hir_file) override
+         {
+             // A cdylib is a final artifact too: without the glue its `__rust_alloc` etc. stay undefined, which a Python
+@@ -1276,6 +1379,10 @@ namespace {
+             m_of.close();
+             ASSERT_BUG(Span(), !m_of.bad(), "Error set on output stream for: " << m_outfile_path_c);
+ 
++            // Split units compile separately and merge into the object the single compile would have produced
++            auto unit_srcs = split_units();
++            ::std::string   merged_o = (out_ty == CodegenOutput::Object ? m_outfile_path : m_outfile_path + ".o");
++
+             class LinkList: private StringList
+             {
+             public:
+@@ -1638,7 +1745,7 @@ namespace {
+                     args.push_back(m_outfile_path+".o");
+                     break;
+                 }
+-                args.push_back(m_outfile_path_c.c_str());
++                args.push_back( unit_srcs.empty() ? m_outfile_path_c.c_str() : merged_o.c_str() );
+                 if( out_ty == CodegenOutput::DynamicLibrary && glue_path_c != "" )
+                 {
+                     args.push_back(glue_path_c);
+@@ -1870,7 +1977,59 @@ namespace {
+                 return cmd_ss.str();
+                 };
+             ::std::vector<::std::string>    commands;
+-            commands.push_back( make_command(args, arg_file_start, m_outfile_path + "_cmd.txt") );
++            if( !unit_srcs.empty() )
++            {
++                // Each unit with the single compile's compiler and options, then a relocatable link of the objects
++                // (`-r`, no runtime)
++                StringList  merge_args;
++                for(size_t i = 0; i < arg_file_start; i ++) {
++                    merge_args.push_back( ::std::string(args.get_vec()[i]) );
++                }
++                for( const auto& a : Target_GetCurSpec().m_backend_c.m_compiler_opts ) {
++                    merge_args.push_back( a.c_str() );
++                }
++                merge_args.push_back("-nostdlib");
++                merge_args.push_back("-r");
++                merge_args.push_back("-o");
++                merge_args.push_back(merged_o);
++                ::std::stringstream rm_ss;
++                rm_ss << (is_windows ? "del /f /q" : "rm -f");
++                for(size_t i = 0; i < unit_srcs.size(); i ++)
++                {
++                    auto unit_o = FMT(m_outfile_path << "." << i << ".o");
++                    StringList  unit_args;
++                    for(size_t j = 0; j < cc_prefix_len; j ++) {
++                        unit_args.push_back( ::std::string(args.get_vec()[j]) );
++                    }
++                    unit_args.push_back("-o");
++                    unit_args.push_back(unit_o);
++                    unit_args.push_back(unit_srcs[i]);
++                    unit_args.push_back("-c");
++                    commands.push_back( make_command(unit_args, arg_file_start, FMT(m_outfile_path << "." << i << "_cmd.txt")) );
++                    merge_args.push_back(unit_o);
++                    rm_ss << " \"" << FmtShell(unit_srcs[i], is_windows) << "\" \"" << FmtShell(unit_o, is_windows) << "\"";
++                }
++                commands.push_back( make_command(merge_args, arg_file_start, m_outfile_path + ".merge_cmd.txt") );
++                // The units were inputs only (the single source stays, for reference)
++                commands.push_back( rm_ss.str() );
++                switch(out_ty)
++                {
++                case CodegenOutput::Object:
++                case CodegenOutput::StaticLibrary:
++                case CodegenOutput::StaticArchive:
++                    // The merged object is what the single compile produced
++                    break;
++                case CodegenOutput::Executable:
++                case CodegenOutput::DynamicLibrary:
++                    // Linked from the merged object
++                    commands.push_back( make_command(args, arg_file_start, m_outfile_path + "_cmd.txt") );
++                    break;
++                }
++            }
++            else
++            {
++                commands.push_back( make_command(args, arg_file_start, m_outfile_path + "_cmd.txt") );
++            }
+ 
+             if( out_ty == CodegenOutput::StaticArchive )
+             {
+@@ -3175,6 +3334,10 @@ namespace {
+                 }
+                 m_of << linkage_name << "[0];\n";
+ 
++                if( m_unit_size > 0 ) {
++                    // A pointer-sized definition among the declarations: one copy per unit
++                    m_of << "static ";
++                }
+                 emit_static_ty(type, p, /*is_proto=*/true);
+                 m_of << " = { .raw = { (uintptr_t)" << linkage_name << " } };";
+                 m_of << "\t// static " << p << " : " << type;
+@@ -3218,6 +3381,13 @@ namespace {
+ 
+             TRACE_FUNCTION_F(p);
+             auto type = params.monomorph(m_resolve, item.m_type);
++            if( item.m_params.is_generic() ) {
++                emit_unit_rename(FMT(Trans_Mangle(p)), item.m_linkage);
++            }
++            if( m_unit_size > 0 ) {
++                // Every unit declares the static, unit 0 defines it (emit_static_local)
++                m_of << "extern ";
++            }
+             switch(item.m_linkage.type)
+             {
+             case HIR::Linkage::Type::External:
+@@ -3261,7 +3431,7 @@ namespace {
+                 }
+             }
+             if( item.m_params.is_generic() ) {
+-                m_of << "static ";
++                emit_local_linkage(item.m_linkage);
+             }
+             emit_static_ty(type, p, /*is_proto=*/true);
+             // A defined static with a link name (`#[no_mangle]`, `#[export_name]`) is emitted under that symbol, as
+@@ -3285,10 +3455,14 @@ namespace {
+             TRACE_FUNCTION_F(p);
+ 
+             auto type = params.monomorph(m_resolve, item.m_type);
++            if( m_unit_size > 0 && m_unit_hdr_end < 0 ) {
++                // The first static definition: the declarations before it are what every unit gets
++                m_unit_hdr_end = m_of.tellp();
++            }
+             // statics that are zero do not require initializers, since they will be initialized to zero on program startup.
+             if( !is_zero_literal(type, encoded, params)) {
+                 if( item.m_params.is_generic() ) {
+-                    m_of << "static ";
++                    emit_local_linkage(item.m_linkage);
+                 }
+                 bool is_packed = emit_static_ty(type, p, /*is_proto=*/false);
+                 m_of << " = ";
+@@ -3361,11 +3535,13 @@ namespace {
+                 m_of << "\t// static " << p << " : " << type << " = " << encoded;
+                 m_of << "\n";
+             }
+-            //else {
+-            //    m_of << "//";
+-            //    emit_static_ty(type, p, /*is_proto=*/false);
+-            //    m_of << "\t// Zero init static " << p << " : " << type << " = " << encoded << "\n";
+-            //}
++            else if( m_unit_size > 0 ) {
++                // Declared `extern` in every unit: this is the (zero) definition
++                emit_static_ty(type, p, /*is_proto=*/false);
++                m_of << ";";
++                m_of << "\t// static " << p << " : " << type << " = 0";
++                m_of << "\n";
++            }
+ 
+             m_mir_res = nullptr;
+         }
+@@ -3673,7 +3849,7 @@ namespace {
+             auto emit_prefix = [&]() {
+                 if( is_extern_def )
+                 {
+-                    m_of << "static ";
++                    emit_local_linkage(item.m_linkage);
+                 }
+                 switch(item.m_linkage.type)
+                 {
+@@ -3696,6 +3872,13 @@ namespace {
+                     BUG(Span(), "unexpected ExternWeak on function");
+                 }
+                 };
++            if( is_extern_def )
++            {
++                emit_unit_rename(FMT(Trans_Mangle(p)), item.m_linkage);
++                if( use_cabi ) {
++                    emit_unit_rename(FMT(Trans_Mangle(p) << "__cabi"), item.m_linkage);
++                }
++            }
+             emit_prefix();
+             emit_function_header(p, item, params);
+             if( asm_label && !use_cabi ) {
+@@ -3716,6 +3899,16 @@ namespace {
+         }
+         void emit_function_code(const ::HIR::Path& p, const ::HIR::Function& item, const Trans_Params& params, bool is_extern_def, const ::MIR::FunctionPointer& code) override
+         {
++            if( m_unit_size > 0 )
++            {
++                // The first body: everything before it is what every unit gets (plus the statics for unit 0)
++                if( m_unit_hdr_end < 0 ) {
++                    m_unit_hdr_end = m_of.tellp();
++                }
++                if( m_unit_statics_end < 0 ) {
++                    m_unit_statics_end = m_of.tellp();
++                }
++            }
+             emit_function_code_inner(p, item, params, is_extern_def, code);
+             if( !is_extern_def && item.m_linkage.name != "" ) {
+                 m_defined_link_names.push_back(item.m_linkage.name);
+@@ -3730,12 +3923,15 @@ namespace {
+                 m_mir_res = &top_mir_res;
+                 m_of << "// C ABI wrapper for " << p << "\n";
+                 if( is_extern_def ) {
+-                    m_of << "static ";
++                    emit_local_linkage(item.m_linkage);
+                 }
+                 emit_function_header(p, item, params, &cabi);
+                 emit_cabi_wrapper_body(p, item, params, cabi, /*to_cabi=*/false);
+                 m_mir_res = nullptr;
+             }
++            if( m_unit_size > 0 ) {
++                m_unit_body_ends.push_back( m_of.tellp() );
++            }
+         }
+         void emit_function_code_inner(const ::HIR::Path& p, const ::HIR::Function& item, const Trans_Params& params, bool is_extern_def, const ::MIR::FunctionPointer& code)
+         {
+@@ -3753,7 +3949,7 @@ namespace {
+ 
+             m_of << "// " << p << "\n";
+             if( is_extern_def ) {
+-                m_of << "static ";
++                emit_local_linkage(item.m_linkage);
+             }
+             emit_function_header(p, item, params);
+             m_of << "\n";
