@@ -1,0 +1,135 @@
+From 6105832a391da919c455c4e389bac83de4d8c340 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 6 Nov 2026 04:33:18 +0000
+Subject: [PATCH] expand, resolve: a derive path that re-exports lead to a builtin
+ derive uses it
+
+tor-config-shared 0.47.0 (arti 2.7.0) src/metrics.rs:9:
+"MACRO<::tor_config::derive_deftly_template_TorConfig> error: Failed to
+apply #[derive] - Missing handlers for ::tor_config::derive::exports::
+Default, ::tor_config::derive::exports::Clone, ::tor_config::derive::
+exports::Debug".
+
+The TorConfig derive-deftly template emits `#[derive($crate::derive::
+exports::Default, ..)]`, and tor-config's `derive::exports` module has
+`pub use std::{clone::Clone, default::Default, fmt::Debug, ..}`. libcore's
+builtin derive macros are `#[rustc_builtin_macro] pub macro`s, which mrustc
+turns into imports from `#builtins`. The macro lookup followed the
+re-export to that import, but only knows function-like builtins, so it
+found nothing; the derive dispatcher took builtin derives only by bare
+name or by a direct core/std path.
+
+derive_item now resolves any other path with Resolve_Lookup_Macro and,
+when the lookup ends at a `#builtins` import (named in its out_path), uses
+the builtin derive of that name. Two resolve changes make out_path say so:
+find_item_hir also sets it when the `#builtins` import is one re-export
+further on, and find_item stops the macro search there instead of going
+on to the prelude glob, which overwrote it (a local `mod m { pub use
+tc::ex::Default; }` + `#[derive(m::Default)]`). Only the derive dispatcher
+and expand's macro-`use` scan pass an out_path for macros, and the scan
+ignores it when nothing is found.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/expand/derive.cpp b/src/expand/derive.cpp
+index d0927040..c1c342b7 100644
+--- a/src/expand/derive.cpp
++++ b/src/expand/derive.cpp
+@@ -15,6 +15,7 @@
+ #include <parse/ttstream.hpp>
+ #include "proc_macro.hpp"
+ #include "common.hpp"   // Expand_LookupMacro
++#include "../resolve/common.hpp"   // Resolve_Lookup_Macro
+ 
+ namespace {
+     const RcString rcstring_Self = RcString::new_interned("Self");
+@@ -2221,6 +2222,21 @@ static void derive_item(const Span& sp, const AST::Crate& crate, AST::Module& mo
+                 }
+             }
+         }
++        // Any other path that `use` re-exports lead to a builtin derive: tor-config 0.47.0's TorConfig template emits
++        // `#[derive($crate::derive::exports::Default, ..)]`, and that module does `pub use std::{default::Default, ..}`.
++        // The macro lookup finds the `#builtins` import but only knows function-like builtins, so it reports nothing.
++        if( !trait_path.is_trivial() )
++        {
++            AST::AbsolutePath   out_path;
++            Resolve_Lookup_Macro(sp, crate, mod.path(), trait_path, &out_path);
++            DEBUG("Resolved to " << out_path);
++            if( out_path.crate == CRATE_BUILTINS && !out_path.nodes.empty() ) {
++                if(auto dp = find_impl(out_path.nodes.back())) {
++                    mod.add_item(sp, AST::Visibility::make_bare_private(), "", dp->handle_item(sp, opts, item.params(), type, item), {} );
++                    continue ;
++                }
++            }
++        }
+ 
+         DEBUG("> No handler for " << trait_path);
+         missing_handlers.push_back( trait_path );
+diff --git a/src/resolve/common.cpp b/src/resolve/common.cpp
+index 99c5621d..0b084b40 100644
+--- a/src/resolve/common.cpp
++++ b/src/resolve/common.cpp
+@@ -534,6 +534,12 @@ namespace {
+         /// graph for each name it does not define - exponential. dtls 0.13.0 (localsend-cli, 336 globs over 93 files)
+         /// sat in Expand for hours: every named `use` asks for a macro of that name (Expand_Mod's `Use` arm), which
+         /// no module defines.
++        /// A `use` led to a `#builtins` macro that is not a function-like builtin (a builtin derive): `find_item_hir`
++        /// names it in `out_path` but has no item to return. That is the answer, so the search stops there instead of
++        /// going on to the prelude glob (`#[derive(m::Default)]` with `mod m { pub use tc::ex::Default; }`).
++        bool is_builtin_macro(ResolveNamespace ns, const ::AST::AbsolutePath* out_path) const {
++            return ns == ResolveNamespace::Macro && out_path && out_path->crate == CRATE_BUILTINS;
++        }
+         ResolveItemRef find_item(const AST::Module& mod, const RcString& name, ResolveNamespace ns, ::AST::AbsolutePath* out_path=nullptr, failed_lookups_t* searched=nullptr)
+         {
+             failed_lookups_t    new_search;
+@@ -727,6 +733,9 @@ namespace {
+                                     DEBUG("Found in AST use");
+                                     return rv;
+                                 }
++                                if( this->is_builtin_macro(ns, out_path) ) {
++                                    return ResolveItemRef::make_None({});
++                                }
+                                 }
+                             TU_ARMA(Hir, mod_ptr) {
+                                 // If `get_module` provided a HIR module, then this is right?
+@@ -737,6 +746,9 @@ namespace {
+                                     DEBUG("Found in HIR use");
+                                     return rv;
+                                 }
++                                if( this->is_builtin_macro(ns, out_path) ) {
++                                    return ResolveItemRef::make_None({});
++                                }
+                                 }
+                             TU_ARMA(ImplicitPrelude, _e) {
+                                 if( ns == ResolveNamespace::Namespace )
+@@ -793,6 +805,9 @@ namespace {
+                                     DEBUG("Found in AST glob");
+                                     return rv;
+                                 }
++                                if( this->is_builtin_macro(ns, out_path) ) {
++                                    return ResolveItemRef::make_None({});
++                                }
+                                 // Fall through, keep searching
+                                 }
+                             TU_ARMA(Hir, sm) {
+@@ -802,6 +817,9 @@ namespace {
+                                     DEBUG("Found HIR glob");
+                                     return rv;
+                                 }
++                                if( this->is_builtin_macro(ns, out_path) ) {
++                                    return ResolveItemRef::make_None({});
++                                }
+                                 // Not found, fall through
+                                 }
+                             }
+@@ -956,6 +974,9 @@ namespace {
+                         if(const auto* p = mi->opt_Import())
+                         {
+                             if( p->path.crate_name() == CRATE_BUILTINS ) {
++                                if(out_path) {
++                                    *out_path = sp_to_ap(p->path);
++                                }
+                                 auto v = H2::get_builtin(sp, p->path.components().back());
+                                 if( v.is_None() ) {
+                                     break;

@@ -1,0 +1,149 @@
+From defedd01baafbc66451f85b20c03b1c9c3b05963 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 6 Nov 2026 08:15:56 +0000
+Subject: [PATCH] expand: `$crate` of the crate being compiled goes to a proc
+ macro as `crate` when another crate's `$crate` is in the input
+
+tor-cell 0.47.0 (arti 2.7.0) chancell/msg.rs:28 `restricted_msg! {
+#[derive_deftly(HasMemoryCost)] pub enum AnyChanMsg .. }`: `BUG:
+src/expand/proc_macro.cpp:2949: TODO: realGetToken_ - $crate from more
+than one crate in the input of one proc macro invocation`.
+
+The enum the macro writes names tor-cell's own `$crate` in its field types
+(a lib crate's local `$crate` is `::"tor_cell-.."`), and the template
+macro_rules from tor-memquota-cost hands its `$crate` to the
+derive_deftly_engine proc macro in the same input. Both went out as the
+ident `$crate`; libproc_macro gives every token `Span::call_site()` and
+derive-deftly compares idents to the literal `$crate`, so neither a span
+nor a renamed ident can carry the crate, and the reader mapped `$crate`
+back to the one crate it had seen.
+
+ProcMacro_Invoke now dry-runs the visitor into a sink that only records
+the crates `$crate` names (attribute answers delegated to the real sink,
+so the same attributes are visited and marked). With more than one crate,
+and one of them the crate being compiled, that crate's `$crate` is sent as
+the `crate` keyword, the same path in the invoking crate, and the one
+foreign crate keeps `$crate`. A single crate, local or foreign, keeps
+`$crate` as before. Two foreign crates in one input still hit the TODO,
+which now lists them; carrying the crate needs spans in the protocol.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index a7add828..348ce7ff 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -17,6 +17,7 @@
+ #include <parse/lex.hpp>
+ #include <parse/ttstream.hpp>
+ #include <unordered_set>
++#include <set>
+ #include <map>
+ #ifdef _WIN32
+ # define NOMINMAX
+@@ -350,6 +351,13 @@ public:
+     }
+     /// `$crate` naming another crate (`::"<crate>"` in a macro_rules expansion), mapped back on the way out
+     void send_dollar_crate(const ::std::string& crate_name) override {
++        // The crate being compiled, when another crate's `$crate` is in the same input: `crate::` is the same path
++        // here, and the one `$crate` left maps back to that other crate (see `ProcMacro_Invoke`)
++        if( !m_local_crate_as_crate.empty() && crate_name == m_local_crate_as_crate ) {
++            this->send_rword("crate");
++            return;
++        }
++        m_dollar_crates_seen.insert(crate_name);
+         if( m_dollar_crate == "" ) {
+             m_dollar_crate = crate_name;
+         }
+@@ -359,6 +367,9 @@ public:
+         this->send_u8(static_cast<uint8_t>(TokenClass::Ident));
+         this->send_bytes("$crate", 6);
+     }
++    void set_local_crate_as_crate(::std::string crate_name) {
++        m_local_crate_as_crate = ::std::move(crate_name);
++    }
+     void send_lifetime(const char* val) override {
+         this->send_u8(static_cast<uint8_t>(TokenClass::Lifetime));
+         this->send_bytes(val, ::std::strlen(val));
+@@ -475,6 +486,9 @@ private:
+     /// The crate `$crate` stands for in this invocation's input (see `send_dollar_crate`)
+     ::std::string   m_dollar_crate;
+     bool    m_dollar_crate_ambiguous = false;
++    ::std::set<::std::string>   m_dollar_crates_seen;
++    /// The crate being compiled, when its `$crate` goes out as the `crate` keyword (set by `ProcMacro_Invoke`)
++    ::std::string   m_local_crate_as_crate;
+     /// Crate name to return after the `::` that a `$crate` from the child process maps to
+     ::std::string   m_pending_dollar_crate;
+     void send_u8(uint8_t v);
+@@ -2309,6 +2323,34 @@ namespace {
+     v.visit_type(ty);
+     return rv;
+ }
++namespace {
++    /// Records the crates `$crate` names in an invocation's input: a dry run of the visitor before anything is sent
++    /// (the attribute answers come from the real sink, so the same attributes are visited and marked)
++    struct DollarCrateScan:
++        public TokenSink
++    {
++        const TokenSink&    real;
++        ::std::set<::std::string>   crates;
++        DollarCrateScan(const TokenSink& real): real(real) {}
++        void send_symbol(const char*) override {}
++        void send_none_group_open() override {}
++        void send_none_group_close() override {}
++        void send_rword(const char*) override {}
++        void send_ident(const char*) override {}
++        void send_dollar_crate(const ::std::string& crate_name) override { crates.insert(crate_name); }
++        void send_lifetime(const char*) override {}
++        void send_string(const ::std::string&) override {}
++        void send_bytestring(const ::std::string&) override {}
++        void send_cstring(const ::std::string&) override {}
++        void send_suffix(const RcString&) override {}
++        void send_char(uint32_t) override {}
++        void send_byte_char(uint8_t) override {}
++        void send_int(eCoreType, U128) override {}
++        void send_float(eCoreType, double) override {}
++        bool attr_is_used(const RcString& n) const override { return real.attr_is_used(n); }
++        bool attr_is_helper(const RcString& n) const override { return real.attr_is_helper(n); }
++    };
++}
+ ::std::vector<Token> ProcMacro_ItemTokens(const Span& sp, const AST::Named<AST::Item>& item, const Ident::Hygiene& hygiene)
+ {
+     ::std::vector<Token>    rv;
+@@ -2326,6 +2368,25 @@ namespace {
+     auto pmi = ProcMacro_Invoke_int(sp, crate, mac_path);
+     if( !pmi.check_good() )
+         return ::std::unique_ptr<TokenStream>();
++    // `$crate` from two crates in one input (a derive_deftly template's own `$crate` on a driver another macro_rules
++    // wrote with this crate's `$crate` paths: tor-cell 0.47.0 chancell/msg.rs:28 `restricted_msg! { #[derive_deftly(
++    // HasMemoryCost)] .. }` with tor-memquota-cost's template): every token comes back with `Span::call_site()`, so only
++    // one crate can be mapped back from the echoed `$crate` idents. The crate being compiled gives up its `$crate` for
++    // the `crate` keyword then (the same path from here), leaving `$crate` to the other crate. A single crate, local or
++    // not, keeps the `$crate` spelling as before.
++    {
++        DollarCrateScan scan(pmi);
++        Visitor v(sp, scan);
++        if( attr_input && attr_input->size() != 0 ) {
++            for(size_t i = 1; i < attr_input->size() - 1; i++)
++                v.visit_tokentree( (*attr_input)[i] );
++        }
++        cb(v);
++        if( scan.crates.size() > 1 && scan.crates.count(crate.m_crate_name_real.c_str()) ) {
++            DEBUG("`$crate` names " << scan.crates.size() << " crates, sending the local " << crate.m_crate_name_real << " as `crate`");
++            pmi.set_local_crate_as_crate(crate.m_crate_name_real.c_str());
++        }
++    }
+     if( attr_input ) {
+         // TODO: Assert that this is a `#[proc_macro_attribute]` macro
+         if( attr_input->size() != 0 )
+@@ -2946,7 +3007,8 @@ Token ProcMacroInv::realGetToken_() {
+         // A `$crate` passed in (see `send_dollar_crate`) is the same `::"<crate>"` path prefix again
+         if( val == "$crate" && m_dollar_crate != "" ) {
+             if( m_dollar_crate_ambiguous ) {
+-                TODO(this->m_parent_span, "`$crate` from more than one crate in the input of one proc macro invocation");
++                TODO(this->m_parent_span, "`$crate` from more than one crate in the input of one proc macro invocation: "
++                    << FMT_CB(os, for(const auto& c : m_dollar_crates_seen) os << c << " "));
+             }
+             m_pending_dollar_crate = m_dollar_crate;
+             return Token(TOK_DOUBLE_COLON);

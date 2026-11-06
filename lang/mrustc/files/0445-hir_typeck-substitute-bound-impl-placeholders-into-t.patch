@@ -1,0 +1,120 @@
+From 9d19db65adc79872586a72567ba989c9c2129f55 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Fri, 6 Nov 2026 06:46:21 +0000
+Subject: [PATCH] hir_typeck: substitute bound impl placeholders into the other
+ slots between passes
+
+opentelemetry 0.33.1 (termscp 1.2.2) src/global/trace.rs:346: `BUG:
+src/hir_typeck/expr_cs.cpp:9112: Spare rules left after typecheck
+stabilised` (`_ : Tracer`, `S = <_ as Tracer>::Span`).
+
+`GlobalTracerProvider::new<P, T, S>(provider: P)` stores `Arc::new(provider)`
+as `Arc<dyn ObjectSafeTracerProvider + Send + Sync>`. The unsize needs the
+blanket `impl<S, T, P> ObjectSafeTracerProvider for P where T: Tracer<Span =
+S>, P: TracerProvider<Tracer = T>`, whose T and S are only reachable through
+the fn's own where clause.
+
+ftic_check_params checks the impl's bounds with placeholders for S and T.
+Pass 0 checked `T: Tracer<Span = S>` while T was unknown and bound the S
+placeholder to `<ph_T as Tracer>::Span`; `P: TracerProvider<Tracer = T>`
+then bound ph_T to the fn's T. The S slot kept the stale ph_T, so pass 1
+compared the bounds against that projection, the match came back with
+params `<<ph_T as Tracer>::Span, T, P>`, and check_associated turned the
+leftover placeholder into a fresh ivar nothing can infer.
+
+Before each pass after the first, substitute the bound placeholders into
+the other slots (a pass-through Monomorphiser) and expand the result:
+`<T as Tracer>::Span` is the fn's S through its where-clause equality, so
+the match returns `<S, T, P>` and the bound rules check_associated adds are
+closed over the fn's generics. The verdict stays sticky (a reset to Equal
+for an all-exact pass broke impl-const-ivar-test bound_twice, whose request
+ivar is equated only on the fuzzy single-impl path).
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/helpers.cpp b/src/hir_typeck/helpers.cpp
+index 48e64d1d..7f83028c 100644
+--- a/src/hir_typeck/helpers.cpp
++++ b/src/hir_typeck/helpers.cpp
+@@ -4196,6 +4196,57 @@ namespace {
+     //for(const auto& t : placeholders)
+     //    saved_ph.push_back(t.clone());
+ 
++    // A placeholder bound to a type that names another placeholder (`S := <ph1 as Tracer>::Span` from the fuzzy check of
++    // `T: Tracer<Span = S>` while T was unknown) kept that name after the other placeholder was bound, so the next pass
++    // compared the bounds against the stale projection, stayed fuzzy, and check_associated turned the leftover
++    // placeholder into a fresh ivar nothing constrains.
++    // - opentelemetry 0.33.1 global/trace.rs:346 `Arc::new(provider)` as `Arc<dyn ObjectSafeTracerProvider>` inside
++    //   `new<P, T, S>` (`P: TracerProvider<Tracer = T>`, `T: Tracer<Span = S>`): "Spare rules left", `_ : Tracer`
++    // Before each pass, substitute the bound placeholders into the other slots and expand the result (`<T as Tracer>::Span`
++    // is the fn's `S` through its where clause). The verdict stays sticky: a bound that was fuzzy once keeps the
++    // result Fuzzy (check_associated's single-impl path equates request ivars with what the placeholders bound).
++    struct PlaceholderResolve:
++        public Monomorphiser
++    {
++        const RcString& placeholder_name;
++        const HIR::PathParams& impl_params;
++        const HIR::PathParams& placeholders;
++        unsigned    self_idx;
++        PlaceholderResolve(const RcString& placeholder_name, const HIR::PathParams& impl_params, const HIR::PathParams& placeholders, unsigned self_idx)
++            : placeholder_name(placeholder_name), impl_params(impl_params), placeholders(placeholders), self_idx(self_idx)
++        {}
++        static bool is_raw_placeholder(const ::HIR::TypeRef& ty, const RcString& name, unsigned i) {
++            const auto* g = ty.data().opt_Generic();
++            return g && g->is_placeholder() && g->name == name && g->idx() == i;
++        }
++        static bool is_raw_placeholder(const ::HIR::ConstGeneric& v, const RcString& name, unsigned i) {
++            const auto* g = v.opt_Generic();
++            return g && g->is_placeholder() && g->name == name && g->idx() == i;
++        }
++        ::HIR::TypeRef get_type(const Span& sp, const ::HIR::GenericRef& g) const override {
++            if( g.is_placeholder() && g.name == placeholder_name && g.idx() != self_idx ) {
++                auto i = g.idx();
++                if( i < impl_params.m_types.size() && impl_params.m_types[i] != HIR::TypeRef() )
++                    return impl_params.m_types[i].clone();
++                if( i < placeholders.m_types.size() && placeholders.m_types[i] != HIR::TypeRef() && !is_raw_placeholder(placeholders.m_types[i], placeholder_name, i) )
++                    return placeholders.m_types[i].clone();
++            }
++            return HIR::TypeRef(g);
++        }
++        ::HIR::ConstGeneric get_value(const Span& sp, const ::HIR::GenericRef& g) const override {
++            if( g.is_placeholder() && g.name == placeholder_name ) {
++                auto i = g.idx();
++                if( i < impl_params.m_values.size() && impl_params.m_values[i] != HIR::ConstGeneric() )
++                    return impl_params.m_values[i].clone();
++                if( i < placeholders.m_values.size() && placeholders.m_values[i] != HIR::ConstGeneric() && !is_raw_placeholder(placeholders.m_values[i], placeholder_name, i) )
++                    return placeholders.m_values[i].clone();
++            }
++            return HIR::ConstGeneric(g);
++        }
++        ::HIR::LifetimeRef get_lifetime(const Span& sp, const ::HIR::GenericRef& g) const override {
++            return ::HIR::LifetimeRef(g.binding);
++        }
++    };
+     // Keep looping while placeholders are updated
+     int loops = 0;
+     HIR::PathParams last_placeholders;
+@@ -4203,6 +4254,22 @@ namespace {
+         DEBUG(">> LOOP " << loops);
+         ASSERT_BUG(sp, loops < 4, "Excessive iterations while resolving bound placeholders");
+         loops += 1;
++        if( loops > 1 )
++        {
++            for(size_t i = 0; i < placeholders.m_types.size(); i ++)
++            {
++                auto& slot = placeholders.m_types[i];
++                if( slot == HIR::TypeRef() || PlaceholderResolve::is_raw_placeholder(slot, placeholder_name, i) )
++                    continue;
++                auto resolved = PlaceholderResolve(placeholder_name, out_impl_params, placeholders, i).monomorph_type(sp, slot, true);
++                if( resolved != slot )
++                {
++                    resolved = this->expand_associated_types(sp, mv$(resolved));
++                    DEBUG("Placeholder " << i << ": " << slot << " -> " << resolved);
++                    slot = mv$(resolved);
++                }
++            }
++        }
+         last_placeholders = placeholders.clone();
+         // Check bounds for this impl
+         // - If a bound fails, then this can't be a valid impl
