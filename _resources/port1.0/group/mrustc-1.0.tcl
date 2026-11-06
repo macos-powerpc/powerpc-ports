@@ -1088,7 +1088,7 @@ proc rust::rust_pg_callback {} {
         depends_build-append            port:mrustc
     }
 
-    if { [option openssl.branch] ne "" } {
+    if {[option openssl.branch] ne ""} {
         set openssl_ver                 [string map {. {}} [option openssl.branch]]
         depends_lib-delete              port:openssl${openssl_ver}
         depends_lib-append              port:openssl${openssl_ver}
@@ -1169,3 +1169,14 @@ proc rust::rust_pg_callback {} {
     }
 }
 port::register_callback rust::rust_pg_callback
+
+proc rust::use_right_arch_platform {} {
+    # Avoid arbitrary arch & macOS version restrictions in upstream MacPorts:
+    if {[option supported_archs] ne "noarch"} {
+        supported_archs ppc x86_64 arm64
+    }
+    # Until 10.5 is fixed, only 10.6 ppc supported:
+    platforms {darwin >= 10}
+    known_fail no
+}
+port::register_callback rust::use_right_arch_platform
