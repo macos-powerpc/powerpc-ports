@@ -1,0 +1,106 @@
+russh-sftp: 32-bit PowerPC has no 64-bit atomics, so std::sync::atomic::AtomicU64 does not exist there ("Unable to
+resolve `use` target std::sync::atomic::AtomicU64" in src/client/rawsession.rs; rustc on ppc32 fails the same way).
+RawSftpSession keeps its open-handle count in an AtomicU64 used through load/fetch_add/fetch_update (the timeout is an
+RwLock<u64> in these releases). New src/client/atomic64.rs: std's AtomicU64 where the target has 64-bit atomics
+(`cfg(target_has_atomic = "64")`), else a Mutex<u64> with the same surface (store is unused here, hence
+allow(dead_code)); rawsession.rs imports it from there. Applies to 2.0.0 .. 2.1.1 (2.0.7 is yanked; every other
+release rejected in a dry run); 2.1.2..2.4.0 and 3.0.0+ have their own files. rawsession.rs has CRLF line endings in
+the crate and the hunk keeps them: transport it binary-safe. Base: russh-sftp 2.1.1.
+
+diff -ruN a/src/client/atomic64.rs b/src/client/atomic64.rs
+--- a/src/client/atomic64.rs
++++ b/src/client/atomic64.rs
+@@ -0,0 +1,68 @@
++//! `AtomicU64` for targets without 64-bit atomics.
++//!
++//! 32-bit PowerPC, MIPS and older ARM have no `std::sync::atomic::AtomicU64`.
++//! The open-handle count and the request timeout are `u64` values compared
++//! with `u64` limits, so a narrower atomic would need casts throughout; those
++//! targets get a mutex with the same `new`/`load`/`store`/`fetch_add`/
++//! `fetch_update` surface.
++
++#[cfg(target_has_atomic = "64")]
++pub(crate) use std::sync::atomic::AtomicU64;
++
++#[cfg(not(target_has_atomic = "64"))]
++pub(crate) use fallback::AtomicU64;
++
++#[cfg(not(target_has_atomic = "64"))]
++#[allow(dead_code)]
++mod fallback {
++    use std::sync::atomic::Ordering;
++    use std::sync::Mutex;
++
++    #[derive(Debug)]
++    pub(crate) struct AtomicU64(Mutex<u64>);
++
++    impl AtomicU64 {
++        pub(crate) const fn new(value: u64) -> Self {
++            Self(Mutex::new(value))
++        }
++
++        fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
++            self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++        }
++
++        pub(crate) fn load(&self, _order: Ordering) -> u64 {
++            *self.lock()
++        }
++
++        pub(crate) fn store(&self, value: u64, _order: Ordering) {
++            *self.lock() = value;
++        }
++
++        pub(crate) fn fetch_add(&self, value: u64, _order: Ordering) -> u64 {
++            let mut guard = self.lock();
++            let previous = *guard;
++            *guard = previous.wrapping_add(value);
++            previous
++        }
++
++        pub(crate) fn fetch_update<F>(
++            &self,
++            _set_order: Ordering,
++            _fetch_order: Ordering,
++            mut f: F,
++        ) -> Result<u64, u64>
++        where
++            F: FnMut(u64) -> Option<u64>,
++        {
++            let mut guard = self.lock();
++            let previous = *guard;
++            match f(previous) {
++                Some(next) => {
++                    *guard = next;
++                    Ok(previous)
++                }
++                None => Err(previous),
++            }
++        }
++    }
++}
+diff -ruN a/src/client/mod.rs b/src/client/mod.rs
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -1,3 +1,4 @@
++mod atomic64;
+ pub mod error;
+ pub mod fs;
+ mod handler;
+diff -ruN a/src/client/rawsession.rs b/src/client/rawsession.rs
+--- a/src/client/rawsession.rs
++++ b/src/client/rawsession.rs
+@@ -2,11 +2,12 @@
+ use flurry::HashMap;
+ use std::{
+     sync::{
+-        atomic::{AtomicU32, AtomicU64, Ordering},
++        atomic::{AtomicU32, Ordering},
+         Arc,
+     },
+     time::Duration,
+ };
++use super::atomic64::AtomicU64;
+ use tokio::{
+     io::{AsyncRead, AsyncWrite},
+     sync::{mpsc, RwLock},
