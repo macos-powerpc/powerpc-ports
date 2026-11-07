@@ -1,0 +1,410 @@
+From 4c5180cd89cda7a212bba31eac3b60dfa3d6b3b3 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 7 Nov 2026 06:09:11 +0000
+Subject: [PATCH] expand: a proc macro's input has commas only between list
+ entries
+
+tor-ptmgr 0.47.0 (arti 2.7.0) config.rs:23 `#[derive_deftly(TorConfig)]`
+with `#[deftly(tor_config(default, setter(strip_option)))] path:
+Option<CfgPath>`: `MACRO<..::strip_option> error:0: compile_error!
+"'strip_option' only works on a type that is an Option<X>"`.
+
+The visitor that hands an item to a proc macro wrote a comma after every
+entry of every list it printed: generic arguments (`Option < CfgPath , >`),
+tuple and fn-pointer types, `for<'a,>`, struct, enum and union bodies,
+fn arguments, use lists, slice/tuple/struct patterns and where clauses.
+syn takes a trailing comma everywhere, so nothing had noticed; but
+derive-deftly re-emits a field's type (`$ftype`) into tor-config's
+`strip_option!{..}`, whose `Option < $t:ty >` arm cannot match the comma
+and whose `$t:ty` error arm can. rustc hands over the tokens as written,
+and a trailing comma is only ever written by choice.
+
+A comma now only separates entries, and is kept where it is syntax:
+a one-element tuple type `(T,)` and tuple pattern `(p,)`. The fn-pointer
+type and the higher-ranked bounds go through the AST printers (re-lexed
+as proc-macro input), fixed the same way.
+
+Assisted-by: Claude Fable 5.1
+---
+ 
+diff --git a/src/ast/ast.cpp b/src/ast/ast.cpp
+index ad51d6fd..c653cee8 100644
+--- a/src/ast/ast.cpp
++++ b/src/ast/ast.cpp
+@@ -607,7 +607,11 @@ Item Item::clone() const
+     {
+         os << "for<";
+         for(const auto& l : x.m_lifetimes)
+-            os << l << ",";
++        {
++            if( &l != x.m_lifetimes.data() )
++                os << ",";
++            os << l;
++        }
+         os << "> ";
+     }
+     return os;
+diff --git a/src/ast/types.cpp b/src/ast/types.cpp
+index 7acbe864..601c2395 100644
+--- a/src/ast/types.cpp
++++ b/src/ast/types.cpp
+@@ -296,8 +296,9 @@ void TypeRef::print(::std::ostream& os, bool is_debug/*=false*/) const
+         os << "fn(";
+         for( const auto& arg : ent.info.m_arg_types )
+         {
++            if( &arg != ent.info.m_arg_types.data() )
++                os << ", ";
+             arg.print(os, is_debug);
+-            os << ", ";
+         }
+         os << ")";
+         if( !ent.info.m_rettype->is_unit() ) {
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 348ce7ff..f449de02 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -927,23 +927,26 @@ namespace {
+             TU_ARMA(StructTuple, e) {
+                 this->visit_path(e.path, /*is_expr=*/true);
+                 m_pmi.send_symbol("(");
+-                visit_tuple_pattern(e.tup_pat);
++                visit_tuple_pattern(e.tup_pat, false);
+                 m_pmi.send_symbol(")");
+                 }
+             TU_ARMA(Slice, e) {
+                 m_pmi.send_symbol("[");
++                bool first = true;
+                 for(const auto& p : e.sub_pats) {
++                    sep(first);
+                     visit_pattern(p);
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol("]");
+                 }
+             TU_ARMA(SplitSlice, e) {
+                 m_pmi.send_symbol("[");
++                bool first = true;
+                 for(const auto& p : e.leading) {
++                    sep(first);
+                     visit_pattern(p);
+-                    m_pmi.send_symbol(",");
+                 }
++                sep(first);
+                 if( e.extra_bind.is_valid() ) {
+                     if( e.extra_bind.m_mutable ) {
+                         m_pmi.send_rword("mut");
+@@ -958,10 +961,9 @@ namespace {
+                     m_pmi.send_symbol("@");
+                 }
+                 m_pmi.send_symbol("..");
+-                m_pmi.send_symbol(",");
+                 for(const auto& p : e.trailing) {
++                    sep(first);
+                     visit_pattern(p);
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol("]");
+                 }
+@@ -986,20 +988,22 @@ namespace {
+                 }
+             TU_ARMA(Tuple, e) {
+                 m_pmi.send_symbol("(");
+-                visit_tuple_pattern(e);
++                visit_tuple_pattern(e, true);
+                 m_pmi.send_symbol(")");
+                 }
+             TU_ARMA(Struct, e) {
+                 this->visit_path(e.path, /*is_expr=*/true);
+                 m_pmi.send_symbol("{");
++                bool first = true;
+                 for(const auto& spe : e.sub_patterns) {
++                    sep(first);
+                     this->visit_attrs(spe.attrs);
+                     m_pmi.send_ident(spe.name);
+                     m_pmi.send_symbol(":");
+                     this->visit_pattern(spe.pat);
+-                    m_pmi.send_symbol(",");
+                 }
+                 if( !e.is_exhaustive ) {
++                    sep(first);
+                     m_pmi.send_symbol("..");
+                 }
+                 m_pmi.send_symbol("}");
+@@ -1060,21 +1064,36 @@ namespace {
+                 }
+             }
+         }
+-        void visit_tuple_pattern(const AST::Pattern::TuplePat& v)
++        // The comma between two list entries: rustc hands a proc macro the tokens as written, and a trailing comma is
++        // only there when the source wrote one. derive-deftly re-emits a field's type (`$ftype`) into tor-config's
++        // `strip_option!{..}`, whose `Option < $t:ty >` arm can't take `Option<CfgPath,>` (tor-ptmgr 0.47.0 config.rs:23)
++        void sep(bool& first)
+         {
++            if( !first )
++                m_pmi.send_symbol(",");
++            first = false;
++        }
++        void visit_tuple_pattern(const AST::Pattern::TuplePat& v, bool is_bare_tuple)
++        {
++            bool first = true;
+             for(const auto& p : v.start) {
++                sep(first);
+                 visit_pattern(p);
+-                m_pmi.send_symbol(",");
+             }
+             if( v.has_wildcard )
+             {
++                sep(first);
+                 m_pmi.send_symbol("..");
+-                m_pmi.send_symbol(",");
+                 for(const auto& p : v.end) {
++                    sep(first);
+                     visit_pattern(p);
+-                    m_pmi.send_symbol(",");
+                 }
+             }
++            else if( is_bare_tuple && v.start.size() == 1 )
++            {
++                // `(p,)` is a tuple pattern, `(p)` a parenthesised one
++                m_pmi.send_symbol(",");
++            }
+         }
+         void visit_lifetime(const AST::LifetimeRef& x)
+         {
+@@ -1127,11 +1146,17 @@ namespace {
+                 ),
+             (Tuple,
+                 m_pmi.send_symbol("(");
+-                for(const auto& st : te.inner_types)
+                 {
+-                    this->visit_type(st);
+-                    m_pmi.send_symbol(",");
++                    bool first = true;
++                    for(const auto& st : te.inner_types)
++                    {
++                        sep(first);
++                        this->visit_type(st);
++                    }
+                 }
++                // `(T,)` is a tuple, `(T)` the type itself
++                if( te.inner_types.size() == 1 )
++                    m_pmi.send_symbol(",");
+                 m_pmi.send_symbol(")");
+                 ),
+             (Borrow,
+@@ -1232,10 +1257,11 @@ namespace {
+             {
+                 m_pmi.send_rword("for");
+                 m_pmi.send_symbol("<");
++                bool first = true;
+                 for(const auto& v : hrbs.m_lifetimes)
+                 {
++                    sep(first);
+                     m_pmi.send_lifetime(v.name().name.c_str());
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol(">");
+             }
+@@ -1258,29 +1284,28 @@ namespace {
+                 if( is_expr )
+                     m_pmi.send_symbol("::");
+                 m_pmi.send_symbol("<");
++                bool first = true;
+                 for(const auto& ent : e.args().m_entries)
+                 {
++                    if( !ent.is_Null() )
++                        sep(first);
+                     TU_MATCH_HDRA( (ent), {)
+                     TU_ARMA(Null, _) {}
+                     TU_ARMA(Lifetime, l) {
+                         m_pmi.send_lifetime(l.name().name.c_str());
+-                        m_pmi.send_symbol(",");
+                         }
+                     TU_ARMA(Type, t) {
+                         this->visit_type(t);
+-                        m_pmi.send_symbol(",");
+                         }
+                     TU_ARMA(Value, n) {
+                         m_pmi.send_symbol("{");
+                         this->visit_node(*n);
+                         m_pmi.send_symbol("}");
+-                        m_pmi.send_symbol(",");
+                         }
+                     TU_ARMA(AssociatedTyEqual, a) {
+                         visit_path_node(a.first, false);
+                         m_pmi.send_symbol("=");
+                         this->visit_type(a.second);
+-                        m_pmi.send_symbol(",");
+                         }
+                     TU_ARMA(AssociatedTyBound, a) {
+                         visit_path_node(a.first, false);
+@@ -1290,7 +1315,6 @@ namespace {
+                                 m_pmi.send_symbol("+");
+                             this->visit_path(p);
+                         }
+-                        m_pmi.send_symbol(",");
+                         }
+                     }
+                 }
+@@ -1462,9 +1486,10 @@ namespace {
+             if( !hrb.empty() ) {
+                 m_pmi.send_rword("for");
+                 m_pmi.send_symbol("<");
++                bool first = true;
+                 for(const auto& lft : hrb.m_lifetimes) {
++                    sep(first);
+                     m_pmi.send_lifetime(lft.name().name.c_str());
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol(">");
+             }
+@@ -1523,6 +1548,9 @@ namespace {
+                         m_pmi.send_rword("where");
+                         where_sent = true;
+                     }
++                    else {
++                        m_pmi.send_symbol(",");
++                    }
+                     TU_MATCH_HDRA((e), {)
+                     TU_ARMA(None, be)   continue;
+                     TU_ARMA(Lifetime, be) {
+@@ -1560,7 +1588,6 @@ namespace {
+                         visit_type(be.replacement);
+                         }
+                     }
+-                    m_pmi.send_symbol(",");
+                 }
+             }
+         }
+@@ -1723,12 +1750,13 @@ namespace {
+                 }
+             TU_ARMA(Tuple, se) {
+                 m_pmi.send_symbol("(");
++                bool first = true;
+                 for( const auto& si : se.ents )
+                 {
++                    sep(first);
+                     this->visit_attrs(si.m_attrs);
+                     this->visit_vis(si.m_vis);
+                     this->visit_type(si.m_type);
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol(")");
+                 this->visit_bounds(str.params());
+@@ -1738,8 +1766,10 @@ namespace {
+                 this->visit_bounds(str.params());
+                 m_pmi.send_symbol("{");
+ 
++                bool first = true;
+                 for( const auto& si : se.ents )
+                 {
++                    sep(first);
+                     this->visit_attrs(si.m_attrs);
+                     this->visit_vis(si.m_vis);
+                     m_pmi.send_ident(si.m_name.c_str());
+@@ -1749,7 +1779,6 @@ namespace {
+                         m_pmi.send_symbol("=");
+                         this->visit_nodes(si.m_default);
+                     }
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol("}");
+                 }
+@@ -1764,8 +1793,10 @@ namespace {
+             this->visit_params(enm.params());
+             this->visit_bounds(enm.params());
+             m_pmi.send_symbol("{");
++            bool first_variant = true;
+             for(const auto& v : enm.variants())
+             {
++                sep(first_variant);
+                 this->visit_attrs(v.m_attrs);
+                 m_pmi.send_ident(v.m_name.c_str());
+                 TU_MATCH_HDRA( (v.m_data), { )
+@@ -1773,23 +1804,25 @@ namespace {
+                     }
+                 TU_ARMA(Tuple, e) {
+                     m_pmi.send_symbol("(");
++                    bool first = true;
+                     for(const auto& f : e.m_items)
+                     {
++                        sep(first);
+                         this->visit_attrs(f.m_attrs);
+                         this->visit_type(f.m_type);
+-                        m_pmi.send_symbol(",");
+                     }
+                     m_pmi.send_symbol(")");
+                     }
+                 TU_ARMA(Struct, e) {
+                     m_pmi.send_symbol("{");
++                    bool first = true;
+                     for(const auto& f : e.m_fields)
+                     {
++                        sep(first);
+                         this->visit_attrs(f.m_attrs);
+                         m_pmi.send_ident(f.m_name.c_str());
+                         m_pmi.send_symbol(":");
+                         this->visit_type(f.m_type);
+-                        m_pmi.send_symbol(",");
+                     }
+                     m_pmi.send_symbol("}");
+                     }
+@@ -1799,7 +1832,6 @@ namespace {
+                     m_pmi.send_symbol("=");
+                     this->visit_nodes(v.m_discriminant_value);
+                 }
+-                m_pmi.send_symbol(",");
+             }
+             m_pmi.send_symbol("}");
+         }
+@@ -1814,14 +1846,15 @@ namespace {
+             this->visit_params(unn.params());
+             this->visit_bounds(unn.params());
+             m_pmi.send_symbol("{");
++            bool first = true;
+             for( const auto& si : unn.m_variants )
+             {
++                sep(first);
+                 this->visit_attrs(si.m_attrs);
+                 this->visit_vis(si.m_vis);
+                 m_pmi.send_ident(si.m_name.c_str());
+                 m_pmi.send_symbol(":");
+                 this->visit_type(si.m_type);
+-                m_pmi.send_symbol(",");
+             }
+             m_pmi.send_symbol("}");
+         }
+@@ -1848,18 +1881,19 @@ namespace {
+             m_pmi.send_ident(name.c_str());
+             this->visit_params(fcn.params());
+             m_pmi.send_symbol("(");
++            bool first = true;
+             for( const auto& arg : fcn.args() ) {
++                sep(first);
+                 this->visit_attrs(arg.attrs);
+                 if( &arg == &fcn.args().front() && this->visit_receiver_shorthand(arg) ) {
+-                    m_pmi.send_symbol(",");
+                     continue;
+                 }
+                 this->visit_pattern(arg.pat);
+                 m_pmi.send_symbol(":");
+                 this->visit_type(arg.ty);
+-                m_pmi.send_symbol(",");
+             }
+             if( fcn.is_variadic() ) {
++                sep(first);
+                 m_pmi.send_symbol("...");
+             }
+             m_pmi.send_symbol(")");
+@@ -1971,9 +2005,10 @@ namespace {
+                 // The entries are full paths (a `use a::{b, c}` tree is flattened), so send them as one group
+                 // - ratatui 0.30.2 widgets.rs:690: `#[instability::unstable(..)] pub use {x::A, y::B};`
+                 m_pmi.send_symbol("{");
++                bool first = true;
+                 for(const auto& ent : item.entries) {
++                    sep(first);
+                     visit_use_ent(ent);
+-                    m_pmi.send_symbol(",");
+                 }
+                 m_pmi.send_symbol("}");
+             }

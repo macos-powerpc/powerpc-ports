@@ -1,0 +1,233 @@
+From 4c8cdbd9ac5a27bec829e7d8886bda9b422c08bd Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 7 Nov 2026 04:56:48 +0000
+Subject: [PATCH] hir: a `_` generic argument in a const parameter's position
+ is an inferred const
+
+tor-proto 0.47.0 (arti 2.7.0) circuit/reactor/backward.rs:400
+`<PollAll::<_, _> as Future>::Output::new()` with
+`struct PollAll<'a, const N: usize, T>`: `error:0: Too many type
+parameters passed to ::..::PollAll<'#omitted,_,_,>`.
+
+`_` may stand for a const argument (generic_arg_infer, stable since
+1.89). The parser can only write it as a type, and the kinds were never
+revisited, so the struct received two type arguments.
+
+LowerHIR_PathParams now takes the parameter kinds of the item the path is
+bound to: an item of this crate gives the declaration order, so each `_`
+is a type or a const by position; an item of another crate keeps its
+types and consts apart in HIR, so the trailing `_`s take the missing
+const slots. Such a `_` lowers to an inferred value. A method or
+associated-function turbofish is only matched against its callee in
+typeck, where fix_param_count_ moves the surplus inferred types into the
+missing values (last first, each given an ivar). Placement is exact for
+this crate's items; the other two cases are wrong only when `_` consts
+and written consts mix in a list whose declaration order interleaves
+kinds (noted as a limitation).
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 6e50e8bb..35655485 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -28,6 +28,7 @@
+ ::HIR::Function LowerHIR_Function(::HIR::ItemPath path, const ::AST::AttributeList& attrs, const ::AST::Function& f, const ::HIR::TypeRef& self_type, const RcString& parent_unstable = RcString());
+ ::HIR::ValueItem LowerHIR_Static(::HIR::ItemPath p, const ::AST::AttributeList& attrs, const ::AST::Static& e, const Span& sp, const RcString& name);
+ ::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc);
++::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc, const ::AST::Path* path);
+ ::HIR::ConstGeneric LowerHIR_ConstGeneric(const ::AST::ExprNode& node_ref);
+ // `self_ty` = the type the trait path bounds (a generic bound's type, `Self` for a supertrait, the erased self of
+ // `dyn`/`impl Trait`): omitted trait parameters take the trait's defaults (`Rhs = Self`) in terms of it when a bound
+@@ -618,13 +619,66 @@ namespace {
+     assert(ap);
+     return ::HIR::SimplePath( (ap->crate == "" ? g_crate_name : ap->crate), ap->nodes );
+ }
++namespace {
++    // The kinds of an item's non-lifetime generic parameters: a `_` argument is a type or a const by its position
++    // (generic_arg_infer, stable since 1.89), and the parser can only write it as a type
++    struct ParamKinds {
++        size_t  n_types = 0;
++        size_t  n_values = 0;
++        ::std::vector<bool> is_value;   // declaration order; empty for another crate's item (its HIR keeps the kinds apart)
++    };
++    bool get_param_kinds(const ::AST::GenericParams& gp, ParamKinds& rv)
++    {
++        for(const auto& p : gp.m_params) {
++            if( p.is_Type() ) {
++                rv.is_value.push_back(false);
++                rv.n_types ++;
++            }
++            else if( p.is_Value() ) {
++                rv.is_value.push_back(true);
++                rv.n_values ++;
++            }
++        }
++        return true;
++    }
++    bool get_param_kinds(const ::HIR::GenericParams& gp, ParamKinds& rv)
++    {
++        rv.n_types = gp.m_types.size();
++        rv.n_values = gp.m_values.size();
++        return true;
++    }
++    bool get_param_kinds(const ::AST::Path& path, ParamKinds& rv)
++    {
++        const auto& tb = path.m_bindings.type.binding;
++        const auto& vb = path.m_bindings.value.binding;
++        if(const auto* e = tb.opt_Struct())     return e->struct_ ? get_param_kinds(e->struct_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_Enum())       return e->enum_ ? get_param_kinds(e->enum_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_Union())      return e->union_ ? get_param_kinds(e->union_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_Trait())      return e->trait_ ? get_param_kinds(e->trait_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_TraitAlias()) return e->trait_ ? get_param_kinds(e->trait_->params, rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_EnumVar())    return e->enum_ ? get_param_kinds(e->enum_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = tb.opt_TypeAlias())  return e->alias_ ? get_param_kinds(e->alias_->params(), rv) : false;
++        if(const auto* e = vb.opt_Function())   return e->func_ ? get_param_kinds(e->func_->params(), rv) : false;
++        if(const auto* e = vb.opt_Struct())     return e->struct_ ? get_param_kinds(e->struct_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        if(const auto* e = vb.opt_EnumVar())    return e->enum_ ? get_param_kinds(e->enum_->params(), rv) : e->hir ? get_param_kinds(e->hir->m_params, rv) : false;
++        return false;
++    }
++    bool is_infer_type(const ::AST::PathParamEnt& e) {
++        return e.is_Type() && e.as_Type().m_data.is_Any();
++    }
++}
+ ::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc)
++{
++    return LowerHIR_PathParams(sp, src_params, allow_assoc, nullptr);
++}
++::HIR::PathParams LowerHIR_PathParams(const Span& sp, const ::AST::PathParams& src_params, bool allow_assoc, const ::AST::Path* path)
+ {
+     ::HIR::PathParams   params;
+ 
+     size_t num_lft = 0;
+     size_t num_ty = 0;
+     size_t num_val = 0;
++    size_t num_infer = 0;
+     
+     for(const auto& param : src_params.m_entries) {
+         TU_MATCH_HDRA( (param), {)
+@@ -635,6 +689,8 @@ namespace {
+             }
+         TU_ARMA(Type, ty) {
+             num_ty ++;
++            if( ty.m_data.is_Any() )
++                num_infer ++;
+             }
+         TU_ARMA(Value, iv) {
+             num_val ++;
+@@ -644,10 +700,53 @@ namespace {
+         }
+     }
+ 
++    // `_` arguments standing for const parameters become inferred values
++    ::std::vector<bool> infer_is_value;
++    ParamKinds  kinds;
++    if( num_infer > 0 && path && get_param_kinds(*path, kinds) && kinds.n_values > num_val && kinds.n_values - num_val <= num_infer )
++    {
++        size_t  n_infer_values = kinds.n_values - num_val;
++        infer_is_value.resize(src_params.m_entries.size(), false);
++        if( !kinds.is_value.empty() )
++        {
++            // This crate's item: by position
++            size_t pos = 0;
++            for(size_t i = 0; i < src_params.m_entries.size(); i ++)
++            {
++                const auto& param = src_params.m_entries[i];
++                if( param.is_Type() || param.is_Value() )
++                {
++                    if( is_infer_type(param) && pos < kinds.is_value.size() && kinds.is_value[pos] )
++                        infer_is_value[i] = true;
++                    pos ++;
++                }
++            }
++        }
++        else
++        {
++            // Another crate's item, the order between types and consts is unknown: the trailing `_`s are the consts
++            for(size_t i = src_params.m_entries.size(); i -- > 0 && n_infer_values > 0; )
++            {
++                if( is_infer_type(src_params.m_entries[i]) ) {
++                    infer_is_value[i] = true;
++                    n_infer_values --;
++                }
++            }
++        }
++        for(bool b : infer_is_value) {
++            if( b ) {
++                num_ty --;
++                num_val ++;
++            }
++        }
++        DEBUG("`_` const arguments in " << src_params << " for " << *path);
++    }
++
+     params.m_lifetimes.reserve_init(num_lft);
+     params.m_types.reserve_init(num_ty);
+     params.m_values.reserve_init(num_val);
+-    for(const auto& param : src_params.m_entries) {
++    for(size_t i = 0; i < src_params.m_entries.size(); i ++) {
++        const auto& param = src_params.m_entries[i];
+         TU_MATCH_HDRA( (param), {)
+         TU_ARMA(Null, ty) {
+             }
+@@ -655,7 +754,10 @@ namespace {
+             params.m_lifetimes.push_back(LowerHIR_LifetimeRef(lft));
+             }
+         TU_ARMA(Type, ty) {
+-            params.m_types.push_back( LowerHIR_Type(ty) );
++            if( !infer_is_value.empty() && infer_is_value[i] )
++                params.m_values.push_back( ::HIR::ConstGeneric() );
++            else
++                params.m_types.push_back( LowerHIR_Type(ty) );
+             }
+         TU_ARMA(Value, iv) {
+             ASSERT_BUG(sp, iv, "Value parameter with null node");
+@@ -699,7 +801,7 @@ namespace {
+     if(const auto* e = path.m_class.opt_Absolute())
+     {
+         auto simpepath = LowerHIR_SimplePath(sp, path, pc, /*allow_params*/true);
+-        ::HIR::PathParams   params = LowerHIR_PathParams(sp, e->nodes.back().args(), allow_assoc);
++        ::HIR::PathParams   params = LowerHIR_PathParams(sp, e->nodes.back().args(), allow_assoc, &path);
+         auto rv = ::HIR::GenericPath(mv$(simpepath), mv$(params));
+         DEBUG(path << " => " << rv);
+         return rv;
+diff --git a/src/hir_typeck/expr_cs__enum.cpp b/src/hir_typeck/expr_cs__enum.cpp
+index 1a38c6ea..55065add 100644
+--- a/src/hir_typeck/expr_cs__enum.cpp
++++ b/src/hir_typeck/expr_cs__enum.cpp
+@@ -80,6 +80,34 @@ namespace typecheck
+     template<typename T>
+     void fix_param_count_(const Span& sp, Context& context, const ::HIR::TypeRef& self_ty, bool use_defaults, const T& path, const ::HIR::GenericParams& param_defs,  ::HIR::PathParams& params)
+     {
++        // A `_` written for a const argument of a method or associated function is lowered as a type (the callee is
++        // only known here): the surplus inferred types fill the missing values, last first
++        if( params.m_types.size() > param_defs.m_types.size() && params.m_values.size() < param_defs.m_values.size() )
++        {
++            size_t n_move = ::std::min(params.m_types.size() - param_defs.m_types.size(), param_defs.m_values.size() - params.m_values.size());
++            ::std::vector<bool> keep(params.m_types.size(), true);
++            for(size_t i = params.m_types.size(); i -- > 0 && n_move > 0; ) {
++                if( params.m_types[i].data().is_Infer() ) {
++                    keep[i] = false;
++                    n_move --;
++                }
++            }
++            if( n_move == 0 ) {
++                ::HIR::PathParams   new_params;
++                new_params.m_lifetimes = ::std::move(params.m_lifetimes);
++                new_params.m_values = ::std::move(params.m_values);
++                for(size_t i = 0; i < params.m_types.size(); i ++) {
++                    if( keep[i] )
++                        new_params.m_types.push_back( ::std::move(params.m_types[i]) );
++                    else {
++                        new_params.m_values.push_back({});
++                        context.m_ivars.add_ivars(new_params.m_values.back());
++                    }
++                }
++                DEBUG("`_` const arguments: " << params << " -> " << new_params);
++                params = ::std::move(new_params);
++            }
++        }
+         if( params.m_lifetimes.size() == param_defs.m_lifetimes.size() ) {
+         }
+         else if( params.m_lifetimes.size() > param_defs.m_lifetimes.size() ) {

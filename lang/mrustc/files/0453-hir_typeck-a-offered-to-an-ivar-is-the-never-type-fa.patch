@@ -1,0 +1,128 @@
+From 450c2ed0bd3518f029b5a9aa2e90beece8f5f72f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 7 Nov 2026 07:55:24 +0000
+Subject: [PATCH] hir_typeck: a `!` offered to an ivar is the never-type
+ fallback, taken last
+
+arti-client 0.47.0 (arti 2.7.0) client.rs:1323
+`enforce_protocol_recommendations(.., |fatal| async move { ..;
+std::process::exit(1); })` where `F: FnOnce(E) -> Fut, Fut:
+Future<Output = ()>`: `Failed to find an impl of Future for async[..]
+with Output = ()`.
+
+The async block's body ends in a diverging statement, so the body block
+is `!` and the block's return ivar had `!` as its only offer. The "one
+source possibility" shortcut of the ivar-possibility pass took that
+offer at once (ivars are walked in index order), so the block's Output
+was `!` before the closure's type was chosen and the caller's
+`FnOnce::Output` / `Future<Output = ()>` rules could reach the block.
+rustc never lets a `!` at a coercion site constrain the target; the
+never-type fallback only applies at the end.
+
+Neither the one-source shortcut nor the unblock pass's single-option
+rule takes a diverging offer any more. The `!` pick (previously part of
+the unblock pass) runs in a pass of its own, IvarPossFallbackType::
+NeverType, after an unblock pass that changed nothing; everything else
+about that level is as the unblock pass.
+
+Assisted-by: Claude Fable 5.1
+---
+
+diff --git a/src/hir_typeck/expr_cs.cpp b/src/hir_typeck/expr_cs.cpp
+index c16cfa0d..9783dd5a 100644
+--- a/src/hir_typeck/expr_cs.cpp
++++ b/src/hir_typeck/expr_cs.cpp
+@@ -6842,6 +6842,8 @@ namespace
+         Assume,
+         // Ignores the weaker disable flags (`force_no_to` and `force_no_from`)
+         IgnoreWeakDisable,
++        // As IgnoreWeakDisable, and takes a `!` that is the only offer (the never-type fallback)
++        NeverType,
+         // First bound, if nothing else works
+         PickFirstBound,
+         // Just picks an option (even if it might be wrong)
+@@ -6854,6 +6856,7 @@ namespace
+         case IvarPossFallbackType::Backwards:   os << " backwards";   break;
+         case IvarPossFallbackType::Assume:  os << " weak";   break;
+         case IvarPossFallbackType::IgnoreWeakDisable:  os << " unblock";   break;
++        case IvarPossFallbackType::NeverType:  os << " never";   break;
+         case IvarPossFallbackType::PickFirstBound:  os << " pick-bound";   break;
+         case IvarPossFallbackType::FinalOption:  os << " final";   break;
+         }
+@@ -7337,7 +7340,7 @@ namespace
+     {
+         static Span _span;
+         const auto& sp = _span;
+-        const bool honour_disable = (fallback_ty != IvarPossFallbackType::IgnoreWeakDisable);
++        const bool honour_disable = (fallback_ty != IvarPossFallbackType::IgnoreWeakDisable && fallback_ty != IvarPossFallbackType::NeverType);
+ 
+         const auto& ty_l = context.m_ivars.get_type(i);
+ 
+@@ -7654,8 +7657,9 @@ namespace
+                     }
+                 }
+             }
+-            if( fallback_ty == IvarPossFallbackType::IgnoreWeakDisable
++            if( (fallback_ty == IvarPossFallbackType::IgnoreWeakDisable || fallback_ty == IvarPossFallbackType::NeverType)
+                 && possible_tys.size() == 1
++                && !possible_tys[0].ty->data().is_Diverge()
+                 )
+             {
+                 auto ent = possible_tys[0];
+@@ -7739,7 +7743,8 @@ namespace
+ 
+             // If there's no disable flags set, and there's only one source, pick it.
+             // - Slight hack to speed up flow-down inference
+-            if( possible_tys.size() == 1 && possible_tys[0].is_source() && !ivar_ent.force_no_from ) {
++            // - Not a `!` source: that is the never-type fallback, taken last (see IvarPossFallbackType::NeverType)
++            if( possible_tys.size() == 1 && possible_tys[0].is_source() && !ivar_ent.force_no_from && !possible_tys[0].ty->data().is_Diverge() ) {
+                 const auto* ty_p = possible_tys[0].ty;
+                 if( possible_tys[0].is_unsize() ) {
+                     HIR::TypeRef tmp_ty;
+@@ -7774,6 +7779,7 @@ namespace
+                 switch(fallback_ty)
+                 {
+                 case IvarPossFallbackType::IgnoreWeakDisable:
++                case IvarPossFallbackType::NeverType:
+                 case IvarPossFallbackType::PickFirstBound:
+                 case IvarPossFallbackType::FinalOption:
+                     break;
+@@ -8323,7 +8329,12 @@ namespace
+             }
+             DEBUG("possible_tys = {" << possible_tys << "} (" << n_src_ivars << " src ivars, " << n_dst_ivars << " dst ivars, possibly_diverge=" << possibly_diverge << ")");
+ 
+-            if( n_src_ivars == 0 && /*n_dst_ivars == 0 &&*/ possible_tys.empty() && possibly_diverge && fallback_ty == IvarPossFallbackType::IgnoreWeakDisable ) {
++            // A `!` offered to an ivar (a diverging value at a coercion site) is the weakest guess there is: rustc never
++            // lets it constrain the ivar and only falls back to it at the end. Taking it in the unblock pass (ivar order)
++            // made an async block's return type `!` before the closure holding the block was chosen and the caller's
++            // `Fut: Future<Output = ()>` could reach it (arti-client 0.47.0 client.rs:1323 `|fatal| async move { ..;
++            // exit(1); }`): it waits for a pass of its own, after an unblock pass that changed nothing.
++            if( n_src_ivars == 0 && /*n_dst_ivars == 0 &&*/ possible_tys.empty() && possibly_diverge && fallback_ty == IvarPossFallbackType::NeverType ) {
+                 auto t = ::HIR::TypeRef::new_diverge();
+                 if( !check_ivar_poss__fails_bounds(sp, context, ty_l, t) )
+                 {
+@@ -8367,6 +8378,7 @@ namespace
+                 case IvarPossFallbackType::None:
+                 case IvarPossFallbackType::Backwards:
+                 case IvarPossFallbackType::IgnoreWeakDisable:
++                case IvarPossFallbackType::NeverType:
+                     active = (n_ivars == 0 && ivar_ent.bounded.size() == 0);
+                     break;
+                 case IvarPossFallbackType::Assume:
+@@ -8917,6 +8929,16 @@ void Typecheck_Code_CS(const typeck::ModuleState& ms, t_args& args, const ::HIR:
+                 }
+             }
+         } // `if peek_changed` (ivar possibilities #2)
++        if( !context.m_ivars.peek_changed() )
++        {
++            DEBUG("--- IVar possibilities (never type)");
++            for(unsigned int i = 0; i < context.possible_ivar_vals.size(); i ++ )
++            {
++                if( check_ivar_poss(context, i, context.possible_ivar_vals[i], IvarPossFallbackType::NeverType) ) {
++                    break;
++                }
++            }
++        }
+ #endif
+ 
+         if( !context.m_ivars.peek_changed() )
