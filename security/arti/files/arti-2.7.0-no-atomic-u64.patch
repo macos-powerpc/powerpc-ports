@@ -1,0 +1,293 @@
+arti: no `AtomicU64` on targets without 64-bit atomics (32-bit PowerPC)
+
+mrustc on powerpc-apple-darwin, building arti 2.7.0 (`--package arti`):
+
+    crates/tor-async-utils/src/bw_pool/bucket.rs:16:5-46 error:0: Unable to resolve `use` target ::"std-0_0_0"::sync::atomic::AtomicU64
+
+32-bit PowerPC, MIPS and older ARM have no 64-bit atomics, so `std::sync::atomic::AtomicU64`
+does not exist there (`cfg(target_has_atomic = "64")` is unset). Five workspace crates use it
+outside tests:
+
+- tor-async-utils bw_pool: the token bucket's `available` count and a waiter's `granted` grant
+  (fetch_update, swap, load, store);
+- tor-proto util/ts.rs `AtomicOptTimestamp` (coarsetime ticks: compare_exchange, fetch_max,
+  load, store; also a `static` via its `const fn new`, and `Default`/`Debug` derives), conflux
+  `last_seq_delivered` (load, fetch_add), `TunnelId` counter;
+- tor-chanmgr `UniqPendingChanId`, tor-guardmgr `RequestId`, tor-circmgr `IsolationToken`:
+  `static` u64 ID counters (fetch_add).
+
+All of them need the full 64 bits (tick counts, u64 IDs whose exhaustion is asserted), so a new
+`tor_async_utils::atomic64::AtomicU64` (the other four crates depend on tor-async-utils; it lives
+there rather than in tor-basic-utils so that no crate built before this stop changes)
+re-exports `std`'s type where the target has 64-bit atomics, and is otherwise a `Mutex<u64>`
+with the same `const fn new`, `Default`, `Debug` and the eight methods above. The orderings are
+accepted and ignored: each operation holds the lock. Other targets compile exactly the code
+they did. tor-proto's xon_xoff reader.rs uses `AtomicU64` in a `#[cfg(test)]` module only and is
+left alone; tests/benches/examples are not built by the port.
+
+Vendored crates in the default `arti` build were scanned too: they either gate their 64-bit
+atomics (tokio, crossbeam, bitvec/radium, figment via the `atomic` crate, serde, bytemuck, ...),
+use portable-atomic (moka, metrics), or are optional and off by default
+(metrics-exporter-prometheus = `metrics`, opentelemetry_sdk). coarsetime has its own
+crate_patches (coarsetime@0.1.32+.patch).
+
+Applies to the GitLab arti-v2.7.0 tree (arti-arti-v2.7.0/) with -p1 (patch.pre_args-replace -p0 -p1).
+
+diff -Nru a/crates/tor-async-utils/src/atomic64.rs b/crates/tor-async-utils/src/atomic64.rs
+--- a/crates/tor-async-utils/src/atomic64.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/tor-async-utils/src/atomic64.rs	2026-11-06 03:52:14.309762292 +0000
+@@ -0,0 +1,114 @@
++//! `AtomicU64` for targets without 64-bit atomics.
++//!
++//! 32-bit PowerPC, MIPS and older ARM have no `std::sync::atomic::AtomicU64`.
++//! There, [`AtomicU64`] is a `u64` behind a mutex with the subset of the
++//! `AtomicU64` API that Arti uses; everywhere else it is `std`'s type.
++
++#[cfg(target_has_atomic = "64")]
++pub use std::sync::atomic::AtomicU64;
++
++#[cfg(not(target_has_atomic = "64"))]
++pub use fallback::AtomicU64;
++
++/// The mutex-based `AtomicU64`.
++#[cfg(not(target_has_atomic = "64"))]
++mod fallback {
++    use std::fmt;
++    use std::sync::atomic::Ordering;
++    use std::sync::{Mutex, MutexGuard};
++
++    /// A `u64` behind a mutex, standing in for `std::sync::atomic::AtomicU64`.
++    ///
++    /// Every operation holds the lock, so it is at least as strong as any
++    /// [`Ordering`] Arti asks for; the orderings are accepted and ignored.
++    #[derive(Default)]
++    pub struct AtomicU64(Mutex<u64>);
++
++    impl AtomicU64 {
++        /// See `std::sync::atomic::AtomicU64::new`.
++        pub const fn new(value: u64) -> Self {
++            Self(Mutex::new(value))
++        }
++
++        /// Lock the value, ignoring poisoning: a `u64` has no invariant to break.
++        fn lock(&self) -> MutexGuard<'_, u64> {
++            self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++        }
++
++        /// See `std::sync::atomic::AtomicU64::load`.
++        pub fn load(&self, _order: Ordering) -> u64 {
++            *self.lock()
++        }
++
++        /// See `std::sync::atomic::AtomicU64::store`.
++        pub fn store(&self, value: u64, _order: Ordering) {
++            *self.lock() = value;
++        }
++
++        /// See `std::sync::atomic::AtomicU64::swap`.
++        pub fn swap(&self, value: u64, _order: Ordering) -> u64 {
++            std::mem::replace(&mut *self.lock(), value)
++        }
++
++        /// See `std::sync::atomic::AtomicU64::fetch_add`.
++        pub fn fetch_add(&self, value: u64, _order: Ordering) -> u64 {
++            let mut cur = self.lock();
++            let prev = *cur;
++            *cur = prev.wrapping_add(value);
++            prev
++        }
++
++        /// See `std::sync::atomic::AtomicU64::fetch_max`.
++        pub fn fetch_max(&self, value: u64, _order: Ordering) -> u64 {
++            let mut cur = self.lock();
++            let prev = *cur;
++            *cur = prev.max(value);
++            prev
++        }
++
++        /// See `std::sync::atomic::AtomicU64::compare_exchange`.
++        pub fn compare_exchange(
++            &self,
++            current: u64,
++            new: u64,
++            _success: Ordering,
++            _failure: Ordering,
++        ) -> Result<u64, u64> {
++            let mut cur = self.lock();
++            let prev = *cur;
++            if prev == current {
++                *cur = new;
++                Ok(prev)
++            } else {
++                Err(prev)
++            }
++        }
++
++        /// See `std::sync::atomic::AtomicU64::fetch_update`.
++        pub fn fetch_update<F>(
++            &self,
++            _set_order: Ordering,
++            _fetch_order: Ordering,
++            mut f: F,
++        ) -> Result<u64, u64>
++        where
++            F: FnMut(u64) -> Option<u64>,
++        {
++            let mut cur = self.lock();
++            let prev = *cur;
++            match f(prev) {
++                Some(next) => {
++                    *cur = next;
++                    Ok(prev)
++                }
++                None => Err(prev),
++            }
++        }
++    }
++
++    impl fmt::Debug for AtomicU64 {
++        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++            fmt::Debug::fmt(&self.load(Ordering::Relaxed), f)
++        }
++    }
++}
+diff -Nru a/crates/tor-async-utils/src/bw_pool/bucket.rs b/crates/tor-async-utils/src/bw_pool/bucket.rs
+--- a/crates/tor-async-utils/src/bw_pool/bucket.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-async-utils/src/bw_pool/bucket.rs	2026-11-06 03:52:14.202759655 +0000
+@@ -13,7 +13,8 @@
+ // TODO MSRV 1.95: Remove this, and use try_update instead of fetch_update.
+ #![allow(deprecated)]
+ 
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use crate::atomic64::AtomicU64;
+ 
+ /// The atomic token bucket minus the clock component.
+ ///
+diff -Nru a/crates/tor-async-utils/src/bw_pool/refiller.rs b/crates/tor-async-utils/src/bw_pool/refiller.rs
+--- a/crates/tor-async-utils/src/bw_pool/refiller.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-async-utils/src/bw_pool/refiller.rs	2026-11-06 03:52:14.202759655 +0000
+@@ -21,7 +21,8 @@
+ use futures::task::AtomicWaker;
+ use std::num::NonZero;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use crate::atomic64::AtomicU64;
+ use std::task::Waker;
+ 
+ use tor_basic_utils::token_bucket::{TokenBucket, TokenBucketConfig};
+diff -Nru a/crates/tor-async-utils/src/lib.rs b/crates/tor-async-utils/src/lib.rs
+--- a/crates/tor-async-utils/src/lib.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-async-utils/src/lib.rs	2026-11-06 03:52:14.199759581 +0000
+@@ -54,6 +54,7 @@
+ mod sinkext;
+ mod watch;
+ 
++pub mod atomic64;
+ pub mod bw_pool;
+ pub mod counting_streams;
+ pub mod global_rate_limit;
+diff -Nru a/crates/tor-chanmgr/src/mgr/state.rs b/crates/tor-chanmgr/src/mgr/state.rs
+--- a/crates/tor-chanmgr/src/mgr/state.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-chanmgr/src/mgr/state.rs	2026-11-06 03:52:14.260761085 +0000
+@@ -9,7 +9,8 @@
+ use futures::FutureExt;
+ use std::result::Result as StdResult;
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use tor_async_utils::atomic64::AtomicU64;
+ use tor_async_utils::oneshot;
+ use tor_basic_utils::RngExt as _;
+ use tor_cell::chancell::msg::PaddingNegotiate;
+diff -Nru a/crates/tor-circmgr/src/isolation.rs b/crates/tor-circmgr/src/isolation.rs
+--- a/crates/tor-circmgr/src/isolation.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-circmgr/src/isolation.rs	2026-11-06 03:52:14.262761134 +0000
+@@ -1,7 +1,8 @@
+ //! Types related to stream isolation
+ use downcast_rs::{Downcast, impl_downcast};
+ use dyn_clone::{DynClone, clone_trait_object};
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use tor_async_utils::atomic64::AtomicU64;
+ 
+ /// A type that can make isolation decisions about streams it is attached to.
+ ///
+diff -Nru a/crates/tor-guardmgr/src/pending.rs b/crates/tor-guardmgr/src/pending.rs
+--- a/crates/tor-guardmgr/src/pending.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-guardmgr/src/pending.rs	2026-11-06 03:52:14.259761060 +0000
+@@ -15,7 +15,8 @@
+ use pin_project::pin_project;
+ use std::fmt::Debug;
+ use std::pin::Pin;
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use tor_async_utils::atomic64::AtomicU64;
+ use std::task::{Context, Poll};
+ use tor_proto::ClockSkew;
+ use web_time_compat::Instant;
+diff -Nru a/crates/tor-proto/src/client/reactor/conflux/msghandler.rs b/crates/tor-proto/src/client/reactor/conflux/msghandler.rs
+--- a/crates/tor-proto/src/client/reactor/conflux/msghandler.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-proto/src/client/reactor/conflux/msghandler.rs	2026-11-06 03:52:14.262761134 +0000
+@@ -1,7 +1,8 @@
+ //! Client-side conflux message handling.
+ 
+ use std::sync::Arc;
+-use std::sync::atomic::{self, AtomicU64};
++use std::sync::atomic;
++use tor_async_utils::atomic64::AtomicU64;
+ use std::time::{Duration, SystemTime};
+ 
+ use tor_cell::relaycell::conflux::V1Nonce;
+diff -Nru a/crates/tor-proto/src/client/reactor/conflux.rs b/crates/tor-proto/src/client/reactor/conflux.rs
+--- a/crates/tor-proto/src/client/reactor/conflux.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-proto/src/client/reactor/conflux.rs	2026-11-06 03:52:14.261761109 +0000
+@@ -9,7 +9,8 @@
+ pub(crate) mod msghandler;
+ 
+ use std::pin::Pin;
+-use std::sync::atomic::{self, AtomicU64};
++use std::sync::atomic;
++use tor_async_utils::atomic64::AtomicU64;
+ use std::sync::{Arc, Mutex};
+ 
+ use futures::{FutureExt as _, StreamExt, select_biased};
+diff -Nru a/crates/tor-proto/src/conflux/msghandler.rs b/crates/tor-proto/src/conflux/msghandler.rs
+--- a/crates/tor-proto/src/conflux/msghandler.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-proto/src/conflux/msghandler.rs	2026-11-06 03:52:14.261761109 +0000
+@@ -2,7 +2,8 @@
+ 
+ use std::cmp::Ordering;
+ use std::sync::Arc;
+-use std::sync::atomic::{self, AtomicU64};
++use std::sync::atomic;
++use tor_async_utils::atomic64::AtomicU64;
+ use std::time::{Duration, SystemTime};
+ 
+ use tor_cell::relaycell::{AnyRelayMsgOuter, RelayCmd, StreamId, UnparsedRelayMsg};
+diff -Nru a/crates/tor-proto/src/tunnel.rs b/crates/tor-proto/src/tunnel.rs
+--- a/crates/tor-proto/src/tunnel.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-proto/src/tunnel.rs	2026-11-06 03:52:14.260761085 +0000
+@@ -1,6 +1,7 @@
+ //! Module exposing tunnel-related types shared by clients and relays.
+ 
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use tor_async_utils::atomic64::AtomicU64;
+ 
+ use crate::circuit::UniqId;
+ use derive_more::Display;
+diff -Nru a/crates/tor-proto/src/util/ts.rs b/crates/tor-proto/src/util/ts.rs
+--- a/crates/tor-proto/src/util/ts.rs	2026-10-01 16:32:57.000000000 +0000
++++ b/crates/tor-proto/src/util/ts.rs	2026-11-06 03:52:14.260761085 +0000
+@@ -1,7 +1,8 @@
+ //! Implement a fast 'timestamp' for determining when an event last
+ //! happened.
+ 
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::Ordering;
++use tor_async_utils::atomic64::AtomicU64;
+ 
+ /// An object for determining whether an event happened,
+ /// and if yes, when it happened.
