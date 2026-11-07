@@ -1,0 +1,274 @@
+From 6239f07d3e9b9ca5666d6c1c5fdc23d018883655 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sat, 7 Nov 2026 03:22:58 +0000
+Subject: [PATCH 2/2] Fix `r2 -d` spawning programs on PowerPC Darwin ##debug
+
+- Spawn with posix_spawn START_SUSPENDED, use addinherit_np/CLOEXEC_DEFAULT only with 10.7+ SDKs
+- The fork path set PT_SIGEXC before any exception port existed, so the exec SIGTRAP was lost and the child ran free
+- On ppc call PT_ATTACHEXC after installing the exception port and swallow its SIGSTOP, xnu-1228 resumes a suspended target on attach
+- Use proc_pidpath on ppc too, without a path the bin loader reopened dbg:// and spawned the target again
+- Ignore the pid of a failed posix_spawn and report its actual error
+
+Assisted-by: Claude Opus 5.5
+---
+ libr/debug/p/native/xnu/xnu_debug.c      |  4 +++
+ libr/debug/p/native/xnu/xnu_excthreads.c | 29 ++++++++++++++++-----
+ libr/io/p/io_debug.c                     | 32 +++++++++++-------------
+ libr/util/sys.c                          |  5 ----
+ 4 files changed, 41 insertions(+), 29 deletions(-)
+
+diff --git a/libr/debug/p/native/xnu/xnu_debug.c b/libr/debug/p/native/xnu/xnu_debug.c
+index a6e58f8..b76c1d5 100644
+--- a/libr/debug/p/native/xnu/xnu_debug.c
++++ b/libr/debug/p/native/xnu/xnu_debug.c
+@@ -50,8 +50,12 @@ static task_t task_dbg = 0;
+ #else
+ #define XNU_PTRACE_STEP 0
+ #endif
++// PT_ATTACHEXC after installing the exception port, its SIGSTOP is swallowed
++#define XNU_ATTACH_STOP (XNU_PTRACE_STEP || (__POWERPC__ && XNU_USE_EXCTHR))
+ #if XNU_PTRACE_STEP
+ static bool xnu_ptrace_step = false;
++#endif
++#if XNU_ATTACH_STOP
+ static bool xnu_ptrace_attach_stop = false;
+ #endif
+ #include "xnu_debug.h"
+diff --git a/libr/debug/p/native/xnu/xnu_excthreads.c b/libr/debug/p/native/xnu/xnu_excthreads.c
+index d5ea842..25810b6 100644
+--- a/libr/debug/p/native/xnu/xnu_excthreads.c
++++ b/libr/debug/p/native/xnu/xnu_excthreads.c
+@@ -234,12 +234,16 @@ static bool xnu_reply_pending_exception(void) {
+ 	}
+ 	return true;
+ }
++#endif
+ 
++#if XNU_ATTACH_STOP
+ static bool xnu_exception_is_signal(const exc_msg *msg, int sig) {
+ 	return msg->exception == EXC_SOFTWARE && msg->code_cnt > 1
+ 		&& msg->code.values[0] == EXC_SOFT_SIGNAL && msg->code.values[1] == sig;
+ }
++#endif
+ 
++#if XNU_PTRACE_STEP
+ static int xnu_signal_reason(int sig) {
+ 	switch (sig) {
+ 	case SIGABRT:
+@@ -357,10 +361,15 @@ static bool handle_dead_notify(RDebug *dbg, exc_msg *msg) {
+ static int handle_exception_message(RDebug *dbg, exc_msg *msg, int *ret_code) {
+ 	int ret = R_DEBUG_REASON_UNKNOWN;
+ 	kern_return_t kr;
++#if XNU_ATTACH_STOP
++	const bool ptrace_attach_signal = xnu_ptrace_attach_stop && xnu_exception_is_signal (msg, SIGSTOP);
++	if (ptrace_attach_signal) {
++		xnu_ptrace_attach_stop = false;
++	}
++#endif
+ #if XNU_PTRACE_STEP
+ 	const bool ptrace_step_signal = xnu_ptrace_step && xnu_exception_is_signal (msg, SIGTRAP);
+-	const bool ptrace_attach_signal = xnu_ptrace_attach_stop && xnu_exception_is_signal (msg, SIGSTOP);
+-	if (ptrace_attach_signal || ptrace_step_signal) {
++	if (ptrace_step_signal) {
+ 		xnu_ptrace_attach_stop = false;
+ 	}
+ #endif
+@@ -397,10 +406,12 @@ static int handle_exception_message(RDebug *dbg, exc_msg *msg, int *ret_code) {
+ 		R_LOG_ERROR ("EXC_EMULATION");
+ 		break;
+ 	case EXC_SOFTWARE:
+-#if XNU_PTRACE_STEP
++#if XNU_ATTACH_STOP
+ 		if (ptrace_attach_signal) {
+ 			break;
+ 		}
++#endif
++#if XNU_PTRACE_STEP
+ 		if (ptrace_step_signal) {
+ 			ret = R_DEBUG_REASON_STEP;
+ 		} else if (msg->code_cnt > 1 && msg->code.values[0] == EXC_SOFT_SIGNAL) {
+@@ -497,9 +508,11 @@ static int __xnu_wait(RDebug *dbg, int pid) {
+ 			continue;
+ 		}
+ 
+-#if XNU_PTRACE_STEP
++#if XNU_ATTACH_STOP
+ 		const bool ptrace_attach_signal = xnu_ptrace_attach_stop
+ 			&& xnu_exception_is_signal (&msg, SIGSTOP);
++#endif
++#if XNU_PTRACE_STEP
+ 		const bool ptrace_signal = msg.exception == EXC_SOFTWARE
+ 			&& msg.code_cnt > 1 && msg.code.values[0] == EXC_SOFT_SIGNAL;
+ #endif
+@@ -543,6 +556,10 @@ static int __xnu_wait(RDebug *dbg, int pid) {
+ 		if (retry_exception || retry_attach) {
+ 			continue;
+ 		}
++#elif XNU_ATTACH_STOP
++		if (ptrace_attach_signal) {
++			continue;
++		}
+ #endif
+ 		break; // to avoid infinite loops
+ 	}
+@@ -561,7 +578,7 @@ bool xnu_create_exception_thread(RDebug *dbg, int pid) {
+ 		R_LOG_ERROR ("xnu_start_exception_thread: cannot get task for pid %d", pid);
+ 		return false;
+ 	}
+-#if !XNU_PTRACE_STEP
++#if !XNU_ATTACH_STOP
+ 	r_debug_ptrace (dbg, PT_ATTACHEXC, pid, 0, 0);
+ #endif
+ 	if (!MACH_PORT_VALID (task_self)) {
+@@ -590,7 +607,7 @@ bool xnu_create_exception_thread(RDebug *dbg, int pid) {
+ 		R_LOG_ERROR ("Termination notification request failed");
+ 	}
+ 	ex.exception_port = exception_port;
+-#if XNU_PTRACE_STEP
++#if XNU_ATTACH_STOP
+ 	xnu_ptrace_attach_stop = r_debug_ptrace (dbg, PT_ATTACHEXC, pid, 0, 0) != -1;
+ #endif
+ 	return true;
+diff --git a/libr/io/p/io_debug.c b/libr/io/p/io_debug.c
+index f35ff6e..ff7ddfe 100644
+--- a/libr/io/p/io_debug.c
++++ b/libr/io/p/io_debug.c
+@@ -28,9 +28,7 @@
+ #endif
+ 
+ #if __APPLE__
+-#if !__POWERPC__
+ #include <spawn.h>
+-#endif
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <mach/exception_types.h>
+@@ -195,31 +193,24 @@ err_fork:
+ }
+ #else // windows
+ 
+-#if ((__APPLE__ && __POWERPC__) || !__APPLE__) && !defined(__HAIKU__)
++#if !__APPLE__ && !defined(__HAIKU__)
+ 
+-#if __APPLE__ || R2__BSD__
++#if R2__BSD__
+ static void inferior_abort_handler(int pid) {
+ 	R_LOG_ERROR ("Inferior received signal SIGABRT. Executing BKPT");
+ }
+ #endif
+ 
+ static void trace_me(void) {
+-#if __APPLE__
+-	r_sys_signal (SIGTRAP, SIG_IGN); //NEED BY STEP
+-#endif
+ #if __serenity__
+ 	if (ptrace (PT_TRACE_ME, 0, 0, 0) != 0) {
+ 		r_sys_perror ("ptrace-traceme");
+ 	}
+-#elif __APPLE__ || R2__BSD__
+-	/* we can probably remove this #if..as long as PT_TRACE_ME is redefined for OSX in r_debug.h */
++#elif R2__BSD__
+ 	r_sys_signal (SIGABRT, inferior_abort_handler);
+ 	if (ptrace (PT_TRACE_ME, 0, 0, 0) != 0) {
+ 		r_sys_perror ("ptrace-traceme");
+ 	}
+-#if __APPLE__
+-	ptrace (PT_SIGEXC, r_sys_getpid (), NULL, 0);
+-#endif
+ #else
+ 	if (ptrace (PTRACE_TRACEME, 0, NULL, NULL) != 0) {
+ 		r_sys_perror ("ptrace-traceme");
+@@ -229,7 +220,7 @@ static void trace_me(void) {
+ }
+ #endif
+ 
+-#if __APPLE__ && !__POWERPC__
++#if __APPLE__
+ static void handle_posix_error(int err) {
+ 	switch (err) {
+ 	case 0: // success, no error so far
+@@ -241,8 +232,7 @@ static void handle_posix_error(int err) {
+ 		R_LOG_ERROR ("Unsupported architecture. Please specify -b 32");
+ 		break;
+ 	default:
+-		R_LOG_ERROR ("posix_spawnp: unknown error %d", err);
+-		r_sys_perror ("posix_spawnp");
++		R_LOG_ERROR ("posix_spawnp: %s (%d)", strerror (err), err);
+ 		break;
+ 	}
+ }
+@@ -300,7 +290,7 @@ static RRunProfile* _get_run_profile(RIO *io, int bits, char **argv) {
+ }
+ #endif
+ 
+-#if __APPLE__ && !__POWERPC__
++#if __APPLE__
+ 
+ static void handle_posix_redirection(RRunProfile *rp, posix_spawn_file_actions_t *fileActions) {
+ 	const int mode = S_IRUSR | S_IWUSR;
+@@ -333,11 +323,13 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
+ 	posix_spawnattr_setsigdefault (&attr, &all_signals);
+ 
+ 	posix_spawn_file_actions_init (&fileActions);
++#ifdef __MAC_10_7
+ 	posix_spawn_file_actions_addinherit_np (&fileActions, STDIN_FILENO);
+ 	posix_spawn_file_actions_addinherit_np (&fileActions, STDOUT_FILENO);
+ 	posix_spawn_file_actions_addinherit_np (&fileActions, STDERR_FILENO);
+ 
+ 	ps_flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
++#endif
+ 	ps_flags |= POSIX_SPAWN_START_SUSPENDED;
+ #define _POSIX_SPAWN_DISABLE_ASLR 0x0100
+ 	int ret;
+@@ -367,6 +359,10 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
+ 		posix_spawnattr_setbinpref_np (&attr, 1, &cpu, &copied);
+ 		ret = posix_spawnp (&p, rp->_args[0], &fileActions, &attr, rp->_args, NULL);
+ 		handle_posix_error (ret);
++		if (ret) {
++			// xnu-1228 reports the pid of the already exited child on failure
++			p = -1;
++		}
+ 	}
+ 	r_str_argv_free (argv);
+ 	free (ncmd);
+@@ -374,7 +370,7 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
+ 	posix_spawn_file_actions_destroy (&fileActions);
+ 	return p; // -1 ?
+ }
+-#endif // __APPLE__ && !__POWERPC__
++#endif // __APPLE__
+ 
+ #if __HAIKU__
+ // spawn the team with load_image() so the debugger can attach before its suspended main thread runs
+@@ -404,7 +400,7 @@ static int platform_fork_and_ptraceme(RIO *io, int bits, const char *cmd) {
+ 	return (int)ti.team;
+ }
+ 
+-#elif (!(__APPLE__ && !__POWERPC__))
++#elif !__APPLE__
+ typedef struct fork_child_data_t {
+ 	RIO *io;
+ 	int bits;
+diff --git a/libr/util/sys.c b/libr/util/sys.c
+index 58463b5..cc1e6fc 100644
+--- a/libr/util/sys.c
++++ b/libr/util/sys.c
+@@ -1393,10 +1393,6 @@ R_API char *r_sys_pidpath(int pid) {
+ 	CloseHandle (processHandle);
+ 	return filename;
+ #elif __APPLE__
+-#if __POWERPC__
+-#pragma message("TODO getpidproc")
+-	return NULL;
+-#else
+ 	char pathbuf[PROC_PIDPATHINFO_MAXSIZE];
+ 	pathbuf[0] = 0;
+ 	int ret = proc_pidpath (pid, pathbuf, sizeof (pathbuf));
+@@ -1404,7 +1400,6 @@ R_API char *r_sys_pidpath(int pid) {
+ 		return NULL;
+ 	}
+ 	return strdup (pathbuf);
+-#endif
+ #else
+ #if __FreeBSD__ || __DragonFly__
+ 	char pathbuf[PATH_MAX];
