@@ -1,0 +1,317 @@
+From 03762a1fa7a260d51374d65892601c5977309486 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 8 Nov 2026 18:52:15 +0000
+Subject: [PATCH 01/14] fix(vendor): portability groundwork for macOS 10.6
+ PowerPC
+
+- Root CMakeLists.txt: CMAKE_OBJCXX_STANDARD=23, so the Objective-C++
+  engine source (text_shaper/CoreTextLocator.mm) sees the same C++23
+  headers as the C++ sources.
+- cmake/CheckAtomic.cmake (new): probe whether 64-bit std::atomic needs
+  libatomic -- it does on 32-bit PowerPC -- and expose the result as
+  contour::atomic, which vtbackend links.
+- src/CMakeLists.txt: exactly one `contour` executable may enter the
+  build. With CONTOUR_FRONTEND_MACOS the native AppKit frontend
+  (src/contour_macos) replaces src/contour wholesale, CLI included.
+- crispy/AlignedAllocator.hpp + crispy/CMakeLists.txt: aligned_alloc only
+  appeared in macOS's libc in 10.15; probe for it, fall back to
+  posix_memalign, then to a manual over-aligned malloc (10.5).
+- text_shaper/CMakeLists.txt: link ApplicationServices (CoreText is a
+  standalone framework only from 10.8 on); take harfbuzz's include dirs
+  from pkg-config instead of the Homebrew-only `brew --prefix` probe,
+  which silently expanded to `-I/include` under MacPorts.
+- vtpty/Process.hpp: XSI strerror_r (Darwin, the BSDs) returns int and
+  fills the buffer; only glibc's GNU variant returns char*.
+
+Rebase note (v0.8.0.9335): the -fexperimental-library hunk this commit
+used to carry is gone. Upstream now adds that flag only where a probe
+shows std::jthread needs it (libc++ before 20), so GCC/libstdc++ never
+sees it. CoreTextLocator.mm is no longer touched here: the 10.6 port of
+upstream's 0.8.0 font locator is a patch of its own, later in the series.
+---
+ CMakeLists.txt                  |  8 ++++++
+ cmake/CheckAtomic.cmake         | 45 +++++++++++++++++++++++++++++++++
+ src/CMakeLists.txt              | 13 +++++++++-
+ src/crispy/AlignedAllocator.hpp | 38 ++++++++++++++++++++++++++--
+ src/crispy/CMakeLists.txt       |  8 ++++++
+ src/text_shaper/CMakeLists.txt  | 23 +++++++++--------
+ src/vtbackend/CMakeLists.txt    |  4 +++
+ src/vtpty/Process.hpp           |  9 ++++++-
+ 8 files changed, 133 insertions(+), 15 deletions(-)
+ create mode 100644 cmake/CheckAtomic.cmake
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c2c55865f..adc5c6ed7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,14 @@ if (NOT(CMAKE_CXX_STANDARD))
+ endif()
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ set(CMAKE_CXX_EXTENSIONS OFF)
++# Objective-C++ engine sources (e.g. text_shaper/CoreTextLocator.mm) include the same
++# C++23 headers as the C++ sources, so they need the same standard. The macOS frontend's
++# own .mm files override this to a lower standard per-source (see src/contour_macos).
++if (NOT(CMAKE_OBJCXX_STANDARD))
++    set(CMAKE_OBJCXX_STANDARD 23)
++endif()
++set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
++set(CMAKE_OBJCXX_EXTENSIONS OFF)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ set(CMAKE_COLOR_DIAGNOSTICS ON)
+diff --git a/cmake/CheckAtomic.cmake b/cmake/CheckAtomic.cmake
+new file mode 100644
+index 000000000..6f1cf21fd
+--- /dev/null
++++ b/cmake/CheckAtomic.cmake
+@@ -0,0 +1,45 @@
++# Determines whether std::atomic operations (notably 64-bit ones on 32-bit targets such as
++# PowerPC) require linking against libatomic, and exposes the result as an INTERFACE target
++# `contour::atomic` that callers can link unconditionally. On targets where the compiler lowers
++# every atomic to a lock-free intrinsic (most 64-bit hosts) the target links nothing.
++#
++# Adapted from the well-established CheckAtomic idiom used by LLVM and others: probe by trying
++# to compile-and-link a program that exercises a 64-bit atomic, first with no extra library and
++# then with -latomic.
++
++include_guard(GLOBAL)
++include(CheckCXXSourceCompiles)
++
++set(_contour_atomic_test_source "
++#include <atomic>
++#include <cstdint>
++std::atomic<std::uint64_t> x(0);
++int main()
++{
++    std::uint64_t v = x.load(std::memory_order_relaxed);
++    x.store(v + 1, std::memory_order_relaxed);
++    x.fetch_add(1, std::memory_order_relaxed);
++    x.exchange(v, std::memory_order_relaxed);
++    return static_cast<int>(x.load(std::memory_order_relaxed));
++}
++")
++
++check_cxx_source_compiles("${_contour_atomic_test_source}" CONTOUR_ATOMIC_WITHOUT_LIB)
++
++if(NOT CONTOUR_ATOMIC_WITHOUT_LIB)
++    set(CMAKE_REQUIRED_LIBRARIES_SAVED "${CMAKE_REQUIRED_LIBRARIES}")
++    list(APPEND CMAKE_REQUIRED_LIBRARIES atomic)
++    check_cxx_source_compiles("${_contour_atomic_test_source}" CONTOUR_ATOMIC_WITH_LIBATOMIC)
++    set(CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES_SAVED}")
++    if(NOT CONTOUR_ATOMIC_WITH_LIBATOMIC)
++        message(FATAL_ERROR "std::atomic requires a library this toolchain does not provide "
++                            "(neither builtin intrinsics nor libatomic satisfied the probe).")
++    endif()
++endif()
++
++if(NOT TARGET contour::atomic)
++    add_library(contour::atomic INTERFACE IMPORTED GLOBAL)
++    if(NOT CONTOUR_ATOMIC_WITHOUT_LIB)
++        set_target_properties(contour::atomic PROPERTIES INTERFACE_LINK_LIBRARIES atomic)
++    endif()
++endif()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d3663b08f..03af90564 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,4 +22,15 @@ add_subdirectory(vtworkspace)
+ add_subdirectory(vthost)
+ add_subdirectory(vtrasterizer)
+ 
+-add_subdirectory(contour)
++# src/contour no longer needs Qt when CONTOUR_FRONTEND_GUI is OFF (it then builds the
++# Qt-free CLI), but it defines a `contour` executable target either way -- and so does the
++# native macOS frontend below. Exactly one of the two may enter the build: the macOS
++# frontend replaces src/contour wholesale, CLI included.
++if(NOT CONTOUR_FRONTEND_MACOS)
++    add_subdirectory(contour)
++endif()
++
++# The native macOS frontend (AppKit + CoreGraphics, no Qt).
++if(CONTOUR_FRONTEND_MACOS)
++    add_subdirectory(contour_macos)
++endif()
+diff --git a/src/crispy/AlignedAllocator.hpp b/src/crispy/AlignedAllocator.hpp
+index d1ad91e51..67920f904 100644
+--- a/src/crispy/AlignedAllocator.hpp
++++ b/src/crispy/AlignedAllocator.hpp
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <cstdlib>
+ #include <limits>
+ #include <new>
+@@ -42,8 +43,18 @@ class AlignedAllocator
+ 
+ #ifdef _MSC_VER
+         auto* ptr = static_cast<T*>(_aligned_malloc(alignedSize, Alignment));
+-#else
++#elif defined(HAVE_ALIGNED_ALLOC)
+         auto* ptr = static_cast<T*>(std::aligned_alloc(Alignment, alignedSize));
++#elif defined(HAVE_POSIX_MEMALIGN)
++        void* raw = nullptr;
++        if (posix_memalign(&raw, Alignment, alignedSize) != 0)
++            raw = nullptr;
++        auto* ptr = static_cast<T*>(raw);
++#else
++        // No aligned allocator available (e.g. macOS 10.5): over-allocate with plain malloc,
++        // align the returned block up, and stash the original malloc pointer in the word just
++        // before it so deallocate() can recover the exact pointer to free.
++        auto* ptr = alignedMallocFallback(alignedSize);
+ #endif
+         if (!ptr)
+             throw std::bad_alloc();
+@@ -56,8 +67,10 @@ class AlignedAllocator
+             return;
+ #ifdef _MSC_VER
+         _aligned_free(p);
+-#else
++#elif defined(HAVE_ALIGNED_ALLOC) || defined(HAVE_POSIX_MEMALIGN)
+         std::free(p);
++#else
++        std::free(static_cast<void**>(static_cast<void*>(p))[-1]);
+ #endif
+     }
+ 
+@@ -72,6 +85,27 @@ class AlignedAllocator
+     {
+         return false;
+     }
++
++#if !defined(_MSC_VER) && !defined(HAVE_ALIGNED_ALLOC) && !defined(HAVE_POSIX_MEMALIGN)
++  private:
++    /// Aligned allocation on platforms with neither aligned_alloc nor posix_memalign.
++    ///
++    /// Over-allocates by Alignment (headroom to align up) plus one pointer (to store the
++    /// original malloc result), aligns the user block up, and writes the base pointer in the
++    /// word immediately preceding it. deallocate() reads that word back to free the exact
++    /// pointer malloc returned.
++    [[nodiscard]] static T* alignedMallocFallback(std::size_t alignedSize) noexcept
++    {
++        void* base = std::malloc(alignedSize + Alignment + sizeof(void*));
++        if (!base)
++            return nullptr;
++        auto const rawAddr = reinterpret_cast<std::uintptr_t>(base) + sizeof(void*);
++        auto const userAddr = (rawAddr + Alignment - 1) & ~(static_cast<std::uintptr_t>(Alignment) - 1);
++        auto* user = reinterpret_cast<void*>(userAddr);
++        static_cast<void**>(user)[-1] = base;
++        return static_cast<T*>(user);
++    }
++#endif
+ };
+ 
+ /// Convenience alias: std::vector with 64-byte cache-line aligned allocation.
+diff --git a/src/crispy/CMakeLists.txt b/src/crispy/CMakeLists.txt
+index dbd20ae99..c77a4e957 100644
+--- a/src/crispy/CMakeLists.txt
++++ b/src/crispy/CMakeLists.txt
+@@ -90,6 +90,12 @@ if(UNIX)
+     include(CheckIncludeFileCXX)
+     include(CheckFunctionExists)
+ 
++    # aligned_alloc is C11/C++17 but only appeared in macOS's libc in 10.15; posix_memalign
++    # is the older POSIX spelling. AlignedAllocator.hpp falls back to a manual malloc when
++    # neither exists (e.g. macOS 10.5).
++    check_function_exists(aligned_alloc HAVE_ALIGNED_ALLOC)
++    check_function_exists(posix_memalign HAVE_POSIX_MEMALIGN)
++
+     check_function_exists(backtrace HAVE_BACKTRACE)
+     check_function_exists(backtrace_symbols HAVE_BACKTRACE_SYMBOLS)
+     check_function_exists(dladdr HAVE_DLADDR)
+@@ -113,6 +119,8 @@ if(UNIX)
+         target_compile_definitions(crispy-core PUBLIC CONTOUR_STACKTRACE_ADDR2LINE=1)
+     endif()
+     target_compile_definitions_if(crispy-core PUBLIC
++        HAVE_ALIGNED_ALLOC
++        HAVE_POSIX_MEMALIGN
+         HAVE_BACKTRACE
+         HAVE_BACKTRACE_SYMBOLS
+         HAVE_CXXABI_H
+diff --git a/src/text_shaper/CMakeLists.txt b/src/text_shaper/CMakeLists.txt
+index ba1410622..739104b1e 100644
+--- a/src/text_shaper/CMakeLists.txt
++++ b/src/text_shaper/CMakeLists.txt
+@@ -30,21 +30,22 @@ if(APPLE)
+     enable_language(OBJC)
+     list(APPEND TEXT_SHAPER_LIBS "-framework Foundation")
+     list(APPEND TEXT_SHAPER_LIBS "-framework AppKit")
+-    list(APPEND TEXT_SHAPER_LIBS "-framework CoreText")
++    # CoreText became a standalone framework only in macOS 10.8; before that its symbols and
++    # headers live in the ApplicationServices umbrella, which CoreTextLocator.mm includes.
++    # ApplicationServices still re-exports CoreText on modern macOS, so it is always linked;
++    # -framework CoreText is added only where it actually exists.
++    list(APPEND TEXT_SHAPER_LIBS "-framework ApplicationServices")
++    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET OR NOT CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "10.8")
++        list(APPEND TEXT_SHAPER_LIBS "-framework CoreText")
++    endif()
+     find_package(PkgConfig REQUIRED)
+     find_package(Fontconfig REQUIRED)
+     find_package(Freetype REQUIRED)
+     pkg_check_modules(harfbuzz REQUIRED IMPORTED_TARGET harfbuzz)
+-    if(NOT DEFINED VCPKG_TOOLCHAIN)
+-        # Homebrew-only fallback. It must not run under vcpkg: `include_directories` is
+-        # global and would put Homebrew's harfbuzz headers ahead of the vcpkg ones we
+-        # actually link against, which is a header/library version mismatch waiting to
+-        # happen. Release packaging goes through vcpkg precisely to avoid Homebrew.
+-        execute_process(
+-            COMMAND sh -c "brew --prefix harfbuzz | cut -d. -f1 | tr -d $'\n'"
+-            OUTPUT_VARIABLE HARFBUZZ_APPLE_INCLUDE)
+-        include_directories("${HARFBUZZ_APPLE_INCLUDE}/include")
+-    endif()
++    # harfbuzz's headers come from the pkg-config IMPORTED_TARGET below; the previous
++    # Homebrew-only `brew --prefix harfbuzz` probe does not exist under MacPorts and
++    # silently expanded to `-I/include`.
++    include_directories(${harfbuzz_INCLUDE_DIRS})
+     list(APPEND TEXT_SHAPER_LIBS Freetype::Freetype)
+     list(APPEND TEXT_SHAPER_LIBS PkgConfig::harfbuzz)
+     list(APPEND TEXT_SHAPER_LIBS Fontconfig::Fontconfig)
+diff --git a/src/vtbackend/CMakeLists.txt b/src/vtbackend/CMakeLists.txt
+index 36d96f9ec..61a189dbf 100644
+--- a/src/vtbackend/CMakeLists.txt
++++ b/src/vtbackend/CMakeLists.txt
+@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.10)
+ 
+ find_package(Threads)
+ 
++# 64-bit std::atomic on 32-bit targets (e.g. PowerPC) needs libatomic; provides contour::atomic.
++include(CheckAtomic)
++
+ option(LIBTERMINAL_TESTING "Enables building of unittests for libterminal [default: ON]" ${CONTOUR_TESTING})
+ option(LIBTERMINAL_LOG_TRACE "Enables VT sequence tracing. [default: ON]" ON)
+ 
+@@ -233,6 +236,7 @@ target_link_libraries(vtbackend PUBLIC
+     core::cli
+     core::log
+     core::platform
++    contour::atomic
+     crispy::core
+     unicode::unicode
+     vtparser
+diff --git a/src/vtpty/Process.hpp b/src/vtpty/Process.hpp
+index 4b7799418..6a9cad5e9 100644
+--- a/src/vtpty/Process.hpp
++++ b/src/vtpty/Process.hpp
+@@ -201,10 +201,17 @@ struct std::formatter<vtpty::Process::ExitStatus>: std::formatter<std::string>
+ #ifdef _WIN32
+                                               strerror_s(buf, sizeof(buf), errno);
+                                               return std::format("{} (signal number {})", buf, exit.signum);
+-#else
++#elif defined(__GLIBC__) && (defined(_GNU_SOURCE) || !((_POSIX_C_SOURCE >= 200112L) || defined(_XOPEN_SOURCE)))
++                                              // glibc's GNU strerror_r returns a char* that may or may not be buf.
+                                               return std::format("{} (signal number {})",
+                                                                  strerror_r(errno, buf, sizeof(buf)),
+                                                                  exit.signum);
++#else
++                                              // XSI strerror_r (Darwin, the BSDs, POSIX) returns int and
++                                              // writes the message into buf.
++                                              buf[0] = '\0';
++                                              (void) strerror_r(errno, buf, sizeof(buf));
++                                              return std::format("{} (signal number {})", buf, exit.signum);
+ #endif
+                                           } },
+                        status);
+-- 
+2.43.0
+

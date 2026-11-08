@@ -1,0 +1,463 @@
+From ff535ca5beac2ebfe84c9378e2fc7851b46ae879 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 8 Nov 2026 18:52:16 +0000
+Subject: [PATCH 06/14] fix(vendor): CoreTextLocator for macOS 10.6: port
+ upstream's 0.8.0 locator
+
+Upstream 0.8.0 rewrote the macOS font locator (PR #2167): a configured
+fallback chain resolved family by family with the family as a mandatory
+match attribute, by-content fallback through CTFontCreateForString, and --
+the part this port never had -- resolution of a CoreText face to the right
+face INSIDE a .ttc collection (FontPath::collectionIndex), by matching the
+face's PostScript name against the faces FreeType finds in the file, with
+the file mapped once through HarfBuzz and the scan cached per file. Without
+it a collection resolves to face 0 whatever CoreText picked, which is why
+Menlo.ttc's bold and italic, and every .ttc CJK fallback, used to open the
+regular face.
+
+This takes that file and makes it build with GCC and run on 10.6:
+
+- No Objective-C literals. GCC compiles neither `@{}` dictionaries nor
+  boxed `@()` numbers nor `@autoreleasepool`, and `__bridge` casts are an
+  ARC spelling. The descriptor's attributes and mandatory-attribute set are
+  built with CFDictionaryCreate/CFSetCreate, numbers with CFNumberCreate,
+  strings read with CFStringGetCString/CFURLGetFileSystemRepresentation.
+  The one Objective-C call left (NSFontManager, below) runs under a small
+  RAII NSAutoreleasePool.
+- The NSFontWeight* constants (10.11+) are spelled as the numbers they
+  stand for, in CoreText's -1..1 weight-trait scale.
+- CTFontCopyDefaultCascadeListForLanguages (10.8+) is not used. Without an
+  explicit fallback list the chain is the primary alone; a codepoint it
+  lacks is resolved by content in resolve(), which asks CoreText directly
+  which font renders it -- the face the cascade would eventually reach,
+  found in one query rather than by walking a family-ordered list (the one
+  CJK-capable face was observed 83rd of 201 on a real system, past any walk
+  limit worth paying for). CoreTextLocator_test's "automatic cascade"
+  expectation follows.
+- kCTFontURLAttribute is frequently null for system fonts on 10.6: the
+  path falls back to Apple Type Services (CTFontCopyPostScriptName ->
+  ATSFontFindFromPostScriptName -> ATSFontGetFileReference -> FSRef), on
+  32-bit builds, where those APIs exist; 64-bit builds have the URL.
+- 10.6's CoreText, given a family plus a weight/slant traits dictionary,
+  can answer with another family altogether (Lucida Grande) when the
+  weight is not an exact match -- how bold text came out proportional.
+  The resolved family is verified and, if wrong, the family's own bold or
+  italic member is taken from NSFontManager fontWithFamily:traits:weight:
+  size:, which gets this right.
+- CoreText is included through the ApplicationServices umbrella; it is a
+  standalone framework only from 10.8 on.
+- The by-content anchor is Menlo, as upstream has it; Menlo has shipped
+  with every release since 10.6.
+
+Rebase note (v0.8.0.9335): replaces this port's own locator, which the
+former portability, bold-spacing and by-content-fallback patches had built
+up from upstream's pre-0.8.0 file (CFDictionary traits, the ATS path
+fallback, the NSFontManager re-resolution, a resolve() on the same
+CTFontCreateForString primitive anchored on Helvetica). Everything those
+did for 10.6 is here; what upstream added on top is kept.
+
+Assisted-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/text_shaper/CoreTextLocator.mm       | 301 ++++++++++++++++-------
+ src/text_shaper/CoreTextLocator_test.cpp |   4 +-
+ 2 files changed, 210 insertions(+), 95 deletions(-)
+
+diff --git a/src/text_shaper/CoreTextLocator.mm b/src/text_shaper/CoreTextLocator.mm
+index 103c63f7b..4bbf32a80 100644
+--- a/src/text_shaper/CoreTextLocator.mm
++++ b/src/text_shaper/CoreTextLocator.mm
+@@ -10,6 +10,7 @@
+ 
+ #include <algorithm>
+ #include <bit>
++#include <climits> // PATH_MAX
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -19,8 +20,11 @@
+ #include <unordered_map>
+ #include <utility>
+ 
+-#import <AppKit/AppKit.h>
+-#import <CoreText/CoreText.h>
++// CoreText became a standalone framework only in macOS 10.8; before that its headers and symbols
++// live in the ApplicationServices umbrella, which still re-exports it on every later release.
++#include <AppKit/AppKit.h>
++#include <ApplicationServices/ApplicationServices.h>
++#include <Foundation/Foundation.h>
+ 
+ namespace text
+ {
+@@ -41,28 +45,107 @@ namespace
+     using FontBlob = std::unique_ptr<hb_blob_t, decltype(&hb_blob_destroy)>;
+     using FtFace = std::unique_ptr<std::remove_pointer_t<FT_Face>, decltype(&FT_Done_Face)>;
+ 
+-    constexpr NSFontWeight makeFontWeight(FontWeight value) noexcept
++    /// Drains an autorelease pool at scope exit: what `@autoreleasepool` spells, which GCC's
++    /// Objective-C++ does not know. Needed only around the one NSFontManager call below; everything
++    /// else here is CoreFoundation and owns its objects through CFObject.
++    struct AutoreleasePool
++    {
++        AutoreleasePool() = default;
++        AutoreleasePool(AutoreleasePool const&) = delete;
++        AutoreleasePool& operator=(AutoreleasePool const&) = delete;
++        ~AutoreleasePool() { [pool drain]; }
++
++        NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
++    };
++
++    /// CoreText's weight trait (kCTFontWeightTrait, -1.0 .. 1.0), spelled as the numbers behind
++    /// AppKit's NSFontWeight* constants: those exist only from macOS 10.11 on.
++    constexpr float makeFontWeight(FontWeight value) noexcept
+     {
+         switch (value)
+         {
+-            case FontWeight::Thin: return NSFontWeightThin;
+-            case FontWeight::ExtraLight: return NSFontWeightUltraLight;
+-            case FontWeight::Light: return NSFontWeightLight;
+-            case FontWeight::DemiLight: return NSFontWeightLight; // does not exist on CoreText
+-            case FontWeight::Book: return NSFontWeightRegular;    // does not exist on CoreText
+-            case FontWeight::Normal: return NSFontWeightRegular;
+-            case FontWeight::Medium: return NSFontWeightMedium;
+-            case FontWeight::DemiBold: return NSFontWeightSemibold;
+-            case FontWeight::Bold: return NSFontWeightBold;
+-            case FontWeight::ExtraBold: return NSFontWeightHeavy;
+-            case FontWeight::Black: return NSFontWeightBlack;
+-            case FontWeight::ExtraBlack: return NSFontWeightBlack; // does not exist on CoreText
++            case FontWeight::Thin: return -0.6f;       // NSFontWeightThin
++            case FontWeight::ExtraLight: return -0.8f; // NSFontWeightUltraLight
++            case FontWeight::Light: return -0.4f;      // NSFontWeightLight
++            case FontWeight::DemiLight: return -0.4f;  // does not exist on CoreText
++            case FontWeight::Book: return 0.0f;        // does not exist on CoreText
++            case FontWeight::Normal: return 0.0f;      // NSFontWeightRegular
++            case FontWeight::Medium: return 0.23f;     // NSFontWeightMedium
++            case FontWeight::DemiBold: return 0.3f;    // NSFontWeightSemibold
++            case FontWeight::Bold: return 0.4f;        // NSFontWeightBold
++            case FontWeight::ExtraBold: return 0.56f;  // NSFontWeightHeavy
++            case FontWeight::Black: return 0.62f;      // NSFontWeightBlack
++            case FontWeight::ExtraBlack: return 0.62f; // does not exist on CoreText
++        }
++        return 0.0f;
++    }
++
++    constexpr bool isBold(FontWeight value) noexcept
++    {
++        switch (value)
++        {
++            case FontWeight::DemiBold:
++            case FontWeight::Bold:
++            case FontWeight::ExtraBold:
++            case FontWeight::Black:
++            case FontWeight::ExtraBlack: return true;
++            default: return false;
++        }
++    }
++
++    [[nodiscard]] CFObject<CFNumberRef> cfNumber(float value)
++    {
++        return CFObject<CFNumberRef>(CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &value));
++    }
++
++    [[nodiscard]] CFObject<CFDictionaryRef> cfDictionary(void const** keys,
++                                                        void const** values,
++                                                        CFIndex count)
++    {
++        return CFObject<CFDictionaryRef>(CFDictionaryCreate(
++            kCFAllocatorDefault, keys, values, count, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
++    }
++
++    /// Resolves the on-disk file path of a CTFont, returning true and filling @p out on success.
++    ///
++    /// Prefers kCTFontURLAttribute (reliable on modern macOS). On older systems (notably 10.6) that
++    /// attribute frequently returns null for system fonts, so it falls back to Apple Type Services:
++    /// CTFontGetPlatformFont -> ATSFontRef -> ATSFontGetFileReference -> FSRef -> path.
++    [[nodiscard]] bool copyFontFilePath(CTFontRef font, char* out, size_t outSize)
++    {
++        if (!font)
++            return false;
++
++        if (auto const url = CFObject<CFURLRef>(static_cast<CFURLRef>(CTFontCopyAttribute(font, kCTFontURLAttribute))))
++        {
++            if (CFURLGetFileSystemRepresentation(url.get(), true, reinterpret_cast<UInt8*>(out), static_cast<CFIndex>(outSize)))
++                return true;
++        }
++
++#if !defined(__LP64__)
++        // ATS fallback for 10.6, where kCTFontURLAttribute is frequently null for system fonts.
++        // Resolve via the PostScript name (reliably available from the CTFont) to an ATSFontRef,
++        // then to the font file. The ATSFontRef file APIs are 32-bit-only, which matches the
++        // PowerPC target; on 64-bit builds this path is unavailable but the URL attribute above
++        // works there anyway.
++        if (auto const psName = CFObject<CFStringRef>(CTFontCopyPostScriptName(font)))
++        {
++            ATSFontRef const atsFont = ATSFontFindFromPostScriptName(psName.get(), kATSOptionFlagsDefault);
++            if (atsFont != kATSFontRefUnspecified && atsFont != 0)
++            {
++                FSRef fsRef;
++                if (ATSFontGetFileReference(atsFont, &fsRef) == noErr
++                    && FSRefMakePath(&fsRef, reinterpret_cast<UInt8*>(out), static_cast<UInt32>(outSize)) == noErr)
++                    return true;
++            }
+         }
+-        return NSFontWeightRegular;
++#endif
++        return false;
+     }
+ 
+     [[nodiscard]] CFObject<CTFontRef> matchFamily(std::string const& family,
+-                                                  FontDescription const& description)
++                                                  FontDescription const& description,
++                                                  NSFontManager* fontManager)
+     {
+         auto nativeFamily = family;
+         if (family == "emoji")
+@@ -73,26 +156,59 @@ namespace
+             CFStringCreateWithCString(kCFAllocatorDefault, nativeFamily.c_str(), kCFStringEncodingUTF8));
+         if (!name)
+             return {};
+-        auto const weight = makeFontWeight(description.weight);
+-        auto const slant = description.slant == FontSlant::Normal ? 0.0 : 1.0;
+-        // Require the family, but allow the closest installed style. Traits belong in the
+-        // traits dictionary; a missing explicit fallback must not silently name a default font.
+-        auto const descriptor =
+-            CFObject<CTFontDescriptorRef>(CTFontDescriptorCreateWithAttributes((__bridge CFDictionaryRef) @{
+-                (id) kCTFontFamilyNameAttribute: (__bridge id) name.get(),
+-                (id) kCTFontTraitsAttribute: @ {
+-                    (id) kCTFontWeightTrait: [NSNumber numberWithDouble:weight],
+-                    (id) kCTFontSlantTrait: [NSNumber numberWithDouble:slant],
+-                },
+-            }));
+-        auto const match = CFObject<CTFontDescriptorRef>(CTFontDescriptorCreateMatchingFontDescriptor(
+-            descriptor.get(), (__bridge CFSetRef) [NSSet setWithObject:(id) kCTFontFamilyNameAttribute]));
++
++        // Require the family, but allow the closest installed style. Traits belong in the traits
++        // dictionary; a missing explicit fallback must not silently name a default font. Built with
++        // the CoreFoundation API rather than Objective-C literals, which GCC does not compile.
++        auto const weight = cfNumber(makeFontWeight(description.weight));
++        auto const slant = cfNumber(description.slant == FontSlant::Normal ? 0.0f : 1.0f);
++        void const* traitKeys[] = { kCTFontWeightTrait, kCTFontSlantTrait };
++        void const* traitValues[] = { weight.get(), slant.get() };
++        auto const traits = cfDictionary(traitKeys, traitValues, 2);
++        void const* attributeKeys[] = { kCTFontFamilyNameAttribute, kCTFontTraitsAttribute };
++        void const* attributeValues[] = { name.get(), traits.get() };
++        auto const attributes = cfDictionary(attributeKeys, attributeValues, 2);
++        auto const descriptor = CFObject<CTFontDescriptorRef>(CTFontDescriptorCreateWithAttributes(attributes.get()));
++
++        void const* mandatory[] = { kCTFontFamilyNameAttribute };
++        auto const mandatoryAttributes =
++            CFObject<CFSetRef>(CFSetCreate(kCFAllocatorDefault, mandatory, 1, &kCFTypeSetCallBacks));
++        auto const match = CFObject<CTFontDescriptorRef>(
++            CTFontDescriptorCreateMatchingFontDescriptor(descriptor.get(), mandatoryAttributes.get()));
+         if (!match)
+         {
+             locatorLog()("No installed font family matches {}", family);
+             return {};
+         }
+-        return CFObject<CTFontRef>(CTFontCreateWithFontDescriptor(match.get(), 16.0, nullptr));
++        auto font = CFObject<CTFontRef>(CTFontCreateWithFontDescriptor(match.get(), 16.0, nullptr));
++        if (!font)
++            return font;
++
++        // On 10.6, CoreText given a family name plus a weight/slant traits dictionary can answer with
++        // a different family altogether (the system default, Lucida Grande) when the requested weight
++        // is not an exact trait match, rather than with the family's closest face -- which is how bold
++        // text came out proportional. Verify the family; if it is wrong, resolve the family's own
++        // bold/italic member through NSFontManager, which gets this right, and take that face.
++        auto const resolvedFamily = CFObject<CFStringRef>(CTFontCopyFamilyName(font.get()));
++        auto const familyMatches =
++            resolvedFamily && CFStringCompare(resolvedFamily.get(), name.get(), 0) == kCFCompareEqualTo;
++        if (!familyMatches && fontManager)
++        {
++            auto const pool = AutoreleasePool {};
++            NSFontTraitMask mask = 0;
++            if (isBold(description.weight))
++                mask |= NSBoldFontMask;
++            if (description.slant == FontSlant::Italic)
++                mask |= NSItalicFontMask;
++            NSString* nsFamily = [NSString stringWithUTF8String:nativeFamily.c_str()];
++            NSFont* nsFont = [fontManager fontWithFamily:nsFamily
++                                                  traits:mask
++                                                  weight:(mask & NSBoldFontMask) ? 9 : 5
++                                                    size:16.0];
++            if (nsFont)
++                font = CFObject<CTFontRef>(CTFontCreateWithName((CFStringRef) [nsFont fontName], 16.0, nullptr));
++        }
++        return font;
+     }
+ 
+     // Replacing a font at the same path can change collection indices without changing names.
+@@ -119,6 +235,9 @@ struct CoreTextLocator::Private
+         std::vector<std::pair<FT_Long, FT_ULong>> variableFaces;
+     };
+ 
++    // The shared font manager is a singleton owned by AppKit; it is not released here.
++    NSFontManager* fontManager = [NSFontManager sharedFontManager];
++
+     std::mutex mutex;
+     FtLibrary library { nullptr, FT_Done_FreeType };
+     std::unordered_map<std::string, FontFile> files;
+@@ -223,16 +342,17 @@ struct CoreTextLocator::Private
+     {
+         if (!font)
+             return;
+-        auto const url =
+-            CFObject<CFURLRef>(static_cast<CFURLRef>(CTFontCopyAttribute(font, kCTFontURLAttribute)));
+-        if (!url)
+-            return;
+-        auto const* path = [(__bridge NSURL*) url.get() fileSystemRepresentation];
+-        if (!path)
++        char path[PATH_MAX];
++        if (!copyFontFilePath(font, path, sizeof(path)))
++        {
++            locatorLog()("Cannot resolve a file path for a CoreText font; skipping it.");
+             return;
++        }
+         auto const name = CFObject<CFStringRef>(CTFontCopyPostScriptName(font));
+-        auto const* postscript = [(__bridge NSString*) name.get() UTF8String];
+-        if (!postscript || std::string_view(postscript) == "LastResort")
++        char postscript[256] = {};
++        if (!name || !CFStringGetCString(name.get(), postscript, sizeof(postscript), kCFStringEncodingUTF8))
++            return;
++        if (std::string_view(postscript) == "LastResort")
+             return;
+         auto const index = fontIndex(path, postscript);
+         if (!index)
+@@ -272,72 +392,65 @@ CoreTextLocator::CoreTextLocator(): _d { new Private, [](Private* p) { delete p;
+ 
+ FontSourceList CoreTextLocator::locate(FontDescription const& description)
+ {
+-    @autoreleasepool
++    locatorLog()("Locating font chain for: {}", description);
++    auto fonts = FontSourceList {};
++    auto font = matchFamily(description.familyName, description, _d->fontManager);
++    if (!font)
++        font = matchFamily("Menlo", description, _d->fontManager);
++    _d->appendFont(fonts, font.get());
++    if (auto const* list = std::get_if<FontFallbackList>(&description.fontFallback))
+     {
+-        locatorLog()("Locating font chain for: {}", description);
+-        auto fonts = FontSourceList {};
+-        auto font = matchFamily(description.familyName, description);
+-        if (!font)
+-            font = matchFamily("Menlo", description);
+-        _d->appendFont(fonts, font.get());
+-        if (auto const* list = std::get_if<FontFallbackList>(&description.fontFallback))
++        for (auto const& family: list->fallbackFonts)
+         {
+-            for (auto const& family: list->fallbackFonts)
+-            {
+-                auto const fallback = matchFamily(family, description);
+-                _d->appendFont(fonts, fallback.get());
+-            }
++            auto const fallback = matchFamily(family, description, _d->fontManager);
++            _d->appendFont(fonts, fallback.get());
+         }
+-        else if (font && !std::holds_alternative<FontFallbackNone>(description.fontFallback))
+-        {
+-            auto const cascade = CFObject<CFArrayRef>(CTFontCopyDefaultCascadeListForLanguages(
+-                font.get(), (__bridge CFArrayRef) NSLocale.preferredLanguages));
+-            _d->appendDescriptors(fonts, cascade.get());
+-        }
+-        return fonts;
+     }
++    // Without an explicit list, upstream appends CoreText's default cascade for the user's languages
++    // (CTFontCopyDefaultCascadeListForLanguages), an API that exists from macOS 10.8 on only. This
++    // port leaves the chain at the primary: a codepoint it lacks is resolved by content in resolve(),
++    // which asks CoreText directly which font renders it -- the face the cascade would eventually
++    // reach, found in one query rather than by walking a family-ordered list (where the one
++    // CJK-capable face was observed 83rd of 201, past any walk limit worth paying for).
++    return fonts;
+ }
+ 
+ FontSourceList CoreTextLocator::all()
+ {
+-    @autoreleasepool
+-    {
+-        auto fonts = FontSourceList {};
+-        auto const collection =
+-            CFObject<CTFontCollectionRef>(CTFontCollectionCreateFromAvailableFonts(nullptr));
+-        auto const descriptors =
+-            CFObject<CFArrayRef>(CTFontCollectionCreateMatchingFontDescriptors(collection.get()));
+-        _d->appendDescriptors(fonts, descriptors.get());
+-        return fonts;
+-    }
++    auto fonts = FontSourceList {};
++    auto const collection = CFObject<CTFontCollectionRef>(CTFontCollectionCreateFromAvailableFonts(nullptr));
++    auto const descriptors =
++        CFObject<CFArrayRef>(CTFontCollectionCreateMatchingFontDescriptors(collection.get()));
++    _d->appendDescriptors(fonts, descriptors.get());
++    return fonts;
+ }
+ 
+ FontSourceList CoreTextLocator::resolve(gsl::span<char32_t const> codepoints)
+ {
+-    @autoreleasepool
+-    {
+-        auto fonts = FontSourceList {};
+-        if (codepoints.empty() || std::ranges::any_of(codepoints, [](char32_t cp) {
+-                return cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF);
+-            }))
+-            return fonts;
+-        // Let CoreFoundation transcode UTF-32 into its UTF-16 string representation. The
+-        // CoreText range must use that string's length, including surrogate pairs and selectors.
+-        auto constexpr Encoding =
+-            std::endian::native == std::endian::little ? kCFStringEncodingUTF32LE : kCFStringEncodingUTF32BE;
+-        auto const string = CFObject<CFStringRef>(
+-            CFStringCreateWithBytes(kCFAllocatorDefault,
+-                                    reinterpret_cast<UInt8 const*>(codepoints.data()),
+-                                    static_cast<CFIndex>(codepoints.size() * sizeof(char32_t)),
+-                                    Encoding,
+-                                    false));
+-        auto const base = CFObject<CTFontRef>(CTFontCreateWithName(CFSTR("Menlo"), 16.0, nullptr));
+-        if (!string || !base)
+-            return fonts;
+-        auto const font = CFObject<CTFontRef>(
+-            CTFontCreateForString(base.get(), string.get(), CFRangeMake(0, CFStringGetLength(string.get()))));
+-        _d->appendFont(fonts, font.get());
++    auto fonts = FontSourceList {};
++    if (codepoints.empty() || std::ranges::any_of(codepoints, [](char32_t cp) {
++            return cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF);
++        }))
+         return fonts;
+-    }
++    // Let CoreFoundation transcode UTF-32 into its UTF-16 string representation. The CoreText range
++    // must use that string's length, including surrogate pairs and selectors.
++    auto constexpr Encoding =
++        std::endian::native == std::endian::little ? kCFStringEncodingUTF32LE : kCFStringEncodingUTF32BE;
++    auto const string = CFObject<CFStringRef>(
++        CFStringCreateWithBytes(kCFAllocatorDefault,
++                                reinterpret_cast<UInt8 const*>(codepoints.data()),
++                                static_cast<CFIndex>(codepoints.size() * sizeof(char32_t)),
++                                Encoding,
++                                false));
++    // CTFontCreateForString consults ITS argument's own cascade list, not a global one, so the anchor
++    // font matters. Menlo has shipped with every release since 10.6; CTFontCreateForString itself has
++    // existed since CoreText's 10.5 debut.
++    auto const base = CFObject<CTFontRef>(CTFontCreateWithName(CFSTR("Menlo"), 16.0, nullptr));
++    if (!string || !base)
++        return fonts;
++    auto const font = CFObject<CTFontRef>(
++        CTFontCreateForString(base.get(), string.get(), CFRangeMake(0, CFStringGetLength(string.get()))));
++    _d->appendFont(fonts, font.get());
++    return fonts;
+ }
+ } // namespace text
+diff --git a/src/text_shaper/CoreTextLocator_test.cpp b/src/text_shaper/CoreTextLocator_test.cpp
+index 07cfccbb5..08db55ba0 100644
+--- a/src/text_shaper/CoreTextLocator_test.cpp
++++ b/src/text_shaper/CoreTextLocator_test.cpp
+@@ -76,8 +76,10 @@ TEST_CASE("CoreTextLocator.configured_fallback_chain", "[coretext][fallback]")
+     }
+     SECTION("automatic cascade")
+     {
++        // CoreText's default cascade (CTFontCopyDefaultCascadeListForLanguages) is 10.8+ and not used
++        // by this port: the chain stays at the primary, and resolve() answers by content.
+         desc.fontFallback = std::monostate {};
+-        CHECK(locator.locate(desc).size() > 1);
++        CHECK(locator.locate(desc).size() == 1);
+     }
+ }
+ 
+-- 
+2.43.0
+
