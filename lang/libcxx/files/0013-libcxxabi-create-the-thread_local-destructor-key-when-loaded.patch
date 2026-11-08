@@ -1,0 +1,79 @@
+libc++abi: create the thread_local destructor key when libc++abi is loaded
+
+At thread exit the pthread key destructors run in the order in which the
+keys were created: Darwin hands out the lowest free key and walks the keys
+upwards, PTHREAD_DESTRUCTOR_ITERATIONS times (Libc-594 on 10.6 and current
+libpthread alike). GCC implements thread_local with emulated TLS, and
+libgcc's emutls frees all TLS storage of a thread from the destructor of a
+key of its own, which it creates at the first TLS access in the process.
+The key of __cxa_thread_atexit() was created at its first call, which is
+always later: a thread_local is accessed, and constructed in its emutls
+storage, before its destructor is registered. So at thread exit the emutls
+storage was released first and the destructors then ran on freed memory.
+Darwin's malloc writes its free-list pointers into freed blocks, so the
+first members of the objects are already overwritten when their
+destructors read them.
+
+Patch 0011 moved the destructor list out of TLS, but the objects still live
+there. Create the key from a constructor function when libc++abi is loaded
+instead. libc++abi depends only on libSystem, so its initializers run
+before those of any code using it, and thus before that code's first TLS
+access; the key's destructor then runs first, while the objects exist. If
+emulated TLS was used before libc++abi was loaded (dlopen() into a process
+which already used it), the order is the same as before.
+
+DtorsManager, whose destructor runs the destructors of the main thread at
+exit, stays a function-local static: constructed at load time, its
+destructor would run after those of all other objects with static storage
+duration. Only the key creation moves; a once flag serves both paths.
+
+Checked on Linux with libgcc's __emutls_get_address and this file built
+with -D__APPLE__: without the change the destructor of a thread_local reads
+freed memory (glibc.malloc.perturb), with it the object is intact.
+
+diff --git a/libcxxabi/src/cxa_thread_atexit.cpp b/libcxxabi/src/cxa_thread_atexit.cpp
+--- a/libcxxabi/src/cxa_thread_atexit.cpp
++++ b/libcxxabi/src/cxa_thread_atexit.cpp
+@@ -75,6 +75,7 @@
+   // key destructor of its own, which is created earlier and therefore runs
+   // earlier, after which thread_locals read as freshly zero-initialized.
+   std::__libcpp_tls_key dtors_key;
++  std::__libcpp_exec_once_flag dtors_key_once = _LIBCPP_EXEC_ONCE_INITIALIZER;
+ 
+   void run_dtors(void* p) {
+     // The key's destructor is given the list after the key was reset; put it
+@@ -90,14 +91,28 @@
+     }
+   }
+ 
++  void create_dtors_key() {
++    // There is intentionally no matching std::__libcpp_tls_delete call, as
++    // __cxa_thread_atexit() may be called arbitrarily late (for example, from
++    // global destructors or atexit() handlers).
++    if (std::__libcpp_tls_create(&dtors_key, run_dtors) != 0) {
++      __abort_message("std::__libcpp_tls_create() failed in __cxa_thread_atexit()");
++    }
++  }
++
++#if defined(__APPLE__)
++  // Key destructors run in creation order, and emutls frees a thread's TLS
++  // storage from the destructor of a key it creates at the first TLS access.
++  // Create this key before that, when libc++abi is loaded, so that the
++  // thread_local destructors run while their objects still exist.
++  __attribute__((constructor)) void create_dtors_key_at_load() {
++    std::__libcpp_execute_once(&dtors_key_once, create_dtors_key);
++  }
++#endif
++
+   struct DtorsManager {
+     DtorsManager() {
+-      // There is intentionally no matching std::__libcpp_tls_delete call, as
+-      // __cxa_thread_atexit() may be called arbitrarily late (for example, from
+-      // global destructors or atexit() handlers).
+-      if (std::__libcpp_tls_create(&dtors_key, run_dtors) != 0) {
+-        __abort_message("std::__libcpp_tls_create() failed in __cxa_thread_atexit()");
+-      }
++      std::__libcpp_execute_once(&dtors_key_once, create_dtors_key);
+     }
+ 
+     ~DtorsManager() {
