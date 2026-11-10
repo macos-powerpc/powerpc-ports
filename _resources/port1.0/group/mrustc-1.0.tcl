@@ -981,6 +981,14 @@ proc rust::set_environment {} {
         configure.pkg_config_path-prepend   ${prefix}/libexec/openssl${openssl_ver}/lib/pkgconfig
     }
 
+    # libsqlite3-sys (not `bundled`) asks pkg-config for sqlite3 >= 3.34.1 and otherwise links a
+    # bare `-l sqlite3`: /usr/lib/libsqlite3.dylib (3.6.12 on 10.6) unless sqlite3 is active.
+    # With SQLITE3_LIB_DIR it links ${prefix}/lib with or without pkg-config (arti, tor-dirmgr).
+    if {[rust::uses_crate libsqlite3-sys]} {
+        rust::append_envs               SQLITE3_LIB_DIR=${prefix}/lib         {build destroot}
+        rust::append_envs               SQLITE3_INCLUDE_DIR=${prefix}/include {build destroot}
+    }
+
     # Propagate pkgconfig path to build and destroot phases as well.
     # Needed to work with openssl PG.
     if { ${configure.pkg_config_path} ne "" } {
@@ -1103,6 +1111,12 @@ proc rust::rust_pg_callback {} {
     if {[rust::uses_crate curl-sys]} {
         depends_lib-delete              port:curl
         depends_lib-append              port:curl
+    }
+
+    # See SQLITE3_LIB_DIR in rust::set_environment (a port with rusqlite/bundled may delete it)
+    if {[rust::uses_crate libsqlite3-sys]} {
+        depends_lib-delete              port:sqlite3
+        depends_lib-append              port:sqlite3
     }
 
     # Use PEM from ports:
