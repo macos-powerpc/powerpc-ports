@@ -30,7 +30,7 @@ if {${rust.compiler} eq "mrustc"} {
     default build.target        {}
     # Keep the vendor and output directories out of build.args: a Portfile that sets `build.args --features=..` (websocat)
     # instead of appending would otherwise drop them (minicargo then finds no crate at all)
-    default build.pre_args      {-L ${mrustc_root}/lib/ -j${build.jobs} --vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
+    default build.pre_args      {-L ${mrustc_root}/lib/ [rust::minicargo_lib_args] -j${build.jobs} --vendor-dir ${cargo.home}/macports/ --output-dir ${worksrcpath}/target/[cargo.rust_platform]/release}
     default build.args          {}
 
     destroot {

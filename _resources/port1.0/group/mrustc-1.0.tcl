@@ -157,6 +157,14 @@ default     rust.rt_static_libs     {[rust::get_static_rutime_libraries]}
 options     rust.add_compiler_runtime
 default     rust.add_compiler_runtime   {no}
 
+# The libc crate requests `-liconv` on Apple targets, which resolves to ${prefix}/lib/libiconv.dylib
+#     (std's -L${prefix}/lib, LIBRARY_PATH), so by default port:libiconv is added to depends_lib.
+# Set to `yes` to link the system libiconv instead and drop that dependency
+#     only works if no C code built by the port uses iconv (e.g. vendored libgit2 via libgit2-sys);
+#     such code is compiled against MacPorts iconv.h and needs its `libiconv_*` symbols
+options     rust.system_libiconv
+default     rust.system_libiconv        {no}
+
 # The distfiles of the main port will also be stored in this directory,
 # but this is the only way to allow reusing the same crates across multiple ports.
 default     dist_subdir             {[expr {[llength ${cargo.crates}] > 0 || [llength ${cargo.crates_github}] > 0 ? "cargo-crates" : ${name}}]}
@@ -302,6 +310,42 @@ proc rust::configure_ldflags_proc {option action args} {
     }
 }
 option_proc configure.ldflags rust::configure_ldflags_proc
+
+# Holds only a link to the system libiconv. minicargo passes it to mrustc with -L after the standard
+# library, so mrustc links libc's `iconv` from it by its full path, or (a .tbd) with this
+# directory ahead of std's -L${prefix}/lib.
+proc rust::system_libiconv_dir {} {
+    return [option workpath]/rust-system-libiconv
+}
+
+proc rust::system_libiconv_file {} {
+    foreach dir [list [option configure.sdkroot]/usr/lib /usr/lib] {
+        foreach lib {libiconv.tbd libiconv.dylib} {
+            if {[file exists ${dir}/${lib}]} {
+                return ${dir}/${lib}
+            }
+        }
+    }
+    return ""
+}
+
+# Library directories for minicargo's -L, after ${mrustc_root}/lib (minicargo hands its first -L to
+# build scripts as MRUSTC_LIBDIR): the cargo PortGroup's build.pre_args and the cargo stand-in
+proc rust::minicargo_lib_dirs {} {
+    set dirs [list]
+    if {[option os.platform] eq "darwin" && [option rust.system_libiconv]} {
+        lappend dirs [rust::system_libiconv_dir]
+    }
+    return ${dirs}
+}
+
+proc rust::minicargo_lib_args {} {
+    set args [list]
+    foreach dir [rust::minicargo_lib_dirs] {
+        lappend args -L ${dir}
+    }
+    return ${args}
+}
 
 # Based on portextract::disttagclean from portextract.tcl
 proc rust::disttagclean {list} {
@@ -925,6 +969,7 @@ proc rust::write_cargo_shim {} {
         MRUSTC_SHIM_MINICARGO   [option cargo.bin] \
         MRUSTC_SHIM_MRUSTC      ${mrustc_root}/bin/mrustc \
         MRUSTC_SHIM_LIBDIR      ${mrustc_root}/lib \
+        MRUSTC_SHIM_LINK_DIRS   [join [rust::minicargo_lib_dirs] :] \
         MRUSTC_SHIM_VENDOR_DIR  [option cargo.home]/macports \
         MRUSTC_SHIM_JOBS        [option build.jobs] \
         MRUSTC_SHIM_HOST        [cargo.rust_platform] \
@@ -1094,6 +1139,23 @@ proc rust::rust_pg_callback {} {
 
         depends_build-delete            port:mrustc
         depends_build-append            port:mrustc
+
+        if {[option os.platform] eq "darwin"} {
+            if {[option rust.system_libiconv]} {
+                post-extract {
+                    set lib [rust::system_libiconv_file]
+                    if {${lib} ne ""} {
+                        file mkdir [rust::system_libiconv_dir]
+                        ln -sf ${lib} [rust::system_libiconv_dir]/[file tail ${lib}]
+                    } else {
+                        ui_debug "mrustc PG: no system libiconv found; -liconv will resolve normally"
+                    }
+                }
+            } else {
+                depends_lib-delete      port:libiconv
+                depends_lib-append      port:libiconv
+            }
+        }
     }
 
     if {[option openssl.branch] ne ""} {

@@ -48,6 +48,7 @@ interpreter of the python PortGroup:
     MRUSTC_SHIM_MINICARGO   minicargo
     MRUSTC_SHIM_MRUSTC      mrustc
     MRUSTC_SHIM_LIBDIR      the installed standard library (minicargo -L)
+    MRUSTC_SHIM_LINK_DIRS   more minicargo -L directories, `:`-separated (rust.system_libiconv)
     MRUSTC_SHIM_VENDOR_DIR  the vendored crates (minicargo --vendor-dir)
     MRUSTC_SHIM_JOBS        minicargo -j
     MRUSTC_SHIM_HOST        the host target triple (also the only target)
@@ -683,6 +684,9 @@ def cargo_build(command, opts):
             "-j", opts.get("--jobs", "-j") or env("MRUSTC_SHIM_JOBS"),
             "--vendor-dir", env("MRUSTC_SHIM_VENDOR_DIR"),
             "--output-dir", str(out_dir)] + feature_args(opts, pkg)
+    for d in os.environ.get("MRUSTC_SHIM_LINK_DIRS", "").split(":"):
+        if d:
+            argv += ["-L", d]
     if lib_only:
         argv.append("--lib")
     if crate_types:
