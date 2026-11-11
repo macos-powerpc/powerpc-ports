@@ -69,7 +69,7 @@ proc openssl::depends_portname {} {
 }
 
 proc openssl::known_branches {} {
-    return [list no_version 1.0 1.1 3]
+    return [list no_version 1.0 1.1 3 4]
 }
 
 proc openssl::check_branch {} {
@@ -83,7 +83,7 @@ proc openssl::check_branch {} {
 }
 
 proc openssl::is_enabled {} {
-    return [expr {[openssl::check_branch] && [option openssl.branch] != "no_version"}]
+    return [expr { [openssl::check_branch] && [option openssl.branch] != "no_version"} ]
 }
 
 proc openssl::set_openssl_dependency {} {
