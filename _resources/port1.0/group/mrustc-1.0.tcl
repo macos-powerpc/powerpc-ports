@@ -43,6 +43,10 @@
 #
 # cargo.crate_patch_dirs-append ${filespath}/crate_patches
 #
+# The `pregenerated` directory there holds files that build scripts would make
+# with tools ppc lacks, such as nettle-sys's bindgen bindings (see
+# rust::nettle_sys_bindings).
+#
 # Ports whose own build system runs cargo (PortGroup rust 1.0) get cargo and
 # rustc stand-ins in ${cargo.home}/bin that build with minicargo, see
 # mrustc.cargo_shim. By default this is on for
@@ -750,6 +754,46 @@ proc rust::crate_patches {cname cversion exact_only} {
     return ${patches}
 }
 
+# A file for a build script from the `pregenerated` directory of the first cargo.crate_patch_dirs entry that has it
+proc rust::pregenerated_file {name} {
+    foreach dir [option cargo.crate_patch_dirs] {
+        if {[file isfile ${dir}/pregenerated/${name}]} {
+            return ${dir}/pregenerated/${name}
+        }
+    }
+    return ""
+}
+
+# nettle-sys runs bindgen, which needs libclang, unless NETTLE_PREGENERATED_BINDINGS names a bindings file:
+# pregenerated/nettle-<version>-<triple>.rs, or nettle-<major>.<minor>-<triple>.rs, for the installed Nettle
+# (bindgen-gcc's recipes/nettle-sys.sh makes them from the Nettle headers with the port's GCC)
+proc rust::nettle_sys_bindings {} {
+    set pc [option prefix]/lib/pkgconfig/nettle.pc
+    set version ""
+    if {![catch {open ${pc} r} fd]} {
+        while {[gets ${fd} line] >= 0} {
+            regexp {^Version:\s*(\S+)} ${line} -> version
+        }
+        close ${fd}
+    }
+    if {${version} eq ""} {
+        return -code error "mrustc PG: no Nettle version in ${pc}"
+    }
+    set triple [cargo.rust_platform]
+    foreach v [lsort -unique [list ${version} [join [lrange [split ${version} .] 0 1] .]]] {
+        set f [rust::pregenerated_file nettle-${v}-${triple}.rs]
+        if {${f} ne ""} {
+            return ${f}
+        }
+    }
+    set msg "no pregenerated/nettle-${version}-${triple}.rs in cargo.crate_patch_dirs"
+    if {[option configure.build_arch] in {ppc ppc64}} {
+        return -code error "mrustc PG: ${msg}: nettle-sys would run bindgen, which needs libclang"
+    }
+    ui_debug "mrustc PG: ${msg}, nettle-sys runs bindgen"
+    return ""
+}
+
 proc rust::apply_crate_patches {cname cversion cdirname exact_only} {
     set patchbin [findBinary patch ${portutil::autoconf::patch_path}]
     foreach patchfile [rust::crate_patches ${cname} ${cversion} ${exact_only}] {
@@ -1179,6 +1223,21 @@ proc rust::rust_pg_callback {} {
     if {[rust::uses_crate libsqlite3-sys]} {
         depends_lib-delete              port:sqlite3
         depends_lib-append              port:sqlite3
+    }
+
+    # nettle-sys links Nettle and GMP, found by pkg-config, and needs its bindings (rust::nettle_sys_bindings)
+    if {[rust::uses_crate nettle-sys]} {
+        depends_lib-delete              port:nettle port:gmp
+        depends_lib-append              port:nettle port:gmp
+        depends_build-delete            path:bin/pkg-config:pkgconfig
+        depends_build-append            path:bin/pkg-config:pkgconfig
+        pre-build {
+            set bindings [rust::nettle_sys_bindings]
+            if {${bindings} ne ""} {
+                ui_info "nettle-sys: bindings from ${bindings}"
+                build.env-append        NETTLE_PREGENERATED_BINDINGS=${bindings}
+            }
+        }
     }
 
     # Use PEM from ports:
