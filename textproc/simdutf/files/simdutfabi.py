@@ -16,7 +16,10 @@
 # virtual interface of simdutf::implementation are reported but do not
 # fail: the port's dependents never call through it, which `users` checks.
 # users fails when a source file outside a vendored simdutf copy uses the
-# implementation objects (get_active_implementation & co.).
+# implementation objects (get_active_implementation & co.).  It also lists
+# uses of the atomic_* functions: simdutf compiles those only when built as
+# C++20 (SIMDUTF_ATOMIC_REF), while a C++20 dependent sees the declarations
+# whatever the library was built as - the port passes SIMDUTF_CXX_STANDARD=20.
 # Text-level parsing, no compiler: treat a pass as necessary, not
 # sufficient, and read the release notes too.
 import os, re, subprocess, sys
@@ -166,11 +169,14 @@ def abi(repo, old, new):
 USE = re.compile(r'get_active_implementation|get_available_implementations|'
                  r'get_default_implementation|builtin_implementation|'
                  r'\bsimdutf::implementation\b|available_implementation_list')
+CXX20_ONLY = re.compile(r'\bsimdutf::atomic_(binary_to_base64|'
+                        r'base64_to_binary_safe)\b')
 SRC = ('.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.mm', '.m')
 
 
 def users(dirs):
     hits = 0
+    cxx20 = 0
     for top in dirs:
         for root, subdirs, files in os.walk(top):
             subdirs[:] = [d for d in subdirs if d not in ('.git', 'simdutf')]
@@ -186,7 +192,13 @@ def users(dirs):
                     if USE.search(l):
                         hits += 1
                         print(f'{p}:{i}: {l.strip()}')
+                    if CXX20_ONLY.search(l):
+                        cxx20 += 1
+                        print(f'{p}:{i}: [C++20-only] {l.strip()}')
     print(f'implementation-object uses: {hits}')
+    print(f'C++20-only (SIMDUTF_ATOMIC_REF) uses: {cxx20}'
+          + (' - the library must be built with SIMDUTF_CXX_STANDARD=20'
+             if cxx20 else ''))
     return 1 if hits else 0
 
 
