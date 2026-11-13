@@ -1,0 +1,247 @@
+AltiVec (VMX) for simdjson's "ppc64" kernel, for the +altivec variant.
+
+Upstream builds the ppc64 kernel only for 64-bit PowerPC with VSX/POWER8
+(portability.h requires __PPC64__, __ALTIVEC__ and __POWER8_VECTOR__) and
+its simd.h uses VSX-only operations (vec_vsx_ld/st, vbpermq, 2x64-bit
+vectors).  This patch:
+
+- portability.h, isadetection.h: recognise PowerPC under every macro
+  spelling (Darwin compilers define __ppc__/__ppc64__, never
+  __PPC__/__PPC64__) and enable the kernel on any PowerPC with AltiVec,
+  including 32-bit, where it also defines SIMDJSON_IS_32BITS.  Without
+  AltiVec nothing changes: the portable fallback kernel is used.
+- ppc64/simd.h: plain-AltiVec replacements behind __VSX__ /
+  __POWER8_VECTOR__ guards (POWER7+ code generation is unchanged):
+  to_bitmask as bit weights + vec_msum, unaligned loads as the
+  lvx/lvsl/vperm idiom (reads only the two aligned lines holding the 16
+  bytes, so it stays inside SIMDJSON_PADDING), stores through an aligned
+  temporary, compress masks from the thintable halves.
+- ppc64/numberparsing_defs.h: full_multiplication for 32-bit non-MSVC
+  compilers (the kernel otherwise calls the MSVC-only _umul128 there) and
+  __builtin_bswap64 where neither byteswap.h nor sys/endian.h exists.
+
+Written for this port (2026-09, rebased onto 5.1.1); upstream CI never
+runs big-endian PowerPC, so the test suite (+tests) is the validation.
+
+diff -ru include/simdjson/portability.h include/simdjson/portability.h
+--- include/simdjson/portability.h
++++ include/simdjson/portability.h
+@@ -86,9 +86,24 @@
+ 
+ 
+ #endif
+-#elif defined(__PPC64__) || defined(_M_PPC64)
++#elif defined(__PPC64__) || defined(_M_PPC64) || defined(__ppc64__) ||         \
++    defined(__powerpc64__) ||                                                  \
++    ((defined(__PPC__) || defined(__ppc__) || defined(_ARCH_PPC)) &&           \
++     defined(__ALTIVEC__))
++// Covers 64-bit PowerPC under every macro spelling (Darwin compilers define
++// __ppc64__, not __PPC64__), plus 32-bit PowerPC with AltiVec: the "ppc64"
++// kernel only needs 128-bit vectors and 64-bit scalar arithmetic, both of
++// which 32-bit PowerPC provides.  32-bit PowerPC without AltiVec falls
++// through to the generic 32-bit fallback below.
+ #define SIMDJSON_IS_PPC64 1
+-#if defined(__ALTIVEC__) && defined(__POWER8_VECTOR__)
++#if !(defined(__PPC64__) || defined(_M_PPC64) || defined(__ppc64__) ||         \
++      defined(__powerpc64__))
++#define SIMDJSON_IS_PPC_32BITS 1
++#define SIMDJSON_IS_32BITS 1
++#endif
++// The kernel's VSX/POWER8 operations have plain-AltiVec replacements
++// (ppc64/simd.h), so AltiVec alone is enough.
++#if defined(__ALTIVEC__)
+ #define SIMDJSON_IS_PPC64_VMX 1
+ #endif // defined(__ALTIVEC__)
+ #else
+diff -ru include/simdjson/ppc64/numberparsing_defs.h include/simdjson/ppc64/numberparsing_defs.h
+--- include/simdjson/ppc64/numberparsing_defs.h
++++ include/simdjson/ppc64/numberparsing_defs.h
+@@ -30,6 +30,10 @@
+   val = bswap_64(val);
+ #elif defined(__FreeBSD__)
+   val = bswap64(val);
++#else
++  // Darwin and AIX have no byteswap.h/sys/endian.h; every compiler that
++  // builds this kernel provides the builtin.
++  val = __builtin_bswap64(val);
+ #endif
+ #endif
+   val = (val & 0x0F0F0F0F0F0F0F0F) * 2561 >> 8;
+@@ -45,8 +49,18 @@
+   // ARM64 has native support for 64-bit multiplications, no need to emultate
+   answer.high = __umulh(value1, value2);
+   answer.low = value1 * value2;
+-#else
++#elif SIMDJSON_REGULAR_VISUAL_STUDIO
+   answer.low = _umul128(value1, value2, &answer.high); // _umul128 not available on ARM64
++#else
++  // 32-bit without MSVC: no __uint128_t and no _umul128.  Same algorithm
++  // as umul128_generic in compile_time_json-inl.h.
++  uint64_t ad = uint64_t(uint32_t(value1 >> 32)) * uint32_t(value2);
++  uint64_t bd = uint64_t(uint32_t(value1)) * uint32_t(value2);
++  uint64_t adbc = ad + uint64_t(uint32_t(value1)) * uint32_t(value2 >> 32);
++  uint64_t adbc_carry = uint64_t(adbc < ad);
++  answer.low = bd + (adbc << 32);
++  answer.high = uint64_t(uint32_t(value1 >> 32)) * uint32_t(value2 >> 32) +
++                (adbc >> 32) + (adbc_carry << 32) + uint64_t(answer.low < bd);
+ #endif // SIMDJSON_IS_ARM64
+ #else // SIMDJSON_REGULAR_VISUAL_STUDIO || SIMDJSON_IS_32BITS
+   __uint128_t r = (static_cast<__uint128_t>(value1)) * value2;
+diff -ru include/simdjson/ppc64/simd.h include/simdjson/ppc64/simd.h
+--- include/simdjson/ppc64/simd.h
++++ include/simdjson/ppc64/simd.h
+@@ -7,6 +7,7 @@
+ #include "simdjson/internal/simdprune_tables.h"
+ #endif // SIMDJSON_CONDITIONAL_INCLUDE
+ 
++#include <cstring>
+ #include <type_traits>
+ 
+ namespace simdjson {
+@@ -16,6 +17,26 @@
+ 
+ using __m128i = __vector unsigned char;
+ 
++// This kernel predates VSX-less systems and used POWER7/POWER8 operations
++// (vec_vsx_ld/vec_vsx_st, vbpermq, the 2x64 vector type) unconditionally.
++// Apple PowerPC CPUs (G4/G5) have AltiVec/VMX only, so each such use now
++// carries a VMX replacement; the guards keep the original instructions on
++// every CPU that has them.
++//
++// VMX has no unaligned vector load: the classic lvx/lvsl/vperm idiom loads
++// the two 16-byte lines containing [ptr, ptr+15] and permutes.  lvx masks
++// its address to 16-byte alignment, so the idiom never touches memory
++// outside those lines; simdjson's SIMDJSON_PADDING contract (checked in
++// intrinsics.h) keeps that in-bounds at buffer ends, matching what
++// vec_vsx_ld already read.
++#ifndef __VSX__
++simdjson_inline __m128i vmx_loadu(const uint8_t *bytes) {
++  __m128i lo = vec_ld(0, bytes);
++  __m128i hi = vec_ld(15, bytes);
++  return vec_perm(lo, hi, vec_lvsl(0, bytes));
++}
++#endif
++
+ template <typename Child> struct base {
+   __m128i value;
+ 
+@@ -104,6 +125,7 @@
+       : base8<bool>(splat(_value)) {}
+ 
+   simdjson_inline int to_bitmask() const {
++#ifdef __POWER8_VECTOR__
+     __vector unsigned long long result;
+     const __m128i perm_mask = {0x78, 0x70, 0x68, 0x60, 0x58, 0x50, 0x48, 0x40,
+                                0x38, 0x30, 0x28, 0x20, 0x18, 0x10, 0x08, 0x00};
+@@ -115,6 +137,22 @@
+ #else
+     return static_cast<int>(result[0]);
+ #endif
++#else
++    // VMX: weight each 0xFF/0x00 mask lane by its bit value and reduce.
++    // vec_msum sums groups of four lanes into the four words, so words
++    // 0+1 hold bits 0-7 (lanes 0-7) and words 2+3 hold bits 8-15 - lane
++    // indexing makes this endian-independent.  Bit i of the result
++    // corresponds to lane i, exactly like the vbpermq path above.
++    const __m128i bit_weights = {1, 2, 4, 8, 16, 32, 64, 128,
++                                 1, 2, 4, 8, 16, 32, 64, 128};
++    __vector unsigned int sums =
++        vec_msum(vec_and(this->value, bit_weights),
++                 (__m128i)vec_splat_u8(1),
++                 (__vector unsigned int)vec_splat_u32(0));
++    alignas(16) unsigned int w[4];
++    vec_st(sums, 0, w);
++    return static_cast<int>((w[0] + w[1]) | ((w[2] + w[3]) << 8));
++#endif // __POWER8_VECTOR__
+   }
+   simdjson_inline bool any() const {
+     return !vec_all_eq(this->value, (__m128i)vec_splats(0));
+@@ -131,7 +169,11 @@
+   }
+   static simdjson_inline simd8<T> zero() { return splat(0); }
+   static simdjson_inline simd8<T> load(const T values[16]) {
++#ifdef __VSX__
+     return (__m128i)(vec_vsx_ld(0, reinterpret_cast<const uint8_t *>(values)));
++#else
++    return vmx_loadu(reinterpret_cast<const uint8_t *>(values));
++#endif
+   }
+   // Repeat 16 values as many times as necessary (usually for lookup tables)
+   static simdjson_inline simd8<T> repeat_16(T v0, T v1, T v2, T v3, T v4,
+@@ -148,7 +190,14 @@
+ 
+   // Store to array
+   simdjson_inline void store(T dst[16]) const {
++#ifdef __VSX__
+     vec_vsx_st(this->value, 0, reinterpret_cast<__m128i *>(dst));
++#else
++    // VMX has no unaligned vector store; go through an aligned buffer.
++    alignas(16) uint8_t tmp[16];
++    vec_st(this->value, 0, tmp);
++    std::memcpy(dst, tmp, 16);
++#endif
+   }
+ 
+   // Override to distinguish from bool version
+@@ -195,13 +244,21 @@
+     // next line just loads the 64-bit values thintable_epi8[mask1] and
+     // thintable_epi8[mask2] into a 128-bit register, using only
+     // two instructions on most compilers.
+-#ifdef __LITTLE_ENDIAN__
++#if defined(__LITTLE_ENDIAN__)
+     __m128i shufmask = (__m128i)(__vector unsigned long long){
+         thintable_epi8[mask1], thintable_epi8[mask2]};
+-#else
++#elif defined(__VSX__)
+     __m128i shufmask = (__m128i)(__vector unsigned long long){
+         thintable_epi8[mask2], thintable_epi8[mask1]};
+     shufmask = (__m128i)vec_reve((__m128i)shufmask);
++#else
++    // VMX big endian, without the 2x64 vector type: the table stores the
++    // shuffle indices least-significant-byte first (pshufb style), so
++    // materialize each half byte-reversed and load the aligned pair.
++    alignas(16) uint64_t shuf64[2];
++    shuf64[0] = __builtin_bswap64(thintable_epi8[mask1]);
++    shuf64[1] = __builtin_bswap64(thintable_epi8[mask2]);
++    __m128i shufmask = vec_ld(0, reinterpret_cast<const uint8_t *>(shuf64));
+ #endif
+     // we increment by 0x08 the second half of the mask
+     shufmask = ((__m128i)shufmask) +
+@@ -216,10 +273,21 @@
+     // only the first pop1 bytes from the first 8 bytes, and then
+     // it fills in with the bytes from the second 8 bytes + some filling
+     // at the end.
++#ifdef __VSX__
+     __m128i compactmask =
+         vec_vsx_ld(0, reinterpret_cast<const uint8_t *>(pshufb_combine_table + pop1 * 8));
++#else
++    __m128i compactmask = vmx_loadu(
++        reinterpret_cast<const uint8_t *>(pshufb_combine_table + pop1 * 8));
++#endif
+     __m128i answer = vec_perm(pruned, (__m128i)vec_splats(0), compactmask);
++#ifdef __VSX__
+     vec_vsx_st(answer, 0, reinterpret_cast<__m128i *>(output));
++#else
++    alignas(16) uint8_t tmp[16];
++    vec_st(answer, 0, tmp);
++    std::memcpy(output, tmp, 16);
++#endif
+   }
+ 
+   template <typename L>
+diff -ru src/internal/isadetection.h src/internal/isadetection.h
+--- src/internal/isadetection.h
++++ src/internal/isadetection.h
+@@ -74,7 +74,11 @@
+ namespace simdjson {
+ namespace internal {
+ 
+-#if defined(__PPC64__)
++#if defined(__PPC64__) || defined(_M_PPC64) || defined(__ppc64__) ||           \
++    defined(__powerpc64__) ||                                                  \
++    ((defined(__PPC__) || defined(__ppc__) || defined(_ARCH_PPC)) &&           \
++     defined(__ALTIVEC__))
++// Keep in sync with the PowerPC branch in include/simdjson/portability.h.
+ 
+ static inline uint32_t detect_supported_architectures() {
+   return instruction_set::ALTIVEC;
