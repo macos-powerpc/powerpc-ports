@@ -1,0 +1,492 @@
+From ae6679881ed3a6010d0361baa5d70724bec182ca Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Thu, 12 Nov 2026 01:18:58 +0000
+Subject: [PATCH 68/70] maglev: ppc32 bodies for the 64-bit-only nodes of the
+ ppc Maglev backend
+
+maglev-ir-ppc.cc, the node half of the ppc backend, uses XER-based
+overflow detection through mcrxrx (ISA 3.0, POWER9), 64-bit register
+canonicalization (extsw), 64-bit FPU and POWER5+ instructions, none
+of which a G3/G4/G5 has in 32-bit mode.  Give the affected nodes ppc32
+bodies under #if V8_TARGET_ARCH_PPC64 / #else; the ppc64 text is
+unchanged.
+
+- The 17 `extsw(out, out)` re-canonicalizations become
+  SignExtend32To64Bits(out, out): extsw on ppc64 (same code), empty on
+  ppc32, as on arm.
+
+- Int32AddWithOverflow / Int32SubtractWithOverflow: upstream does
+  `add/sub SetOE; mcrxrx; deopt overflow32`.  Use the macro
+  assembler's xor-sign AddAndCheckForOverflow / SubAndCheckForOverflow
+  (TurboFan's kPPC_AddWithOverflow32/SubWithOverflow32 helpers) with a
+  masm scratch for the overflow word and r0 as their scratch; overflow
+  is cr0 lt.  Both handle dst aliasing either input; Sub needs the
+  dst == left == right fix from the macro-assembler commit for `a - a`.
+
+- Int32Increment/Decrement/Negate/AbsWithOverflow: compare against
+  kMaxInt/kMinInt and deopt before computing (x + 1 overflows only for
+  kMaxInt, x - 1, -x and |x| only for kMinInt), then addi/neg.  The
+  deopt happens before `out` is written.
+
+- Int32MultiplyWithOverflow: upstream uses `mullw SetOE SetRC` and
+  deopts on `overflow`, which on PowerPC is CR0[SO], a copy of the
+  sticky XER[SO]: once any OE instruction overflowed on the thread it
+  deopts forever (see below).  Its -0 test also reads left and right
+  after mullw wrote `out`, which may alias one of them, so (-5) * 0
+  with out == left produced +0.  ppc32 takes arm's shape: mulhw/mullw
+  into scratch high/low words (low word in `out` unless it aliases an
+  input), overflow iff high != low >> 31 (as TurboFan's
+  kPPC_Mul32WithHigh32), then the -0 test on the intact inputs
+  (or. of left and right, negative means -0), then move to `out`.
+
+- Int32DivideWithOverflow: upstream's `divw LeaveOE SetRC` followed by
+  `deopt overflow` tests only the stale sticky SO bit (OE is off); the
+  deferred pre-checks already exclude x / 0, 0 / negative and
+  kMinInt / -1.  The remainder check reads left and right after divw
+  wrote `out`; with out aliasing an input (x / y where x dies) it
+  computes q - q * y and deopts on exact divisions.  ppc32 divides
+  into a scratch when `out` aliases an input, as arm does, and has no
+  overflow deopt.
+
+- Float64Round: frin/frip/frim/fcpsgn are ISA 2.02+/2.05.  The graph
+  builder asks IsSupported(CpuOperation::kFloat64Round), which is
+  false for ppc32, before creating the node (Math.round/floor/ceil/
+  trunc, the Float64 Math.clz32 path, Uint8Clamped stores); the ppc32
+  body is UNREACHABLE so a future change fails loudly instead of
+  raising SIGILL.
+
+- Float64Sqrt: fsqrt is optional and absent on G3/G4.  The generic
+  commit made the node a call node on ppc32; the body calls
+  ExternalReference::ieee754_sqrt_function() (the reference the series
+  uses for TurboFan's Float64Sqrt) with the input fixed in d1, the
+  Darwin FP argument and return register, the way
+  Float64Ieee754Unary does.
+
+- Float64Modulus: now a call node on ppc (generic commit); define its
+  MaxCallStackArgs (0, as Float64Exponentiate).
+
+- CheckedIntPtrToInt32: an IntPtr is an Int32 on 32-bit targets; empty
+  body, as on arm (the lowered 32-bit compares would be dead).
+
+- CheckFloat64SameValue against +-0: upstream compares all 64 bits.
+  Once the value compared equal to zero, its low word is zero and the
+  high word carries the sign, so compare the high word
+  (MovDoubleHighToInt), as arm does.
+
+Latent ppc64 defects seen while deriving the bodies, not changed here
+(the ppc64 text is left as upstream has it): sticky XER[SO] in the
+Multiply and Divide overflow deopts, the aliasing in the Multiply -0
+test and in the Divide remainder check; details in the port's Maglev
+design document.
+
+Assisted-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ v8/src/maglev/ppc/maglev-ir-ppc.cc | 157 +++++++++++++++++++++++++----
+ 1 file changed, 140 insertions(+), 17 deletions(-)
+
+diff --git a/v8/src/maglev/ppc/maglev-ir-ppc.cc b/v8/src/maglev/ppc/maglev-ir-ppc.cc
+index 813acc7..3f08350 100644
+--- a/v8/src/maglev/ppc/maglev-ir-ppc.cc
++++ b/v8/src/maglev/ppc/maglev-ir-ppc.cc
+@@ -32,14 +32,21 @@ void Int32NegateWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ CmpS32(value, Operand::Zero(), r0);
+   __ EmitEagerDeoptIf(eq, DeoptimizeReason::kOverflow, this);
+ 
++#if V8_TARGET_ARCH_PPC64
+     __ neg(out, value, SetOE);
+     __ MoveToCrFromXer(cr0);
+     // Output register must not be a register input into the eager deopt info.
+     DCHECK_REGLIST_EMPTY(RegList{out} &
+                          GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
+     __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
++#else
++  // No mcrxrx (ISA 3.0): -x overflows only for kMinInt.
++  __ CmpS32(value, Operand(kMinInt), r0);
++  __ EmitEagerDeoptIf(eq, DeoptimizeReason::kOverflow, this);
++  __ neg(out, value);
++#endif
+ 
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32AbsWithOverflow::GenerateCode(MaglevAssembler* masm,
+@@ -50,14 +57,20 @@ void Int32AbsWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ CmpS32(out, Operand::Zero(), r0);
+   __ bge(&done);
+ 
++#if V8_TARGET_ARCH_PPC64
+   __ neg(out, out, SetOE);
+   __ MoveToCrFromXer(cr0);
+   DCHECK_REGLIST_EMPTY(RegList{out} &
+                        GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
+   __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
++#else
++  __ CmpS32(out, Operand(kMinInt), r0);
++  __ EmitEagerDeoptIf(eq, DeoptimizeReason::kOverflow, this);
++  __ neg(out, out);
++#endif
+ 
+   __ bind(&done);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32Increment::SetValueLocationConstraints() {
+@@ -69,7 +82,7 @@ void Int32Increment::GenerateCode(MaglevAssembler* masm,
+   Register value = ToRegister(ValueInput());
+   Register out = ToRegister(result());
+   __ addi(out, value, Operand(1));
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32Decrement::SetValueLocationConstraints() {
+@@ -81,7 +94,7 @@ void Int32Decrement::GenerateCode(MaglevAssembler* masm,
+   Register value = ToRegister(ValueInput());
+   Register out = ToRegister(result());
+   __ addi(out, value, Operand(-1));
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32IncrementWithOverflow::SetValueLocationConstraints() {
+@@ -93,6 +106,7 @@ void Int32IncrementWithOverflow::GenerateCode(MaglevAssembler* masm,
+                                               const ProcessingState& state) {
+   Register value = ToRegister(ValueInput());
+   Register out = ToRegister(result());
++#if V8_TARGET_ARCH_PPC64
+     __ li(r0, Operand(1));
+     __ add(out, value, r0, SetOE);
+     __ MoveToCrFromXer(cr0);
+@@ -101,8 +115,13 @@ void Int32IncrementWithOverflow::GenerateCode(MaglevAssembler* masm,
+     DCHECK_REGLIST_EMPTY(RegList{out} &
+                          GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
+     __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
++#else
++  __ CmpS32(value, Operand(kMaxInt), r0);
++  __ EmitEagerDeoptIf(eq, DeoptimizeReason::kOverflow, this);
++  __ addi(out, value, Operand(1));
++#endif
+ 
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32DecrementWithOverflow::SetValueLocationConstraints() {
+@@ -114,6 +133,7 @@ void Int32DecrementWithOverflow::GenerateCode(MaglevAssembler* masm,
+                                               const ProcessingState& state) {
+   Register value = ToRegister(ValueInput());
+   Register out = ToRegister(result());
++#if V8_TARGET_ARCH_PPC64
+     __ li(r0, Operand(-1));
+     __ add(out, value, r0, SetOE);
+     __ MoveToCrFromXer(cr0);
+@@ -122,8 +142,13 @@ void Int32DecrementWithOverflow::GenerateCode(MaglevAssembler* masm,
+     DCHECK_REGLIST_EMPTY(RegList{out} &
+                          GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
+     __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
++#else
++  __ CmpS32(value, Operand(kMinInt), r0);
++  __ EmitEagerDeoptIf(eq, DeoptimizeReason::kOverflow, this);
++  __ addi(out, value, Operand(-1));
++#endif
+ 
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ int BuiltinStringFromCharCode::MaxCallStackArgs() const {
+@@ -222,6 +247,7 @@ void CheckedIntPtrToInt32::SetValueLocationConstraints() {
+ 
+ void CheckedIntPtrToInt32::GenerateCode(MaglevAssembler* masm,
+                                         const ProcessingState& state) {
++#if V8_TARGET_ARCH_PPC64
+   Register input_reg = ToRegister(ValueInput());
+   Label* deopt = __ GetDeoptLabel(this, DeoptimizeReason::kNotInt32);
+ 
+@@ -229,6 +255,9 @@ void CheckedIntPtrToInt32::GenerateCode(MaglevAssembler* masm,
+   __ bgt(deopt);
+   __ CmpS64(input_reg, Operand(std::numeric_limits<int32_t>::min()), r0);
+   __ blt(deopt);
++#else
++  // On 32-bit platforms, IntPtr is the same as Int32.
++#endif
+ }
+ 
+ void CheckFloat64SameValue::SetValueLocationConstraints() {
+@@ -250,8 +279,14 @@ void CheckFloat64SameValue::GenerateCode(MaglevAssembler* masm,
+     __ CompareFloat64AndJumpIf(double_scratch, target, kNotEqual, fail, fail);
+     if (value().get_scalar() == 0) {  // If value is +0.0 or -0.0.
+       Register scratch = temps.AcquireScratch();
++#if V8_TARGET_ARCH_PPC64
+       __ MovDoubleToInt64(scratch, target);
+       __ CmpU64(scratch, Operand(0), r0);
++#else
++      // The low word of +-0 is zero, the high word holds the sign.
++      __ MovDoubleHighToInt(scratch, target);
++      __ CmpU32(scratch, Operand(0), r0);
++#endif
+       __ JumpIf(value().get_bits() == 0 ? kNotEqual : kEqual, fail);
+     }
+   }
+@@ -268,7 +303,7 @@ void Int32Add::GenerateCode(MaglevAssembler* masm,
+   Register right = ToRegister(RightInput());
+   Register out = ToRegister(result());
+   __ add(out, left, right);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32Subtract::SetValueLocationConstraints() {
+@@ -282,7 +317,7 @@ void Int32Subtract::GenerateCode(MaglevAssembler* masm,
+   Register right = ToRegister(RightInput());
+   Register out = ToRegister(result());
+   __ sub(out, left, right);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32Multiply::SetValueLocationConstraints() {
+@@ -363,7 +398,7 @@ void Int32Divide::GenerateCode(MaglevAssembler* masm,
+   __ bind(*do_division);
+   __ divw(out, left, right);
+   __ bind(*done);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32AddWithOverflow::SetValueLocationConstraints() {
+@@ -377,14 +412,25 @@ void Int32AddWithOverflow::GenerateCode(MaglevAssembler* masm,
+   Register left = ToRegister(LeftInput());
+   Register right = ToRegister(RightInput());
+   Register out = ToRegister(result());
++#if V8_TARGET_ARCH_PPC64
+     __ add(out, left, right, SetOE);
+     __ MoveToCrFromXer(cr0);
++#else
++  // No mcrxrx (ISA 3.0): the xor-sign test, result in cr0 lt.
++  MaglevAssembler::TemporaryRegisterScope temps(masm);
++  Register overflow = temps.AcquireScratch();
++  __ AddAndCheckForOverflow(out, left, right, overflow, r0);
++#endif
+     // The output register shouldn't be a register input into the eager deopt
+     // info.
+     DCHECK_REGLIST_EMPTY(RegList{out} &
+                          GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
++#if V8_TARGET_ARCH_PPC64
+     __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
+-    __ extsw(out, out);
++#else
++  __ EmitEagerDeoptIf(lt, DeoptimizeReason::kOverflow, this);
++#endif
++    __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32SubtractWithOverflow::SetValueLocationConstraints() {
+@@ -397,14 +443,25 @@ void Int32SubtractWithOverflow::GenerateCode(MaglevAssembler* masm,
+   Register left = ToRegister(LeftInput());
+   Register right = ToRegister(RightInput());
+   Register out = ToRegister(result());
++#if V8_TARGET_ARCH_PPC64
+     __ sub(out, left, right, SetOE);
+     __ MoveToCrFromXer(cr0);
++#else
++  // No mcrxrx (ISA 3.0): the xor-sign test, result in cr0 lt.
++  MaglevAssembler::TemporaryRegisterScope temps(masm);
++  Register overflow = temps.AcquireScratch();
++  __ SubAndCheckForOverflow(out, left, right, overflow, r0);
++#endif
+     // The output register shouldn't be a register input into the eager deopt
+     // info.
+     DCHECK_REGLIST_EMPTY(RegList{out} &
+                          GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
++#if V8_TARGET_ARCH_PPC64
+     __ EmitEagerDeoptIf(overflow32, DeoptimizeReason::kOverflow, this);
+-    __ extsw(out, out);
++#else
++  __ EmitEagerDeoptIf(lt, DeoptimizeReason::kOverflow, this);
++#endif
++    __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32MultiplyWithOverflow::SetValueLocationConstraints() {
+@@ -421,6 +478,7 @@ void Int32MultiplyWithOverflow::GenerateCode(MaglevAssembler* masm,
+ 
+   // TODO(leszeks): peephole optimise multiplication by a constant.
+ 
++#if V8_TARGET_ARCH_PPC64
+   MaglevAssembler::TemporaryRegisterScope temps(masm);
+   Register temp = temps.AcquireScratch();
+   __ mullw(out, left, right, SetOE, SetRC);
+@@ -444,6 +502,33 @@ void Int32MultiplyWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ EmitEagerDeoptIf(lt, DeoptimizeReason::kOverflow, this);
+ 
+   __ bind(&end);
++#else
++  // No XER: the product fits iff the high word is the sign of the low word
++  // (as kPPC_Mul32WithHigh32).  Keep left and right intact for the -0 test.
++  MaglevAssembler::TemporaryRegisterScope temps(masm);
++  Register res_high = temps.AcquireScratch();
++  Register res_low =
++      (out == left || out == right) ? temps.AcquireScratch() : out;
++  __ mulhw(res_high, left, right);
++  __ mullw(res_low, left, right);
++  __ srawi(r0, res_low, 31);
++  __ CmpS32(res_high, r0);
++  DCHECK_REGLIST_EMPTY(RegList{out} &
++                       GetGeneralRegistersUsedAsInputs(eager_deopt_info()));
++  __ EmitEagerDeoptIf(ne, DeoptimizeReason::kOverflow, this);
++
++  // If the result is zero, check if either lhs or rhs is negative.
++  Label end;
++  __ CmpS32(res_low, Operand::Zero(), r0);
++  __ bne(&end);
++  __ orx(r0, left, right, SetRC);
++  // If one of them is negative, we must have a -0 result, which is non-int32,
++  // so deopt.
++  __ EmitEagerDeoptIf(lt, DeoptimizeReason::kOverflow, this);
++
++  __ bind(&end);
++  __ Move(out, res_low);
++#endif
+ }
+ 
+ void Int32DivideWithOverflow::SetValueLocationConstraints() {
+@@ -498,6 +583,7 @@ void Int32DivideWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ bind(*done);
+ 
+   // Perform the actual integer division.
++#if V8_TARGET_ARCH_PPC64
+   __ divw(out, left, right, LeaveOE, SetRC);
+   __ EmitEagerDeoptIf(overflow, DeoptimizeReason::kNotInt32, this);
+ 
+@@ -505,8 +591,21 @@ void Int32DivideWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ mullw(r0, out, right);
+   __ sub(r0, left, r0, LeaveOE, SetRC);
+   __ EmitEagerDeoptIf(ne, DeoptimizeReason::kNotInt32, this);
++#else
++  // The deferred checks above rule out the cases divw cannot represent; the
++  // remainder check must read left and right, so do not divide into them.
++  MaglevAssembler::TemporaryRegisterScope temps(masm);
++  Register res = (out == left || out == right) ? temps.AcquireScratch() : out;
++  __ divw(res, left, right);
++
++  // Check that the remainder is zero.
++  __ mullw(r0, res, right);
++  __ sub(r0, left, r0, LeaveOE, SetRC);
++  __ EmitEagerDeoptIf(ne, DeoptimizeReason::kNotInt32, this);
++  __ Move(out, res);
++#endif
+ 
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Int32ModulusWithOverflow::SetValueLocationConstraints() {
+@@ -601,7 +700,7 @@ void Int32ModulusWithOverflow::GenerateCode(MaglevAssembler* masm,
+   __ bind(&rhs_not_power_of_2);
+   __ ModU32(out, lhs, rhs);
+   __ bind(*done);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ #define DEF_BITWISE_BINOP(Instruction, opcode)                   \
+@@ -617,7 +716,7 @@ void Int32ModulusWithOverflow::GenerateCode(MaglevAssembler* masm,
+     Register right = ToRegister(RightInput());                   \
+     Register out = ToRegister(result());                         \
+     __ opcode(out, left, right);                                 \
+-    __ extsw(out, out);                                          \
++    __ SignExtend32To64Bits(out, out);                           \
+   }
+ DEF_BITWISE_BINOP(Int32BitwiseAnd, and_)
+ DEF_BITWISE_BINOP(Int32BitwiseOr, orx)
+@@ -646,14 +745,14 @@ DEF_BITWISE_BINOP(Int32BitwiseXor, xor_)
+         return;                                                  \
+       }                                                          \
+       __ opcode(out, left, Operand(shift));                      \
+-      __ extsw(out, out);                                        \
++      __ SignExtend32To64Bits(out, out);                         \
+     } else {                                                     \
+       MaglevAssembler::TemporaryRegisterScope temps(masm);       \
+       Register scratch = temps.AcquireScratch();                 \
+       Register right = ToRegister(RightInput());                 \
+       __ andi(scratch, right, Operand(31));                      \
+       __ opcode(out, left, scratch);                             \
+-      __ extsw(out, out);                                        \
++      __ SignExtend32To64Bits(out, out);                         \
+     }                                                            \
+   }
+ DEF_SHIFT_BINOP(Int32ShiftLeft, ShiftLeftU32)
+@@ -671,7 +770,7 @@ void Int32BitwiseNot::GenerateCode(MaglevAssembler* masm,
+   Register value = ToRegister(ValueInput());
+   Register out = ToRegister(result());
+   __ notx(out, value);
+-  __ extsw(out, out);
++  __ SignExtend32To64Bits(out, out);
+ }
+ 
+ void Float64Add::SetValueLocationConstraints() {
+@@ -730,6 +829,7 @@ void Float64Divide::GenerateCode(MaglevAssembler* masm,
+   __ DivF64(out, left, right);
+ }
+ 
++int Float64Modulus::MaxCallStackArgs() const { return 0; }
+ void Float64Modulus::SetValueLocationConstraints() {
+   UseFixed(LeftInput(), d1);
+   UseFixed(RightInput(), d2);
+@@ -764,6 +864,7 @@ void Float64Abs::GenerateCode(MaglevAssembler* masm,
+ 
+ void Float64Round::GenerateCode(MaglevAssembler* masm,
+                                 const ProcessingState& state) {
++#if V8_TARGET_ARCH_PPC64
+   DoubleRegister in = ToDoubleRegister(ValueInput());
+   DoubleRegister out = ToDoubleRegister(result());
+   if (kind_ == Kind::kNearest) {
+@@ -790,6 +891,11 @@ void Float64Round::GenerateCode(MaglevAssembler* masm,
+   } else if (kind_ == Kind::kFloor) {
+     __ frim(out, in);
+   }
++#else
++  // frin/frip/frim are POWER5+; IsSupported(kFloat64Round) is false on ppc32,
++  // so the graph builder never creates this node.
++  UNREACHABLE();
++#endif
+ }
+ 
+ int Float64Exponentiate::MaxCallStackArgs() const { return 0; }
+@@ -863,6 +969,7 @@ void Float64Ieee754Binary::GenerateCode(MaglevAssembler* masm,
+   __ MultiPop({r3, r4, r5, r6, r7, r8, r9, r10, r11});
+ }
+ 
++#if V8_TARGET_ARCH_PPC64
+ void Float64Sqrt::SetValueLocationConstraints() {
+   UseRegister(ValueInput());
+   DefineSameAsFirst(this);
+@@ -873,6 +980,22 @@ void Float64Sqrt::GenerateCode(MaglevAssembler* masm,
+   DoubleRegister result_register = ToDoubleRegister(result());
+   __ fsqrt(result_register, value);
+ }
++#else
++// fsqrt is optional before the 970 (G5); call the C library, as TurboFan does.
++int Float64Sqrt::MaxCallStackArgs() const { return 0; }
++void Float64Sqrt::SetValueLocationConstraints() {
++  UseFixed(ValueInput(), d1);
++  DefineSameAsFirst(this);
++}
++void Float64Sqrt::GenerateCode(MaglevAssembler* masm,
++                               const ProcessingState& state) {
++  FrameScope scope(masm, StackFrame::MANUAL);
++  __ MultiPush({r3, r4, r5, r6, r7, r8, r9, r10, r11});
++  __ PrepareCallCFunction(0, 1);
++  __ CallCFunction(ExternalReference::ieee754_sqrt_function(), 0, 1);
++  __ MultiPop({r3, r4, r5, r6, r7, r8, r9, r10, r11});
++}
++#endif
+ 
+ void LoadTypedArrayLength::SetValueLocationConstraints() {
+   UseRegister(ValueInput());
+-- 
+2.43.0
+

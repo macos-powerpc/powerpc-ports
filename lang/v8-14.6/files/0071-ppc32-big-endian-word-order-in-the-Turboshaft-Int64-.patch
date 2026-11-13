@@ -1,0 +1,109 @@
+From 94f3ba2eb6d5b4f245f1b967d66cee87d0c9b695 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Fri, 13 Nov 2026 16:32:26 +0000
+Subject: [PATCH 71/71] ppc32: big-endian word order in the Turboshaft Int64
+ lowering
+
+Int64LoweringReducer splits an Int64/Uint64 Load or Store into two
+Word32 accesses with the low word at +0 and the high word at +4, on
+every target.  That is the little-endian layout.  The TurboFan-era
+Int64Lowering (src/compiler/int64-lowering.cc, GetIndexNodes) and
+src/utils/utils.h (kInt64LowerHalfMemoryOffset /
+kInt64UpperHalfMemoryOffset) put the high word first on
+V8_TARGET_BIG_ENDIAN; the Turboshaft reducer that replaced it for
+32-bit wasm lost that, since no 32-bit big-endian target was left
+upstream.
+
+On big-endian the wasm graph builder emits a native 64-bit load
+followed by BuildChangeEndiannessLoad (a full 64-bit byte reversal,
+lowered to swap-halves + Word32ReverseBytes).  With the halves loaded
+in little-endian order the result has its two words exchanged: an
+i64.load of 01 02 03 04 05 06 07 08 gave 0x0403020108070605 instead of
+0x0807060504030201.  Stores mirror it, so wasm values that wasm itself
+stored and reloaded survived, but i64 data from data segments, from JS
+(DataView/BigInt64 writes, wasm-bindgen glue), read back at another
+width, and i64 globals initialised or read by C++ were wrong.
+G5 symptom: node 26's TypeScript stripping (amaro = swc as wasm,
+Rust u64 hashing and constants) trapped with "unreachable" on every
+input, while C-built llhttp wasm (undici fetch, i32 and byte loads)
+worked.
+
+Load and store the words in native order on big-endian; little-endian
+code generation is unchanged.  Atomic pair loads/stores
+(AtomicWord32PairLoad/Store) keep their (low, high) operands - their
+memory order is the backend's business.  d8-smoke.js gains a
+wasm-i64-memory group (data segment, DataView, i32 views, i64 global
+shared with C++), checked against x86-64 node 18.
+
+Assisted-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../turboshaft/int64-lowering-reducer.h       | 40 ++++++++++++-------
+ 1 file changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/v8/src/compiler/turboshaft/int64-lowering-reducer.h b/v8/src/compiler/turboshaft/int64-lowering-reducer.h
+index 4da4f04..fd9a223 100644
+--- a/v8/src/compiler/turboshaft/int64-lowering-reducer.h
++++ b/v8/src/compiler/turboshaft/int64-lowering-reducer.h
+@@ -347,15 +347,21 @@ class Int64LoweringReducer : public Next {
+     }
+     if (loaded_rep == MemoryRepresentation::Int64() ||
+         loaded_rep == MemoryRepresentation::Uint64()) {
+-      auto [high_index, high_offset] =
++      auto [second_index, second_offset] =
+           IncreaseOffset(index, offset, sizeof(int32_t), kind.tagged_base);
+-      return __ MakeTuple(
++      V<Word32> first =
+           Next::ReduceLoad(base, index, kind, MemoryRepresentation::Int32(),
+                            RegisterRepresentation::Word32(), offset,
+-                           element_scale),
+-          Next::ReduceLoad(
+-              base, high_index, kind, MemoryRepresentation::Int32(),
+-              RegisterRepresentation::Word32(), high_offset, element_scale));
++                           element_scale);
++      V<Word32> second = Next::ReduceLoad(
++          base, second_index, kind, MemoryRepresentation::Int32(),
++          RegisterRepresentation::Word32(), second_offset, element_scale);
++#if defined(V8_TARGET_BIG_ENDIAN)
++      // Native layout (kInt64UpperHalfMemoryOffset == 0): high word first.
++      return __ MakeTuple(second, first);
++#else
++      return __ MakeTuple(first, second);
++#endif
+     }
+     return Next::ReduceLoad(base, index, kind, loaded_rep, result_rep, offset,
+                             element_scale);
+@@ -382,17 +388,23 @@ class Int64LoweringReducer : public Next {
+         offset -= kind.tagged_base;
+         return __ AtomicWord32PairStore(base, index, low, high, offset);
+       }
+-      // low store
+-      Next::ReduceStore(base, index, low, kind, MemoryRepresentation::Int32(),
+-                        write_barrier, offset, element_size_log2,
+-                        maybe_initializing_or_transitioning,
++#if defined(V8_TARGET_BIG_ENDIAN)
++      // Native layout (kInt64UpperHalfMemoryOffset == 0): high word first.
++      V<Word32> first = high;
++      V<Word32> second = low;
++#else
++      V<Word32> first = low;
++      V<Word32> second = high;
++#endif
++      Next::ReduceStore(base, index, first, kind,
++                        MemoryRepresentation::Int32(), write_barrier, offset,
++                        element_size_log2, maybe_initializing_or_transitioning,
+                         maybe_indirect_pointer_tag);
+-      // high store
+-      auto [high_index, high_offset] =
++      auto [second_index, second_offset] =
+           IncreaseOffset(index, offset, sizeof(int32_t), kind.tagged_base);
+       Next::ReduceStore(
+-          base, high_index, high, kind, MemoryRepresentation::Int32(),
+-          write_barrier, high_offset, element_size_log2,
++          base, second_index, second, kind, MemoryRepresentation::Int32(),
++          write_barrier, second_offset, element_size_log2,
+           maybe_initializing_or_transitioning, maybe_indirect_pointer_tag);
+       return V<None>::Invalid();
+     }
+-- 
+2.43.0
+

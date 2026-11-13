@@ -1,0 +1,396 @@
+From 1a00cdb18fb7153162a1c9e0089b1eba890aefc6 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Thu, 12 Nov 2026 01:15:53 +0000
+Subject: [PATCH 67/70] maglev: ppc32 bodies for the 64-bit-only helpers of the
+ ppc Maglev assembler
+
+The ppc MaglevAssembler (maglev-assembler-ppc-inl.h and
+maglev-assembler-ppc.cc) has no V8_TARGET_ARCH_PPC64 conditionals
+upstream.  Most of it already does the right thing on ppc32 through
+the series' pointer-size lowering (LoadU64/StoreU64/AddS64/CmpS64/
+ShiftLeftU64/... become the word-size instructions), but a dozen
+helpers use 64-bit registers, ISA 3.0 instructions or 64-bit FPU
+conversions that a G3/G4/G5 in 32-bit mode does not have, or rely on
+helpers the macro assembler declares for ppc64 only.  Give each a
+ppc32 body under #if V8_TARGET_ARCH_PPC64 / #else; the ppc64 text is
+kept as is except where noted.
+
+- TrySmiTagInt32: upstream does `add SetOE; mcrxrx; return
+  nooverflow32`.  mcrxrx is ISA 3.0 (POWER9).  ppc32 Smis are 31-bit,
+  so src << 1 overflows exactly when bits 31 and 30 of src differ:
+  slwi r0, src, 1; xor. r0, r0, src; SmiTag(dst, src); return ge.
+  dst is written last, so dst == src and dst == r0 (CheckInt32IsSmi's
+  default scratch) both work.  The generic callers only negate the
+  condition, branch on it or Assert it.
+
+- SmiAddConstant/SmiSubConstant: same mcrxrx issue.  Use the macro
+  assembler's xor-sign AddAndCheckForOverflow(dst, src, imm,
+  overflow_dst, r0) with +/-Smi::FromInt(value).ptr(), the helper
+  behind TurboFan's kPPC_AddWithOverflow32 immediate form, and branch
+  on lt.  overflow_dst is the acquired masm scratch (r26/ip), never a
+  Maglev register; dst == src is handled inside the helper.
+
+- ReverseByteOrder(value, 8): ByteReverseU64 is UNREACHABLE on ppc32.
+  The DataView reducers only inline 1-, 2- and 4-byte integer
+  elements; doubles take the two helpers below.  UNREACHABLE for
+  size 8.
+
+- LoadUnalignedFloat64AndReverseByteOrder /
+  ReverseByteOrderAndStoreUnalignedFloat64: upstream moves the double
+  through one 64-bit GPR.  On ppc32 the element is a little-endian
+  double, so its low word is the byte-reversed word at +0 and its high
+  word the one at +4: two lwbrx/stwbrx (base PowerPC; the regexp
+  backend already uses lwbrx on this target) into r0 and one scratch,
+  joined and split by the 3-argument ppc32 MovInt64ToDouble/
+  MovDoubleToInt64 (high word at kExponentOffset).
+
+- Move(Register, intptr_t): defined for ppc64 and, matching the
+  generic declaration, for Darwin ppc32, where intptr_t is `long`.
+
+- SignExtend32To64Bits: extsw is a 64-bit instruction; the body is
+  empty on ppc32 (as on arm).  NegateInt32: neg only.
+
+- ToUint8Clamped: ConvertDoubleToInt64 (fctid) becomes the ppc32
+  ConvertDoubleToInt32 (fctiw under round-to-nearest-even, which is
+  ToUint8Clamp's rounding).  The helper also never sent negative
+  inputs to `min`: after the NaN and >= 255 checks it converted
+  directly, so -3.7 was stored as 252 (and -0.6 as 255) in a
+  Uint8ClampedArray.  arm and x64 test value <= 0 first; do the same
+  here, for both widths.  On ppc32 the path is not reached yet - the
+  graph builder declines Uint8Clamped stores while kFloat64Round is
+  unsupported - but ppc64 reaches it.
+
+- JumpIfHoleNan/JumpIfNotHoleNan and the (compiled-out)
+  undefined-NaN variants with a DoubleRegister: the upper word was
+  taken as MovDoubleToInt64 + ShiftRightU64(32).  Use
+  MovDoubleHighToInt, which is the same mffprd + srdi on ppc64 and
+  the stfd/lwz of the high word on ppc32.
+
+- IntPtrToDouble: ConvertInt64ToDouble is ppc64-only; an IntPtr is an
+  int32 on ppc32, so Int32ToDouble (as on arm).
+
+- TryTruncateDoubleToInt32 / TryChangeFloat64ToIndex: fctidz
+  (ConvertDoubleToInt64) needs the 64-bit FPU; use ConvertDoubleToInt32
+  (fctiwz).  Saturated results (0x7fffffff/0x80000000 for out-of-range
+  inputs, 0x80000000 for NaN) fail the existing int -> double round
+  trip, kMinInt itself passes it.  The -0 test reads the sign of the
+  high word (MovDoubleHighToInt) instead of a 64-bit arithmetic shift.
+
+- TryTruncateDoubleToUint32: fctiduz is ISA 2.06.  Use the two-range
+  sequence of the ppc32 kPPC_DoubleToUint32: below 2^31 fctiwz
+  directly, otherwise fctiwz of src - 2^31 (exact in that range) and
+  xoris 0x8000.  Negative inputs, NaN (which compares unordered and
+  takes the upper path) and values >= 2^32 produce a value that fails
+  the unsigned round trip; -0 fails the sign test as before.
+
+The round-trip conversions convert back into the scratch double the
+helpers acquire (d13); that relies on the ConvertIntToDoubleNoFPU64
+commit, which lets the ppc32 int -> double conversion target d13.
+
+Assisted-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ v8/src/maglev/ppc/maglev-assembler-ppc-inl.h | 71 +++++++++++++++++---
+ v8/src/maglev/ppc/maglev-assembler-ppc.cc    | 40 +++++++++++
+ 2 files changed, 103 insertions(+), 8 deletions(-)
+
+diff --git a/v8/src/maglev/ppc/maglev-assembler-ppc-inl.h b/v8/src/maglev/ppc/maglev-assembler-ppc-inl.h
+index c22f6da..97f6664 100644
+--- a/v8/src/maglev/ppc/maglev-assembler-ppc-inl.h
++++ b/v8/src/maglev/ppc/maglev-assembler-ppc-inl.h
+@@ -216,9 +216,18 @@ inline void MaglevAssembler::BindBlock(BasicBlock* block) {
+ // Returns the condition code for the no overflow flag.
+ inline Condition MaglevAssembler::TrySmiTagInt32(Register dst, Register src) {
+   if (SmiValuesAre31Bits()) {
++#if V8_TARGET_ARCH_PPC64
+       add(dst, src, src, SetOE);
+       MoveToCrFromXer(cr0);
+       return nooverflow32;
++#else
++    // src << 1 overflows iff bits 31 and 30 of src differ.
++    DCHECK_NE(src, r0);
++    ShiftLeftU32(r0, src, Operand(1));
++    xor_(r0, r0, src, SetRC);
++    SmiTag(dst, src);
++    return ge;
++#endif
+   } else {
+     SmiTag(dst, src);
+   }
+@@ -246,6 +255,7 @@ inline void MaglevAssembler::SmiAddConstant(Register dst, Register src,
+   TemporaryRegisterScope temps(this);
+   Register scratch = temps.AcquireScratch();
+ 
++#if V8_TARGET_ARCH_PPC64
+   Move(scratch, Smi::FromInt(value));
+   if (SmiValuesAre31Bits()) {
+       add(dst, src, scratch, SetOE);
+@@ -255,6 +265,12 @@ inline void MaglevAssembler::SmiAddConstant(Register dst, Register src,
+     AddS64(dst, src, scratch, SetOE, SetRC);
+     JumpIf(kOverflow, fail, distance);
+   }
++#else
++  AddAndCheckForOverflow(dst, src,
++                         static_cast<intptr_t>(Smi::FromInt(value).ptr()),
++                         scratch, r0);
++  JumpIf(lt, fail, distance);
++#endif
+ }
+ 
+ inline void MaglevAssembler::SmiSubConstant(Register dst, Register src,
+@@ -268,6 +284,7 @@ inline void MaglevAssembler::SmiSubConstant(Register dst, Register src,
+   TemporaryRegisterScope temps(this);
+   Register scratch = temps.AcquireScratch();
+ 
++#if V8_TARGET_ARCH_PPC64
+   Move(scratch, Smi::FromInt(value));
+   if (SmiValuesAre31Bits()) {
+       sub(dst, src, scratch, SetOE);
+@@ -277,6 +294,12 @@ inline void MaglevAssembler::SmiSubConstant(Register dst, Register src,
+     SubS64(dst, src, scratch, SetOE, SetRC);
+     JumpIf(kOverflow, fail, distance);
+   }
++#else
++  AddAndCheckForOverflow(dst, src,
++                         -static_cast<intptr_t>(Smi::FromInt(value).ptr()),
++                         scratch, r0);
++  JumpIf(lt, fail, distance);
++#endif
+ }
+ 
+ inline void MaglevAssembler::MoveHeapNumber(Register dst, double value) {
+@@ -544,7 +567,11 @@ inline void MaglevAssembler::ReverseByteOrder(Register value, int size) {
+     ByteReverseU32(value, value, r0);
+     SignedExtend<int32_t>(value, value);
+   } else {
++#if V8_TARGET_ARCH_PPC64
+     ByteReverseU64(value, value, r0);
++#else
++    UNREACHABLE();
++#endif
+   }
+ }
+ 
+@@ -680,9 +707,11 @@ inline void MaglevAssembler::Move(Register dst, uint32_t i) {
+   mov(dst, Operand(i));
+ }
+ 
++#if V8_TARGET_ARCH_PPC64 || V8_OS_DARWIN
+ inline void MaglevAssembler::Move(Register dst, intptr_t p) {
+   mov(dst, Operand(p));
+ }
++#endif
+ 
+ void MaglevAssembler::MoveTagged(Register dst, Handle<HeapObject> obj) {
+ #ifdef V8_COMPRESS_POINTERS
+@@ -723,9 +752,17 @@ inline void MaglevAssembler::LoadUnalignedFloat64AndReverseByteOrder(
+     DoubleRegister dst, Register base, Register index) {
+   TemporaryRegisterScope scope(this);
+   Register scratch = scope.AcquireScratch();
++#if V8_TARGET_ARCH_PPC64
+   LoadU64(scratch, MemOperand(base, index), r0);
+   ByteReverseU64(scratch, scratch);
+   MovInt64ToDouble(dst, scratch);
++#else
++  // The low word of the little-endian double comes first.
++  addi(r0, index, Operand(4));
++  lwbrx(r0, MemOperand(base, r0));
++  lwbrx(scratch, MemOperand(base, index));
++  MovInt64ToDouble(dst, r0, scratch);
++#endif
+ }
+ inline void MaglevAssembler::StoreUnalignedFloat64(Register base,
+                                                    Register index,
+@@ -736,17 +773,28 @@ inline void MaglevAssembler::ReverseByteOrderAndStoreUnalignedFloat64(
+     Register base, Register index, DoubleRegister src) {
+   TemporaryRegisterScope scope(this);
+   Register scratch = scope.AcquireScratch();
++#if V8_TARGET_ARCH_PPC64
+   MovDoubleToInt64(scratch, src);
+   ByteReverseU64(scratch, scratch);
+   StoreU64(scratch, MemOperand(base, index), r0);
++#else
++  MovDoubleToInt64(r0, scratch, src);
++  stwbrx(scratch, MemOperand(base, index));
++  addi(scratch, index, Operand(4));
++  stwbrx(r0, MemOperand(base, scratch));
++#endif
+ }
+ 
+ inline void MaglevAssembler::SignExtend32To64Bits(Register dst, Register src) {
++#if V8_TARGET_ARCH_PPC64
+   // No 64-bit registers.
+   extsw(dst, src);
++#endif
+ }
+ inline void MaglevAssembler::NegateInt32(Register val) {
++#if V8_TARGET_ARCH_PPC64
+   extsw(val, val);
++#endif
+   neg(val, val);
+ }
+ 
+@@ -758,11 +806,18 @@ inline void MaglevAssembler::ToUint8Clamped(Register result,
+   fcmpu(value, value);
+   // Set to 0 if NaN.
+   bunordered(min);
++  MacroAssembler::LoadDoubleLiteral(scratch, base::Double(0.0), r0);
++  fcmpu(value, scratch);
++  JumpIf(le, min);
+   MacroAssembler::LoadDoubleLiteral(scratch, base::Double(255.0), r0);
+   fcmpu(value, scratch);
+   JumpIf(ge, max);
+   // if value in [0, 255], then round up to the nearest.
++#if V8_TARGET_ARCH_PPC64
+   ConvertDoubleToInt64(value, result, scratch, kRoundToNearest);
++#else
++  ConvertDoubleToInt32(value, result, scratch, kRoundToNearest);
++#endif
+   Jump(done);
+ }
+ 
+@@ -1050,8 +1105,7 @@ void MaglevAssembler::JumpIfUndefinedNan(DoubleRegister value, Register scratch,
+          MakeDeferredCode(
+              [](MaglevAssembler* masm, DoubleRegister value, Register scratch,
+                 ZoneLabelRef is_undefined, ZoneLabelRef is_not_undefined) {
+-               masm->MovDoubleToInt64(scratch, value);
+-               masm->ShiftRightU64(scratch, scratch, Operand(32));
++               masm->MovDoubleHighToInt(scratch, value);
+                masm->CompareInt32AndJumpIf(scratch, kUndefinedNanUpper32,
+                                            kEqual, *is_undefined);
+                masm->Jump(*is_not_undefined);
+@@ -1080,8 +1134,7 @@ void MaglevAssembler::JumpIfNotUndefinedNan(DoubleRegister value,
+                                             Register scratch, Label* target,
+                                             Label::Distance distance) {
+   JumpIfNotNan(value, target, distance);
+-  MovDoubleToInt64(scratch, value);
+-  ShiftRightU64(scratch, scratch, Operand(32));
++  MovDoubleHighToInt(scratch, value);
+   CompareInt32AndJumpIf(scratch, kUndefinedNanUpper32, kNotEqual, target,
+                         distance);
+ }
+@@ -1101,8 +1154,7 @@ void MaglevAssembler::JumpIfHoleNan(DoubleRegister value, Register scratch,
+          MakeDeferredCode(
+              [](MaglevAssembler* masm, DoubleRegister value, Register scratch,
+                 ZoneLabelRef is_hole, ZoneLabelRef is_not_hole) {
+-               masm->MovDoubleToInt64(scratch, value);
+-               masm->ShiftRightU64(scratch, scratch, Operand(32));
++               masm->MovDoubleHighToInt(scratch, value);
+                masm->CompareInt32AndJumpIf(scratch, kHoleNanUpper32, kEqual,
+                                            *is_hole);
+                masm->Jump(*is_not_hole);
+@@ -1133,8 +1185,7 @@ void MaglevAssembler::JumpIfNotHoleNan(DoubleRegister value, Register scratch,
+   fcmpu(value, value);
+   JumpIf(ordered, target, distance);
+ 
+-  MovDoubleToInt64(scratch, value);
+-  ShiftRightU64(scratch, scratch, Operand(32));
++  MovDoubleHighToInt(scratch, value);
+   CompareInt32AndJumpIf(scratch, kHoleNanUpper32, kNotEqual, target, distance);
+ }
+ 
+@@ -1471,7 +1522,11 @@ inline void MaglevAssembler::Int32ToDouble(DoubleRegister result,
+ 
+ inline void MaglevAssembler::IntPtrToDouble(DoubleRegister result,
+                                             Register src) {
++#if V8_TARGET_ARCH_PPC64
+   ConvertInt64ToDouble(src, result);
++#else
++  Int32ToDouble(result, src);
++#endif
+ }
+ 
+ inline void MaglevAssembler::Uint32ToDouble(DoubleRegister result,
+diff --git a/v8/src/maglev/ppc/maglev-assembler-ppc.cc b/v8/src/maglev/ppc/maglev-assembler-ppc.cc
+index fa30d43..f5690d2 100644
+--- a/v8/src/maglev/ppc/maglev-assembler-ppc.cc
++++ b/v8/src/maglev/ppc/maglev-assembler-ppc.cc
+@@ -534,8 +534,14 @@ void MaglevAssembler::TryTruncateDoubleToInt32(Register dst, DoubleRegister src,
+   Label done;
+ 
+   // Convert the input float64 value to int32.
++#if V8_TARGET_ARCH_PPC64
+   ConvertDoubleToInt64(src, dst, temp);
+   SignedExtend<int>(dst, dst);
++#else
++  // The int -> double conversion below then borrows kDoubleRegZero.
++  DCHECK(temp == kScratchDoubleReg);
++  ConvertDoubleToInt32(src, dst, temp);
++#endif
+ 
+   // Convert that int32 value back to float64.
+   ConvertIntToDouble(dst, temp);
+@@ -551,9 +557,14 @@ void MaglevAssembler::TryTruncateDoubleToInt32(Register dst, DoubleRegister src,
+ 
+   // In case of 0, we need to check the high bits for the IEEE -0 pattern.
+   {
++#if V8_TARGET_ARCH_PPC64
+     MovDoubleToInt64(scratch, src);
+     ShiftRightS64(scratch, scratch, Operand(63));
+     CmpS64(scratch, Operand::Zero(), r0);
++#else
++    MovDoubleHighToInt(scratch, src);
++    CmpS32(scratch, Operand::Zero(), r0);
++#endif
+     JumpIf(lt, fail);
+   }
+ 
+@@ -569,8 +580,27 @@ void MaglevAssembler::TryTruncateDoubleToUint32(Register dst,
+   Label done;
+ 
+   // Convert the input float64 value to uint32.
++#if V8_TARGET_ARCH_PPC64
+   ConvertDoubleToUnsignedInt64(src, dst, temp);
+   ZeroExtend<int>(dst, dst);
++#else
++  // No fctiwuz (POWER7): [2^31, 2^32) converts as src - 2^31 and gets the
++  // top bit back; anything else out of range fails the round trip below.
++  DCHECK(temp == kScratchDoubleReg);
++  {
++    Label above31, converted;
++    LoadDoubleLiteral(temp, base::Double(2147483648.0), scratch);
++    fcmpu(src, temp);
++    bge(&above31);
++    ConvertDoubleToInt32(src, dst, temp);
++    b(&converted);
++    bind(&above31);
++    fsub(temp, src, temp);
++    ConvertDoubleToInt32(temp, dst, temp);
++    xoris(dst, dst, Operand(0x8000));
++    bind(&converted);
++  }
++#endif
+ 
+   // Convert that uint32 value back to float64.
+   ConvertUnsignedIntToDouble(dst, temp);
+@@ -586,9 +616,14 @@ void MaglevAssembler::TryTruncateDoubleToUint32(Register dst,
+ 
+   // In case of 0, we need to check the high bits for the IEEE -0 pattern.
+   {
++#if V8_TARGET_ARCH_PPC64
+     MovDoubleToInt64(scratch, src);
+     ShiftRightS64(scratch, scratch, Operand(63));
+     CmpS64(scratch, Operand(0), r0);
++#else
++    MovDoubleHighToInt(scratch, src);
++    CmpS32(scratch, Operand::Zero(), r0);
++#endif
+     JumpIf(lt, fail);
+   }
+ 
+@@ -601,8 +636,13 @@ void MaglevAssembler::TryChangeFloat64ToIndex(Register result,
+   TemporaryRegisterScope temps(this);
+   DoubleRegister temp = temps.AcquireScratchDouble();
+   // Convert the input float64 value to int32.
++#if V8_TARGET_ARCH_PPC64
+   ConvertDoubleToInt64(value, result, temp);
+   SignedExtend<int>(result, result);
++#else
++  DCHECK(temp == kScratchDoubleReg);
++  ConvertDoubleToInt32(value, result, temp);
++#endif
+ 
+   // Convert that int32 value back to float64.
+   ConvertIntToDouble(result, temp);
+-- 
+2.43.0
+
