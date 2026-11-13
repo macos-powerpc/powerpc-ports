@@ -1,0 +1,221 @@
+From 40b66917cbf5253d1d47c22460cda7119d5fdfee Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Fri, 13 Nov 2026 16:12:49 +0000
+Subject: [PATCH] ffi: pointer-width argument slots and little-endian
+ shared-buffer slots
+
+Two big-endian 32-bit defects in node:ffi, both invisible on the little-endian targets
+upstream tests:
+
+- Pointer arguments (strings, Buffers, ArrayBuffers, BigInt pointers,
+  null) and pointer return values of JS callbacks were stored as
+  a uint64_t into their 8-byte slot, while libffi reads sizeof(void*)
+  bytes from the start of the slot.  On a 32-bit big-endian host that
+  is the zero high half: every pointer argument arrived as NULL
+  (strlen("hello") died with a bus error on darwin-ppc32), and the
+  callback return case also wrote 8 bytes into a return buffer that
+  GetFFIReturnValueStorageSize() sizes at 4.  StoreFFIPointer() writes
+  sizeof(void*) bytes instead.
+
+- The shared-buffer invoker's slots are written and read by
+  lib/internal/ffi-shared-buffer.js with little-endian DataView
+  accessors (pointers as little-endian u64), but ReadFFIArgFromBuffer()
+  and WriteFFIReturnToBuffer() copied them in host order, so on
+  a big-endian host every scalar argument and return value of that path
+  was byte-swapped.  They now byte-swap the type's width on big-endian
+  hosts; reading type->size bytes from the start of a little-endian
+  slot also yields a 32-bit pointer correctly.
+
+Little-endian hosts compile to the same code as before.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/ffi/types.cc | 45 ++++++++++++++++++++++++++++++---------------
+ src/ffi/types.h  |  7 +++++++
+ src/node_ffi.cc  |  2 +-
+ 3 files changed, 38 insertions(+), 16 deletions(-)
+
+diff --git a/src/ffi/types.cc b/src/ffi/types.cc
+index 5a910e6..de0cb53 100644
+--- a/src/ffi/types.cc
++++ b/src/ffi/types.cc
+@@ -8,6 +8,7 @@
+ #include "node_ffi.h"
+ #include "v8.h"
+ 
++#include <algorithm>
+ #include <climits>
+ #include <cmath>
+ #include <cstring>
+@@ -487,6 +488,18 @@ bool SignatureHasPointerArgs(const FFIFunction& fn) {
+   return false;
+ }
+ 
++// The JS side reads and writes shared-buffer slots little-endian.
++static void SwapSlotBytesOnBigEndian(uint8_t* p, size_t n) {
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++  std::reverse(p, p + n);
++#endif
++}
++
++static void CopyToSlot(uint8_t* dst, const void* src, size_t n) {
++  std::memcpy(dst, src, n);
++  SwapSlotBytesOnBigEndian(dst, n);
++}
++
+ void ReadFFIArgFromBuffer(ffi_type* type,
+                           const uint8_t* buffer,
+                           size_t offset,
+@@ -497,6 +510,7 @@ void ReadFFIArgFromBuffer(ffi_type* type,
+   // from the raw uint8_t buffer would incur.
+   const uint8_t* src = buffer + offset;
+   std::memcpy(out, src, type->size);
++  SwapSlotBytesOnBigEndian(static_cast<uint8_t*>(out), type->size);
+ }
+ 
+ void WriteFFIReturnToBuffer(ffi_type* type,
+@@ -515,38 +529,38 @@ void WriteFFIReturnToBuffer(ffi_type* type,
+   // branches read as ffi_arg or ffi_sarg and then truncate back down.
+   if (type == &ffi_type_sint8) {
+     int8_t tmp = static_cast<int8_t>(*static_cast<const ffi_sarg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+   if (type == &ffi_type_uint8) {
+     uint8_t tmp = static_cast<uint8_t>(*static_cast<const ffi_arg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+   if (type == &ffi_type_sint16) {
+     int16_t tmp = static_cast<int16_t>(*static_cast<const ffi_sarg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+   if (type == &ffi_type_uint16) {
+     uint16_t tmp = static_cast<uint16_t>(*static_cast<const ffi_arg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+   if (type == &ffi_type_sint32) {
+     int32_t tmp = static_cast<int32_t>(*static_cast<const ffi_sarg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+   if (type == &ffi_type_uint32) {
+     uint32_t tmp = static_cast<uint32_t>(*static_cast<const ffi_arg*>(result));
+-    std::memcpy(dst, &tmp, sizeof(tmp));
++    CopyToSlot(dst, &tmp, sizeof(tmp));
+     return;
+   }
+ 
+   // Remaining SB-eligible types (sint64, uint64, float, double, pointer)
+   // are not promoted by libffi and can be copied as-is.
+-  std::memcpy(dst, result, type->size);
++  CopyToSlot(dst, result, type->size);
+ }
+ 
+ v8::Maybe<ffi_type*> ToFFIType(Environment* env, std::string_view type_str) {
+@@ -703,7 +717,7 @@ Maybe<FFIArgumentCategory> ToFFIArgument(Environment* env,
+     *static_cast<double*>(ret) = arg->NumberValue(context).FromJust();
+   } else if (type == &ffi_type_pointer) {
+     if (arg->IsNullOrUndefined()) {
+-      *static_cast<uint64_t*>(ret) = reinterpret_cast<uint64_t>(nullptr);
++      StoreFFIPointer(ret, nullptr);
+     } else if (arg->IsString()) {
+       // String arguments are handled in Invoke so the UTF-8 copy can be
+       // freed after the call.
+@@ -735,8 +749,7 @@ Maybe<FFIArgumentCategory> ToFFIArgument(Environment* env,
+       void* data = store->Data();
+       size_t offset = view->ByteOffset();
+ 
+-      *static_cast<uint64_t*>(ret) =
+-          reinterpret_cast<uint64_t>(static_cast<char*>(data) + offset);
++      StoreFFIPointer(ret, static_cast<char*>(data) + offset);
+     } else if (arg->IsArrayBuffer()) {
+       // Pointer-like ArrayBuffer arguments borrow backing-store memory without
+       // pinning. Resizing, transferring, detaching, or otherwise invalidating
+@@ -756,7 +769,7 @@ Maybe<FFIArgumentCategory> ToFFIArgument(Environment* env,
+         return {};
+       }
+ 
+-      *static_cast<uint64_t*>(ret) = reinterpret_cast<uint64_t>(store->Data());
++      StoreFFIPointer(ret, store->Data());
+     } else if (arg->IsBigInt()) {
+       bool lossless;
+       uint64_t pointer = arg.As<BigInt>()->Uint64Value(&lossless);
+@@ -767,7 +780,8 @@ Maybe<FFIArgumentCategory> ToFFIArgument(Environment* env,
+         return {};
+       }
+ 
+-      *static_cast<uint64_t*>(ret) = pointer;
++      StoreFFIPointer(ret,
++                      reinterpret_cast<void*>(static_cast<uintptr_t>(pointer)));
+     } else {
+       THROW_ERR_INVALID_ARG_VALUE(
+           env,
+@@ -965,7 +979,7 @@ bool ToFFIReturnValue(Local<Value> result, ffi_type* type, void* ret) {
+     bool lossless;
+ 
+     if (result->IsNullOrUndefined()) {
+-      *static_cast<uint64_t*>(ret) = reinterpret_cast<uint64_t>(nullptr);
++      StoreFFIPointer(ret, nullptr);
+     } else if (result->IsBigInt()) {
+       uint64_t pointer = result.As<BigInt>()->Uint64Value(&lossless);
+       if (!lossless || pointer > static_cast<uint64_t>(
+@@ -973,12 +987,13 @@ bool ToFFIReturnValue(Local<Value> result, ffi_type* type, void* ret) {
+         return false;
+       }
+ 
+-      *static_cast<uint64_t*>(ret) = pointer;
++      StoreFFIPointer(ret,
++                      reinterpret_cast<void*>(static_cast<uintptr_t>(pointer)));
+     } else {
+       // Strings, Buffers, and ArrayBuffers are not accepted as pointer
+       // return values from a JS callback. The slot is zeroed before the
+       // false return so the caller sees a defined null pointer.
+-      *static_cast<uint64_t*>(ret) = reinterpret_cast<uint64_t>(nullptr);
++      StoreFFIPointer(ret, nullptr);
+       return false;
+     }
+   } else if (type != &ffi_type_void) {
+diff --git a/src/ffi/types.h b/src/ffi/types.h
+index a68549b..af7c4eb 100644
+--- a/src/ffi/types.h
++++ b/src/ffi/types.h
+@@ -6,11 +6,18 @@
+ #include "ffi.h"
+ 
+ #include <cstdint>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+ namespace node::ffi {
+ 
++// libffi reads sizeof(void*) bytes from the start of an argument or return
++// slot; a 64-bit store puts a 32-bit pointer in the wrong half on big-endian.
++inline void StoreFFIPointer(void* slot, const void* pointer) {
++  std::memcpy(slot, &pointer, sizeof(pointer));
++}
++
+ struct FFIFunction;
+ 
+ bool ThrowIfContainsNullBytes(Environment* env,
+diff --git a/src/node_ffi.cc b/src/node_ffi.cc
+index 0cce543..913bad9 100644
+--- a/src/node_ffi.cc
++++ b/src/node_ffi.cc
+@@ -639,7 +639,7 @@ void DynamicLibrary::InvokeFunction(const FunctionCallbackInfo<Value>& args) {
+         strings.reserve(expected_args);
+       }
+       strings.push_back(*str);
+-      values[i] = reinterpret_cast<uint64_t>(strings.back().c_str());
++      StoreFFIPointer(&values[i], strings.back().c_str());
+       ffi_args[i] = &values[i];
+     } else {
+       ffi_args[i] = &values[i];

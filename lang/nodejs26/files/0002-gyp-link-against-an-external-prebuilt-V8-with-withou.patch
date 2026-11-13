@@ -1,0 +1,148 @@
+From da576b31ab57ec4a65c832e4ae245a008aefad40 Mon Sep 17 00:00:00 2001
+From: barracuda156 <barracuda@macos-powerpc.org>
+Date: Thu, 12 Nov 2026 11:52:31 +0000
+Subject: [PATCH] gyp: link against an external prebuilt V8 with
+ --without-bundled-v8
+
+node 26 carries the configure flag: node_use_bundled_v8=false removes
+the dependencies on tools/v8_gypfiles/v8.gyp, so torque, mksnapshot
+and all of V8 compilation drop out of the gyp build.  New since node
+24, upstream also conditions the Darwin force_load of
+v8_base_without_compiler in the node executable and the
+tools/v8_gypfiles/abseil.gyp dependencies of libnode and cctest on
+node_use_bundled_v8, and configure probes pkg-config for a v8.pc (the
+v8-14.6 port installs none; the probe is a no-op).  What upstream still
+does not wire up is where the V8 symbols then come from.
+
+Add an else-branch in node.gypi supplying the static archives installed
+by the v8-14.6 port (every linkable target - node, node_mksnapshot,
+cctest, embedtest - includes node.gypi, so one patch point covers all),
+and give the force_load in the node executable - required so the node
+binary re-exports the full V8 API to native addons - an else-branch
+pointing at the installed archive.
+
+The else-branch also supplies include dirs: deps/v8/include, which the
+dropped v8.gyp dependencies used to propagate through
+direct_dependent_settings (at node 26 every includer lists it itself;
+kept so the branch stays self-sufficient), and
+deps/v8/third_party/abseil-cpp for node's own absl use
+(absl::SetMutexDeadlockDetectionMode in src/node.cc): with abseil.gyp
+out of the graph nothing else puts the absl headers on the include
+path, and the code comes from libv8_absl.a.  The abseil source patches
+that follow keep those headers identical to the ones the v8 port
+compiled its archives from.  (nodejs24 needed a patch of its own to
+gate abseil.gyp; node 26 has that upstream, so only the include dir
+remains and lives here.)
+
+Archives, as installed by the v8-14.6 port: libv8_initializers.a is
+not optional - the harness builds the CSA/Turboshaft builtin
+generators once, there, instead of a second time into v8_base.
+libv8_absl.a is the abseil dependency closure of v8_libbase, merged by
+the Portfile from the constituent absl archives so that single-pass
+ld64 archive resolution needs no topological ordering among them.
+Maglev, new at 14.6 and built by the v8 port's maglev variant, lives
+inside libv8_base_without_compiler.a, so the list is the same nine as
+at 13.6.  V8 links highway (json-stringifier) and simdutf; the v8 port
+uses the system libraries from ports highway and simdutf, so the
+archives' link interface needs -lhwy (added here) and -lsimdutf (which
+--shared-simdutf puts on every link line, with the -L for both).
+
+The @V8_LIBDIR@ placeholder is substituted by the Portfile.  Compile-
+time headers stay the in-tree deps/v8/include, which the next patch
+brings to parity with the port's installed headers (the 14.6 series
+patches three public headers).  The libnode (node_shared) target has
+the same bundled-only force_load condition and is left alone: this
+port does not build the shared library.
+---
+ node.gyp  | 11 +++++++++++
+ node.gypi | 46 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/node.gyp b/node.gyp
+index 1373c89..eebc032 100644
+--- a/node.gyp
++++ b/node.gyp
+@@ -668,12 +668,23 @@
+             },
+           },
+           'conditions': [
++            # v8_base_without_compiler must be force-loaded in full: it is
++            # what re-exports the whole V8 API from the node binary so that
++            # native addons can resolve V8 symbols at runtime.  With
++            # --without-bundled-v8 the archive lives in the v8 port's prefix
++            # (@V8_LIBDIR@, substituted by the Portfile), not in PRODUCT_DIR.
+             ['node_use_bundled_v8=="true"', {
+               'xcode_settings': {
+                 'OTHER_LDFLAGS': [
+                   '-Wl,-force_load,<(PRODUCT_DIR)/<(STATIC_LIB_PREFIX)v8_base_without_compiler<(STATIC_LIB_SUFFIX)',
+                 ],
+               },
++            }, {
++              'xcode_settings': {
++                'OTHER_LDFLAGS': [
++                  '-Wl,-force_load,@V8_LIBDIR@/libv8_base_without_compiler.a',
++                ],
++              },
+             }],
+             ['node_use_bundled_v8=="true" and OS != "aix" and OS != "os400" and OS != "mac" and OS != "ios"', {
+               'ldflags': [
+diff --git a/node.gypi b/node.gypi
+index 9eb972a..93859fb 100644
+--- a/node.gypi
++++ b/node.gypi
+@@ -107,6 +107,52 @@
+         'tools/v8_gypfiles/v8.gyp:v8_snapshot',
+         'tools/v8_gypfiles/v8.gyp:v8_libplatform',
+       ],
++    }, {
++      # --without-bundled-v8: supply what the dropped v8.gyp and abseil.gyp
++      # dependencies used to provide.  Headers first.  deps/v8/include is
++      # what v8.gyp propagated through direct_dependent_settings (at node
++      # 26 every includer lists it itself; kept so this branch stays
++      # self-sufficient - duplicates are harmless to gyp).
++      'include_dirs': [
++        'deps/v8/include',
++        # abseil headers for node's own absl use (src/node.cc).  The code
++        # comes from libv8_absl.a below, so tools/v8_gypfiles/abseil.gyp is
++        # not built in this configuration (node.gyp gates it on
++        # node_use_bundled_v8).  Header/archive parity: the port's absl
++        # patches keep these headers identical to the ones the v8 port
++        # compiled the archives from.
++        'deps/v8/third_party/abseil-cpp',
++      ],
++      # Then the archives installed by the v8 port.  Absolute paths, not
++      # -L/-l: on Darwin -l would also match dylibs, and ld64 resolves
++      # archive members regardless of command line order, so no grouping
++      # is needed.  @V8_LIBDIR@ is substituted by the Portfile.
++      # link_settings on a static_library propagates to the executables
++      # that link it.  libv8_initializers.a carries the CSA/Turboshaft
++      # builtin generators (built once there by the harness, not a second
++      # time into v8_base).  libv8_absl.a is the abseil dependency closure
++      # of v8_libbase, merged from the individual absl archives by the
++      # Portfile (single archive, so no inter-archive ordering).  Maglev
++      # (14.6) lives inside v8_base_without_compiler.
++      'link_settings': {
++        'libraries': [
++          '@V8_LIBDIR@/libv8_libplatform.a',
++          '@V8_LIBDIR@/libv8_base_without_compiler.a',
++          '@V8_LIBDIR@/libv8_compiler.a',
++          '@V8_LIBDIR@/libv8_initializers.a',
++          '@V8_LIBDIR@/libv8_snapshot.a',
++          '@V8_LIBDIR@/libv8_torque_generated.a',
++          '@V8_LIBDIR@/libv8_libsampler.a',
++          '@V8_LIBDIR@/libv8_libbase.a',
++          '@V8_LIBDIR@/libv8_absl.a',
++          # V8 links highway (json-stringifier); the v8 port uses the
++          # system libhwy from port highway rather than the vendored copy.
++          # -L${prefix}/lib is on every link line already through
++          # --shared-simdutf-libpath, which also resolves the archives'
++          # simdutf references.
++          '-lhwy',
++        ],
++      },
+     }],
+     [ 'node_use_v8_platform=="true"', {
+       'defines': [
+-- 
+2.43.0
+
