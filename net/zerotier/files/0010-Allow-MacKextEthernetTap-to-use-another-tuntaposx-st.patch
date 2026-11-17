@@ -1,0 +1,181 @@
+From 351b393511534f673e2fb0fc1a8a7182c3482b52 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Sun, 25 Oct 2026 07:45:33 +0000
+Subject: [PATCH 10/13] Allow MacKextEthernetTap to use another tuntaposx-style
+ kext
+
+macOS releases without the feth device (Darwin < 17, i.e. before 10.13)
+use MacKextEthernetTap, which needs ZeroTier's own tap.kext in the home
+directory providing /dev/zt# devices. That kext is no longer shipped in
+this tree, and the last copy that was (ext/bin/tap-mac) was x86_64-only,
+so there is nothing to use on e.g. PowerPC 10.5/10.6.
+
+ZeroTier's kext is tuntaposx 20150118 with the device family renamed to
+"zt", 32 instead of 16 interfaces, and a 2800 byte default MTU. The MTU
+is set explicitly via ifconfig when the device is brought up and
+tuntaposx accepts any MTU through SIOCSIFMTU, so tuntaposx's own tap
+kext works as well -- and is packaged for these systems (MacPorts'
+tuntaposx port, and the macos-powerpc ports tree's, which covers
+10.4-10.6 including PowerPC).
+
+Add two build-time settings, with make-mac.mk options of the same name:
+
+- ZT_MAC_KEXT_TAP_NAME: the device/interface family (default "zt").
+- ZT_MAC_KEXT_TAP_PATH: absolute path of the kext to load if
+  /dev/<name>0 is missing, instead of <home>/tap.kext. Such a kext may
+  be shared with other software, so it is only unloaded on shutdown if
+  zerotier-one loaded it itself.
+
+OneService already excludes tap* interfaces from use as physical paths,
+as it does zt*. Without either define the behavior is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ make-mac.mk                  | 11 +++++++
+ osdep/MacKextEthernetTap.cpp | 63 +++++++++++++++++++++++++++---------
+ 2 files changed, 58 insertions(+), 16 deletions(-)
+
+diff --git a/make-mac.mk b/make-mac.mk
+index f1bfb9204..18823a6c8 100644
+--- a/make-mac.mk
++++ b/make-mac.mk
+@@ -169,6 +169,17 @@ ifeq ($(ZT_USE_OPENSSL_SHA512),1)
+ 	OPENSSL_LIBS?=-lcrypto
+ 	LIBS+=$(OPENSSL_LIBS)
+ endif
++
++# Tap driver for macOS releases without feth (before 10.13): by default ZeroTier's own
++# tap.kext (zt# devices) from the home directory. ZT_MAC_KEXT_TAP_NAME and
++# ZT_MAC_KEXT_TAP_PATH select another tuntaposx-style kext instead, e.g. "tap" and
++# /opt/local/Library/Extensions/tap.kext for tuntaposx.
++ifneq ($(ZT_MAC_KEXT_TAP_NAME),)
++	override DEFS+=-DZT_MAC_KEXT_TAP_NAME=\"$(ZT_MAC_KEXT_TAP_NAME)\"
++endif
++ifneq ($(ZT_MAC_KEXT_TAP_PATH),)
++	override DEFS+=-DZT_MAC_KEXT_TAP_PATH=\"$(ZT_MAC_KEXT_TAP_PATH)\"
++endif
+ ifeq ($(ZT_CONTROLLER),1)
+ 	MACOS_VERSION_MIN=10.15
+ 	LIBS+=-L/opt/homebrew/lib -L/usr/local/opt/libpqxx/lib -L/usr/local/opt/libpq/lib -L/usr/local/opt/openssl/lib/ -lpqxx -lpq -lssl -lcrypto -lgssapi_krb5 ext/redis-plus-plus-1.1.1/install/macos/lib/libredis++.a ext/hiredis-0.14.1/lib/macos/libhiredis.a rustybits/target/libsmeeclient.a
+diff --git a/osdep/MacKextEthernetTap.cpp b/osdep/MacKextEthernetTap.cpp
+index 399742929..3b83fb467 100644
+--- a/osdep/MacKextEthernetTap.cpp
++++ b/osdep/MacKextEthernetTap.cpp
+@@ -245,6 +245,15 @@ static inline void _intl_freeifmaddrs(struct _intl_ifmaddrs* ifmp)
+ // ff:ff:ff:ff:ff:ff with no ADI
+ static const ZeroTier::MulticastGroup _blindWildcardMulticastGroup(ZeroTier::MAC(0xff), 0);
+ 
++// The tap devices come from a tuntaposx-style kext: /dev/<name>N character devices
++// backing <name>N interfaces. By default this is ZeroTier's own tap.kext ("zt"),
++// loaded from the home directory when needed. Packagers can use another one instead,
++// e.g. tuntaposx's own with -DZT_MAC_KEXT_TAP_NAME=\"tap\" and
++// -DZT_MAC_KEXT_TAP_PATH=\"/opt/local/Library/Extensions/tap.kext\" (absolute path).
++#ifndef ZT_MAC_KEXT_TAP_NAME
++#define ZT_MAC_KEXT_TAP_NAME "zt"
++#endif
++
+ static inline bool _setIpv6Stuff(const char* ifname, bool performNUD, bool acceptRouterAdverts)
+ {
+ 	struct in6_ndireq nd;
+@@ -291,6 +300,9 @@ namespace ZeroTier {
+ 
+ static long globalTapsRunning = 0;
+ static Mutex globalTapCreateLock;
++#ifdef ZT_MAC_KEXT_TAP_PATH
++static bool globalTapKextLoadedByUs = false;
++#endif
+ 
+ MacKextEthernetTap::MacKextEthernetTap(
+ 	const char* homePath,
+@@ -317,12 +329,18 @@ MacKextEthernetTap::MacKextEthernetTap(
+ 
+ 	Mutex::Lock _gl(globalTapCreateLock);
+ 
+-	if (::stat("/dev/zt0", &stattmp)) {
++	OSUtils::ztsnprintf(devpath, sizeof(devpath), "/dev/%s0", ZT_MAC_KEXT_TAP_NAME);
++	if (::stat(devpath, &stattmp)) {
+ 		long kextpid = (long)fork();
+ 		if (kextpid == 0) {
++#ifdef ZT_MAC_KEXT_TAP_PATH
++			OSUtils::redirectUnixOutputs("/dev/null", (const char*)0);
++			::execl("/sbin/kextload", "/sbin/kextload", "-q", ZT_MAC_KEXT_TAP_PATH, (const char*)0);
++#else
+ 			::chdir(homePath);
+ 			OSUtils::redirectUnixOutputs("/dev/null", (const char*)0);
+ 			::execl("/sbin/kextload", "/sbin/kextload", "-q", "-repository", homePath, "tap.kext", (const char*)0);
++#endif
+ 			::_exit(-1);
+ 		}
+ 		else if (kextpid > 0) {
+@@ -330,8 +348,11 @@ MacKextEthernetTap::MacKextEthernetTap(
+ 			::waitpid(kextpid, &exitcode, 0);
+ 		}
+ 		::usleep(500);	 // give tap device driver time to start up and try again
+-		if (::stat("/dev/zt0", &stattmp))
+-			throw std::runtime_error("/dev/zt# tap devices do not exist and cannot load tap.kext");
++		if (::stat(devpath, &stattmp))
++			throw std::runtime_error(std::string("/dev/") + ZT_MAC_KEXT_TAP_NAME + "# tap devices do not exist and cannot load tap.kext");
++#ifdef ZT_MAC_KEXT_TAP_PATH
++		globalTapKextLoadedByUs = true;
++#endif
+ 	}
+ 
+ 	// Try to reopen the last device we had, if we had one and it's still unused.
+@@ -373,13 +394,13 @@ MacKextEthernetTap::MacKextEthernetTap(
+ 	// Open the first unused tap device if we didn't recall a previous one.
+ 	if (! recalledDevice) {
+ 		for (int i = 0; i < 64; ++i) {
+-			OSUtils::ztsnprintf(devpath, sizeof(devpath), "/dev/zt%d", i);
++			OSUtils::ztsnprintf(devpath, sizeof(devpath), "/dev/%s%d", ZT_MAC_KEXT_TAP_NAME, i);
+ 			if (stat(devpath, &stattmp))
+ 				throw std::runtime_error("no more TAP devices available");
+ 			_fd = ::open(devpath, O_RDWR);
+ 			if (_fd > 0) {
+ 				char foo[16];
+-				OSUtils::ztsnprintf(foo, sizeof(foo), "zt%d", i);
++				OSUtils::ztsnprintf(foo, sizeof(foo), "%s%d", ZT_MAC_KEXT_TAP_NAME, i);
+ 				_dev = foo;
+ 				break;
+ 			}
+@@ -453,17 +474,27 @@ MacKextEthernetTap::~MacKextEthernetTap()
+ 		if (--globalTapsRunning <= 0) {
+ 			globalTapsRunning = 0;	 // sanity check -- should not be possible
+ 
+-			char tmp[16384];
+-			snprintf(tmp, sizeof(tmp), "%s/%s", _homePath.c_str(), "tap.kext");
+-			long kextpid = (long)fork();
+-			if (kextpid == 0) {
+-				OSUtils::redirectUnixOutputs("/dev/null", (const char*)0);
+-				::execl("/sbin/kextunload", "/sbin/kextunload", tmp, (const char*)0);
+-				::_exit(-1);
+-			}
+-			else if (kextpid > 0) {
+-				int exitcode = -1;
+-				::waitpid(kextpid, &exitcode, 0);
++			std::string kext;
++#ifdef ZT_MAC_KEXT_TAP_PATH
++			// A kext installed elsewhere may be shared with other software (e.g. tuntaposx),
++			// so only unload it if we were the ones who loaded it.
++			if (globalTapKextLoadedByUs)
++				kext = ZT_MAC_KEXT_TAP_PATH;
++			globalTapKextLoadedByUs = false;
++#else
++			kext = _homePath + ZT_PATH_SEPARATOR_S + "tap.kext";
++#endif
++			if (! kext.empty()) {
++				long kextpid = (long)fork();
++				if (kextpid == 0) {
++					OSUtils::redirectUnixOutputs("/dev/null", (const char*)0);
++					::execl("/sbin/kextunload", "/sbin/kextunload", kext.c_str(), (const char*)0);
++					::_exit(-1);
++				}
++				else if (kextpid > 0) {
++					int exitcode = -1;
++					::waitpid(kextpid, &exitcode, 0);
++				}
+ 			}
+ 		}
+ 	}
+-- 
+2.43.0
+
