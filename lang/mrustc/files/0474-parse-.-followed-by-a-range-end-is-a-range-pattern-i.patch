@@ -1,0 +1,167 @@
+From 3121fa0b35481e1433163a890335474b5ab1ae1b Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 17:21:28 +0000
+Subject: [PATCH] parse: `..` followed by a range end is a range pattern in
+ tuple and slice patterns
+
+rustc 1.90 tests/ui, parse-only run:
+
+    half-open-range-patterns/pat-tuple-4.rs   (.. PAT) => {}
+    error: Unexpected token TOK_IDENT, expected TOK_PAREN_CLOSE
+
+and rustfmt tests/{source,target}/configs/spaces_around_ranges/*.rs
+`[_, ..105, _] => {}` (Unexpected token TOK_INTEGER, expected
+TOK_SQUARE_CLOSE).
+
+Reference, Patterns: RangeToExclusivePattern `..` RangePatternBound and
+RangeToInclusivePattern `..=` RangePatternBound are PatternWithoutRange
+forms like RestPattern `..`; inside TuplePatternItems and
+SlicePatternItems a `..` is the rest pattern only when no range bound
+(a literal, `-` literal, or path) follows it. rustc decides the same way
+(`is_pat_range_end_start`).
+
+Parser (pattern.cpp): Parse_PatternTuple (tuples and tuple structs) and
+Parse_PatternReal_Slice took every `..` as the rest pattern. A helper
+now tells the two apart by the token after the `..` (the tokens
+Parse_PatternValue takes), and the slice parser's `x @ ..` / `x ..` /
+`_ @ ..` rest bindings use it too, so `[x @ ..3, ..]` binds a range.
+`ref x @ ..` keeps the old check: the token after its `..` is beyond
+the parser's lookahead.
+
+macro_rules pat skimmer (eval.cpp consume_pat): a fragment starting
+with `..` failed; it takes `..` (rest, which rustc accepts as a `pat`
+fragment: pattern/rest-pat-syntactic.rs `accept_pat!(..)`) and `..X`.
+
+Checked, unchanged: the proc-macro visitor sends a range with no start
+as `..` + end, ast/dump as ` .. ` + end, both read back as ranges now.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 6350fc58..f464e00b 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -1418,6 +1418,23 @@ namespace
+                 if( allow_or && lex.consume_if(TOK_PIPE) )
+                     continue;
+                 return true;
++            // `..X` (a range with only an end) or `..` (the rest pattern)
++            case TOK_DOUBLE_DOT:
++                lex.consume();
++                switch(lex.next())
++                {
++                case TOK_IDENT: case TOK_RWORD_SUPER:   case TOK_RWORD_SELF:    case TOK_RWORD_CRATE:
++                case TOK_DOUBLE_COLON:  case TOK_INTERPOLATED_PATH: case TOK_LT:    case TOK_DOUBLE_LT:
++                case TOK_DASH:  case TOK_STRING:    case TOK_BYTESTRING:    case TOK_INTEGER:   case TOK_FLOAT:
++                    if( !consume_pat_range_value(lex) )
++                        return false;
++                    break;
++                default:
++                    break;
++                }
++                if( allow_or && lex.consume_if(TOK_PIPE) )
++                    continue;
++                return true;
+             default:
+                 return false;
+             }
+diff --git a/src/parse/pattern.cpp b/src/parse/pattern.cpp
+index 204ce4a3..6185b84a 100644
+--- a/src/parse/pattern.cpp
++++ b/src/parse/pattern.cpp
+@@ -400,6 +400,25 @@ AST::Pattern Parse_PatternReal_Path(TokenStream& lex, ProtoSpan ps, AST::Path pa
+     }
+ }
+ 
++// `..` in a tuple or slice pattern is the rest pattern unless a range end follows it (`(..5,)`, `[_, ..105, _]`)
++static bool is_range_end_start(eTokenType t)
++{
++    switch( t )
++    {
++    case TOK_RWORD_CRATE:   case TOK_RWORD_SELF:    case TOK_RWORD_SUPER:
++    case TOK_IDENT: case TOK_LT:    case TOK_DOUBLE_LT: case TOK_DOUBLE_COLON:  case TOK_INTERPOLATED_PATH:
++    case TOK_DASH:  case TOK_FLOAT: case TOK_INTEGER:   case TOK_RWORD_TRUE:    case TOK_RWORD_FALSE:
++    case TOK_STRING:    case TOK_BYTESTRING:    case TOK_INTERPOLATED_EXPR:
++        return true;
++    default:
++        return false;
++    }
++}
++static bool is_rest_pattern(TokenStream& lex, unsigned int ofs)
++{
++    return lex.lookahead(ofs) == TOK_DOUBLE_DOT && !is_range_end_start(lex.lookahead(ofs+1));
++}
++
+ AST::Pattern Parse_PatternReal_Slice(TokenStream& lex)
+ {
+     auto ps = lex.start_span();
+@@ -414,10 +433,10 @@ AST::Pattern Parse_PatternReal_Slice(TokenStream& lex)
+     {
+         bool has_binding = true;
+         ::AST::PatternBinding  binding;
+-        // `ref foo ..` or `ref foo @ ..`
++        // `ref foo ..` or `ref foo @ ..` (the token after the `..` of `ref foo @ ..` is beyond the lookahead)
+         if( tok.type() == TOK_RWORD_REF && lex.lookahead(0) == TOK_IDENT
+             && (
+-                lex.lookahead(1) == TOK_DOUBLE_DOT
++                is_rest_pattern(lex, 1)
+                 || (lex.lookahead(1) == TOK_AT && lex.lookahead(2) == TOK_DOUBLE_DOT)
+                 ) ) {
+             GET_TOK(tok, lex);
+@@ -425,19 +444,19 @@ AST::Pattern Parse_PatternReal_Slice(TokenStream& lex)
+         }
+         // `foo ..` or `foo @ ..`
+         else if( tok.type() == TOK_IDENT && (
+-            lex.lookahead(0) == TOK_DOUBLE_DOT
+-            || (lex.lookahead(0) == TOK_AT && lex.lookahead(1) == TOK_DOUBLE_DOT)
++            is_rest_pattern(lex, 0)
++            || (lex.lookahead(0) == TOK_AT && is_rest_pattern(lex, 1))
+             ) ) {
+             binding = ::AST::PatternBinding( tok.ident(), ::AST::PatternBinding::Type::MOVE, false );
+         }
+         // `_ ..` or `_ @ ..`
+         else if( tok.type() == TOK_UNDERSCORE && (
+-            lex.lookahead(0) == TOK_DOUBLE_DOT
+-            || (lex.lookahead(0) == TOK_AT && lex.lookahead(1) == TOK_DOUBLE_DOT)
++            is_rest_pattern(lex, 0)
++            || (lex.lookahead(0) == TOK_AT && is_rest_pattern(lex, 1))
+             ) ) {
+             // No binding, but switching to trailing
+         }
+-        else if( tok.type() == TOK_DOUBLE_DOT ) {
++        else if( tok.type() == TOK_DOUBLE_DOT && !is_range_end_start(lex.lookahead(0)) ) {
+             // No binding, but switching to trailing
+             PUTBACK(tok, lex);
+         }
+@@ -490,7 +509,7 @@ AST::Pattern Parse_PatternReal_Slice(TokenStream& lex)
+     if(just_paren) *just_paren = false;
+ 
+     ::std::vector<AST::Pattern> leading;
+-    while( LOOK_AHEAD(lex) != TOK_PAREN_CLOSE && LOOK_AHEAD(lex) != TOK_DOUBLE_DOT )
++    while( LOOK_AHEAD(lex) != TOK_PAREN_CLOSE && !is_rest_pattern(lex, 0) )
+     {
+         leading.push_back( Parse_Pattern(lex) );
+ 
+@@ -502,7 +521,7 @@ AST::Pattern Parse_PatternReal_Slice(TokenStream& lex)
+         }
+     }
+ 
+-    if( LOOK_AHEAD(lex) != TOK_DOUBLE_DOT )
++    if( !is_rest_pattern(lex, 0) )
+     {
+         GET_TOK(tok, lex);
+ 
+diff --git a/src/version.cpp b/src/version.cpp
+index ed5954fa..32457e58 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  473
++#define VERSION_SERIES  474
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

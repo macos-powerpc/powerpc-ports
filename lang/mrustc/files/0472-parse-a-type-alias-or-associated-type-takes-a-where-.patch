@@ -1,0 +1,138 @@
+From 9bb5d0674bbf9635da6484af822128161d6cbb13 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 17:10:51 +0000
+Subject: [PATCH] parse: a type alias or associated type takes a where clause
+ before and after its type
+
+rustc 1.90 tests/ui, parse-only run:
+
+    where-clauses/where-clause-placement-assoc-type-in-impl.rs
+        impl Trait for u32 { type Assoc where u32: Copy = (); .. }
+        error: Unexpected token TOK_RWORD_WHERE, expected TOK_EQUAL
+    where-clauses/where-clause-placement-assoc-type-in-trait.rs
+        trait Trait { type Assoc where u32: Copy = (); .. }
+        error: Unexpected token TOK_EQUAL, expected TOK_SEMICOLON
+    type-alias-impl-trait/closure_parent_substs.rs
+        type Opaque<'a> where &'a (): Trait, = impl Sized + 'a;
+        error: Unexpected token TOK_EQUAL
+
+Reference, Type aliases: TypeAlias is `type IDENTIFIER GenericParams?
+( : TypeParamBounds )? WhereClause? ( = Type WhereClause? )? ;`, and
+Where clauses: `where ( WhereClauseItem , )* WhereClauseItem?`, so
+a clause may be empty or end in a comma, before the `=` and after the
+type.
+
+Parser (root.cpp):
+- Parse_WhereClause stopped only at `{` and `;` once a comma had been
+  taken; it also stops at `=` (and at an interpolated `$b:block` body)
+  now, which gives the trailing comma and the empty clause before `=`.
+- free aliases (Parse_TypeAlias) take a clause after the type,
+- trait items take one before the default as well as after it,
+- impl items take one before the `=` as well as after the type.
+Both clauses go into the item's generics, as the single clause did.
+
+macro_rules item skimmer (eval.cpp consume_item): a `type` item took no
+where clause at all; it takes one before the `=` and one after the
+type, and its where-clause reader stops at `=`.
+
+Checked, unchanged: the proc-macro visitor sends a trait item's clause
+before the `;` and an impl item's or free alias's after the type, both
+of which the parser takes; ast/dump the same.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index f3629f68..ef9ca9d0 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -1982,7 +1982,8 @@ namespace
+                 if(lex.consume_if(TOK_RWORD_WHERE))
+                 {
+                     do {
+-                        if( lex.next() == TOK_BRACE_OPEN || lex.next() == TOK_SEMICOLON || lex.next() == TOK_INTERPOLATED_BLOCK )
++                        if( lex.next() == TOK_BRACE_OPEN || lex.next() == TOK_SEMICOLON || lex.next() == TOK_INTERPOLATED_BLOCK
++                         || lex.next() == TOK_EQUAL )
+                             break;
+                         if( lex.consume_if(TOK_LIFETIME) ) {
+                             if( !lex.consume_if(TOK_COLON) )
+@@ -2097,11 +2098,15 @@ namespace
+                 return false;
+             if( !H::maybe_generics(lex) )
+                 return false;
+-
++            // A where clause before and/or after the type
++            if( !H::maybe_where(lex) )
++                return false;
+             if( !lex.consume_if(TOK_EQUAL) )
+                 return false;
+             if( !consume_type(lex) )
+                 return false;
++            if( !H::maybe_where(lex) )
++                return false;
+             if( !lex.consume_if(TOK_SEMICOLON) )
+                 return false;
+ 
+diff --git a/src/parse/root.cpp b/src/parse/root.cpp
+index a8bd135c..e28c300c 100644
+--- a/src/parse/root.cpp
++++ b/src/parse/root.cpp
+@@ -452,7 +452,9 @@ void Parse_WhereClause(TokenStream& lex, AST::GenericParams& params)
+     Token   tok;
+ 
+     do {
+-        if( lex.lookahead(0) == TOK_BRACE_OPEN || lex.lookahead(0) == TOK_SEMICOLON ) {
++        // Empty, or after a trailing comma: the item's body, `;`, or the `=` of a type alias / associated type
++        if( lex.lookahead(0) == TOK_BRACE_OPEN || lex.lookahead(0) == TOK_SEMICOLON || lex.lookahead(0) == TOK_EQUAL
++         || lex.lookahead(0) == TOK_INTERPOLATED_BLOCK ) {
+             break;
+         }
+ 
+@@ -725,6 +727,11 @@ AST::TypeAlias Parse_TypeAlias(TokenStream& lex)
+ 
+     // Type
+     TypeRef type = Parse_Type(lex);
++    // A where clause may also follow the type
++    if( lex.getTokenIf(TOK_RWORD_WHERE) )
++    {
++        Parse_WhereClause(lex, params);
++    }
+     GET_CHECK_TOK(tok, lex, TOK_SEMICOLON);
+ 
+     return AST::TypeAlias( ::std::move(params), ::std::move(type) );
+@@ -928,6 +935,11 @@ AST::Named<AST::Item> Parse_Trait_Item(TokenStream& lex)
+             Parse_TypeBound(lex, bounds, TypeRef(lex.point_span(), RcString::new_interned("Self"), 0xFFFF));
+             GET_TOK(tok, lex);
+         }
++        // A where clause before and/or after the default
++        if( tok.type() == TOK_RWORD_WHERE ) {
++            Parse_WhereClause(lex, type_params);
++            GET_TOK(tok, lex);
++        }
+ 
+         TypeRef default_type = TypeRef( lex.point_span() );
+         if( tok.type() == TOK_EQUAL ) {
+@@ -1551,6 +1563,10 @@ void Parse_Impl_Item(TokenStream& lex, AST::Impl& impl)
+         GET_CHECK_TOK(tok, lex, TOK_IDENT);
+         auto name = tok.ident().name;
+         auto atype_params = Parse_GenericParamsOpt(lex);
++        // A where clause before and/or after the type
++        if( lex.getTokenIf(TOK_RWORD_WHERE) ) {
++            Parse_WhereClause(lex, atype_params);
++        }
+         GET_CHECK_TOK(tok, lex, TOK_EQUAL);
+         auto ty = Parse_Type(lex);
+         if( lex.getTokenIf(TOK_RWORD_WHERE) ) {
+diff --git a/src/version.cpp b/src/version.cpp
+index cafb55ec..03e3a878 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  471
++#define VERSION_SERIES  472
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

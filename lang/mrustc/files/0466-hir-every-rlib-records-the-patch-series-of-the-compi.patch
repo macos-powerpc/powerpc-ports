@@ -1,0 +1,416 @@
+From b233f7d11ab018be42cbec3cb8bff13336f29d07 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 16:45:30 +0000
+Subject: [PATCH] hir: every rlib records the patch series of the compiler that
+ wrote it
+
+Ports are built on the G5 in a resume mode that keeps every rlib whose
+output exists, also after the compiler was updated. Three "recurring"
+bugs were rlibs older than their fix: arti's fs-mistrust rlib built
+before 0440 (the C290 stop again), a librsvg built before 0407 (the C256
+panic verbatim in audacious), cryptography built before 0421 (komikku).
+Nothing in an rlib said which compiler wrote it; telling "this crate
+fails again" from "a dependency is stale" took comparing mtimes.
+
+src/version.cpp defines VERSION_SERIES, the number of the last patch of
+this fork's series (466 = this commit); every later fix commit bumps it.
+HIR_Serialise appends `#mrustc-series=0466` to the string table that
+opens the metadata stream (`<rlib>.hir`). No data references it (a `#`
+cannot start a crate or item name), and it is appended after the table
+is sorted by use count, so every other string keeps its index: a stamped
+stream is the unstamped one plus one table entry, and an unstamped write
+is byte-identical to what 0465 writes (checked on the decompressed
+streams). The layout of the stream does not change: 0465 loads a stamped
+rlib and carries an unused string, this compiler reads an rlib without
+the entry as "unstamped". Existing rlibs keep loading.
+
+HIR_Deserialise reads the stamp and records crate name -> series. When
+compilation ends in Span::error or Span::bug (ERROR, BUG, TODO,
+ASSERT_BUG) or in a metadata load failure, one line follows the message
+if a loaded crate comes from another series, grouped by series, at most
+eight names per group:
+
+    note: crates loaded from rlibs of another mrustc series than this compiler's 0466 (rebuild them before treating this as a new bug): unstamped: e10; 0012: e1, e2, e3, e4, e5, e6, e7, e8 +1 more
+
+Nothing is printed on success or when every crate matches.
+
+VERSION_SERIES_FLOOR (0 = accept everything) is the lowest series this
+compiler loads: a fix that makes older rlibs known bad raises it, and
+loading one below it stops with
+
+    error: rlib out/old/libdep.rlib (mrustc series 0012) is below the floor 0100 of this compiler (series 0466): delete it and rebuild it
+
+`mrustc --rlib-series [<rlib>...]` prints the compiler's series, then
+each rlib's, without compiling (`mrustc: 0466`, `libdep.rlib: 0466`,
+`libold.rlib: unstamped`; exit 1 if a file cannot be read). `--version`
+and `-vV` are unchanged.
+
+Test hooks: MRUSTC_STAMP_SERIES=<n>|none sets the stamp written,
+MRUSTC_SERIES_FLOOR=<n> the floor, so one binary can write "old" rlibs.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/hir/deserialise.cpp b/src/hir/deserialise.cpp
+index 41ad08d5..51f759fd 100644
+--- a/src/hir/deserialise.cpp
++++ b/src/hir/deserialise.cpp
+@@ -16,7 +16,13 @@ namespace {
+ #include <mir/mir.hpp>
+ #include <macro_rules/macro_rules.hpp>
+ #include "serialise_lowlevel.hpp"
++#include "rlib_series.hpp"
++#include <version.hpp>
+ #include <typeinfo>
++#include <climits>
++#include <cstring>
++#include <iomanip>
++#include <sstream>
+ 
+ namespace {
+     bool des_debug_enabled() {
+@@ -1804,14 +1810,107 @@ namespace {
+     }
+ //}
+ 
++namespace {
++    // Crate name -> series of the rlib it was loaded from
++    ::std::map<::std::string, unsigned>& loaded_crate_series() {
++        static ::std::map<::std::string, unsigned> rv;
++        return rv;
++    }
++    unsigned series_from_table(const ::HIR::serialise::Reader& in) {
++        const size_t plen = strlen(RLIB_SERIES_PREFIX);
++        for(const auto& s : in.string_table())
++        {
++            if( s.size() > plen && memcmp(s.c_str(), RLIB_SERIES_PREFIX, plen) == 0 )
++            {
++                unsigned rv;
++                if( RlibSeries_Parse(::std::string(s.c_str() + plen, s.size() - plen).c_str(), rv) )
++                    return rv;
++            }
++        }
++        return 0;
++    }
++    void check_series_floor(const ::std::string& filename, unsigned series) {
++        unsigned floor = giVersion_SeriesFloor;
++        // Test hook: MRUSTC_SERIES_FLOOR=<n> replaces the floor
++        if( const char* e = getenv("MRUSTC_SERIES_FLOOR") )
++        {
++            if( !RlibSeries_Parse(e, floor) ) {
++                ::std::cerr << "error: $MRUSTC_SERIES_FLOOR must be a number, got `" << e << "`" << ::std::endl;
++                exit(1);
++            }
++        }
++        if( series < floor )
++        {
++            ::std::cerr << "error: rlib " << filename << " (mrustc series " << RlibSeries_Format(series) << ")"
++                << " is below the floor " << RlibSeries_Format(floor) << " of this compiler (series " << RlibSeries_Format(giVersion_Series) << ")"
++                << ": delete it and rebuild it" << ::std::endl;
++            exit(1);
++        }
++    }
++}
++
++bool RlibSeries_Parse(const char* s, unsigned& out)
++{
++    if( !('0' <= *s && *s <= '9') )
++        return false;
++    char* end = nullptr;
++    unsigned long v = strtoul(s, &end, 10);
++    if( *end != '\0' || v > UINT_MAX )
++        return false;
++    out = static_cast<unsigned>(v);
++    return true;
++}
++::std::string RlibSeries_Format(unsigned series)
++{
++    if( series == 0 )
++        return "unstamped";
++    ::std::stringstream ss;
++    ss << ::std::setw(4) << ::std::setfill('0') << series;
++    return ss.str();
++}
++unsigned RlibSeries_OfFile(const ::std::string& rlib_path)
++{
++    bool is_hir = rlib_path.size() > 4 && rlib_path.compare(rlib_path.size() - 4, 4, ".hir") == 0;
++    ::HIR::serialise::Reader    in{ is_hir ? rlib_path : rlib_path + ".hir" };
++    return series_from_table(in);
++}
++void RlibSeries_PrintNote(::std::ostream& os)
++{
++    ::std::map<unsigned, ::std::vector<const ::std::string*>>   groups;
++    for(const auto& e : loaded_crate_series())
++    {
++        if( e.second != giVersion_Series )
++            groups[e.second].push_back(&e.first);
++    }
++    if( groups.empty() )
++        return ;
++    const size_t MAX_NAMES = 8;
++    os << "note: crates loaded from rlibs of another mrustc series than this compiler's " << RlibSeries_Format(giVersion_Series)
++        << " (rebuild them before treating this as a new bug):";
++    const char* sep = " ";
++    for(const auto& g : groups)
++    {
++        os << sep << RlibSeries_Format(g.first) << ":";
++        for(size_t i = 0; i < g.second.size() && i < MAX_NAMES; i ++)
++            os << (i == 0 ? " " : ", ") << *g.second[i];
++        if( g.second.size() > MAX_NAMES )
++            os << " +" << (g.second.size() - MAX_NAMES) << " more";
++        sep = "; ";
++    }
++    os << ::std::endl;
++}
++
+ ::HIR::CratePtr HIR_Deserialise(const ::std::string& filename)
+ {
+     try
+     {
+         ::HIR::serialise::Reader    in{ filename + ".hir" };    // HACK!
++        unsigned series = series_from_table(in);
++        check_series_floor(filename, series);
+         HirDeserialiser  s { in };
+ 
+         ::HIR::Crate    rv = s.deserialise_crate();
++        loaded_crate_series()[rv.m_crate_name.c_str()] = series;
+ 
+         return ::HIR::CratePtr( mv$(rv) );
+     }
+@@ -1820,6 +1919,7 @@ namespace {
+     catch(const ::std::runtime_error& e)
+     {
+         ::std::cerr << "Unable to deserialise crate metadata from " << filename << ": " << e.what() << ::std::endl;
++        RlibSeries_PrintNote(::std::cerr);
+         ::std::abort();
+     }
+     #if 0
+diff --git a/src/hir/rlib_series.hpp b/src/hir/rlib_series.hpp
+new file mode 100644
+index 00000000..8cc6900c
+--- /dev/null
++++ b/src/hir/rlib_series.hpp
+@@ -0,0 +1,23 @@
++/*
++ * MRustC - Rust Compiler
++ * - By John Hodge (Mutabah/thePowersGang)
++ *
++ * hir/rlib_series.hpp
++ * - Patch-series stamp of the compiler that wrote an rlib's metadata
++ */
++#pragma once
++
++#include <iosfwd>
++#include <string>
++
++// The stamp is an entry of the metadata string table that no data references
++constexpr const char* RLIB_SERIES_PREFIX = "#mrustc-series=";
++
++// Decimal series number, false if `s` is anything else
++extern bool RlibSeries_Parse(const char* s, unsigned& out);
++// "0466", or "unstamped" for 0
++extern ::std::string RlibSeries_Format(unsigned series);
++// Series of the rlib at `rlib_path` (0 = unstamped), throws if the metadata cannot be read
++extern unsigned RlibSeries_OfFile(const ::std::string& rlib_path);
++// One `note:` line naming the loaded crates of another series than this compiler's, if any
++extern void RlibSeries_PrintNote(::std::ostream& os);
+diff --git a/src/hir/serialise.cpp b/src/hir/serialise.cpp
+index fc9fe131..b53bced7 100644
+--- a/src/hir/serialise.cpp
++++ b/src/hir/serialise.cpp
+@@ -10,6 +10,9 @@
+ #include <macro_rules/macro_rules.hpp>
+ #include <mir/mir.hpp>
+ #include "serialise_lowlevel.hpp"
++#include "rlib_series.hpp"
++#include <version.hpp>
++#include <cstring>
+ #include "../hir_typeck/monomorph.hpp"  // monomorphise_path_needed
+ 
+ //namespace {
+@@ -1467,6 +1470,22 @@ void HIR_Serialise(const ::std::string& filename, const ::HIR::Crate& crate)
+     HirSerialiser  s { out };
+     s.serialise_crate(crate);
+     s.clear();
++    unsigned series = giVersion_Series;
++    // Test hook: MRUSTC_STAMP_SERIES=<n> writes series n, `none` (or 0) writes no stamp
++    if( const char* e = getenv("MRUSTC_STAMP_SERIES") )
++    {
++        if( strcmp(e, "none") == 0 ) {
++            series = 0;
++        }
++        else if( !RlibSeries_Parse(e, series) ) {
++            ::std::cerr << "error: $MRUSTC_STAMP_SERIES must be a number or `none`, got `" << e << "`" << ::std::endl;
++            exit(1);
++        }
++    }
++    if( series != 0 )
++    {
++        out.add_unreferenced_string(RcString::new_interned(RLIB_SERIES_PREFIX + RlibSeries_Format(series)));
++    }
+     out.open(filename);
+     s.serialise_crate(crate);
+ }
+diff --git a/src/hir/serialise_lowlevel.cpp b/src/hir/serialise_lowlevel.cpp
+index 9789921a..de6ff0b9 100644
+--- a/src/hir/serialise_lowlevel.cpp
++++ b/src/hir/serialise_lowlevel.cpp
+@@ -48,6 +48,12 @@ void Writer::open(const ::std::string& filename)
+         sorted.push_back( e );
+     // 2. Write out string table
+     ::std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b){ return a.second > b.second; });
++    // After the sort, so the other strings keep their indices
++    for(const auto& s : m_unreferenced_strings)
++    {
++        if( m_istring_cache.count(s) == 0 )
++            sorted.push_back(::std::make_pair(s, 0u));
++    }
+ 
+     m_objname_cache.clear();
+ 
+diff --git a/src/hir/serialise_lowlevel.hpp b/src/hir/serialise_lowlevel.hpp
+index 2bd65435..22456070 100644
+--- a/src/hir/serialise_lowlevel.hpp
++++ b/src/hir/serialise_lowlevel.hpp
+@@ -36,6 +36,7 @@ class Writer
+ {
+     WriterInner*    m_inner;
+     ::std::map<RcString, unsigned>  m_istring_cache;
++    ::std::vector<RcString> m_unreferenced_strings;
+     ::std::map<const char*, unsigned>  m_objname_cache;
+ public:
+     Writer();
+@@ -43,6 +44,11 @@ public:
+     Writer(Writer&&) = delete;
+     ~Writer();
+ 
++    // Before `open`: append a string that no data references to the table
++    void add_unreferenced_string(const RcString& s) {
++        assert(!m_inner);
++        m_unreferenced_strings.push_back(s);
++    }
+     void open(const ::std::string& filename);
+     void write(const void* data, size_t count);
+ 
+@@ -250,6 +256,7 @@ public:
+     ~Reader();
+ 
+     size_t get_pos() const { return m_pos; }
++    const ::std::vector<RcString>& string_table() const { return m_strings; }
+     void read(void* dst, size_t count);
+ 
+     uint8_t read_u8() {
+diff --git a/src/include/version.hpp b/src/include/version.hpp
+index 2270a592..64682b73 100644
+--- a/src/include/version.hpp
++++ b/src/include/version.hpp
+@@ -12,6 +12,10 @@
+ extern unsigned int giVersion_Major;
+ extern unsigned int giVersion_Minor;
+ extern unsigned int giVersion_Patch;
++// Patch-series number of this compiler, stamped into every rlib it writes
++extern unsigned int giVersion_Series;
++// Lowest rlib series this compiler loads
++extern unsigned int giVersion_SeriesFloor;
+ extern const char* gsVersion_GitHash;
+ extern const char* gsVersion_GitShortHash;
+ extern const char* gsVersion_BuildTime;
+diff --git a/src/main.cpp b/src/main.cpp
+index 3a07c012..5fa4ca36 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -22,6 +22,7 @@
+ #include <main_bindings.hpp>
+ #include "resolve/main_bindings.hpp"
+ #include "hir/main_bindings.hpp"
++#include "hir/rlib_series.hpp"
+ #include "hir_conv/main_bindings.hpp"
+ #include "hir_typeck/main_bindings.hpp"
+ #include "hir_expand/main_bindings.hpp"
+@@ -991,6 +992,25 @@ ProgramParams::ProgramParams(int argc, char *argv[])
+ 
+             exit(0);
+         }
++        // --rlib-series [<rlib>...]  >> Print the series of this compiler, then of each rlib (its `.hir`)
++        if( strcmp(arg, "--rlib-series") == 0 ) {
++            extern bool g_debug_enabled;
++            g_debug_enabled = false;    // no compile phase is active: the metadata reader's debug output would be on
++            ::std::cout << "mrustc: " << RlibSeries_Format(giVersion_Series) << ::std::endl;
++            int rv = 0;
++            for(i ++; i < argc; i ++)
++            {
++                try {
++                    auto series = RlibSeries_OfFile(argv[i]);
++                    ::std::cout << argv[i] << ": " << RlibSeries_Format(series) << ::std::endl;
++                }
++                catch(const ::std::exception& e) {
++                    ::std::cout << argv[i] << ": error: " << e.what() << ::std::endl;
++                    rv = 1;
++                }
++            }
++            exit(rv);
++        }
+ 
+         if( arg[0] != '-' || arg[1] == '\0' )
+         {
+@@ -1449,5 +1469,7 @@ void ProgramParams::show_help() const
+         "--test             : Generate a unit test executable\n"
+         "-C <option>        : Code-generation options\n"
+         "-Z <option>        : Debugging/experimental options\n"
++        "--rlib-series [<rlib>...]\n"
++        "                   : Print the patch series of this compiler and of the compiler that wrote each rlib\n"
+         ;
+ }
+diff --git a/src/span.cpp b/src/span.cpp
+index 75de124b..1f40f70b 100644
+--- a/src/span.cpp
++++ b/src/span.cpp
+@@ -10,6 +10,7 @@
+ #include <span.hpp>
+ #include <parse/lex.hpp>
+ #include <common.hpp>
++#include <hir/rlib_series.hpp>
+ 
+ Span::Span(Span parent, RcString filename, unsigned int start_line, unsigned int start_ofs,  unsigned int end_line, unsigned int end_ofs):
+     m_ptr(SpanInner_Source::alloc( parent, ::std::move(filename), start_line, start_ofs, end_line, end_ofs ))
+@@ -77,6 +78,7 @@ void Span::print_span_message(::std::function<void(::std::ostream&)> tag, ::std:
+ void Span::bug(::std::function<void(::std::ostream&)> msg) const
+ {
+     print_span_message([](auto& os){os << "BUG";}, msg);
++    RlibSeries_PrintNote(::std::cerr);
+ #ifndef _WIN32
+     abort();
+ #else
+@@ -86,6 +88,7 @@ void Span::bug(::std::function<void(::std::ostream&)> msg) const
+ 
+ void Span::error(ErrorType tag, ::std::function<void(::std::ostream&)> msg) const {
+     print_span_message([&](auto& os){os << "error:" << tag;}, msg);
++    RlibSeries_PrintNote(::std::cerr);
+ #ifndef _WIN32
+     abort();
+ #else
+diff --git a/src/version.cpp b/src/version.cpp
+index 6ae56177..c82fd032 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -12,6 +12,11 @@
+ #define VERSION_MINOR   12
+ #define VERSION_PATCH   0
+ 
++// Number of the last patch in this fork's series: every fix commit bumps it
++#define VERSION_SERIES  466
++// rlibs written by an older series are refused (0 = accept all)
++#define VERSION_SERIES_FLOOR    0
++
+ #ifdef _WIN32
+ # define VERSION_GIT_ISDIRTY    1
+ # define VERSION_GIT_FULLHASH   "unknown"
+@@ -23,6 +28,8 @@
+ unsigned int giVersion_Major = VERSION_MAJOR;
+ unsigned int giVersion_Minor = VERSION_MINOR;
+ unsigned int giVersion_Patch = VERSION_PATCH;
++unsigned int giVersion_Series = VERSION_SERIES;
++unsigned int giVersion_SeriesFloor = VERSION_SERIES_FLOOR;
+ bool gbVersion_GitDirty = VERSION_GIT_ISDIRTY;
+ const char* gsVersion_GitHash = VERSION_GIT_FULLHASH;
+ const char* gsVersion_GitShortHash = VERSION_GIT_SHORTHASH;

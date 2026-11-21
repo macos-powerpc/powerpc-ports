@@ -1,0 +1,250 @@
+From a1030087a3102637c58ae956d41e780e42d23ddb Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 18:18:56 +0000
+Subject: [PATCH] ast: an associated item constraint's trait bounds may be
+ higher-ranked
+
+rustc 1.90 tests/ui, parse-only run, after 0468 (lifetime bounds):
+
+    associated-type-bounds/bad-bounds-on-assoc-in-trait.rs
+        type C: Clone + Iterator<Item: Send + Iterator<Item: for<'a> Lam<&'a u8, App: Debug>> + Sync>;
+    associated-type-bounds/issue-81193.rs
+        for<'b> F: Iterator<Item: for<'c> B<'a, 'b, 'c> + for<'c> A<'a, 'c>>,
+    associated-type-bounds/issue-83017.rs
+        for<'a> T: TraitA<'a, AsA: for<'b> TraitB<'a, 'b, AsB: for<'c> TraitC<'a, 'b, 'c>>>,
+    error: Unexpected token TOK_RWORD_FOR, expected TOK_IDENT
+
+and, since 0468, a dozen more associated-type-bounds tests whose first
+failure moved to such a bound (fn-where.rs, fn-inline.rs, struct-bounds.rs,
+type-alias.rs `T: Iterator<Item: for<'a> Into<&'a u8>>`, ...).
+
+Reference, Paths > GenericArgsBounds: `IDENTIFIER GenericArgs? :
+TypeParamBounds`; Trait and lifetime bounds: TraitBound is `( ? |
+ForLifetimes )? TypePath | ( ( ? | ForLifetimes )? TypePath )`.
+
+The AST entry (PathParamEnt::AssociatedTyBound) held plain trait paths,
+with no place for a binder, so a `for<..>` could not even be dropped:
+the path's `'a` would not resolve. It now holds Type_TraitPath (the
+binder and the path), as trait objects and `impl Trait` already do.
+ast/path.hpp is the one header changed (a full rebuild).
+
+- parse (paths.cpp): an optional ForLifetimes before each trait bound,
+  also inside parentheses;
+- resolve (absolute.cpp): the binder is in scope while the bound's path
+  is resolved;
+- lower (hir/from_ast.cpp): LowerHIR_TraitPath gets the binder, as for
+  every other higher-ranked trait bound. LowerHIR_GenericParams turns
+  a constraint's own constraints into bounds on the projection
+  (`Out: for<'c> Lam<&'c u8, App: Copy>` bounds `<<T as Gen>::Out as
+  Lam<&'c u8>>::App: Copy`); that bound now gets the `for<'c>` its type
+  refers to (it got the outer clause's, none here, and typeck failed
+  "expr_cs__enum.cpp:393: Generic lifetime out of input range - H:0 >= 0"
+  at a call);
+- expand (mod.cpp): macros inside the path, unchanged otherwise;
+- proc-macro visitor: sends `for<..>` before the path; ast/path.cpp
+  prints, clones and orders the new form (ast/dump uses that printer).
+
+The macro_rules skimmer reads generic arguments as angle-bracketed
+token trees and needed nothing.
+
+Not done: a higher-ranked bound in a constraint under an outer binder
+(`for<'b> F: It<Item: for<'c> B<'b, 'c>>`, issue-81193.rs and
+issue-83017.rs) parses, resolves and lowers, but hir_typeck stops at
+its existing "resolve_common.cpp:123: TODO: prep_indexes__add_trait_bound
+- Handle multiple layers of HRTBs": the bound has two binders.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/ast/path.cpp b/src/ast/path.cpp
+index 158e8ae6..cb494779 100644
+--- a/src/ast/path.cpp
++++ b/src/ast/path.cpp
+@@ -149,7 +149,12 @@ namespace {
+             v.second.print(os, is_debug);
+             }
+         TU_ARMA(AssociatedTyBound, v) {
+-            os << v.first << ": " << v.second;
++            os << v.first << ":";
++            for(const auto& t : v.second) {
++                if( &t != v.second.data() )
++                    os << " +";
++                os << " " << t.hrbs << *t.path;
++            }
+             }
+         }
+     }
+diff --git a/src/ast/path.hpp b/src/ast/path.hpp
+index 616ce9e3..71146380 100644
+--- a/src/ast/path.hpp
++++ b/src/ast/path.hpp
+@@ -699,7 +699,8 @@ TAGGED_UNION_EX(PathParamEnt, (), Null, (
+     (Type, TypeRef),
+     (Value, AST::ExprNodeP),
+     (AssociatedTyEqual, ::std::pair<PathNode, TypeRef>),
+-    (AssociatedTyBound, ::std::pair<PathNode, std::vector<Path>>)
++    // `Assoc: for<'a> Tr<'a> + Tr2` (lifetime bounds are not kept)
++    (AssociatedTyBound, ::std::pair<PathNode, std::vector<Type_TraitPath>>)
+     ),
+     (), (),
+     (
+diff --git a/src/expand/mod.cpp b/src/expand/mod.cpp
+index f50b6235..4c9ba1e9 100644
+--- a/src/expand/mod.cpp
++++ b/src/expand/mod.cpp
+@@ -772,8 +772,8 @@ void Expand_PathParams(const ExpandState& es, ::AST::Module& mod, ::AST::PathPar
+             }
+         TU_ARMA(AssociatedTyBound, aty) {
+             Expand_PathParams(es, mod, aty.first.args());
+-            for(auto& p : aty.second) {
+-                Expand_Path(es, mod, p);
++            for(auto& t : aty.second) {
++                Expand_Path(es, mod, *t.path);
+             }
+             }
+         }
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 991e7acb..754d95db 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -1318,10 +1318,11 @@ namespace {
+                     TU_ARMA(AssociatedTyBound, a) {
+                         visit_path_node(a.first, false);
+                         m_pmi.send_symbol(":");
+-                        for(const auto& p : a.second) {
+-                            if( &p != a.second.data() )
++                        for(const auto& t : a.second) {
++                            if( &t != a.second.data() )
+                                 m_pmi.send_symbol("+");
+-                            this->visit_path(p);
++                            this->visit_hrbs(t.hrbs);
++                            this->visit_path(*t.path);
+                         }
+                         }
+                     }
+diff --git a/src/hir/from_ast.cpp b/src/hir/from_ast.cpp
+index 35655485..ef2a6c62 100644
+--- a/src/hir/from_ast.cpp
++++ b/src/hir/from_ast.cpp
+@@ -160,8 +160,11 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+             // An associated type bound (`T: Trait<Assoc: Bound>`) becomes a bound on the projection `<T as Trait>::Assoc`.
+             // `Bound` can carry associated type bounds of its own, which bound the next projection, and so on.
+             // - e.g. `I: ParallelIterator<Item: IntoIterator<Item: Send>>` (rayon 1.12.0)
+-            ::std::function<void(const ::HIR::TypeRef&, ::std::map<RcString, ::HIR::TraitPath::AtyBound>&)>  add_aty_bounds;
+-            add_aty_bounds = [&](const ::HIR::TypeRef& bounded_ty, ::std::map<RcString, ::HIR::TraitPath::AtyBound>& aty_bounds) {
++            // `binder` is what the bounded type's higher-ranked lifetimes refer to: the bound's own `for<..>` at the
++            // top, then that of the trait whose projection is bounded (`Out: for<'c> Lam<&'c u8, App: Copy>` bounds
++            // `<<T as Gen>::Out as Lam<&'c u8>>::App`, under `for<'c>`)
++            ::std::function<void(const ::HIR::TypeRef&, ::std::map<RcString, ::HIR::TraitPath::AtyBound>&, const ::HIR::GenericParams*)>  add_aty_bounds;
++            add_aty_bounds = [&](const ::HIR::TypeRef& bounded_ty, ::std::map<RcString, ::HIR::TraitPath::AtyBound>& aty_bounds, const ::HIR::GenericParams* binder) {
+                 for(auto& bound : aty_bounds)
+                 {
+                     const auto& name = bound.first;
+@@ -170,26 +173,36 @@ HIR::LifetimeRef LowerHIR_LifetimeRef(const ::AST::LifetimeRef& r)
+                     for(auto& trait : bound.second.traits)
+                     {
+                         std::unique_ptr<HIR::GenericParams> hrls;
+-                        if( !e.outer_hrbs.empty() ) {
+-                            hrls = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
+-                        }
+-                        if( !e.inner_hrbs.empty() ) {
+-                            hrls = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
++                        if( binder ) {
++                            hrls = box$(binder->clone());
+                         }
+                         auto aty_ty = ::HIR::TypeRef::new_path( ::HIR::Path(bounded_ty.clone(), src_trait.clone(), name, params.clone()), {} );
+                         auto inner_bounds = mv$(trait.m_trait_bounds);
+                         trait.m_trait_bounds.clear();
++                        std::unique_ptr<HIR::GenericParams> inner_binder;
++                        if( trait.m_hrtbs && !trait.m_hrtbs->is_empty() ) {
++                            inner_binder = box$(trait.m_hrtbs->clone());
++                        }
+                         rv.m_bounds.push_back(::HIR::GenericBound::make_TraitBound({
+                             std::move(hrls),
+                             aty_ty.clone(),
+                             std::move(trait)
+                             }));
+-                        add_aty_bounds(aty_ty, inner_bounds);
++                        add_aty_bounds(aty_ty, inner_bounds, inner_binder ? inner_binder.get() : binder);
+                     }
+                     bound.second.traits.clear();
+                 }
+                 };
+-            add_aty_bounds(type, tp_bounds);
++            {
++                std::unique_ptr<HIR::GenericParams> top_binder;
++                if( !e.outer_hrbs.empty() ) {
++                    top_binder = box$(LowerHIR_HigherRankedBounds(e.outer_hrbs));
++                }
++                if( !e.inner_hrbs.empty() ) {
++                    top_binder = box$(LowerHIR_HigherRankedBounds(e.inner_hrbs));
++                }
++                add_aty_bounds(type, tp_bounds, top_binder.get());
++            }
+             }
+         TU_ARMA(MaybeTrait, e) {
+             auto type = LowerHIR_Type(e.type);
+@@ -1070,7 +1083,7 @@ namespace {
+                 for(const auto& trait : assoc.second) {
+                     // The bound's own associated type bounds stay in its trait path (expanded by the caller, see
+                     // `LowerHIR_GenericParams`): `I: ParallelIterator<Item: IntoIterator<Item: Send>>` (rayon 1.12.0)
+-                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, trait, {}, /*ignore_bounds*/true) );
++                    it.first->second.traits.push_back( LowerHIR_TraitPath(sp, *trait.path, trait.hrbs, /*ignore_bounds*/true) );
+                 }
+ 
+             }
+diff --git a/src/parse/paths.cpp b/src/parse/paths.cpp
+index 07b6b278..1bdf8e42 100644
+--- a/src/parse/paths.cpp
++++ b/src/parse/paths.cpp
+@@ -293,7 +293,7 @@ AST::Path Parse_Path(TokenStream& lex, bool is_abs, eParsePathGenericMode generi
+                     rv.m_entries.push_back( ::std::make_pair( mv$(n), Parse_Type(lex,false) ) );
+                 }
+                 else if( lex.getTokenIf(TOK_COLON) ) {
+-                    std::vector<AST::Path>  traits;
++                    std::vector<Type_TraitPath>  traits;
+                     // TODO: Trait list instead of duplicating the name
+                     for(;;)
+                     {
+@@ -303,7 +303,9 @@ AST::Path Parse_Path(TokenStream& lex, bool is_abs, eParsePathGenericMode generi
+                         else {
+                             // In parentheses, as any trait bound (see Parse_TypeBound): `Iterator<Item: (Tr)>`
+                             bool is_paren = lex.getTokenIf(TOK_PAREN_OPEN);
+-                            traits.push_back( Parse_Path(lex, PATH_GENERIC_TYPE) );
++                            // Higher-ranked: `Iterator<Item: for<'a> Tr<&'a u8>>`
++                            auto hrbs = Parse_HRB_Opt(lex);
++                            traits.push_back( Type_TraitPath(mv$(hrbs), Parse_Path(lex, PATH_GENERIC_TYPE)) );
+                             if( is_paren ) {
+                                 GET_CHECK_TOK(tok, lex, TOK_PAREN_CLOSE);
+                             }
+diff --git a/src/resolve/absolute.cpp b/src/resolve/absolute.cpp
+index 865b9bbe..51a77fb4 100644
+--- a/src/resolve/absolute.cpp
++++ b/src/resolve/absolute.cpp
+@@ -982,8 +982,11 @@ void Resolve_Absolute_PathParams(/*const*/ Context& context, const Span& sp, ::A
+             }
+         TU_ARMA(AssociatedTyBound, a) {
+             Resolve_Absolute_PathParams(context, sp, a.first.args());
+-            for(auto& p : a.second)
+-                Resolve_Absolute_Path(context, sp, Context::LookupMode::Type, p);
++            for(auto& t : a.second) {
++                context.push(t.hrbs);
++                Resolve_Absolute_Path(context, sp, Context::LookupMode::Type, *t.path);
++                context.pop(t.hrbs);
++            }
+             }
+         }
+     }
+diff --git a/src/version.cpp b/src/version.cpp
+index 520b97c4..d000022c 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  484
++#define VERSION_SERIES  485
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

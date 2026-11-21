@@ -1,0 +1,134 @@
+From c019244e13a4e415a205fa9df5aa70038c5bf1f4 Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 17:52:19 +0000
+Subject: [PATCH] parse: outer attributes before `...` and before a function
+ pointer type's parameters
+
+rustc 1.90 tests/ui, parse-only run:
+
+    rfcs/rfc-2565-param-attrs/param-attrs-allowed.rs
+        extern "C" { fn ffi(.., #[deny(unused_mut)] #[warn(unused_mut)] ...); }
+    error: Unexpected token TOK_TRIPLE_DOT
+
+(param-attrs-pretty.rs fails the same way but also needs
+`#![feature(c_variadic)]`.)
+
+Reference, Functions: FunctionParam is `OuterAttribute* (
+FunctionParamPattern | ... | Type )`, so the C-variadic `...` takes
+attributes like any parameter; Function pointer types:
+MaybeNamedParam is `OuterAttribute* ( ( IDENTIFIER | _ ) : )? Type` and
+MaybeNamedFunctionParametersVariadic ends in `OuterAttribute* ...`.
+
+Parser:
+- Parse_FunctionDef read a parameter's attributes inside
+  Parse_Function_Arg, after its check for `...`. The loop now reads
+  them first; before `...` they are dropped (lint attributes), before
+  a parameter they go to it as before.
+- Parse_Type_Fn read no attributes at all. It reads them before every
+  parameter and before `...`. A type keeps no attributes, so `#[cfg]`
+  and `#[cfg_attr(.., cfg(..))]` are applied there and then (the cfg
+  set is known while parsing, as for `mod x;`): a disabled parameter is
+  left out of the type. Other attributes are dropped.
+
+Grammar copies: the macro_rules skimmer reads parameter lists as token
+trees; the proc-macro visitor and ast/dump print no parameter
+attributes of types or of `...`.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/parse/root.cpp b/src/parse/root.cpp
+index 7fb9a1c2..e0b79fe4 100644
+--- a/src/parse/root.cpp
++++ b/src/parse/root.cpp
+@@ -645,6 +645,8 @@ AST::Function Parse_FunctionDef(TokenStream& lex, bool allow_self, bool can_be_p
+                 GET_TOK(tok, lex);
+                 break;
+             }
++            // Outer attributes may also precede the C-variadic `...` (they are not kept)
++            auto arg_attrs = Parse_ItemAttrs(lex);
+             if( LOOK_AHEAD(lex) == TOK_TRIPLE_DOT ) {
+                 GET_TOK(tok, lex);
+                 is_variadic = true;
+@@ -652,6 +654,10 @@ AST::Function Parse_FunctionDef(TokenStream& lex, bool allow_self, bool can_be_p
+                 break;
+             }
+             args.push_back( Parse_Function_Arg(lex, !can_be_prototype) );
++            if( !arg_attrs.m_items.empty() ) {
++                auto& a = args.back().attrs.m_items;
++                a.insert(a.begin(), ::std::make_move_iterator(arg_attrs.m_items.begin()), ::std::make_move_iterator(arg_attrs.m_items.end()));
++            }
+             if( !had_self && args.size() == 1 && !first_attrs.m_items.empty() ) {
+                 // The attributes before the first (non-self) parameter, read above, go first
+                 auto& a = args.back().attrs.m_items;
+diff --git a/src/parse/types.cpp b/src/parse/types.cpp
+index 6ec5f90f..e083b049 100644
+--- a/src/parse/types.cpp
++++ b/src/parse/types.cpp
+@@ -9,12 +9,14 @@
+ #include "parseerror.hpp"
+ #include <ast/types.hpp>
+ #include <ast/ast.hpp>
++#include <expand/cfg.hpp>   // check_cfg - for `#[cfg]` on a function pointer type's parameters
+ 
+ // === PROTOTYPES ===
+ //TypeRef Parse_Type(TokenStream& lex, bool allow_trait_list);
+ TypeRef Parse_Type_Int(TokenStream& lex, bool allow_trait_list);
+ TypeRef Parse_Type_Fn(TokenStream& lex, AST::HigherRankedBounds hrbs = {});
+ TypeRef Parse_Type_Path(TokenStream& lex, AST::HigherRankedBounds hrbs, bool allow_trait_list);
++static bool Parse_FnPtrParamEnabled(const AST::AttributeList& attrs);
+ TypeRef Parse_Type_TraitObject(TokenStream& lex, ::AST::HigherRankedBounds hrbs = {});
+ TypeRef Parse_Type_ErasedType(TokenStream& lex, bool allow_trait_list);
+ 
+@@ -247,6 +249,8 @@ TypeRef Parse_Type_Fn(TokenStream& lex, ::AST::HigherRankedBounds hrbs)
+     GET_CHECK_TOK(tok, lex, TOK_PAREN_OPEN);
+     while( LOOK_AHEAD(lex) != TOK_PAREN_CLOSE )
+     {
++        // Outer attributes on a parameter or on `...`: a type keeps no attributes, so a `#[cfg]` is applied here
++        auto attrs = Parse_ItemAttrs(lex);
+         if( LOOK_AHEAD(lex) == TOK_TRIPLE_DOT ) {
+             GET_TOK(tok, lex);
+             is_variadic = true;
+@@ -258,6 +262,9 @@ TypeRef Parse_Type_Fn(TokenStream& lex, ::AST::HigherRankedBounds hrbs)
+             GET_TOK(tok, lex);
+         }
+         args.push_back( Parse_Type(lex) );
++        if( !Parse_FnPtrParamEnabled(attrs) ) {
++            args.pop_back();
++        }
+         if( GET_TOK(tok, lex) != TOK_COMMA ) {
+             PUTBACK(tok, lex);
+             break;
+@@ -278,6 +285,19 @@ TypeRef Parse_Type_Fn(TokenStream& lex, ::AST::HigherRankedBounds hrbs)
+     return TypeRef(TypeRef::TagFunction(), lex.end_span(ps), mv$(hrbs), is_unsafe, mv$(abi), mv$(args), is_variadic, mv$(ret_type));
+ }
+ 
++// The `#[cfg]` / `#[cfg_attr(.., cfg(..))]` of a function pointer type's parameter
++static bool Parse_FnPtrParamEnabled(const AST::AttributeList& attrs)
++{
++    for(const auto& a : attrs.m_items)
++    {
++        if( a.name() == "cfg" && !check_cfg(a.span(), a) )
++            return false;
++        if( a.name() == "cfg_attr" && !Parse_FnPtrParamEnabled(AST::AttributeList(check_cfg_attr(a))) )
++            return false;
++    }
++    return true;
++}
++
+ TypeRef Parse_Type_Path(TokenStream& lex, ::AST::HigherRankedBounds hrbs, bool allow_trait_list)
+ {
+     Token   tok;
+diff --git a/src/version.cpp b/src/version.cpp
+index 24f38777..f7b7b0b0 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  480
++#define VERSION_SERIES  481
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

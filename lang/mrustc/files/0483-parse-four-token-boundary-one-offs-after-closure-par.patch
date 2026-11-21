@@ -1,0 +1,190 @@
+From 7b17f4db2fd640d6c9c05145298e55ec3c35268f Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 18:03:06 +0000
+Subject: [PATCH] parse: four token-boundary one-offs (`||` after closure
+ params, `unsafe {}` arms, `t. 0.0`, `+=` after bounds)
+
+rustc 1.90 tests/ui, parse-only run, one rule each:
+
+    functions-closures/closure-returning-closure.rs  let f = |_||x, y| x+y;
+    error: Unexpected token TOK_DOUBLE_PIPE, expected TOK_PIPE
+    parser/macro/statement-boundaries.rs  X if false => unsafe {} | X if false => {}
+    error: Unexpected token TOK_RWORD_IF
+    tuple/index-float.rs                  let () = tuple. 0.0; // OK, whitespace
+    error: Unexpected token TOK_FLOAT
+    parser/trait-plusequal-splitting.rs   struct TokenSplit<T: Clone +=  ()> { t: T }
+    error: Unexpected token TOK_PLUS_EQUAL, expected one of TOK_GT or TOK_GTE
+
+1. Closure expressions: ClosureParameters end in `|`; rustc splits
+   a `||` there (expect_or), the second half opening the body's closure.
+   Parse_ExprVal_Closure now does the same, and so does the macro_rules
+   expression skimmer (eval.cpp consume_expr), which then reads the
+   inner closure's parameters.
+2. Expression statements / match arms: ExpressionWithBlock includes
+   UnsafeBlockExpression and ConstBlockExpression; an arm body that is
+   one ends at its `}` (the `|` after it starts the next arm's
+   patterns). Parse_Stmt (match arm bodies, `stmt` fragments) handled
+   `{ .. }`, if, match and loops, not `unsafe { .. }` / `const { .. }`;
+   they go the block path now (still continued by `.` / `?`).
+3. Tuple indexes: TUPLE_INDEX after `.` with whitespace or a comment in
+   between (rustc splits the float token `0.0`). mrustc lexes digits
+   right after a `.` as an integer; the lexer now skips whitespace and
+   comments after a `.` before that check, so `tuple. 0.0` and
+   `tuple./*c*/0.0` are `.0` `.0` as without the space.
+4. Trait and lifetime bounds: a bound list may end in `+`, and the `=`
+   of a type parameter's default may follow it; `+=` lexes as one
+   token. Parse_BoundList_Next splits it into the trailing `+` and `=`.
+
+The fifth one-off of this group, `for _ in (1..{ 2 }) {}`, came with
+the range-end rule (0478).
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/macro_rules/eval.cpp b/src/macro_rules/eval.cpp
+index 432f0573..d925c584 100644
+--- a/src/macro_rules/eval.cpp
++++ b/src/macro_rules/eval.cpp
+@@ -1504,18 +1504,25 @@ namespace
+             lex.consume_if(TOK_RWORD_MOVE);
+             if( lex.consume_if(TOK_PIPE) )
+             {
+-                do
++                for(;;)
+                 {
+-                    if( lex.next() == TOK_PIPE )
+-                        break;
+-                    consume_pat(lex, /*allow_or=*/false);
+-                    if(lex.consume_if(TOK_COLON))
++                    do
+                     {
+-                        consume_type(lex);
+-                    }
+-                } while(lex.consume_if(TOK_COMMA));
+-                if( !lex.consume_if(TOK_PIPE) )
+-                    return false;
++                        if( lex.next() == TOK_PIPE || lex.next() == TOK_DOUBLE_PIPE )
++                            break;
++                        consume_pat(lex, /*allow_or=*/false);
++                        if(lex.consume_if(TOK_COLON))
++                        {
++                            consume_type(lex);
++                        }
++                    } while(lex.consume_if(TOK_COMMA));
++                    // `|_||x, y| x+y`: the `||` closes this list and opens that of the body's closure
++                    if( lex.consume_if(TOK_DOUBLE_PIPE) )
++                        continue;
++                    if( !lex.consume_if(TOK_PIPE) )
++                        return false;
++                    break;
++                }
+             }
+             else
+             {
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 2730f2ba..3b6f4fdb 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -754,9 +754,20 @@ ExprNodeP Parse_Stmt(TokenStream& lex)
+         return Parse_FlowControl(lex, AST::ExprNode_Flow::BREAK);
+     case TOK_RWORD_RETURN:
+         return Parse_FlowControl(lex, AST::ExprNode_Flow::RETURN);
++    // ExpressionWithBlock also covers `unsafe { .. }` and `const { .. }`: a match arm `X => unsafe {} | X => ..` ends
++    // at the block like the other block-like arms
++    case TOK_RWORD_UNSAFE:
++    case TOK_RWORD_CONST:
++        if( lex.lookahead(0) != TOK_BRACE_OPEN ) {
++            PUTBACK(tok, lex);
++            return Parse_Expr0(lex);
++        }
+     case TOK_BRACE_OPEN: {
+-        PUTBACK(tok, lex);
+-        auto rv = Parse_ExprBlockNode(lex);
++        auto blk_ty = tok.type() == TOK_RWORD_UNSAFE ? AST::ExprNode_Block::Type::Unsafe
++            : tok.type() == TOK_RWORD_CONST ? AST::ExprNode_Block::Type::Const : AST::ExprNode_Block::Type::Bare;
++        if( tok.type() == TOK_BRACE_OPEN )
++            PUTBACK(tok, lex);
++        auto rv = Parse_ExprBlockNode(lex, blk_ty);
+         // A block followed by `.` or `?` starts an expression, as in a block's statements (Parse_ExprBlockLine): a match
+         // arm `Body::Raw(body) => { .. }.body(body),` (xh 0.26.2 main.rs:486)
+         if( lex.lookahead(0) == TOK_DOT || lex.lookahead(0) == TOK_QMARK ) {
+@@ -1405,6 +1416,11 @@ ExprNodeP Parse_ExprVal_Closure(TokenStream& lex, bool is_async = false)
+ 
+             if( !lex.getTokenIf(TOK_COMMA) ) {
+                 GET_TOK(tok, lex);
++                // `|_||x, y| x+y`: the `||` closes this list and opens the body's closure
++                if( tok.type() == TOK_DOUBLE_PIPE ) {
++                    lex.putback(Token(TOK_PIPE));
++                    tok = Token(TOK_PIPE);
++                }
+                 break;
+             }
+         }
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index c6f3f799..6e97c7a5 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -682,7 +682,33 @@ Token Lexer::getTokenInt()
+         {
+             // If the symbol is `TOK_DOT`, check if the next character is a digit and consume an integer
+             if(sym == TOK_DOT) {
++                // Also past whitespace and comments: `tuple. 0.0`, `tuple./*c*/0.0` are tuple indices too
+                 auto ch = this->getc();
++                for(;;)
++                {
++                    if( ch.isspace() ) {
++                        ch = this->getc();
++                    }
++                    else if( ch == '/' && m_istream.peek() == '/' ) {
++                        while( ch != '\n' )
++                            ch = this->getc();
++                    }
++                    else if( ch == '/' && m_istream.peek() == '*' ) {
++                        this->getc();
++                        unsigned depth = 1;
++                        Codepoint prev = 0;
++                        while( depth > 0 ) {
++                            ch = this->getc();
++                            if( prev == '/' && ch == '*' ) { depth ++; ch = 0; }
++                            else if( prev == '*' && ch == '/' ) { depth --; ch = 0; }
++                            prev = ch;
++                        }
++                        ch = this->getc();
++                    }
++                    else {
++                        break;
++                    }
++                }
+                 this->ungetc();
+                 if( ch.isdigit() ) {
+                     auto val = this->parseInt(nullptr);
+diff --git a/src/parse/root.cpp b/src/parse/root.cpp
+index e0b79fe4..f72f08e6 100644
+--- a/src/parse/root.cpp
++++ b/src/parse/root.cpp
+@@ -231,6 +231,12 @@ void Parse_Publicity_Inherited(TokenStream& lex, const char* what)
+ // next token can begin a bound
+ bool Parse_BoundList_Next(TokenStream& lex)
+ {
++    // `T: Clone += ()`: a trailing `+` and the `=` of a default, lexed as one token
++    if( lex.lookahead(0) == TOK_PLUS_EQUAL ) {
++        lex.getToken();
++        lex.putback(Token(TOK_EQUAL));
++        return false;
++    }
+     if( !lex.getTokenIf(TOK_PLUS) )
+         return false;
+     switch( lex.lookahead(0) )
+diff --git a/src/version.cpp b/src/version.cpp
+index 4362586e..18a122b4 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  482
++#define VERSION_SERIES  483
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

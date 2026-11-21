@@ -1,0 +1,217 @@
+From 56b22e7880948c5392b62f7d4d6a298f10a81ecf Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 17:44:54 +0000
+Subject: [PATCH] lex: a literal keeps any suffix, an error only where it is a value
+
+rustc 1.90 tests/ui, parse-only run:
+
+    proc-macro/debug/dump-debug.rs, dump-debug-span-debug.rs
+        dump_debug! { .. 0q 1.0q "S"q b"B"q r"R"q .. 'C'q b'B'q }
+    error: Unknown float suffix q
+
+Reference, Tokens > Suffixes: "any kind of literal (string, integer,
+etc) with any suffix is valid as a token" (SUFFIX = IDENTIFIER_OR_
+KEYWORD); only a literal expression or pattern restricts the suffix to
+a numeric type. rustc checks it when lowering the literal.
+
+Lexer (lex.cpp): a float with a suffix that is not a float type was
+a lex error; an integer's unknown suffix was split off as a separate
+identifier token (`10px` = `10` `px`, two `tt`s, and a proc macro got
+two tokens); a character or byte literal's suffix also became an
+identifier. All three now keep the suffix in the token's suffix field
+(Token::m_suffix, which strings already used).
+
+Token::to_str prints the suffix of an integer or float (stringify!,
+proc-macro input text). The proc-macro bridge sends the suffix after
+integers and floats as it did after strings, and takes one back after
+any literal (libproc_macro already attached a Suffix to any literal).
+
+Parser: a literal used as an expression (Parse_ExprVal_Inner) or
+a pattern value (Parse_PatternValue) with a suffix is an error,
+"Invalid suffix `q` on literal 1.0q". Strings with a suffix used as
+a value were accepted silently before.
+
+Grammar copies: macro_rules compares tokens with their suffix (`(10px)`
+matches only `10px`), fragments take the token as before.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/expand/proc_macro.cpp b/src/expand/proc_macro.cpp
+index 61e88232..991e7acb 100644
+--- a/src/expand/proc_macro.cpp
++++ b/src/expand/proc_macro.cpp
+@@ -706,9 +706,10 @@ namespace {
+                 else {
+                     m_pmi.send_int(tok.datatype(), tok.intval());
+                 }
++                m_pmi.send_suffix(tok.suffix());
+                 break;
+             case TOK_CHAR:      m_pmi.send_char(tok.intval().truncate_u64());  break;
+-            case TOK_FLOAT:     m_pmi.send_float(tok.datatype(), tok.floatval());   break;
++            case TOK_FLOAT:     m_pmi.send_float(tok.datatype(), tok.floatval()); m_pmi.send_suffix(tok.suffix());  break;
+             case TOK_STRING:        m_pmi.send_string(tok.str());     m_pmi.send_suffix(tok.suffix());  break;
+             case TOK_BYTESTRING:    m_pmi.send_bytestring(tok.str()); m_pmi.send_suffix(tok.suffix());  break;
+             case TOK_CSTRING:       m_pmi.send_cstring(tok.str());    m_pmi.send_suffix(tok.suffix());  break;
+@@ -2996,8 +2997,8 @@ Token ProcMacroInv::realGetToken() {
+         return rv;
+     }
+     auto rv = this->realGetToken_();
+-    // A string literal may be followed by its suffix (the stream always ends with an end marker, so there is a next byte)
+-    if( rv == TOK_STRING || rv == TOK_BYTESTRING || rv == TOK_CSTRING ) {
++    // A literal may be followed by its suffix (the stream always ends with an end marker, so there is a next byte)
++    if( rv == TOK_STRING || rv == TOK_BYTESTRING || rv == TOK_CSTRING || rv == TOK_INTEGER || rv == TOK_FLOAT ) {
+         uint8_t v = this->recv_u8();
+         if( static_cast<TokenClass>(v) == TokenClass::Suffix ) {
+             rv.set_suffix(RcString::new_interned(this->recv_bytes()));
+diff --git a/src/parse/expr.cpp b/src/parse/expr.cpp
+index 0f427154..2730f2ba 100644
+--- a/src/parse/expr.cpp
++++ b/src/parse/expr.cpp
+@@ -1641,16 +1641,28 @@ ExprNodeP Parse_ExprVal_Inner(TokenStream& lex)
+ 
+     case TOK_UNDERSCORE:
+         return NEWNODE( AST::ExprNode_WildcardPattern );
++    // A literal's suffix is checked where it becomes a value: in a token stream any suffix is allowed
+     case TOK_INTEGER:
+-        return NEWNODE( AST::ExprNode_Integer, tok.intval(), tok.datatype() );
+     case TOK_FLOAT:
+-        return NEWNODE( AST::ExprNode_Float, tok.floatval(), tok.datatype() );
+     case TOK_STRING:
+-        return NEWNODE( AST::ExprNode_String, tok.str(), tok.str_hygiene() );
+     case TOK_BYTESTRING:
+-        return NEWNODE( AST::ExprNode_ByteString, tok.str() );
+     case TOK_CSTRING:
+-        return NEWNODE( AST::ExprNode_CString, tok.str() );
++        if( tok.suffix().size() > 0 ) {
++            ERROR(lex.point_span(), E0000, "Invalid suffix `" << tok.suffix() << "` on literal " << tok.to_str());
++        }
++        switch( tok.type() )
++        {
++        case TOK_INTEGER:
++            return NEWNODE( AST::ExprNode_Integer, tok.intval(), tok.datatype() );
++        case TOK_FLOAT:
++            return NEWNODE( AST::ExprNode_Float, tok.floatval(), tok.datatype() );
++        case TOK_STRING:
++            return NEWNODE( AST::ExprNode_String, tok.str(), tok.str_hygiene() );
++        case TOK_BYTESTRING:
++            return NEWNODE( AST::ExprNode_ByteString, tok.str() );
++        default:
++            return NEWNODE( AST::ExprNode_CString, tok.str() );
++        }
+     case TOK_RWORD_TRUE:
+         return NEWNODE( AST::ExprNode_Bool, true );
+     case TOK_RWORD_FALSE:
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index dffc3a7d..602f087f 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -335,6 +335,10 @@ Token Lexer::realGetToken()
+             continue;
+         case TOK_COMMENT: {
+             continue; }
++        case TOK_INTEGER:
++            // Numbers read their suffix themselves; a character literal is followed by it (`'C'q`, `b'B'q`)
++            if( !(tok.datatype() == CORETYPE_CHAR || tok.is_byte_char()) )
++                return tok;
+         case TOK_STRING:
+         case TOK_BYTESTRING:
+         case TOK_CSTRING:
+@@ -505,8 +509,12 @@ Token Lexer::getTokenInt()
+                         else if(suffix == "f32") num_type = CORETYPE_F32;
+                         else if(suffix == "f64") num_type = CORETYPE_F64;
+                         else if(suffix == "f128") num_type = CORETYPE_F128;
+-                        else
+-                            ERROR(this->point_span(), E0000, "Unknown float suffix " << suffix);
++                        else {
++                            // Any other suffix stays on the token: an error only where the literal is a value
++                            auto rv = Token::make_float(fval, CORETYPE_ANY);
++                            rv.set_suffix(RcString::new_interned(suffix));
++                            return rv;
++                        }
+                     }
+                     else
+                     {
+@@ -544,9 +552,11 @@ Token Lexer::getTokenInt()
+                     else if(suffix == "f128") num_type = CORETYPE_F128;
+                     else
+                     {
+-                        // Not a numeric type suffix - rustc allows any identifier here, so emit it as a following ident token
+-                        m_next_tokens.push_back(Token(TOK_IDENT, Ident(this->realGetHygiene(), RcString::new_interned(suffix))));
+-                        return Token(val, CORETYPE_ANY);
++                        // Any other suffix stays on the token (`10px` is one literal to a macro): an error only where the
++                        // literal is a value
++                        auto rv = Token(val, CORETYPE_ANY);
++                        rv.set_suffix(RcString::new_interned(suffix));
++                        return rv;
+                     }
+                     return Token(val, num_type);
+                 }
+diff --git a/src/parse/pattern.cpp b/src/parse/pattern.cpp
+index 6185b84a..2621b970 100644
+--- a/src/parse/pattern.cpp
++++ b/src/parse/pattern.cpp
+@@ -242,7 +242,11 @@ AST::Pattern::Value Parse_PatternValue(TokenStream& lex)
+         return AST::Pattern::Value::make_Named( Parse_Path(lex, PATH_GENERIC_EXPR) );
+ 
+     case TOK_DASH:
+-        if(GET_TOK(tok, lex) == TOK_INTEGER)
++        GET_TOK(tok, lex);
++        if( tok.suffix().size() > 0 && (tok.type() == TOK_INTEGER || tok.type() == TOK_FLOAT) ) {
++            ERROR(lex.point_span(), E0000, "Invalid suffix `" << tok.suffix() << "` on literal " << tok.to_str());
++        }
++        if(tok.type() == TOK_INTEGER)
+         {
+             auto dt = tok.datatype();
+             // TODO: Ensure that the type is ANY or a signed integer
+@@ -256,6 +260,20 @@ AST::Pattern::Value Parse_PatternValue(TokenStream& lex)
+         {
+             throw ParseError::Unexpected(lex, tok, {TOK_INTEGER, TOK_FLOAT});
+         }
++    case TOK_FLOAT:
++    case TOK_INTEGER:
++    case TOK_STRING:
++    case TOK_BYTESTRING:
++        // A literal's suffix is checked where it becomes a value (see Parse_ExprVal_Inner)
++        if( tok.suffix().size() > 0 ) {
++            ERROR(lex.point_span(), E0000, "Invalid suffix `" << tok.suffix() << "` on literal " << tok.to_str());
++        }
++        break;
++    default:
++        break;
++    }
++    switch( tok.type() )
++    {
+     case TOK_FLOAT:
+         return AST::Pattern::Value::make_Float({tok.datatype(), tok.floatval()});
+     case TOK_INTEGER:
+diff --git a/src/parse/token.cpp b/src/parse/token.cpp
+index 0e278905..86022497 100644
+--- a/src/parse/token.cpp
++++ b/src/parse/token.cpp
+@@ -421,6 +421,12 @@ struct EscapedByteString {
+ 
+ ::std::string Token::to_str() const
+ {
++    // An integer or float literal with a suffix that is not a type (`1.0q` in a macro's input)
++    if( m_suffix.size() > 0 && (m_type == TOK_INTEGER || m_type == TOK_FLOAT) ) {
++        Token t = this->clone();
++        t.m_suffix = RcString();
++        return t.to_str() + m_suffix.c_str();
++    }
+     ::std::stringstream ss;
+     switch(m_type)
+     {
+diff --git a/src/version.cpp b/src/version.cpp
+index e47ac88d..f1da996e 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  478
++#define VERSION_SERIES  479
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

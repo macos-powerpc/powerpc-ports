@@ -1,0 +1,202 @@
+From 8c047a8b9ffbbd810d55bf5a927a7f01b03dc1ee Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 17:57:23 +0000
+Subject: [PATCH] lex: shebang by rustc's rule, a bare CR in a line comment,
+ `_` in `\u{..}`
+
+Three lexer crashes or failures on valid input from the rustc 1.90
+tests/ui parse-only run:
+
+    parser/shebang/shebang-empty.rs     `#!` alone on the first line
+    parser/shebang/shebang-space.rs     `#!    `
+    parser/shebang/multiline-attrib.rs  `#!` then `[allow(unused_variables)]`
+                                        on the next line
+    terminate called after throwing an instance of 'ParseError::BadChar'
+    parser/shebang/sneaky-attrib.rs     `#!//bin/bash`, comments, then `[allow(..)]`
+    error: Unexpected token TOK_SQUARE_OPEN
+    lexer/lex-bare-cr-nondoc-comment.rs `// nondoc comment with bare CR: '\r'`
+    BUG: lex.cpp:785: TODO: Lex Fail - Expected ' after character constant
+    issues/issue-43692.rs               '\u{10__FFFF}'
+    terminate called after throwing an instance of 'CompileError::Generic'
+
+Reference, Input format > Shebang removal: a first line starting with
+`#!` is removed unless the next token after the `#!`, ignoring
+whitespace and non-doc comments (rustc_lexer::strip_shebang, which
+looks across lines), is `[`. Comments: LINE_COMMENT runs to LF and
+excludes only LF (a CR alone is allowed outside doc comments).
+Tokens > Character escapes: UNICODE_ESCAPE is `\u{ ( HEX_DIGIT _* )1..6 }`.
+
+Lexer (lex.cpp):
+- `#!` at the start of a file: Lex_ShebangIsAttribute reads ahead in
+  the stream (skipping whitespace, `//` and `/* */` comments that are
+  not doc comments, nested block comments) and seeks back. `[` makes
+  `#!` an inner attribute, anything else makes the first line a
+  shebang. Before, only `#!/..` was a shebang and `#!` followed by
+  anything but `/` or `[` threw an uncaught BadChar; `#` followed by
+  anything but `!` or `[` did too (now a plain `#` token, so `# !/x` is
+  an ordinary parse error, as in rustc).
+- a line comment ended at a CR as well as at LF, so the rest of the
+  line after a bare CR was lexed as code; it ends at LF only (CRLF is
+  already read as LF).
+- `\u{..}` takes `_` after the first digit (libproc_macro's lexer
+  already did).
+
+The error tests in parser/shebang/ (`#!B` not at the start,
+shebang-doc-comment.rs, shebang-must-start-file.rs, shebang-split.rs)
+still fail as rustc expects them to.
+
+Assisted-by: Claude Opus 5.5
+---
+
+diff --git a/src/parse/lex.cpp b/src/parse/lex.cpp
+index 602f087f..c6f3f799 100644
+--- a/src/parse/lex.cpp
++++ b/src/parse/lex.cpp
+@@ -317,6 +317,65 @@ Ident::Hygiene Lexer::realGetHygiene() const
+ {
+     return m_hygiene;
+ }
++// rustc_lexer::strip_shebang: after a `#!` at the start of a file, is the next token (past whitespace and non-doc
++// comments, on any line) a `[`? Reads ahead and returns the stream to where it was.
++static bool Lex_ShebangIsAttribute(::std::istream& is)
++{
++    auto start = is.tellg();
++    if( start == ::std::istream::pos_type(-1) ) {
++        is.clear();
++        return is.peek() == '[';
++    }
++    bool rv = false;
++    for(;;)
++    {
++        int c = is.get();
++        if( c == EOF )
++            break;
++        if( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' )
++            continue;
++        if( c == '/' && is.peek() == '/' ) {
++            is.get();
++            int c3 = is.get();
++            // `//!` and `///` (not `////`) are doc comments, a token
++            if( c3 == '!' || (c3 == '/' && is.peek() != '/') )
++                break;
++            while( c3 != EOF && c3 != '\n' )
++                c3 = is.get();
++            continue;
++        }
++        if( c == '/' && is.peek() == '*' ) {
++            is.get();
++            int cc = is.get();
++            // `/*!` and `/**` (not `/**/` or `/***`) are doc comments
++            if( cc == '!' || (cc == '*' && is.peek() != '*' && is.peek() != '/') )
++                break;
++            unsigned depth = 1;
++            int prev = 0;
++            while( cc != EOF )
++            {
++                if( prev == '/' && cc == '*' ) {
++                    depth ++;
++                    cc = 0;
++                }
++                else if( prev == '*' && cc == '/' ) {
++                    if( --depth == 0 )
++                        break;
++                    cc = 0;
++                }
++                prev = cc;
++                cc = is.get();
++            }
++            continue;
++        }
++        rv = (c == '[');
++        break;
++    }
++    is.clear();
++    is.seekg(start);
++    return rv;
++}
++
+ Token Lexer::realGetToken()
+ {
+     while(true)
+@@ -382,31 +441,18 @@ Token Lexer::getTokenInt()
+         Codepoint ch = this->getc();
+ 
+         if( m_line == 1 && m_line_ofs == 1 && ch == '#') {
+-            switch( (ch = this->getc()).v )
+-            {
+-            case '!':
+-                switch( (ch = this->getc()).v )
+-                {
+-                case '/':
+-                    // SHEBANG!
+-                    while( ch != '\n' )
+-                        ch = this->getc();
+-                    return Token(TOK_NEWLINE);
+-                case '[':
+-                    this->ungetc();
++            if( (ch = this->getc()) == '!' ) {
++                // An inner attribute (`#!` then `[`, past whitespace and non-doc comments on any line), else a shebang
++                if( Lex_ShebangIsAttribute(m_istream) ) {
+                     this->m_next_tokens.push_back(TOK_EXCLAM);
+                     return Token(TOK_HASH);
+-                default:
+-                    throw ParseError::BadChar(*this, ch.v);
+                 }
+-            case '[':
+-                this->ungetc();
+-                return Token(TOK_HASH);
+-            default:
+-                this->ungetc();
+-                //return Token(TOK_HASH);
+-                throw ParseError::BadChar(*this, ch.v);
++                while( ch != '\n' )
++                    ch = this->getc();
++                return Token(TOK_NEWLINE);
+             }
++            this->ungetc();
++            return Token(TOK_HASH);
+         }
+ 
+         if( ch == '\n' )
+@@ -668,7 +714,8 @@ Token Lexer::getTokenInt()
+                     is_pdoc = true;
+                     ch = this->getc();
+                 }
+-                while(ch != '\n' && ch != '\r')
++                // Up to the line feed: a CR alone is part of the comment (a CRLF pair already reads as `\n`)
++                while(ch != '\n')
+                 {
+                     str += ch;
+                     ch = this->getc();
+@@ -1168,11 +1215,14 @@ uint32_t Lexer::parseEscape(char enclosing)
+         }
+         if( !ch.isxdigit() )
+             throw ParseError::Generic(*this, FMT("Found invalid character '\\x" << ::std::hex << ch.v << "' in \\u sequence" ) );
+-        while( ch.isxdigit() )
++        // Underscores may follow any digit: `\u{10__FFFF}`
++        while( ch.isxdigit() || (req_close_brace && ch == '_') )
+         {
+-            char    tmp[2] = {static_cast<char>(ch.v), 0};
+-            val *= 16;
+-            val += ::std::strtol(tmp, NULL, 16);
++            if( ch != '_' ) {
++                char    tmp[2] = {static_cast<char>(ch.v), 0};
++                val *= 16;
++                val += ::std::strtol(tmp, NULL, 16);
++            }
+             ch = this->getc();
+         }
+         if( !req_close_brace )
+diff --git a/src/version.cpp b/src/version.cpp
+index f7b7b0b0..4362586e 100644
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -13,7 +13,7 @@
+ #define VERSION_PATCH   0
+ 
+ // Number of the last patch in this fork's series: every fix commit bumps it
+-#define VERSION_SERIES  481
++#define VERSION_SERIES  482
+ // rlibs written by an older series are refused (0 = accept all)
+ #define VERSION_SERIES_FLOOR    0
+ 

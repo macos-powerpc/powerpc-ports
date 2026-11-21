@@ -1,0 +1,104 @@
+From 6666d737d9c5c7d5137663e18c889dcb4917801a Mon Sep 17 00:00:00 2001
+From: Sergey Fedorov <barracuda@macos-powerpc.org>
+Date: Wed, 18 Nov 2026 16:20:53 +0000
+Subject: [PATCH] trans: a provided method whose where-clause names
+ a projection without an impl is not emitted for that impl
+
+tokio-signal 0.2.9 (websocat) and tokio-tcp 0.1.4 (ffsend), both on
+futures 0.1:
+
+    <null> BUG: ASSERT FAIL: src/hir_typeck/static.cpp:2394:
+    valid_for_opaque(input): Set opaque on a non-generic type:
+    <i32 as ::"core-0_0_0"::iter::traits::collect::IntoIterator>::Item/*O*/
+
+futures 0.1 has
+
+    fn concat2(self) -> Concat2<Self>
+        where Self: Sized,
+              Self::Item: Extend<<<Self as Stream>::Item as IntoIterator>::Item>
+                          + IntoIterator + Default
+
+and tokio-signal has `impl Stream for Signal { type Item = c_int; .. }`.
+For that impl the clause is false and the method cannot be called;
+rustc does not instantiate a provided method with impossible predicates.
+
+Trans Enumerate checks a provided method's bounds before emitting it
+for a non-generic impl, but it expanded each bound before testing it.
+The first bound names `<i32 as IntoIterator>::Item`: there is no impl,
+the expansion assumed an opaque name and asserted that an opaque name
+must mention a generic, before the loop reached `i32: IntoIterator`,
+the bound that fails.
+
+The bound's types are now expanded innermost first with a check:
+a projection on a concrete type that has no impl of its trait makes
+the bound impossible, and the method is skipped as for any other failed
+bound.
+
+Assisted-by: Claude Fable 5.2
+---
+
+diff --git a/src/trans/enumerate.cpp b/src/trans/enumerate.cpp
+index a550f805..3002d71d 100644
+--- a/src/trans/enumerate.cpp
++++ b/src/trans/enumerate.cpp
+@@ -513,6 +513,39 @@ namespace {
+         }
+     }
+ 
++    /// `ty` with its projections expanded innermost first, clearing `ok` when one names a concrete type that has no
++    /// impl of the projection's trait: a bound mentioning it can't hold (rustc's impossible predicates), where
++    /// `expand_associated_types` assumes an opaque name and asserts that it mentions a generic.
++    /// - futures 0.1 stream/mod.rs `fn concat2(self) .. where Self::Item: Extend<<Self::Item as IntoIterator>::Item> +
++    ///   IntoIterator + Default` under `impl Stream for Signal { type Item = c_int; .. }` (tokio-signal 0.2.9, and
++    ///   tokio-tcp 0.1.4's `Incoming`): "Set opaque on a non-generic type: <i32 as IntoIterator>::Item"
++    ::HIR::TypeRef Trans_Enumerate_ExpandChecked(const StaticTraitResolve& resolve, const Span& sp, const ::HIR::TypeRef& ty, bool& ok)
++    {
++        t_cb_clone_ty   cb;
++        cb = [&](const ::HIR::TypeRef& t, ::HIR::TypeRef& out)->bool {
++            if( !(t.data().is_Path() && t.data().as_Path().path.m_data.is_UfcsKnown()) )
++                return false;
++            const auto& pe = t.data().as_Path().path.m_data.as_UfcsKnown();
++            auto self_ty = clone_ty_with(sp, pe.type, cb);
++            auto trait_gp = ::HIR::GenericPath(pe.trait.m_path, clone_path_params_with(sp, pe.trait.m_params, cb));
++            auto item_params = clone_path_params_with(sp, pe.params, cb);
++            if( ok && !monomorphise_type_needed(self_ty) && !monomorphise_pathparams_needed(trait_gp.m_params) )
++            {
++                if( !resolve.find_impl(sp, trait_gp.m_path, trait_gp.m_params, self_ty, [](const ImplRef&, bool){ return true; }) )
++                {
++                    DEBUG("No impl of " << trait_gp << " for " << self_ty << ", so no " << pe.item);
++                    ok = false;
++                }
++            }
++            out = ::HIR::TypeRef::new_path( ::HIR::Path(mv$(self_ty), mv$(trait_gp), pe.item, mv$(item_params)), {} );
++            if( ok ) {
++                resolve.expand_associated_types(sp, out);
++            }
++            return true;
++            };
++        return clone_ty_with(sp, ty, cb);
++    }
++
+     /// Whether the trait bounds of `params` (a trait method's where-clauses) hold once monomorphised by `ms`
+     bool Trans_Enumerate_BoundsHold(const StaticTraitResolve& resolve, const Span& sp, const ::HIR::GenericParams& params, const Monomorphiser& ms)
+     {
+@@ -522,8 +555,19 @@ namespace {
+             if( !b.is_TraitBound() )    continue;
+             const auto& be = b.as_TraitBound();
+ 
+-            auto b_ty_mono = resolve.monomorph_expand(sp, be.type, ms);
++            // Monomorphised, then expanded with a check: a projection that has no impl makes the bound impossible
++            bool ok = true;
++            auto b_ty_mono = Trans_Enumerate_ExpandChecked(resolve, sp, ms.monomorph_type(sp, be.type), ok);
+             auto b_tp_mono = ms.monomorph_traitpath(sp, be.trait, false);
++            for(auto& t : b_tp_mono.m_path.m_params.m_types)
++                t = Trans_Enumerate_ExpandChecked(resolve, sp, t, ok);
++            for(auto& tb : b_tp_mono.m_type_bounds)
++                tb.second.type = Trans_Enumerate_ExpandChecked(resolve, sp, tb.second.type, ok);
++            if( !ok ) {
++                DEBUG("Bound " << be.type << ": " << be.trait << " names a projection without an impl");
++                return false;
++            }
++            resolve.expand_associated_types(sp, b_ty_mono);
+             resolve.expand_associated_types_tp(sp, b_tp_mono);
+ 
+             DEBUG("Check " << b_ty_mono << ": " << b_tp_mono);
